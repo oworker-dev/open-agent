@@ -538,69 +538,102 @@ export function AgentWorkspace({ client, commands = [], defaultPreferences, exte
                     let consumed = 0;
                     const follow = !needsBoundedCatchUp;
                     needsBoundedCatchUp = false;
-                    for await (const event of session.stream({
-                        follow,
-                        signal: controller.signal,
-                        startIndex: cursor,
-                        ...(follow ? { streamReconnectPolicy: RECOVERY_STREAM_RECONNECT_POLICY } : {}),
-                    })) {
-                        mergeLiveAdmissions();
-                        if (cancellationPending && event.type === "turn.started") {
-                            interruptedTurns = retargetLatestInterruptedTurn(interruptedTurns, event.data.turnId);
-                        }
-                        const suppressEvent = shouldSuppressInterruptedTurnStreamEvent(event, cursor, interruptedTurns);
-                        if (!suppressEvent)
-                            events = [...appendThreadEvent(events, event)];
-                        cursor += 1;
-                        consumed += 1;
-                        onEvent?.(event);
-                        if (event.type === "message.received") {
-                            const clientMessageId = event.data.clientMessageId;
-                            if (clientMessageId) {
-                                committedCatchUpTurns.delete(clientMessageId);
-                                consumedQueuedTurnIds.add(clientMessageId);
-                                queuedTurns = queuedTurns.filter((turn) => turn.id !== clientMessageId);
-                                if (pendingTurn?.id === clientMessageId) {
-                                    consumedPendingTurnIds.add(clientMessageId);
-                                    pendingTurn = undefined;
-                                }
+                    let restartFollowFromDurableProgress = false;
+                    const followController = follow ? new AbortController() : undefined;
+                    const abortFollow = () => followController?.abort();
+                    if (followController)
+                        controller.signal.addEventListener("abort", abortFollow, { once: true });
+                    const followWatchdog = followController
+                        ? watchRecoveryDurableProgress({
+                            client: connection.client,
+                            getCursor: () => cursor,
+                            onProgress: () => {
+                                restartFollowFromDurableProgress = true;
+                                followController.abort();
+                            },
+                            sessionId: session.state.sessionId,
+                            signal: followController.signal,
+                        })
+                        : undefined;
+                    try {
+                        for await (const event of session.stream({
+                            follow,
+                            signal: followController?.signal ?? controller.signal,
+                            startIndex: cursor,
+                            ...(follow ? { streamReconnectPolicy: RECOVERY_STREAM_RECONNECT_POLICY } : {}),
+                        })) {
+                            mergeLiveAdmissions();
+                            if (cancellationPending && event.type === "turn.started") {
+                                interruptedTurns = retargetLatestInterruptedTurn(interruptedTurns, event.data.turnId);
                             }
-                            else {
-                                const committedTurn = [...committedCatchUpTurns.values()].find((turn) => turn.text.trim() === event.data.message.trim());
-                                if (committedTurn) {
-                                    committedCatchUpTurns.delete(committedTurn.id);
-                                }
-                                else if (pendingTurn) {
-                                    consumedPendingTurnIds.add(pendingTurn.id);
-                                    pendingTurn = undefined;
+                            const suppressEvent = shouldSuppressInterruptedTurnStreamEvent(event, cursor, interruptedTurns);
+                            if (!suppressEvent)
+                                events = [...appendThreadEvent(events, event)];
+                            cursor += 1;
+                            consumed += 1;
+                            onEvent?.(event);
+                            if (event.type === "message.received") {
+                                const clientMessageId = event.data.clientMessageId;
+                                if (clientMessageId) {
+                                    committedCatchUpTurns.delete(clientMessageId);
+                                    consumedQueuedTurnIds.add(clientMessageId);
+                                    queuedTurns = queuedTurns.filter((turn) => turn.id !== clientMessageId);
+                                    if (pendingTurn?.id === clientMessageId) {
+                                        consumedPendingTurnIds.add(clientMessageId);
+                                        pendingTurn = undefined;
+                                    }
                                 }
                                 else {
-                                    const nextBrowserTurn = queuedTurns.find((turn) => turn.delivery !== "server" && turn.text.trim() === event.data.message.trim());
-                                    if (nextBrowserTurn) {
-                                        consumedQueuedTurnIds.add(nextBrowserTurn.id);
-                                        queuedTurns = queuedTurns.filter((turn) => turn.id !== nextBrowserTurn.id);
+                                    const committedTurn = [...committedCatchUpTurns.values()].find((turn) => turn.text.trim() === event.data.message.trim());
+                                    if (committedTurn) {
+                                        committedCatchUpTurns.delete(committedTurn.id);
+                                    }
+                                    else if (pendingTurn) {
+                                        consumedPendingTurnIds.add(pendingTurn.id);
+                                        pendingTurn = undefined;
+                                    }
+                                    else {
+                                        const nextBrowserTurn = queuedTurns.find((turn) => turn.delivery !== "server" && turn.text.trim() === event.data.message.trim());
+                                        if (nextBrowserTurn) {
+                                            consumedQueuedTurnIds.add(nextBrowserTurn.id);
+                                            queuedTurns = queuedTurns.filter((turn) => turn.id !== nextBrowserTurn.id);
+                                        }
                                     }
                                 }
                             }
+                            if (cancellationPending &&
+                                (event.type === "session.waiting" || event.type === "session.completed" || event.type === "session.failed"))
+                                cancellationPending = false;
+                            updateThread(thread.id, {
+                                events: [...events],
+                                interruptedTurns,
+                                pendingTurn,
+                                queuedTurns,
+                                session: { ...session.state, streamIndex: cursor },
+                                status: cancellationPending
+                                    ? "cancelling"
+                                    : statusFromEvents(events, currentClosedInputRequestIds()),
+                            });
+                            if (isRecoveryBoundary(event)) {
+                                await refreshMailboxQueue();
+                                settled = currentBoundarySettles();
+                                break;
+                            }
                         }
-                        if (cancellationPending &&
-                            (event.type === "session.waiting" || event.type === "session.completed" || event.type === "session.failed"))
-                            cancellationPending = false;
-                        updateThread(thread.id, {
-                            events: [...events],
-                            interruptedTurns,
-                            pendingTurn,
-                            queuedTurns,
-                            session: { ...session.state, streamIndex: cursor },
-                            status: cancellationPending
-                                ? "cancelling"
-                                : statusFromEvents(events, currentClosedInputRequestIds()),
-                        });
-                        if (isRecoveryBoundary(event)) {
-                            await refreshMailboxQueue();
-                            settled = currentBoundarySettles();
-                            break;
-                        }
+                    }
+                    catch (error) {
+                        if (!restartFollowFromDurableProgress)
+                            throw error;
+                    }
+                    finally {
+                        controller.signal.removeEventListener("abort", abortFollow);
+                        followController?.abort();
+                        await followWatchdog;
+                    }
+                    if (restartFollowFromDurableProgress && !settled) {
+                        needsBoundedCatchUp = true;
+                        reconnectAttempt = 0;
+                        continue;
                     }
                     await refreshMailboxQueue();
                     if (consumed === 0 &&
@@ -757,6 +790,9 @@ function UnavailableSubagentView({ locale, onBack, }) {
 }
 const RECOVERY_TAIL_LOOKUP_TIMEOUT_MS = 1_500;
 const RECOVERY_CURSOR_OVERLAP_EVENTS = 256;
+const RECOVERY_PROGRESS_PROBE_DELAY_MS = 10_000;
+const RECOVERY_PROGRESS_PROBE_INTERVAL_MS = 10_000;
+const RECOVERY_PROGRESS_PROBE_TIMEOUT_MS = 2_500;
 const MAX_RECOVERY_RECONNECT_ATTEMPTS = 6;
 const RECOVERY_RETRY_BASE_DELAY_MS = 750;
 const RECOVERY_RETRY_MAX_DELAY_MS = 15_000;
@@ -828,6 +864,62 @@ async function readTailBoundary(session, parentSignal) {
         parentSignal.removeEventListener("abort", abort);
     }
     return undefined;
+}
+async function watchRecoveryDurableProgress({ client, getCursor, onProgress, sessionId, signal, }) {
+    if (!await waitForRecoveryProbe(signal, RECOVERY_PROGRESS_PROBE_DELAY_MS))
+        return;
+    while (!signal.aborted) {
+        const probedCursor = getCursor();
+        const durableProgress = await hasRecoveryDurableProgress(client, sessionId, probedCursor, signal);
+        if (signal.aborted)
+            return;
+        if (durableProgress && getCursor() === probedCursor) {
+            onProgress();
+            return;
+        }
+        if (!await waitForRecoveryProbe(signal, RECOVERY_PROGRESS_PROBE_INTERVAL_MS))
+            return;
+    }
+}
+async function hasRecoveryDurableProgress(client, sessionId, startIndex, parentSignal) {
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    parentSignal.addEventListener("abort", abort, { once: true });
+    const timeout = window.setTimeout(abort, RECOVERY_PROGRESS_PROBE_TIMEOUT_MS);
+    const probe = client.sessions.attach(sessionId, { streamIndex: startIndex });
+    try {
+        for await (const _event of probe.stream({
+            follow: false,
+            signal: controller.signal,
+            startIndex,
+        })) {
+            return true;
+        }
+    }
+    catch (error) {
+        if (!controller.signal.aborted && !isRetryableRecoveryError(error)) {
+            console.warn("Durable recovery progress probe failed", error);
+        }
+    }
+    finally {
+        window.clearTimeout(timeout);
+        parentSignal.removeEventListener("abort", abort);
+    }
+    return false;
+}
+function waitForRecoveryProbe(signal, delayMs) {
+    if (signal.aborted)
+        return Promise.resolve(false);
+    return new Promise((resolve) => {
+        const finish = (elapsed) => {
+            window.clearTimeout(timeout);
+            signal.removeEventListener("abort", abort);
+            resolve(elapsed);
+        };
+        const abort = () => finish(false);
+        const timeout = window.setTimeout(() => finish(true), delayMs);
+        signal.addEventListener("abort", abort, { once: true });
+    });
 }
 function waitForRecoveryRetry(signal, attempt) {
     if (signal.aborted)

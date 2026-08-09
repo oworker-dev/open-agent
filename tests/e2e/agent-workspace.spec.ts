@@ -2067,6 +2067,152 @@ test("a half-open live stream is replaced from the last event observed by the UI
   await expect.poll(() => threadEvents(page).some((event) => isEventType(event, "session.waiting"))).toBeTruthy();
 });
 
+test("a half-open recovery stream is replaced when the durable run advances again", async ({ page }) => {
+  const sessionId = "mock-half-open-recovery-session";
+  const at = new Date().toISOString();
+  const turnId = "turn_half_open_recovery";
+  const durableEvents = [
+    { data: { runtime: { agentId: "open-agent", agentName: "open-agent", eveVersion: "test", modelId: "mock/model" } }, meta: { at, id: "evt-recovery-session" }, type: "session.started" },
+    { data: { sequence: 0, turnId }, meta: { at, id: "evt-recovery-turn" }, type: "turn.started" },
+    { data: { message: "Keep recovering this long task", parts: [{ text: "Keep recovering this long task", type: "text" }], sequence: 0, turnId }, meta: { at, id: "evt-recovery-user" }, type: "message.received" },
+    { data: { sequence: 0, stepIndex: 0, turnId }, meta: { at, id: "evt-recovery-step-0" }, type: "step.started" },
+    { data: { finishReason: "tool-calls", message: null, sequence: 0, stepIndex: 0, turnId }, meta: { at, id: "evt-recovery-message-0" }, type: "message.completed" },
+    { data: { actions: [{ callId: "call-recovery", input: { command: "npm test" }, kind: "tool-call", toolName: "bash" }], sequence: 0, stepIndex: 0, turnId }, meta: { at, id: "evt-recovery-actions" }, type: "actions.requested" },
+    {
+      data: {
+        result: { callId: "call-recovery", kind: "tool-result", output: "tests passed", toolName: "bash" },
+        sequence: 0,
+        status: "completed",
+        stepIndex: 0,
+        turnId,
+      },
+      meta: { at, id: "evt-recovery-result" },
+      type: "action.result",
+    },
+    { data: { finishReason: "tool-calls", sequence: 0, stepIndex: 0, turnId, usage: { inputTokens: 10, outputTokens: 4 } }, meta: { at, id: "evt-recovery-step-completed-0" }, type: "step.completed" },
+    { data: { sequence: 0, stepIndex: 1, turnId }, meta: { at, id: "evt-recovery-step-1" }, type: "step.started" },
+    { data: { finishReason: "stop", message: "Recovery survived a second half-open stream.", sequence: 0, stepIndex: 1, turnId }, meta: { at, id: "evt-recovery-message-1" }, type: "message.completed" },
+    { data: { finishReason: "stop", sequence: 0, stepIndex: 1, turnId, usage: { inputTokens: 12, outputTokens: 5 } }, meta: { at, id: "evt-recovery-step-completed-1" }, type: "step.completed" },
+    { data: { sequence: 0, turnId }, meta: { at, id: "evt-recovery-completed" }, type: "turn.completed" },
+    { data: { wait: "next-user-message" }, meta: { at, id: "evt-recovery-waiting" }, type: "session.waiting" },
+  ];
+
+  await page.addInitScript(({ events, intermediateTail, targetSessionId }) => {
+    const nativeFetch = window.fetch.bind(window);
+    const browser = window as typeof window & {
+      __openAgentRecoveryWatchdog?: {
+        availableEvents: number;
+        boundedRequests: number;
+        liveRequests: number;
+      };
+    };
+    browser.__openAgentRecoveryWatchdog = {
+      availableEvents: 4,
+      boundedRequests: 0,
+      liveRequests: 0,
+    };
+    window.fetch = async (input, init) => {
+      const requestUrl = new URL(
+        typeof input === "string" || input instanceof URL ? input.toString() : input.url,
+        window.location.href,
+      );
+      if (requestUrl.pathname !== `/eve/v1/session/${targetSessionId}/stream`) {
+        return await nativeFetch(input, init);
+      }
+      const state = browser.__openAgentRecoveryWatchdog!;
+      const startIndex = Number(requestUrl.searchParams.get("startIndex") ?? "0");
+      if (requestUrl.searchParams.get("includeTailIndex") === "1") {
+        state.boundedRequests += 1;
+        const available = events.slice(startIndex, state.availableEvents);
+        return new Response(available.length > 0 ? `${available.map((event) => JSON.stringify(event)).join("\n")}\n` : "", {
+          headers: {
+            "content-type": "application/x-ndjson",
+            "x-eve-stream-tail-index": String(state.availableEvents - 1),
+          },
+          status: 200,
+        });
+      }
+
+      state.liveRequests += 1;
+      const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+      const body = new ReadableStream({
+        start(controller) {
+          const endIndex = state.liveRequests === 1 ? 4 : intermediateTail;
+          const prefix = events.slice(startIndex, endIndex);
+          if (prefix.length > 0) {
+            controller.enqueue(new TextEncoder().encode(
+              `${prefix.map((event) => JSON.stringify(event)).join("\n")}\n`,
+            ));
+          }
+          signal?.addEventListener(
+            "abort",
+            () => controller.error(new DOMException("Aborted", "AbortError")),
+            { once: true },
+          );
+        },
+      });
+      return new Response(body, {
+        headers: { "content-type": "application/x-ndjson" },
+        status: 200,
+      });
+    };
+  }, { events: durableEvents, intermediateTail: 8, targetSessionId: sessionId });
+
+  await page.route("**/eve/v1/session", async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({ sessionId }),
+      contentType: "application/json",
+      headers: { "x-eve-session-id": sessionId },
+      status: 200,
+    });
+  });
+
+  await page.goto("/");
+  const composer = page.getByRole("textbox", { name: "Do anything" });
+  await composer.fill("Keep recovering this long task");
+  await composer.press("Enter");
+  await expect(page.getByRole("status").filter({ hasText: "Thinking" })).toBeVisible();
+  await expect.poll(() => page.evaluate(() =>
+    (window as typeof window & { __openAgentRecoveryWatchdog?: { liveRequests: number } })
+      .__openAgentRecoveryWatchdog?.liveRequests ?? 0
+  )).toBe(1);
+
+  await page.evaluate((availableEvents) => {
+    const browser = window as typeof window & {
+      __openAgentRecoveryWatchdog?: { availableEvents: number };
+    };
+    if (browser.__openAgentRecoveryWatchdog) {
+      browser.__openAgentRecoveryWatchdog.availableEvents = availableEvents;
+    }
+  }, 8);
+  await page.waitForTimeout(16_000);
+  await expect.poll(() => page.evaluate(() =>
+    (window as typeof window & { __openAgentRecoveryWatchdog?: { liveRequests: number } })
+      .__openAgentRecoveryWatchdog?.liveRequests ?? 0
+  )).toBe(2);
+
+  await page.evaluate((availableEvents) => {
+    const browser = window as typeof window & {
+      __openAgentRecoveryWatchdog?: { availableEvents: number };
+    };
+    if (browser.__openAgentRecoveryWatchdog) {
+      browser.__openAgentRecoveryWatchdog.availableEvents = availableEvents;
+    }
+  }, durableEvents.length);
+  await page.waitForTimeout(11_000);
+
+  await expect(page.getByText("Recovery survived a second half-open stream.", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Send" })).toBeVisible();
+  await expect.poll(() => threadEvents(page).some((event) => isEventType(event, "session.waiting"))).toBeTruthy();
+  const requestCounts = await page.evaluate(() =>
+    (window as typeof window & {
+      __openAgentRecoveryWatchdog?: { boundedRequests: number; liveRequests: number };
+    }).__openAgentRecoveryWatchdog
+  );
+  expect(requestCounts?.liveRequests).toBe(2);
+  expect(requestCounts?.boundedRequests).toBeGreaterThanOrEqual(4);
+});
+
 test("large legacy incremental history hydrates quickly without an eager writeback", async ({ page }) => {
   const at = new Date().toISOString();
   const events = Array.from({ length: 3_000 }, (_, index) => ({
