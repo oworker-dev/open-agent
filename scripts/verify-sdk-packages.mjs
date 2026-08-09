@@ -9,6 +9,13 @@ const temporaryRoot = await mkdtemp(join(tmpdir(), "open-agent-sdk-"));
 const packageDirectory = join(temporaryRoot, "packages");
 const consumerDirectory = join(temporaryRoot, "consumer");
 const pnpmConsumerDirectory = join(temporaryRoot, "pnpm-consumer");
+const publicPackages = [
+  "@oworker/open-agent-contracts",
+  "@oworker/open-agent-client",
+  "@oworker/open-agent-host",
+  "@oworker/open-agent-ui",
+  "@oworker/open-agent-mcp-adapter",
+];
 
 try {
   await Promise.all([
@@ -16,13 +23,7 @@ try {
     mkdir(consumerDirectory, { recursive: true }),
     mkdir(pnpmConsumerDirectory, { recursive: true }),
   ]);
-  for (const workspace of [
-    "@oworker/open-agent-contracts",
-    "@oworker/open-agent-client",
-    "@oworker/open-agent-host",
-    "@oworker/open-agent-ui",
-    "@oworker/open-agent-mcp-adapter",
-  ]) {
+  for (const workspace of publicPackages) {
     execFileSync(
       "npm",
       ["pack", "--silent", "--workspace", workspace, "--pack-destination", packageDirectory],
@@ -34,6 +35,12 @@ try {
     .filter((file) => file.endsWith(".tgz"))
     .map((file) => join(packageDirectory, file));
   assert.equal(archives.length, 5, "Expected one archive for each public SDK package.");
+  const localPackageSpecs = Object.fromEntries(publicPackages.map((packageName) => {
+    const archivePrefix = `${packageName.slice(1).replaceAll("/", "-")}-`;
+    const archive = archives.find((path) => path.split("/").at(-1)?.startsWith(archivePrefix));
+    assert.ok(archive, `Expected a packed archive for ${packageName}.`);
+    return [packageName, `file:${archive}`];
+  }));
 
   await writeFile(
     join(consumerDirectory, "package.json"),
@@ -81,9 +88,26 @@ try {
 
   await writeFile(
     join(pnpmConsumerDirectory, "package.json"),
-    JSON.stringify({ name: "agent-sdk-pnpm-conformance-consumer", private: true, type: "module" }),
+    JSON.stringify({
+      dependencies: {
+        ...localPackageSpecs,
+        eve: "0.31.1",
+      },
+      name: "agent-sdk-pnpm-conformance-consumer",
+      pnpm: {
+        // pnpm resolves a packed package's regular dependencies separately
+        // from sibling tarballs. Point only the UI's unpublished contracts
+        // dependency at the archive under test instead of the public registry.
+        overrides: {
+          "@oworker/open-agent-ui>@oworker/open-agent-contracts":
+            localPackageSpecs["@oworker/open-agent-contracts"],
+        },
+      },
+      private: true,
+      type: "module",
+    }),
   );
-  execFileSync("pnpm", ["add", "--ignore-scripts", "eve@0.31.1", ...archives], {
+  execFileSync("pnpm", ["install", "--ignore-scripts"], {
     cwd: pnpmConsumerDirectory,
     stdio: "pipe",
   });

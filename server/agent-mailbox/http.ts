@@ -5,7 +5,10 @@ import {
   isAgentReasoningLevelForModel,
 } from "../../lib/agent-runtime-config.ts";
 import type { AgentMailboxItem } from "../data/agent-mailbox-store.ts";
-import type { AgentSessionOwner } from "../data/session-ownership-store.ts";
+import type {
+  AgentSessionOwner,
+  AgentSessionOwnershipStore,
+} from "../data/session-ownership-store.ts";
 import { enqueueAgentMailboxMessage } from "./service.ts";
 import type { AgentMailboxStore } from "../data/agent-mailbox-store.ts";
 
@@ -13,6 +16,7 @@ const MAX_REQUEST_BYTES = 128 * 1024;
 
 export async function enqueueAgentMailboxHttpRequest(options: {
   readonly owner: AgentSessionOwner;
+  readonly ownershipStore?: AgentSessionOwnershipStore;
   readonly request: Request;
   readonly runtimeConfig: AgentRuntimeConfigSnapshot;
   readonly setCookie?: string;
@@ -34,11 +38,26 @@ export async function enqueueAgentMailboxHttpRequest(options: {
   }
 
   try {
-    const result = await enqueueAgentMailboxMessage({
+    let result = await enqueueAgentMailboxMessage({
       ...parsed.value,
       owner: options.owner,
       store: options.store,
     });
+    if (result.status === "missing-session" && options.ownershipStore) {
+      const ownership = await options.ownershipStore.waitForOwnership(
+        parsed.value.sessionId,
+        options.owner,
+      );
+      if (ownership === "owned") {
+        result = await enqueueAgentMailboxMessage({
+          ...parsed.value,
+          owner: options.owner,
+          store: options.store,
+        });
+      } else if (ownership === "forbidden") {
+        result = { status: "forbidden" };
+      }
+    }
     if (result.status === "missing-session") {
       return problem(404, "mailbox_session_not_found", "The Agent session was not found.", options.setCookie);
     }

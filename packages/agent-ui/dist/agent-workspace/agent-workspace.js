@@ -527,6 +527,7 @@ export function AgentWorkspace({ client, commands = [], defaultPreferences, exte
                 (last.type !== "session.waiting" || !hasPendingServerQueue());
         };
         try {
+            cursor = await reconcileRecoveryCursor(connection.client, session.state.sessionId, recoveredCursor, events, controller.signal);
             while (!settled && !controller.signal.aborted) {
                 try {
                     await refreshMailboxQueue();
@@ -755,6 +756,7 @@ function UnavailableSubagentView({ locale, onBack, }) {
     return (_jsx("main", { className: "flex min-h-0 flex-1 items-center justify-center bg-background px-6", children: _jsxs("div", { className: "max-w-md text-center", children: [_jsx(AlertCircleIcon, { className: "mx-auto size-5 text-muted-foreground" }), _jsx("p", { className: "mt-3 text-sm text-muted-foreground", children: messages.subagentUnavailable }), _jsxs(Button, { className: "mt-4", onClick: onBack, size: "sm", variant: "outline", children: [_jsx(ArrowLeftIcon, { className: "size-4" }), messages.backToTask] })] }) }));
 }
 const RECOVERY_TAIL_LOOKUP_TIMEOUT_MS = 1_500;
+const RECOVERY_CURSOR_OVERLAP_EVENTS = 256;
 const MAX_RECOVERY_RECONNECT_ATTEMPTS = 6;
 const RECOVERY_RETRY_BASE_DELAY_MS = 750;
 const RECOVERY_RETRY_MAX_DELAY_MS = 15_000;
@@ -771,6 +773,38 @@ const RECOVERY_STREAM_RECONNECT_POLICY = {
         maxDelayMs: 15_000,
     },
 };
+async function reconcileRecoveryCursor(client, sessionId, recoveredCursor, events, signal) {
+    if (recoveredCursor <= events.length)
+        return recoveredCursor;
+    const lastObservedEventId = [...events].reverse().find((event) => event.meta.id)?.meta.id;
+    if (!lastObservedEventId || recoveredCursor === 0)
+        return recoveredCursor;
+    const nearbyStart = Math.max(0, recoveredCursor - RECOVERY_CURSOR_OVERLAP_EVENTS);
+    const starts = nearbyStart === 0 ? [0] : [nearbyStart, 0];
+    for (const startIndex of starts) {
+        const probe = client.sessions.attach(sessionId, { streamIndex: startIndex });
+        let cursor = startIndex;
+        try {
+            for await (const event of probe.stream({
+                follow: false,
+                signal,
+                startIndex,
+            })) {
+                cursor += 1;
+                if (event.meta.id === lastObservedEventId)
+                    return cursor;
+            }
+        }
+        catch (error) {
+            if (signal.aborted || isAbortError(error))
+                throw error;
+            if (isRetryableRecoveryError(error))
+                return recoveredCursor;
+            throw error;
+        }
+    }
+    return recoveredCursor;
+}
 async function readTailBoundary(session, parentSignal) {
     const controller = new AbortController();
     const abort = () => controller.abort();

@@ -1,10 +1,12 @@
 import { enqueueAgentMailboxHttpRequest } from "@/server/agent-mailbox/http";
 import { createPostgresAgentMailboxStoreFromEnvironment } from "@/server/data/agent-mailbox-store";
+import { createPostgresSessionOwnershipStoreFromEnvironment } from "@/server/data/session-ownership-store";
 import { authenticateHostRequest } from "@/server/http/host-request-auth";
 
 export const runtime = "nodejs";
 
 const store = createPostgresAgentMailboxStoreFromEnvironment();
+const ownershipStore = createPostgresSessionOwnershipStoreFromEnvironment();
 
 export async function POST(request: Request): Promise<Response> {
   const authenticated = await authenticateHostRequest(request);
@@ -17,6 +19,7 @@ export async function POST(request: Request): Promise<Response> {
   }
   return await enqueueAgentMailboxHttpRequest({
     owner: authenticated.identity,
+    ...(ownershipStore ? { ownershipStore } : {}),
     request,
     runtimeConfig: authenticated.runtimeConfig,
     store,

@@ -1,11 +1,13 @@
 import { readDeploymentAgentRuntimeConfig } from "@/lib/agent-runtime-config";
 import { enqueueAgentMailboxHttpRequest } from "@/server/agent-mailbox/http";
 import { createPostgresAgentMailboxStoreFromEnvironment } from "@/server/data/agent-mailbox-store";
+import { createPostgresSessionOwnershipStoreFromEnvironment } from "@/server/data/session-ownership-store";
 import { authenticateStandaloneRequest } from "@/server/http/standalone-request-auth";
 
 export const runtime = "nodejs";
 
 const store = createPostgresAgentMailboxStoreFromEnvironment();
+const ownershipStore = createPostgresSessionOwnershipStoreFromEnvironment();
 
 export async function POST(request: Request): Promise<Response> {
   const authenticated = authenticateStandaloneRequest(request);
@@ -23,6 +25,7 @@ export async function POST(request: Request): Promise<Response> {
   }
   return await enqueueAgentMailboxHttpRequest({
     owner: authenticated.identity,
+    ...(ownershipStore ? { ownershipStore } : {}),
     request,
     runtimeConfig: readDeploymentAgentRuntimeConfig(),
     ...(authenticated.setCookie ? { setCookie: authenticated.setCookie } : {}),

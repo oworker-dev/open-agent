@@ -233,7 +233,20 @@ export function AgentThreadView({
     onEvent: handleEvent,
     onSessionChange: (nextSession) => {
       sessionRef.current = attachAgentSession(connection, nextSession);
-      onChange({ session: nextSession ?? { streamIndex: 0 } });
+      // The transport cursor may move before React commits the matching
+      // events. Persist only a newly assigned session id here; the event
+      // persistence effect below owns the absolute UI-consumed cursor.
+      if (nextSession?.sessionId && nextSession.sessionId !== thread.session.sessionId) {
+        onChange({
+          session: {
+            sessionId: nextSession.sessionId,
+            streamIndex: initialStreamIndexRef.current + Math.max(
+              0,
+              latestEventsRef.current.length - initialEventCountRef.current,
+            ),
+          },
+        });
+      }
       if (sessionRef.current && cancellationRef.current.requested) {
         requestDurableCancellation(sessionRef.current, cancellationRef.current.turnId);
       }
@@ -330,8 +343,8 @@ export function AgentThreadView({
   }, [agent.events, agent.session?.sessionId, isBusy, isRecovering, requestRecovery, thread.pendingTurn?.state, thread.status]);
 
   useEffect(() => {
-    const durableSession = sessionRef.current;
-    if (isRecovering || !agentIsBusy || !agent.session?.sessionId || !durableSession || recoveryRequestedRef.current) return;
+    const sessionId = agent.session?.sessionId;
+    if (isRecovering || !agentIsBusy || !sessionId || recoveryRequestedRef.current) return;
     let disposed = false;
     let timer: number | undefined;
     const probe = async () => {
@@ -340,11 +353,20 @@ export function AgentThreadView({
       try {
         const consumedEvents = Math.max(0, agent.events.length - initialEventCountRef.current);
         const cursor = initialStreamIndexRef.current + consumedEvents;
-        const durableProgress = await hasDurableProgressAfter(durableSession, cursor);
-        const streamSilentFor = Date.now() - lastObservedEventAtRef.current;
-        if (durableProgress || streamSilentFor >= LIVE_STREAM_REATTACH_AFTER_MS) {
-          requestRecovery();
-        }
+        // A bounded read mutates its ClientSession cursor. Never probe with
+        // the session that owns the live turn or its cursor can advance past
+        // events React has not consumed, making recovery permanently skip
+        // those events.
+        const probeSession = connection.client.sessions.attach(
+          sessionId,
+          { streamIndex: cursor },
+        );
+        const durableProgress = await hasDurableProgressAfter(probeSession, cursor);
+        // Provider calls can legitimately stay silent for minutes. Reattach
+        // only when Eve's durable cursor proves that this page missed events;
+        // elapsed silence alone cannot distinguish a slow model from a dead
+        // browser transport.
+        if (durableProgress) requestRecovery();
       } finally {
         durableProbeInFlightRef.current = false;
       }
@@ -357,7 +379,7 @@ export function AgentThreadView({
       disposed = true;
       window.clearTimeout(timer);
     };
-  }, [agent.events.length, agent.session?.sessionId, agentIsBusy, isRecovering, requestRecovery]);
+  }, [agent.events.length, agent.session?.sessionId, agentIsBusy, connection.client, isRecovering, requestRecovery]);
 
   useEffect(() => {
     if (isRecovering) return;
@@ -377,10 +399,7 @@ export function AgentThreadView({
       )
     );
     const consumedEvents = Math.max(0, agent.events.length - initialEventCountRef.current);
-    const streamIndex = Math.max(
-      agent.session?.streamIndex ?? 0,
-      initialStreamIndexRef.current + consumedEvents,
-    );
+    const streamIndex = initialStreamIndexRef.current + consumedEvents;
     if (agent.events.length < processedEventCountRef.current) {
       compactedEventsRef.current = agent.events;
     } else {
@@ -1460,7 +1479,6 @@ function isSessionBoundary(event: MessageStreamEvent): boolean {
 const DURABLE_PROGRESS_PROBE_DELAY_MS = 15_000;
 const DURABLE_PROGRESS_PROBE_INTERVAL_MS = 10_000;
 const DURABLE_PROGRESS_PROBE_TIMEOUT_MS = 2_500;
-const LIVE_STREAM_REATTACH_AFTER_MS = 30_000;
 const MAX_QUEUED_FOLLOW_UPS = 5;
 const MAILBOX_STATUS_POLL_MS = 1_500;
 

@@ -969,6 +969,105 @@ test("a slow Provider does not force the live Agent stream into recovery", async
   await expect(page.getByRole("textbox", { name: "Do anything" })).toBeEnabled();
 });
 
+test("a queued follow-up does not replace a healthy stream during prolonged Provider silence", async ({ page }) => {
+  const sessionId = "mock-slow-provider-queued-follow-up-session";
+  let liveStreamRequests = 0;
+  let mailboxRequests = 0;
+  let mailboxInspections = 0;
+
+  await page.clock.install();
+  await page.addInitScript((targetSessionId) => {
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (input, init) => {
+      const requestUrl = new URL(
+        typeof input === "string" || input instanceof URL ? input.toString() : input.url,
+        window.location.href,
+      );
+      if (requestUrl.pathname !== `/eve/v1/session/${targetSessionId}/stream`) {
+        return await nativeFetch(input, init);
+      }
+      if (requestUrl.searchParams.get("includeTailIndex") === "1") {
+        return new Response("", {
+          headers: {
+            "content-type": "application/x-ndjson",
+            "x-eve-stream-tail-index": "-1",
+          },
+          status: 200,
+        });
+      }
+      const counts = window as typeof window & { __openAgentLiveStreamRequests?: number };
+      counts.__openAgentLiveStreamRequests = (counts.__openAgentLiveStreamRequests ?? 0) + 1;
+      const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+      const body = new ReadableStream({
+        start(controller) {
+          signal?.addEventListener(
+            "abort",
+            () => controller.error(new DOMException("Aborted", "AbortError")),
+            { once: true },
+          );
+        },
+      });
+      return new Response(body, {
+        headers: { "content-type": "application/x-ndjson" },
+        status: 200,
+      });
+    };
+  }, sessionId);
+  await page.route("**/eve/v1/session", async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({ sessionId }),
+      contentType: "application/json",
+      headers: { "x-eve-session-id": sessionId },
+      status: 200,
+    });
+  });
+  await page.route("**/api/standalone/mailbox", async (route) => {
+    mailboxRequests += 1;
+    const body = route.request().postDataJSON() as { clientMessageId: string };
+    await route.fulfill({
+      body: JSON.stringify({
+        item: { clientMessageId: body.clientMessageId, itemId: "mail-slow-follow-up", status: "queued" },
+        ok: true,
+      }),
+      contentType: "application/json",
+      status: 202,
+    });
+  });
+  await page.route("**/api/standalone/mailbox/mail-slow-follow-up", async (route) => {
+    mailboxInspections += 1;
+    await route.fulfill({
+      body: JSON.stringify({
+        item: { clientMessageId: "pending-slow-follow-up", itemId: "mail-slow-follow-up", status: "queued" },
+        ok: true,
+      }),
+      contentType: "application/json",
+      status: 200,
+    });
+  });
+
+  await page.goto("/");
+  const composer = page.getByRole("textbox", { name: "Do anything" });
+  await composer.fill("Run a Provider call that remains silent for over thirty seconds");
+  await composer.press("Enter");
+  await expect(page.getByRole("button", { name: "Stop" })).toBeVisible();
+  await composer.fill("Keep this follow-up queued without replacing the live stream");
+  await composer.press("Enter");
+  await expect(page.locator("[data-agent-steer-queue]")).toContainText(
+    "Keep this follow-up queued without replacing the live stream",
+  );
+
+  await page.clock.runFor(36_000);
+  liveStreamRequests = await page.evaluate(() =>
+    (window as typeof window & { __openAgentLiveStreamRequests?: number }).__openAgentLiveStreamRequests ?? 0
+  );
+  expect(liveStreamRequests).toBe(1);
+  expect(mailboxRequests).toBe(1);
+  expect(mailboxInspections).toBeGreaterThan(0);
+  await expect(page.getByRole("status").filter({ hasText: "Thinking" })).toBeVisible();
+  await expect(page.locator("[data-agent-steer-queue]")).toBeVisible();
+  await expect(page.getByText("Reconnecting to the active run...")).toHaveCount(0);
+});
+
 test("a follow-up is admitted into the active turn at the next model boundary", async ({ page }) => {
   const sessionId = "mock-follow-up-session";
   let continuationRequests = 0;
@@ -2056,6 +2155,56 @@ test("a persisted cursor past a missing UI boundary repairs from the durable tai
   await expect(page.getByText("Reconnecting to the active run...")).toBeHidden({ timeout: 10_000 });
   await expect(page.getByRole("button", { name: "Send" })).toBeVisible();
   await expect.poll(() => threadEvents(page).some((event) => isEventType(event, "session.waiting"))).toBeTruthy();
+});
+
+test("recovery rewinds a transport cursor that advanced past the UI transcript", async ({ page }) => {
+  const sessionId = "mock-polluted-cursor-session";
+  const durableEvents = eventsFromNdjson(
+    mockSuccessfulTurn("Recover every durable event", "No durable event was skipped."),
+  ).map((event, index) => {
+    if (!isRecord(event)) return event;
+    return { ...event, meta: { ...(isRecord(event.meta) ? event.meta : {}), id: `evt-polluted-${index}` } };
+  });
+  const observedEvents = durableEvents.slice(0, 4);
+  const pollutedCursor = durableEvents.length + 12;
+  const requestedStarts: number[] = [];
+
+  await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
+    const url = new URL(route.request().url());
+    const startIndex = Number(url.searchParams.get("startIndex") ?? "0");
+    requestedStarts.push(startIndex);
+    await route.fulfill({
+      body: ndjson(startIndex < 0 ? durableEvents.slice(-1) : durableEvents.slice(startIndex)),
+      contentType: "application/x-ndjson",
+      headers: { "x-eve-stream-tail-index": String(durableEvents.length - 1) },
+      status: 200,
+    });
+  });
+
+  const now = Date.now();
+  setFakeThreadCollection(page, {
+    activeThreadId: "polluted-cursor-thread",
+    threads: [{
+      closedInputRequestIds: [],
+      createdAt: now,
+      events: observedEvents,
+      id: "polluted-cursor-thread",
+      preferences: { executionMode: "standard", modelId: "gpt-5.6-sol", reasoning: "medium" },
+      queuedTurns: [],
+      session: { sessionId, streamIndex: pollutedCursor },
+      status: "streaming",
+      title: "Polluted cursor",
+      updatedAt: now,
+    }],
+    version: 2,
+  });
+
+  await page.goto("/threads/polluted-cursor-thread");
+  await expect(page.getByText("No durable event was skipped.", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Send" })).toBeVisible();
+  expect(requestedStarts).toContain(0);
+  expect(requestedStarts).toContain(observedEvents.length);
+  await expect.poll(() => firstStoredThread(page)?.session?.streamIndex).toBe(durableEvents.length);
 });
 
 test("an in-flight turn reconnects after a hard refresh", async ({ page }) => {

@@ -1,6 +1,6 @@
 "use client";
 
-import { ClientError, type ClientSession, type MessageStreamEvent } from "eve/client";
+import { ClientError, type Client, type ClientSession, type MessageStreamEvent } from "eve/client";
 import { AlertCircleIcon, ArrowLeftIcon, MenuIcon, PanelLeftCloseIcon, PanelLeftIcon, ServerOffIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "../ui/button.js";
@@ -630,6 +630,13 @@ export function AgentWorkspace({
     };
 
     try {
+      cursor = await reconcileRecoveryCursor(
+        connection.client,
+        session.state.sessionId,
+        recoveredCursor,
+        events,
+        controller.signal,
+      );
       while (!settled && !controller.signal.aborted) {
         try {
           await refreshMailboxQueue();
@@ -1117,6 +1124,7 @@ function UnavailableSubagentView({
 }
 
 const RECOVERY_TAIL_LOOKUP_TIMEOUT_MS = 1_500;
+const RECOVERY_CURSOR_OVERLAP_EVENTS = 256;
 const MAX_RECOVERY_RECONNECT_ATTEMPTS = 6;
 const RECOVERY_RETRY_BASE_DELAY_MS = 750;
 const RECOVERY_RETRY_MAX_DELAY_MS = 15_000;
@@ -1133,6 +1141,45 @@ const RECOVERY_STREAM_RECONNECT_POLICY = {
     maxDelayMs: 15_000,
   },
 } as const;
+
+async function reconcileRecoveryCursor(
+  client: Client,
+  sessionId: string,
+  recoveredCursor: number,
+  events: readonly MessageStreamEvent[],
+  signal: AbortSignal,
+): Promise<number> {
+  // An uncompressed transcript with one persisted UI event per consumed Eve
+  // event already proves that its absolute cursor is coherent. Cursor repair
+  // is only needed for legacy transport pollution, compacted transcripts, or
+  // intentionally suppressed interrupted-turn events, where the absolute
+  // cursor can be ahead of the visible event count.
+  if (recoveredCursor <= events.length) return recoveredCursor;
+  const lastObservedEventId = [...events].reverse().find((event) => event.meta.id)?.meta.id;
+  if (!lastObservedEventId || recoveredCursor === 0) return recoveredCursor;
+
+  const nearbyStart = Math.max(0, recoveredCursor - RECOVERY_CURSOR_OVERLAP_EVENTS);
+  const starts = nearbyStart === 0 ? [0] : [nearbyStart, 0];
+  for (const startIndex of starts) {
+    const probe = client.sessions.attach(sessionId, { streamIndex: startIndex });
+    let cursor = startIndex;
+    try {
+      for await (const event of probe.stream({
+        follow: false,
+        signal,
+        startIndex,
+      })) {
+        cursor += 1;
+        if (event.meta.id === lastObservedEventId) return cursor;
+      }
+    } catch (error) {
+      if (signal.aborted || isAbortError(error)) throw error;
+      if (isRetryableRecoveryError(error)) return recoveredCursor;
+      throw error;
+    }
+  }
+  return recoveredCursor;
+}
 
 async function readTailBoundary(
   session: ClientSession,

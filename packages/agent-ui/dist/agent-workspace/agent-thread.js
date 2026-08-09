@@ -138,7 +138,14 @@ export function AgentThreadView({ client, commands, draftStorageKey, isRecoverin
         onEvent: handleEvent,
         onSessionChange: (nextSession) => {
             sessionRef.current = attachAgentSession(connection, nextSession);
-            onChange({ session: nextSession ?? { streamIndex: 0 } });
+            if (nextSession?.sessionId && nextSession.sessionId !== thread.session.sessionId) {
+                onChange({
+                    session: {
+                        sessionId: nextSession.sessionId,
+                        streamIndex: initialStreamIndexRef.current + Math.max(0, latestEventsRef.current.length - initialEventCountRef.current),
+                    },
+                });
+            }
             if (sessionRef.current && cancellationRef.current.requested) {
                 requestDurableCancellation(sessionRef.current, cancellationRef.current.turnId);
             }
@@ -219,8 +226,8 @@ export function AgentThreadView({ client, commands, draftStorageKey, isRecoverin
         }
     }, [agent.events, agent.session?.sessionId, isBusy, isRecovering, requestRecovery, thread.pendingTurn?.state, thread.status]);
     useEffect(() => {
-        const durableSession = sessionRef.current;
-        if (isRecovering || !agentIsBusy || !agent.session?.sessionId || !durableSession || recoveryRequestedRef.current)
+        const sessionId = agent.session?.sessionId;
+        if (isRecovering || !agentIsBusy || !sessionId || recoveryRequestedRef.current)
             return;
         let disposed = false;
         let timer;
@@ -231,11 +238,10 @@ export function AgentThreadView({ client, commands, draftStorageKey, isRecoverin
             try {
                 const consumedEvents = Math.max(0, agent.events.length - initialEventCountRef.current);
                 const cursor = initialStreamIndexRef.current + consumedEvents;
-                const durableProgress = await hasDurableProgressAfter(durableSession, cursor);
-                const streamSilentFor = Date.now() - lastObservedEventAtRef.current;
-                if (durableProgress || streamSilentFor >= LIVE_STREAM_REATTACH_AFTER_MS) {
+                const probeSession = connection.client.sessions.attach(sessionId, { streamIndex: cursor });
+                const durableProgress = await hasDurableProgressAfter(probeSession, cursor);
+                if (durableProgress)
                     requestRecovery();
-                }
             }
             finally {
                 durableProbeInFlightRef.current = false;
@@ -249,7 +255,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, isRecoverin
             disposed = true;
             window.clearTimeout(timer);
         };
-    }, [agent.events.length, agent.session?.sessionId, agentIsBusy, isRecovering, requestRecovery]);
+    }, [agent.events.length, agent.session?.sessionId, agentIsBusy, connection.client, isRecovering, requestRecovery]);
     useEffect(() => {
         if (isRecovering)
             return;
@@ -263,7 +269,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, isRecoverin
             : interruptedTurnsRef.current;
         const persistableNewEvents = newEvents.filter((event, index) => !shouldSuppressInterruptedTurnDisplayEvent(event, processedEventCountRef.current + index, persistenceInterruptedTurns));
         const consumedEvents = Math.max(0, agent.events.length - initialEventCountRef.current);
-        const streamIndex = Math.max(agent.session?.streamIndex ?? 0, initialStreamIndexRef.current + consumedEvents);
+        const streamIndex = initialStreamIndexRef.current + consumedEvents;
         if (agent.events.length < processedEventCountRef.current) {
             compactedEventsRef.current = agent.events;
         }
@@ -1129,7 +1135,6 @@ function isSessionBoundary(event) {
 const DURABLE_PROGRESS_PROBE_DELAY_MS = 15_000;
 const DURABLE_PROGRESS_PROBE_INTERVAL_MS = 10_000;
 const DURABLE_PROGRESS_PROBE_TIMEOUT_MS = 2_500;
-const LIVE_STREAM_REATTACH_AFTER_MS = 30_000;
 const MAX_QUEUED_FOLLOW_UPS = 5;
 const MAILBOX_STATUS_POLL_MS = 1_500;
 function mailboxTurnState(status) {
