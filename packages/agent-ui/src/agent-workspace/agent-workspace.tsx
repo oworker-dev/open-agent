@@ -531,6 +531,14 @@ export function AgentWorkspace({
     let reconnectAttempt = 0;
     let pendingTurn = thread.pendingTurn;
     let queuedTurns = thread.queuedTurns;
+    const committedCatchUpTurns = new Map(
+      queuedTurns
+        .filter((turn) =>
+          turn.delivery === "server" && turn.state === "committed" &&
+          !mailboxMessageWasObserved(events, turn)
+        )
+        .map((turn) => [turn.id, turn]),
+    );
     const recoveryOwnedQueuedTurnIds = new Set(queuedTurns.map((turn) => turn.id));
     const consumedQueuedTurnIds = new Set<string>();
     const recoveryOwnedPendingTurnId = pendingTurn?.id;
@@ -584,7 +592,12 @@ export function AgentWorkspace({
         try {
           const receipt = await mailbox.inspect(turn.mailboxItemId);
           const state = mailboxQueueState(receipt.status);
-          updates.set(turn.id, state === "cancelled" ? "remove" : state);
+          if (state === "committed") {
+            if (!mailboxMessageWasObserved(events, turn)) committedCatchUpTurns.set(turn.id, turn);
+            updates.set(turn.id, "remove");
+          } else {
+            updates.set(turn.id, state === "cancelled" ? "remove" : state);
+          }
         } catch {
           // Keep the last durable UI snapshot during a transient mailbox outage.
         }
@@ -605,7 +618,8 @@ export function AgentWorkspace({
     const currentBoundarySettles = () => {
       const last = events.at(-1);
       if (!last || !isRecoveryBoundary(last)) return false;
-      return last.type !== "session.waiting" || !hasPendingServerQueue();
+      return committedCatchUpTurns.size === 0 &&
+        (last.type !== "session.waiting" || !hasPendingServerQueue());
     };
 
     try {
@@ -636,22 +650,30 @@ export function AgentWorkspace({
             if (event.type === "message.received") {
               const clientMessageId = event.data.clientMessageId;
               if (clientMessageId) {
+                committedCatchUpTurns.delete(clientMessageId);
                 consumedQueuedTurnIds.add(clientMessageId);
                 queuedTurns = queuedTurns.filter((turn) => turn.id !== clientMessageId);
                 if (pendingTurn?.id === clientMessageId) {
                   consumedPendingTurnIds.add(clientMessageId);
                   pendingTurn = undefined;
                 }
-              } else if (pendingTurn) {
-                consumedPendingTurnIds.add(pendingTurn.id);
-                pendingTurn = undefined;
               } else {
-                const nextBrowserTurn = queuedTurns.find((turn) =>
-                  turn.delivery !== "server" && turn.text.trim() === event.data.message.trim()
+                const committedTurn = [...committedCatchUpTurns.values()].find((turn) =>
+                  turn.text.trim() === event.data.message.trim()
                 );
-                if (nextBrowserTurn) {
-                  consumedQueuedTurnIds.add(nextBrowserTurn.id);
-                  queuedTurns = queuedTurns.filter((turn) => turn.id !== nextBrowserTurn.id);
+                if (committedTurn) {
+                  committedCatchUpTurns.delete(committedTurn.id);
+                } else if (pendingTurn) {
+                  consumedPendingTurnIds.add(pendingTurn.id);
+                  pendingTurn = undefined;
+                } else {
+                  const nextBrowserTurn = queuedTurns.find((turn) =>
+                    turn.delivery !== "server" && turn.text.trim() === event.data.message.trim()
+                  );
+                  if (nextBrowserTurn) {
+                    consumedQueuedTurnIds.add(nextBrowserTurn.id);
+                    queuedTurns = queuedTurns.filter((turn) => turn.id !== nextBrowserTurn.id);
+                  }
                 }
               }
             }
@@ -664,7 +686,7 @@ export function AgentWorkspace({
             });
             if (isRecoveryBoundary(event)) {
               await refreshMailboxQueue();
-              settled = event.type !== "session.waiting" || !hasPendingServerQueue();
+              settled = currentBoundarySettles();
               break;
             }
           }
@@ -691,7 +713,7 @@ export function AgentWorkspace({
                 session: { ...session.state, streamIndex: cursor },
                 status: statusFromEvents(events, currentClosedInputRequestIds()),
               });
-              settled = missingBoundary.type !== "session.waiting" || !hasPendingServerQueue();
+              settled = currentBoundarySettles();
             }
           }
           if (!settled && currentBoundarySettles()) settled = true;
@@ -1211,6 +1233,7 @@ function threadNeedsRecovery(thread: AgentThread): boolean {
   if (!thread.session.sessionId) return false;
   if (thread.queuedTurns.some((turn) =>
     (turn.delivery === "server" && mailboxTurnAwaitsAdmission(turn) && Boolean(turn.mailboxItemId)) ||
+    (turn.delivery === "server" && turn.state === "committed" && Boolean(turn.mailboxItemId)) ||
     turn.intent === "post-cancellation"
   )) return true;
   const pendingTurnInFlight = thread.pendingTurn?.state === "clearing" ||
@@ -1255,7 +1278,18 @@ function mailboxQueueState(
 
 function mailboxTurnAwaitsAdmission(turn: AgentQueuedTurn): boolean {
   return turn.state === "queued" || turn.state === "delivering" ||
-    turn.state === "accepted" || turn.state === "committed";
+    turn.state === "accepted";
+}
+
+function mailboxMessageWasObserved(
+  events: readonly import("eve/client").MessageStreamEvent[],
+  turn: AgentQueuedTurn,
+): boolean {
+  return events.some((event) =>
+    event.type === "message.received" &&
+    event.data.message.trim() === turn.text.trim() &&
+    Date.parse(event.meta.at) >= turn.submittedAt
+  );
 }
 
 async function saveThreadCollectionWithConflictRecovery(
@@ -1339,6 +1373,7 @@ function isUrgentPersistenceChange(
     if (
       prior.title !== thread.title ||
       prior.revision !== thread.revision ||
+      prior.draftRestore?.id !== thread.draftRestore?.id ||
       prior.session.sessionId !== thread.session.sessionId ||
       prior.preferences.executionMode !== thread.preferences.executionMode ||
       prior.preferences.modelId !== thread.preferences.modelId ||

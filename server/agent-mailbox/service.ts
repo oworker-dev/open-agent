@@ -30,12 +30,12 @@ export interface AgentMailboxRuntime {
 
 export type DispatchAgentMailboxResult =
   | { readonly status: "idle" }
-  | { readonly item: AgentMailboxItem; readonly status: "accepted" | "deferred" | "failed" | "submission-ambiguous" };
+  | { readonly item: AgentMailboxItem; readonly status: "accepted" | "cancelled" | "deferred" | "failed" | "submission-ambiguous" };
 
 export class AgentMailboxAdmissionError extends Error {
-  readonly disposition: "ambiguous" | "rejected";
+  readonly disposition: "ambiguous" | "busy" | "rejected";
 
-  constructor(disposition: "ambiguous" | "rejected", message: string) {
+  constructor(disposition: "ambiguous" | "busy" | "rejected", message: string) {
     super(message);
     this.name = "AgentMailboxAdmissionError";
     this.disposition = disposition;
@@ -96,13 +96,14 @@ export async function dispatchNextAgentMailboxMessage(options: {
     return { item: deferred, status: "deferred" };
   }
 
-  if (boundary.state === "running" && !boundary.turnId) {
-    const deferred = await options.store.defer(
-      item.itemId,
+  if (boundary.state === "running") {
+    return await deferClaimedMessage({
+      availableAt: nextAttemptAt(options.now, options.busyRetryMs),
       claimToken,
-      nextAttemptAt(options.now, options.busyRetryMs),
-    );
-    return { item: deferred, status: "deferred" };
+      item,
+      owner,
+      store: options.store,
+    });
   }
   if (boundary.state === "terminal") {
     const failed = await options.store.fail(
@@ -133,6 +134,17 @@ export async function dispatchNextAgentMailboxMessage(options: {
       const failed = await options.store.fail(item.itemId, claimToken, error.message);
       return { item: failed, status: "failed" };
     }
+    if (error instanceof AgentMailboxAdmissionError && error.disposition === "busy") {
+      return await deferClaimedMessage({
+        admissionWasRejected: true,
+        availableAt: nextAttemptAt(options.now, options.busyRetryMs),
+        claimToken,
+        item,
+        owner,
+        reason: error.message,
+        store: options.store,
+      });
+    }
     const ambiguous = await options.store.markSubmissionAmbiguous(
       item.itemId,
       claimToken,
@@ -142,6 +154,37 @@ export async function dispatchNextAgentMailboxMessage(options: {
       ),
     );
     return { item: ambiguous, status: "submission-ambiguous" };
+  }
+}
+
+async function deferClaimedMessage(options: {
+  readonly admissionWasRejected?: boolean;
+  readonly availableAt: string;
+  readonly claimToken: string;
+  readonly item: AgentMailboxItem;
+  readonly owner: AgentSessionOwner;
+  readonly reason?: string;
+  readonly store: AgentMailboxStore;
+}): Promise<DispatchAgentMailboxResult> {
+  try {
+    const deferred = options.admissionWasRejected
+      ? await options.store.deferRejectedAdmission(
+          options.item.itemId,
+          options.claimToken,
+          options.availableAt,
+          options.reason,
+        )
+      : await options.store.defer(
+          options.item.itemId,
+          options.claimToken,
+          options.availableAt,
+          options.reason,
+        );
+    return { item: deferred, status: "deferred" };
+  } catch (error) {
+    const current = await options.store.findOwned(options.owner, options.item.itemId);
+    if (current?.status === "cancelled") return { item: current, status: "cancelled" };
+    throw error;
   }
 }
 

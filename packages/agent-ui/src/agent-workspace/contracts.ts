@@ -26,6 +26,11 @@ export type AgentPendingTurn = {
   readonly text: string;
 };
 
+export type AgentComposerDraftRestore = {
+  readonly id: string;
+  readonly text: string;
+};
+
 export type AgentQueuedTurn = {
   readonly delivery?: "browser" | "server";
   readonly id: string;
@@ -121,6 +126,7 @@ export type AgentThread = {
   readonly createdAt: number;
   readonly closedInputRequestIds: readonly string[];
   readonly events: readonly MessageStreamEvent[];
+  readonly draftRestore?: AgentComposerDraftRestore;
   /** Server-backed indexes omit the event transcript until the thread is opened. */
   readonly hydration?: "summary";
   readonly id: string;

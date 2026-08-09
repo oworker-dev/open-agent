@@ -1160,6 +1160,95 @@ test("cancelling a queued follow-up prevents browser delivery before admission",
   expect(continuationRequests).toBe(0);
 });
 
+test("stopping an active turn restores an unadmitted durable follow-up to the composer", async ({ page }) => {
+  const sessionId = "mock-stop-restores-follow-up-session";
+  const itemId = "mail-stop-restores-follow-up";
+  const at = new Date().toISOString();
+  const turnId = "turn_0";
+  const events = [
+    { data: { runtime: { agentId: "open-agent", agentName: "open-agent", eveVersion: "test", modelId: "mock/model" } }, meta: { at }, type: "session.started" },
+    { data: { sequence: 0, turnId }, meta: { at }, type: "turn.started" },
+    { data: { message: "Start long work", parts: [{ text: "Start long work", type: "text" }], sequence: 0, turnId }, meta: { at }, type: "message.received" },
+    { data: { sequence: 0, turnId }, meta: { at }, type: "turn.cancelled" },
+    { data: { wait: "next-user-message" }, meta: { at }, type: "session.waiting" },
+  ];
+  let clientMessageId = "";
+  let mailboxCancelled = false;
+  let turnCancellationAccepted = false;
+
+  await page.route("**/eve/v1/session", async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({ sessionId }),
+      contentType: "application/json",
+      headers: { "x-eve-session-id": sessionId },
+      status: 200,
+    });
+  });
+  await page.route("**/api/standalone/mailbox", async (route) => {
+    const body = route.request().postDataJSON() as { clientMessageId: string };
+    clientMessageId = body.clientMessageId;
+    await route.fulfill({
+      body: JSON.stringify({
+        item: { clientMessageId, itemId, status: "queued" },
+        ok: true,
+      }),
+      contentType: "application/json",
+      status: 202,
+    });
+  });
+  await page.route(`**/api/standalone/mailbox/${itemId}`, async (route) => {
+    if (route.request().method() === "DELETE") mailboxCancelled = true;
+    await route.fulfill({
+      body: JSON.stringify({
+        item: {
+          clientMessageId,
+          itemId,
+          status: mailboxCancelled ? "cancelled" : "queued",
+        },
+        ok: true,
+      }),
+      contentType: "application/json",
+      status: 200,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}/cancel`, async (route) => {
+    turnCancellationAccepted = true;
+    await route.fulfill({
+      body: JSON.stringify({ ok: true, sessionId, status: "accepted" }),
+      contentType: "application/json",
+      status: 202,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
+    const startIndex = Number(new URL(route.request().url()).searchParams.get("startIndex") ?? "0");
+    const visibleEvents = startIndex === 0
+      ? events.slice(0, 3)
+      : turnCancellationAccepted
+        ? events.slice(startIndex)
+        : [];
+    await route.fulfill({
+      body: ndjson(visibleEvents),
+      contentType: "application/x-ndjson",
+      headers: { "x-eve-stream-tail-index": String(events.length - 1) },
+      status: 200,
+    });
+  });
+
+  await page.goto("/");
+  const composer = page.getByRole("textbox", { name: "Do anything" });
+  await composer.fill("Start long work");
+  await composer.press("Enter");
+  await expect(page.getByRole("button", { name: "Stop", exact: true })).toBeVisible();
+  await composer.fill("Use the blue variant instead");
+  await composer.press("Enter");
+  await expect(page.getByText("Use the blue variant instead", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Stop", exact: true }).click();
+
+  await expect.poll(() => mailboxCancelled).toBeTruthy();
+  await expect(composer).toHaveText("Use the blue variant instead");
+  await expect(page.locator("[data-agent-steer-queue]")).toBeHidden();
+});
+
 test("a mailbox cancellation race reconciles committed admission without a stale cancel error", async ({ page }) => {
   const sessionId = "mock-mailbox-cancel-race-session";
   const clientMessageId = "queued-mailbox-cancel-race";
@@ -1251,6 +1340,70 @@ test("a mailbox cancellation race reconciles committed admission without a stale
   await expect(page.getByText("Committed follow-up completed.", { exact: true })).toBeVisible({ timeout: 15_000 });
   await expect(page.locator("[data-agent-steer-queue]")).toBeHidden();
   expect(mailboxInspections).toBeLessThanOrEqual(5);
+});
+
+test("a committed normal-turn mailbox message without a client id clears after transcript catch-up", async ({ page }) => {
+  const sessionId = "mock-committed-normal-turn-session";
+  const threadId = "committed-normal-turn-thread";
+  const clientMessageId = "queued-committed-normal-turn";
+  const itemId = "mail-committed-normal-turn";
+  const settledEvents = eventsFromNdjson(mockSuccessfulTurn("Prepare committed delivery", "Ready."));
+  const admittedEvents = eventsFromNdjson(
+    mockContinuationTurn("Continue without a client id", "Committed delivery completed."),
+  );
+  let streamRequests = 0;
+
+  setFakeThreadCollection(page, {
+    activeThreadId: threadId,
+    threads: [{
+      createdAt: Date.now() - 2_000,
+      events: settledEvents,
+      id: threadId,
+      preferences: { executionMode: "standard", modelId: "gpt-5.6-sol", reasoning: "medium" },
+      queuedTurns: [{
+        delivery: "server",
+        id: clientMessageId,
+        intent: "active-turn",
+        mailboxItemId: itemId,
+        state: "committed",
+        submittedAt: Date.now() - 1_000,
+        text: "Continue without a client id",
+      }],
+      session: { sessionId, streamIndex: settledEvents.length },
+      status: "streaming",
+      title: "Committed normal turn",
+      updatedAt: Date.now(),
+    }],
+    version: 2,
+  });
+  await page.route(`**/api/standalone/mailbox/${itemId}`, async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({
+        item: { clientMessageId, itemId, status: "committed" },
+        ok: true,
+      }),
+      contentType: "application/json",
+      status: 200,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
+    streamRequests += 1;
+    const startIndex = Number(new URL(route.request().url()).searchParams.get("startIndex") ?? "0");
+    const events = startIndex <= settledEvents.length ? admittedEvents : [];
+    await route.fulfill({
+      body: ndjson(events),
+      contentType: "application/x-ndjson",
+      headers: { "x-eve-stream-tail-index": String(settledEvents.length + admittedEvents.length - 1) },
+      status: 200,
+    });
+  });
+
+  await page.goto(`/threads/${threadId}`);
+
+  await expect(page.getByText("Committed delivery completed.", { exact: true })).toBeVisible({ timeout: 15_000 });
+  await expect(page.locator("[data-agent-steer-queue]")).toBeHidden();
+  await expect(page.getByRole("button", { name: "Send" })).toBeVisible();
+  expect(streamRequests).toBeLessThanOrEqual(4);
 });
 
 test("a persisted follow-up survives recovery and dispatches after the durable boundary", async ({ page }) => {
@@ -1347,11 +1500,15 @@ test("two persisted follow-ups remain separate and recover in strict FIFO order"
   const firstEvents = withClientMessageId(
     eventsFromNdjson(mockContinuationTurn("Add the header", "Header added.", 1)),
     "queued-fifo-header",
-  );
+  ).map((event, index) => isRecord(event) && isRecord(event.meta)
+    ? { ...event, meta: { ...event.meta, id: `evt-fifo-header-${index}` } }
+    : event);
   const secondEvents = withClientMessageId(
     eventsFromNdjson(mockContinuationTurn("Add the footer", "Footer added.", 2)),
     "queued-fifo-footer",
-  );
+  ).map((event, index) => isRecord(event) && isRecord(event.meta)
+    ? { ...event, meta: { ...event.meta, id: `evt-fifo-footer-${index}` } }
+    : event);
   const firstCursor = initialEvents.length;
   const secondCursor = firstCursor + firstEvents.length;
   let continuationRequests = 0;

@@ -109,7 +109,6 @@ export function AgentThreadView({
   const turnAdmissionBusyRef = useRef(false);
   const cancellationRecoveryRef = useRef<() => void>(() => undefined);
   const [cancellationState, setCancellationState] = useState<"idle" | "requested" | "cancelling">("idle");
-  const [cancellationRevision, setCancellationRevision] = useState(0);
   const [localInterruption, setLocalInterruption] = useState<LocalInterruption>();
   const [cancellationError, setCancellationError] = useState<string>();
   const [queueError, setQueueError] = useState<string>();
@@ -498,6 +497,37 @@ export function AgentThreadView({
             ? { ...candidate, mailboxItemId: receipt.itemId, state }
             : candidate,
         ));
+    if (state === "committed") requestRecovery();
+  }
+
+  const withdrawLatestQueuedFollowUp = async (): Promise<string | undefined> => {
+    const turn = queuedTurnsRef.current.findLast((candidate) =>
+      candidate.intent === "active-turn" && mailboxTurnIsCancellable(candidate)
+    );
+    if (!turn) return undefined;
+    if (turn.delivery !== "server" || !turn.mailboxItemId || !mailbox) {
+      updateQueuedTurns(queuedTurnsRef.current.filter((candidate) => candidate.id !== turn.id));
+      return turn.text;
+    }
+    try {
+      const receipt = await mailbox.cancel(turn.mailboxItemId);
+      reconcileMailboxReceipt(turn.id, receipt);
+      return receipt.status === "cancelled" ? turn.text : undefined;
+    } catch (error) {
+      if (
+        error instanceof AgentMailboxHttpError &&
+        error.code === "mailbox_item_not_cancellable"
+      ) {
+        try {
+          reconcileMailboxReceipt(turn.id, await mailbox.inspect(turn.mailboxItemId));
+        } catch {
+          // Keep the durable queue snapshot if reconciliation is temporarily unavailable.
+        }
+        return undefined;
+      }
+      setQueueError(error instanceof Error ? error.message : messages.queueDeliveryFailed);
+      return undefined;
+    }
   }
 
   const requestCancellation = () => {
@@ -525,7 +555,6 @@ export function AgentThreadView({
       localTurnId: visibleTurnId,
       requested: true,
     };
-    setCancellationRevision((revision) => revision + 1);
     setCancellationError(undefined);
     setLocalInterruption({
       events: latestEventsRef.current,
@@ -542,8 +571,16 @@ export function AgentThreadView({
       status: "cancelling",
       updatedAt: Date.now(),
     });
+    const queuedFollowUpWithdrawal = withdrawLatestQueuedFollowUp();
     const durableSession = sessionRef.current;
     if (durableSession) requestDurableCancellation(durableSession, turnId);
+    void queuedFollowUpWithdrawal.then((draft) => {
+      if (draft === undefined) return;
+      onChange({
+        draftRestore: { id: createPendingTurnId(), text: draft },
+        updatedAt: Date.now(),
+      });
+    });
   };
 
   const submit = async (message: PromptInputMessage) => {
@@ -952,7 +989,6 @@ export function AgentThreadView({
       <main className="flex min-h-0 flex-1 flex-col overflow-hidden">
         <AssistantThreadSurface
           cancellationState={cancellationState}
-          cancellationRevision={cancellationRevision}
           commands={commands}
           composerTop={visibleQueuedTurns.length > 0 || queueError ? (
             <FollowUpQueue
@@ -977,10 +1013,14 @@ export function AgentThreadView({
           onCloseInputRequest={closeInputRequest}
           onOpenSubagent={onOpenSubagent}
           onPreferencesChange={(preferences) => onChange({ preferences })}
+          onDraftRestoreConsumed={(id) => {
+            if (thread.draftRestore?.id === id) onChange({ draftRestore: undefined });
+          }}
           onRetryRuntimeError={recoveryError ? onRetryRecovery : undefined}
           closedInputRequestIds={closedInputRequestIdsRef.current}
           preferences={thread.preferences}
           reasoningLevels={reasoningLevels}
+          draftRestore={thread.draftRestore}
           runtimeError={runtimeError}
           usage={usage}
         />
@@ -1306,7 +1346,7 @@ function mailboxTurnState(
 
 function mailboxTurnIsCancellable(turn: AgentQueuedTurn): boolean {
   if (turn.delivery !== "server") return true;
-  return turn.state === "queued" || turn.state === "delivery-failed";
+  return turn.state === "queued" || turn.state === "delivering" || turn.state === "delivery-failed";
 }
 
 function sameQueuedTurnSnapshots(

@@ -16,13 +16,13 @@ import { Button } from "../ui/button.js";
 import { cn } from "../utils.js";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuLabel, DropdownMenuRadioGroup, DropdownMenuRadioItem, DropdownMenuTrigger, } from "../ui/dropdown-menu.js";
 import { AgentMessage } from "./agent-message.js";
-export function AssistantThreadSurface({ cancellationRevision, cancellationState, closedInputRequestIds, commands, composerTop, draftStorageKey, events, eveMessages, fallbackStartedAt, inputDisabled, isBusy, locale, mentions, messages, models, onInputResponses, onCloseInputRequest, onOpenSubagent, onPreferencesChange, onRetryRuntimeError, preferences, reasoningLevels, runtimeError, usage, }) {
+export function AssistantThreadSurface({ cancellationState, closedInputRequestIds, commands, composerTop, draftStorageKey, draftRestore, events, eveMessages, fallbackStartedAt, inputDisabled, isBusy, locale, mentions, messages, models, onInputResponses, onCloseInputRequest, onDraftRestoreConsumed, onOpenSubagent, onPreferencesChange, onRetryRuntimeError, preferences, reasoningLevels, runtimeError, usage, }) {
     const eveMessagesById = useMemo(() => new Map(eveMessages.map((message) => [message.id, message])), [eveMessages]);
     const lastMessageId = eveMessages.at(-1)?.id;
     const canRespondToInputRequest = eveMessages.some((message) => message.parts.some((part) => part.type === "dynamic-tool" &&
         Boolean(part.toolMetadata?.eve?.inputRequest) &&
         part.toolMetadata?.eve?.inputResponse === undefined));
-    return (_jsx(ThreadPrimitive.Root, { className: "aui-root flex h-full min-h-0 flex-col bg-background", style: { "--thread-max-width": "48rem" }, children: _jsxs(ThreadPrimitive.Viewport, { "aria-live": "polite", autoScroll: true, turnAnchor: "top", className: "relative flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-auto px-3 pt-3 sm:px-4 sm:pt-4", "data-slot": "thread-viewport", role: "log", children: [_jsxs("div", { className: "mx-auto flex w-full max-w-(--thread-max-width) flex-col gap-6 empty:hidden", children: [_jsx(ThreadPrimitive.Messages, { children: ({ message }) => message.composer.isEditing ? (_jsx(EditMessage, { messages: messages })) : message.role === "user" ? (_jsx(UserMessage, { messages: messages })) : (_jsx(AssistantMessage, { canRespond: !isBusy || canRespondToInputRequest, events: events, fallbackStartedAt: fallbackStartedAt, isStreaming: isBusy && message.id === lastMessageId, locale: locale, message: eveMessagesById.get(message.id), messages: messages, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, closedInputRequestIds: closedInputRequestIds })) }), runtimeError ? (_jsx(RuntimeErrorMessage, { locale: locale, message: runtimeError, messages: messages, onRetry: onRetryRuntimeError })) : null] }), _jsx(ThreadPrimitive.Empty, { children: !isBusy ? _jsx(AssistantEmptyState, { messages: messages }) : null }), _jsxs(ThreadPrimitive.ViewportFooter, { className: "sticky bottom-0 z-20 mx-auto mt-auto flex w-full max-w-(--thread-max-width) flex-col bg-background pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-2 sm:pb-4 md:pb-5", children: [_jsx(ThreadPrimitive.ScrollToBottom, { asChild: true, children: _jsx(TooltipIconButton, { tooltip: locale === "zh-CN" ? "滚动到底部" : "Scroll to bottom", className: "absolute -top-9 left-1/2 z-10 size-8 -translate-x-1/2 rounded-full disabled:invisible", variant: "outline", children: _jsx(ArrowDownIcon, { className: "size-4" }) }) }), _jsx(AssistantComposer, { cancellationState: cancellationState, cancellationRevision: cancellationRevision, commands: commands, composerTop: composerTop, draftStorageKey: draftStorageKey, inputDisabled: inputDisabled, locale: locale, mentions: mentions, messages: messages, models: models, onPreferencesChange: onPreferencesChange, preferences: preferences, reasoningLevels: reasoningLevels, usage: usage })] })] }) }));
+    return (_jsx(ThreadPrimitive.Root, { className: "aui-root flex h-full min-h-0 flex-col bg-background", style: { "--thread-max-width": "48rem" }, children: _jsxs(ThreadPrimitive.Viewport, { "aria-live": "polite", autoScroll: true, turnAnchor: "top", className: "relative flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-auto px-3 pt-3 sm:px-4 sm:pt-4", "data-slot": "thread-viewport", role: "log", children: [_jsxs("div", { className: "mx-auto flex w-full max-w-(--thread-max-width) flex-col gap-6 empty:hidden", children: [_jsx(ThreadPrimitive.Messages, { children: ({ message }) => message.composer.isEditing ? (_jsx(EditMessage, { messages: messages })) : message.role === "user" ? (_jsx(UserMessage, { messages: messages })) : (_jsx(AssistantMessage, { canRespond: !isBusy || canRespondToInputRequest, events: events, fallbackStartedAt: fallbackStartedAt, isStreaming: isBusy && message.id === lastMessageId, locale: locale, message: eveMessagesById.get(message.id), messages: messages, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, closedInputRequestIds: closedInputRequestIds })) }), runtimeError ? (_jsx(RuntimeErrorMessage, { locale: locale, message: runtimeError, messages: messages, onRetry: onRetryRuntimeError })) : null] }), _jsx(ThreadPrimitive.Empty, { children: !isBusy ? _jsx(AssistantEmptyState, { messages: messages }) : null }), _jsxs(ThreadPrimitive.ViewportFooter, { className: "sticky bottom-0 z-20 mx-auto mt-auto flex w-full max-w-(--thread-max-width) flex-col bg-background pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-2 sm:pb-4 md:pb-5", children: [_jsx(ThreadPrimitive.ScrollToBottom, { asChild: true, children: _jsx(TooltipIconButton, { tooltip: locale === "zh-CN" ? "滚动到底部" : "Scroll to bottom", className: "absolute -top-9 left-1/2 z-10 size-8 -translate-x-1/2 rounded-full disabled:invisible", variant: "outline", children: _jsx(ArrowDownIcon, { className: "size-4" }) }) }), _jsx(AssistantComposer, { cancellationState: cancellationState, commands: commands, composerTop: composerTop, draftStorageKey: draftStorageKey, draftRestore: draftRestore, inputDisabled: inputDisabled, locale: locale, mentions: mentions, messages: messages, models: models, onPreferencesChange: onPreferencesChange, onDraftRestoreConsumed: onDraftRestoreConsumed, preferences: preferences, reasoningLevels: reasoningLevels, usage: usage })] })] }) }));
 }
 function RuntimeErrorMessage({ locale, message, messages, onRetry, }) {
     return (_jsx("article", { className: "mx-auto flex w-full max-w-(--thread-max-width) flex-col", "data-agent-message-error": true, role: "alert", children: _jsxs("div", { className: "flex items-start gap-3 px-1 text-sm", children: [_jsx(CircleXIcon, { className: "mt-0.5 size-4 shrink-0 text-destructive" }), _jsxs("div", { className: "min-w-0 flex-1", children: [_jsx("p", { className: "font-medium text-foreground", children: locale === "zh-CN" ? "本轮执行失败" : messages.requestFailed }), _jsx("p", { className: "mt-1 break-words text-muted-foreground", children: message }), _jsx("p", { className: "mt-1 text-muted-foreground", children: messages.requestPreserved }), onRetry ? (_jsxs(Button, { className: "mt-2 h-7 px-2.5 text-xs", onClick: onRetry, size: "sm", variant: "outline", children: [_jsx(RotateCcwIcon, { className: "size-3.5" }), messages.retry] })) : null] })] }) }));
@@ -56,7 +56,7 @@ function EditMessage({ messages }) {
     };
     return (_jsx(MessagePrimitive.Root, { className: "mx-auto w-full max-w-(--thread-max-width)", "data-agent-edit-composer": true, children: _jsxs(ComposerPrimitive.Root, { className: "rounded-2xl bg-muted/70 px-4 py-3", onSubmit: resendFromHere, children: [_jsx(ComposerPrimitive.Input, { autoComplete: "off", autoFocus: true, className: "min-h-12 w-full resize-none border-0 bg-transparent text-[15px] leading-6 outline-none", id: "agent-edit-message", name: "agent-edit-message" }), _jsxs("div", { className: "mt-2 flex justify-end gap-2", children: [_jsx(ComposerPrimitive.Cancel, { asChild: true, children: _jsx(Button, { className: "h-7 bg-background px-2.5 text-xs", size: "sm", variant: "ghost", children: messages.cancelEdit }) }), _jsx(Button, { className: "h-7 px-2.5 text-xs", disabled: !canSend, size: "sm", type: "submit", children: messages.send })] })] }) }));
 }
-export function AssistantComposer({ cancellationRevision, cancellationState, commands, composerTop, draftStorageKey, inputDisabled = false, locale, mentions, messages, models, onPreferencesChange, preferences, reasoningLevels, usage, }) {
+export function AssistantComposer({ cancellationState, commands, composerTop, draftStorageKey, draftRestore, inputDisabled = false, locale, mentions, messages, models, onPreferencesChange, onDraftRestoreConsumed, preferences, reasoningLevels, usage, }) {
     const aui = useAui();
     const isRunning = useAuiState((state) => state.thread.isRunning);
     const composerIsEmpty = useAuiState((state) => state.composer.isEmpty);
@@ -69,17 +69,7 @@ export function AssistantComposer({ cancellationRevision, cancellationState, com
     const draftHydrationRef = useRef(undefined);
     const previousDraftKeyRef = useRef(undefined);
     auiRef.current = aui;
-    const previousCancellationRevision = useRef(cancellationRevision);
-    useEffect(() => {
-        if (previousCancellationRevision.current !== cancellationRevision) {
-            aui.composer.setText("");
-            previousCancellationRevision.current = cancellationRevision;
-        }
-    }, [aui, cancellationRevision]);
-    useEffect(() => {
-        if (cancellationState !== "idle")
-            aui.composer.setText("");
-    }, [aui, cancellationState]);
+    const consumedDraftRestoreIdRef = useRef(undefined);
     useEffect(() => {
         if (previousDraftKeyRef.current && previousDraftKeyRef.current !== draftStorageKey) {
             window.localStorage.removeItem(previousDraftKeyRef.current);
@@ -91,6 +81,14 @@ export function AssistantComposer({ cancellationRevision, cancellationState, com
         if (composer.getState().text !== savedDraft)
             composer.setText(savedDraft);
     }, [draftStorageKey]);
+    useEffect(() => {
+        if (!draftRestore || consumedDraftRestoreIdRef.current === draftRestore.id)
+            return;
+        consumedDraftRestoreIdRef.current = draftRestore.id;
+        draftHydrationRef.current = undefined;
+        aui.composer.setText(draftRestore.text);
+        onDraftRestoreConsumed(draftRestore.id);
+    }, [aui, draftRestore, onDraftRestoreConsumed]);
     useEffect(() => {
         const hydration = draftHydrationRef.current;
         if (hydration?.key === draftStorageKey) {

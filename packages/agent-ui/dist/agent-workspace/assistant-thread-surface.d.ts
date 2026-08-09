@@ -2,17 +2,17 @@ import type { MessageStreamEvent } from "eve/client";
 import type { EveMessage } from "eve/react";
 import { type ReactNode } from "react";
 import { type AgentInputResponse } from "./agent-message.js";
-import type { AgentModelOption, AgentPromptMenuItem, AgentThreadPreferences } from "./contracts.js";
+import type { AgentComposerDraftRestore, AgentModelOption, AgentPromptMenuItem, AgentThreadPreferences } from "./contracts.js";
 import type { AgentLocale, AgentMessages } from "./i18n.js";
 import type { AgentUsageSummary } from "./usage.js";
 export type AgentCancellationState = "idle" | "requested" | "cancelling";
-export declare function AssistantThreadSurface({ cancellationRevision, cancellationState, closedInputRequestIds, commands, composerTop, draftStorageKey, events, eveMessages, fallbackStartedAt, inputDisabled, isBusy, locale, mentions, messages, models, onInputResponses, onCloseInputRequest, onOpenSubagent, onPreferencesChange, onRetryRuntimeError, preferences, reasoningLevels, runtimeError, usage, }: {
-    readonly cancellationRevision: number;
+export declare function AssistantThreadSurface({ cancellationState, closedInputRequestIds, commands, composerTop, draftStorageKey, draftRestore, events, eveMessages, fallbackStartedAt, inputDisabled, isBusy, locale, mentions, messages, models, onInputResponses, onCloseInputRequest, onDraftRestoreConsumed, onOpenSubagent, onPreferencesChange, onRetryRuntimeError, preferences, reasoningLevels, runtimeError, usage, }: {
     readonly cancellationState: AgentCancellationState;
     readonly closedInputRequestIds: ReadonlySet<string>;
     readonly commands: readonly AgentPromptMenuItem[];
     readonly composerTop?: ReactNode;
     readonly draftStorageKey: string;
+    readonly draftRestore?: AgentComposerDraftRestore;
     readonly events: readonly MessageStreamEvent[];
     readonly eveMessages: readonly EveMessage[];
     readonly fallbackStartedAt?: number;
@@ -24,6 +24,7 @@ export declare function AssistantThreadSurface({ cancellationRevision, cancellat
     readonly models: readonly AgentModelOption[];
     readonly onInputResponses: (responses: readonly AgentInputResponse[]) => void | Promise<void>;
     readonly onCloseInputRequest: (requestId: string) => void;
+    readonly onDraftRestoreConsumed: (id: string) => void;
     readonly onOpenSubagent?: (sessionId: string) => void;
     readonly onPreferencesChange: (preferences: AgentThreadPreferences) => void;
     readonly onRetryRuntimeError?: () => void;
@@ -32,18 +33,19 @@ export declare function AssistantThreadSurface({ cancellationRevision, cancellat
     readonly runtimeError?: string;
     readonly usage: AgentUsageSummary;
 }): import("react/jsx-runtime").JSX.Element;
-export declare function AssistantComposer({ cancellationRevision, cancellationState, commands, composerTop, draftStorageKey, inputDisabled, locale, mentions, messages, models, onPreferencesChange, preferences, reasoningLevels, usage, }: {
-    readonly cancellationRevision: number;
+export declare function AssistantComposer({ cancellationState, commands, composerTop, draftStorageKey, draftRestore, inputDisabled, locale, mentions, messages, models, onPreferencesChange, onDraftRestoreConsumed, preferences, reasoningLevels, usage, }: {
     readonly cancellationState: AgentCancellationState;
     readonly commands: readonly AgentPromptMenuItem[];
     readonly composerTop?: ReactNode;
     readonly draftStorageKey: string;
+    readonly draftRestore?: AgentComposerDraftRestore;
     readonly inputDisabled?: boolean;
     readonly locale: AgentLocale;
     readonly mentions: readonly AgentPromptMenuItem[];
     readonly messages: AgentMessages;
     readonly models: readonly AgentModelOption[];
     readonly onPreferencesChange: (preferences: AgentThreadPreferences) => void;
+    readonly onDraftRestoreConsumed: (id: string) => void;
     readonly preferences: AgentThreadPreferences;
     readonly reasoningLevels: readonly string[];
     readonly usage: AgentUsageSummary;

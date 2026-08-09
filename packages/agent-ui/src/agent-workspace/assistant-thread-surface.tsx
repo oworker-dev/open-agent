@@ -51,19 +51,19 @@ import {
   DropdownMenuTrigger,
 } from "../ui/dropdown-menu.js";
 import { AgentMessage, type AgentInputResponse } from "./agent-message.js";
-import type { AgentExecutionMode, AgentModelOption, AgentPromptMenuItem, AgentThreadPreferences } from "./contracts.js";
+import type { AgentComposerDraftRestore, AgentExecutionMode, AgentModelOption, AgentPromptMenuItem, AgentThreadPreferences } from "./contracts.js";
 import type { AgentLocale, AgentMessages } from "./i18n.js";
 import type { AgentUsageSummary } from "./usage.js";
 
 export type AgentCancellationState = "idle" | "requested" | "cancelling";
 
 export function AssistantThreadSurface({
-  cancellationRevision,
   cancellationState,
   closedInputRequestIds,
   commands,
   composerTop,
   draftStorageKey,
+  draftRestore,
   events,
   eveMessages,
   fallbackStartedAt,
@@ -75,6 +75,7 @@ export function AssistantThreadSurface({
   models,
   onInputResponses,
   onCloseInputRequest,
+  onDraftRestoreConsumed,
   onOpenSubagent,
   onPreferencesChange,
   onRetryRuntimeError,
@@ -83,12 +84,12 @@ export function AssistantThreadSurface({
   runtimeError,
   usage,
 }: {
-  readonly cancellationRevision: number;
   readonly cancellationState: AgentCancellationState;
   readonly closedInputRequestIds: ReadonlySet<string>;
   readonly commands: readonly AgentPromptMenuItem[];
   readonly composerTop?: ReactNode;
   readonly draftStorageKey: string;
+  readonly draftRestore?: AgentComposerDraftRestore;
   readonly events: readonly MessageStreamEvent[];
   readonly eveMessages: readonly EveMessage[];
   readonly fallbackStartedAt?: number;
@@ -101,6 +102,7 @@ export function AssistantThreadSurface({
   readonly models: readonly AgentModelOption[];
   readonly onInputResponses: (responses: readonly AgentInputResponse[]) => void | Promise<void>;
   readonly onCloseInputRequest: (requestId: string) => void;
+  readonly onDraftRestoreConsumed: (id: string) => void;
   readonly onOpenSubagent?: (sessionId: string) => void;
   readonly onPreferencesChange: (preferences: AgentThreadPreferences) => void;
   readonly onRetryRuntimeError?: () => void;
@@ -183,16 +185,17 @@ export function AssistantThreadSurface({
           </ThreadPrimitive.ScrollToBottom>
           <AssistantComposer
             cancellationState={cancellationState}
-            cancellationRevision={cancellationRevision}
             commands={commands}
             composerTop={composerTop}
             draftStorageKey={draftStorageKey}
+            draftRestore={draftRestore}
             inputDisabled={inputDisabled}
             locale={locale}
             mentions={mentions}
             messages={messages}
             models={models}
             onPreferencesChange={onPreferencesChange}
+            onDraftRestoreConsumed={onDraftRestoreConsumed}
             preferences={preferences}
             reasoningLevels={reasoningLevels}
             usage={usage}
@@ -357,32 +360,34 @@ function EditMessage({ messages }: { readonly messages: AgentMessages }) {
 }
 
 export function AssistantComposer({
-  cancellationRevision,
   cancellationState,
   commands,
   composerTop,
   draftStorageKey,
+  draftRestore,
   inputDisabled = false,
   locale,
   mentions,
   messages,
   models,
   onPreferencesChange,
+  onDraftRestoreConsumed,
   preferences,
   reasoningLevels,
   usage,
 }: {
-  readonly cancellationRevision: number;
   readonly cancellationState: AgentCancellationState;
   readonly commands: readonly AgentPromptMenuItem[];
   readonly composerTop?: ReactNode;
   readonly draftStorageKey: string;
+  readonly draftRestore?: AgentComposerDraftRestore;
   readonly inputDisabled?: boolean;
   readonly locale: AgentLocale;
   readonly mentions: readonly AgentPromptMenuItem[];
   readonly messages: AgentMessages;
   readonly models: readonly AgentModelOption[];
   readonly onPreferencesChange: (preferences: AgentThreadPreferences) => void;
+  readonly onDraftRestoreConsumed: (id: string) => void;
   readonly preferences: AgentThreadPreferences;
   readonly reasoningLevels: readonly string[];
   readonly usage: AgentUsageSummary;
@@ -399,16 +404,7 @@ export function AssistantComposer({
   const draftHydrationRef = useRef<{ readonly key: string; readonly text: string } | undefined>(undefined);
   const previousDraftKeyRef = useRef<string | undefined>(undefined);
   auiRef.current = aui;
-  const previousCancellationRevision = useRef(cancellationRevision);
-  useEffect(() => {
-    if (previousCancellationRevision.current !== cancellationRevision) {
-      aui.composer.setText("");
-      previousCancellationRevision.current = cancellationRevision;
-    }
-  }, [aui, cancellationRevision]);
-  useEffect(() => {
-    if (cancellationState !== "idle") aui.composer.setText("");
-  }, [aui, cancellationState]);
+  const consumedDraftRestoreIdRef = useRef<string | undefined>(undefined);
   useEffect(() => {
     if (previousDraftKeyRef.current && previousDraftKeyRef.current !== draftStorageKey) {
       window.localStorage.removeItem(previousDraftKeyRef.current);
@@ -419,6 +415,13 @@ export function AssistantComposer({
     const composer = auiRef.current.composer;
     if (composer.getState().text !== savedDraft) composer.setText(savedDraft);
   }, [draftStorageKey]);
+  useEffect(() => {
+    if (!draftRestore || consumedDraftRestoreIdRef.current === draftRestore.id) return;
+    consumedDraftRestoreIdRef.current = draftRestore.id;
+    draftHydrationRef.current = undefined;
+    aui.composer.setText(draftRestore.text);
+    onDraftRestoreConsumed(draftRestore.id);
+  }, [aui, draftRestore, onDraftRestoreConsumed]);
   useEffect(() => {
     const hydration = draftHydrationRef.current;
     if (hydration?.key === draftStorageKey) {

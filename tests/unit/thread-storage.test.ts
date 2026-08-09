@@ -91,6 +91,29 @@ test("hydrates queued follow-ups from the v2 collection without accepting malfor
   ]);
 });
 
+test("hydrates only a valid one-shot composer draft restoration", () => {
+  const collection = parseThreadCollection({
+    threads: [{
+      createdAt: 1,
+      draftRestore: { id: "draft-restore-1", text: "Continue with the blue variant" },
+      events: [],
+      id: "thread-draft-restore",
+      preferences: { modelId: "model", reasoning: "medium" },
+      queuedTurns: [],
+      session: { streamIndex: 0 },
+      status: "ready",
+      title: "Thread",
+      updatedAt: 2,
+    }],
+    version: 2,
+  });
+
+  assert.deepEqual(collection.threads[0]?.draftRestore, {
+    id: "draft-restore-1",
+    text: "Continue with the blue variant",
+  });
+});
+
 test("hydrates bounded retained context used after an edited turn", () => {
   const collection = parseThreadCollection({
     threads: [{

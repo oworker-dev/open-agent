@@ -51,7 +51,7 @@ test("mailbox enqueue is idempotent and rejects changed payload reuse", async ()
   assert.equal(store.items.length, 1);
 });
 
-test("dispatcher waits until a running session publishes its turn id", async () => {
+test("dispatcher keeps a message cancellable while a session is running", async () => {
   const store = await queuedStore();
   const runtime = new FakeMailboxRuntime({ state: "running" });
   const result = await dispatchNextAgentMailboxMessage({
@@ -67,14 +67,33 @@ test("dispatcher waits until a running session publishes its turn id", async () 
   assert.equal(store.items[0]?.availableAt, "2030-01-01T00:00:01.000Z");
 });
 
-test("dispatcher admits a message while the addressed turn is running", async () => {
+test("dispatcher does not hand a message to Eve while the addressed turn is running", async () => {
   const store = await queuedStore();
   const runtime = new FakeMailboxRuntime({ state: "running", turnId: "turn-active" });
   const result = await dispatchNextAgentMailboxMessage({ runtime, store });
 
-  assert.equal(result.status, "accepted");
-  assert.equal(store.items[0]?.status, "accepted");
-  assert.equal(runtime.deliveries.length, 1);
+  assert.equal(result.status, "deferred");
+  assert.equal(store.items[0]?.status, "queued");
+  assert.equal(runtime.deliveries.length, 0);
+});
+
+test("cancelling a leased message wins before admission begins", async () => {
+  const store = await queuedStore();
+  const runtime: AgentMailboxRuntime = {
+    async inspect() {
+      const cancelled = await store.cancelOwned(owner, "mail-1");
+      assert.equal(cancelled?.status, "cancelled");
+      return { state: "running", turnId: "turn-active" };
+    },
+    async deliver() {
+      throw new Error("A cancelled mailbox item must not be delivered.");
+    },
+  };
+
+  const result = await dispatchNextAgentMailboxMessage({ runtime, store });
+
+  assert.equal(result.status, "cancelled");
+  assert.equal(store.items[0]?.status, "cancelled");
 });
 
 test("dispatcher admits exactly one message at a waiting boundary", async () => {
@@ -106,6 +125,34 @@ test("ambiguous admission is not automatically retried", async () => {
   assert.equal(second.status, "idle");
   assert.equal(runtime.deliveries.length, 1);
   assert.equal(store.items[0]?.status, "submission-ambiguous");
+});
+
+test("a delivery race that finds the session running returns to the cancellable queue", async () => {
+  const store = await queuedStore();
+  const runtime = new FakeMailboxRuntime({ state: "waiting" });
+  runtime.deliveryError = new AgentMailboxAdmissionError(
+    "busy",
+    "The session started another turn before mailbox admission.",
+  );
+
+  const result = await dispatchNextAgentMailboxMessage({ runtime, store });
+
+  assert.equal(result.status, "deferred");
+  assert.equal(store.items[0]?.status, "queued");
+  assert.equal(store.items[0]?.admissionStartedAt, undefined);
+});
+
+test("a message cannot be cancelled after admission has begun", async () => {
+  const store = await queuedStore();
+  const claimed = await store.claimNext();
+  assert.ok(claimed?.claimToken);
+  await store.beginAdmission(claimed.itemId, claimed.claimToken);
+
+  const cancelled = await store.cancelOwned(owner, claimed.itemId);
+
+  assert.equal(cancelled, undefined);
+  assert.equal(store.items[0]?.status, "delivering");
+  assert.ok(store.items[0]?.admissionStartedAt);
 });
 
 test("an authoritative message receipt resolves an earlier ambiguous admission", async () => {
@@ -258,6 +305,15 @@ class MemoryMailboxStore implements AgentMailboxStore {
     });
   }
 
+  async deferRejectedAdmission(itemId: string, claimToken: string, availableAt: string, reason?: string) {
+    return this.transitionClaimed(itemId, claimToken, {
+      admissionStartedAt: undefined,
+      availableAt,
+      ...(reason ? { lastError: reason } : {}),
+      status: "queued",
+    });
+  }
+
   async beginAdmission(itemId: string, claimToken: string) {
     return this.transitionClaimed(itemId, claimToken, {
       admissionStartedAt: new Date().toISOString(),
@@ -307,8 +363,18 @@ class MemoryMailboxStore implements AgentMailboxStore {
 
   async cancelOwned(currentOwner: AgentSessionOwner, itemId: string) {
     const item = await this.findOwned(currentOwner, itemId);
-    if (!item || item.status !== "queued" && item.status !== "failed") return undefined;
-    const next = { ...item, status: "cancelled" as const };
+    if (
+      !item ||
+      item.status !== "queued" && item.status !== "failed" &&
+      !(item.status === "delivering" && item.admissionStartedAt === undefined)
+    ) return undefined;
+    const {
+      admissionStartedAt: _,
+      claimExpiresAt: __,
+      claimToken: ___,
+      ...unclaimed
+    } = item;
+    const next = { ...unclaimed, status: "cancelled" as const };
     this.replace(next);
     return next;
   }

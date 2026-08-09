@@ -122,6 +122,7 @@ function parseThread(value: unknown): AgentThread | undefined {
   const session = isRecord(value.session) ? value.session : {};
   const status = isThreadStatus(value.status) ? value.status : "ready";
   const pendingTurn = parsePendingTurn(value.pendingTurn);
+  const draftRestore = parseDraftRestore(value.draftRestore);
   const closedInputRequestIds = Array.isArray(value.closedInputRequestIds)
     ? [...new Set(value.closedInputRequestIds.filter((id): id is string => typeof id === "string" && id.trim().length > 0))].slice(-128)
     : [];
@@ -143,6 +144,7 @@ function parseThread(value: unknown): AgentThread | undefined {
   return {
     createdAt,
     closedInputRequestIds,
+    ...(draftRestore ? { draftRestore } : {}),
     events: compactThreadEvents(rawEvents),
     ...(value.hydration === "summary" ? { hydration: "summary" as const } : {}),
     id: value.id,
@@ -167,6 +169,15 @@ function parseThread(value: unknown): AgentThread | undefined {
     title: value.title,
     updatedAt,
   };
+}
+
+function parseDraftRestore(value: unknown): AgentThread["draftRestore"] {
+  if (
+    !isRecord(value) ||
+    typeof value.id !== "string" || !value.id ||
+    typeof value.text !== "string" || !value.text.trim()
+  ) return undefined;
+  return { id: value.id, text: value.text };
 }
 
 function parseQueuedTurn(value: unknown): AgentQueuedTurn | undefined {

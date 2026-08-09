@@ -40,7 +40,6 @@ export function AgentThreadView({ client, commands, draftStorageKey, isRecoverin
     const turnAdmissionBusyRef = useRef(false);
     const cancellationRecoveryRef = useRef(() => undefined);
     const [cancellationState, setCancellationState] = useState("idle");
-    const [cancellationRevision, setCancellationRevision] = useState(0);
     const [localInterruption, setLocalInterruption] = useState();
     const [cancellationError, setCancellationError] = useState();
     const [queueError, setQueueError] = useState();
@@ -374,7 +373,36 @@ export function AgentThreadView({ client, commands, draftStorageKey, isRecoverin
             : queuedTurnsRef.current.map((candidate) => candidate.id === turnId
                 ? { ...candidate, mailboxItemId: receipt.itemId, state }
                 : candidate));
+        if (state === "committed")
+            requestRecovery();
     }
+    const withdrawLatestQueuedFollowUp = async () => {
+        const turn = queuedTurnsRef.current.findLast((candidate) => candidate.intent === "active-turn" && mailboxTurnIsCancellable(candidate));
+        if (!turn)
+            return undefined;
+        if (turn.delivery !== "server" || !turn.mailboxItemId || !mailbox) {
+            updateQueuedTurns(queuedTurnsRef.current.filter((candidate) => candidate.id !== turn.id));
+            return turn.text;
+        }
+        try {
+            const receipt = await mailbox.cancel(turn.mailboxItemId);
+            reconcileMailboxReceipt(turn.id, receipt);
+            return receipt.status === "cancelled" ? turn.text : undefined;
+        }
+        catch (error) {
+            if (error instanceof AgentMailboxHttpError &&
+                error.code === "mailbox_item_not_cancellable") {
+                try {
+                    reconcileMailboxReceipt(turn.id, await mailbox.inspect(turn.mailboxItemId));
+                }
+                catch {
+                }
+                return undefined;
+            }
+            setQueueError(error instanceof Error ? error.message : messages.queueDeliveryFailed);
+            return undefined;
+        }
+    };
     const requestCancellation = () => {
         if (!isBusy || cancellationRef.current.requested)
             return;
@@ -392,7 +420,6 @@ export function AgentThreadView({ client, commands, draftStorageKey, isRecoverin
             localTurnId: visibleTurnId,
             requested: true,
         };
-        setCancellationRevision((revision) => revision + 1);
         setCancellationError(undefined);
         setLocalInterruption({
             events: latestEventsRef.current,
@@ -409,9 +436,18 @@ export function AgentThreadView({ client, commands, draftStorageKey, isRecoverin
             status: "cancelling",
             updatedAt: Date.now(),
         });
+        const queuedFollowUpWithdrawal = withdrawLatestQueuedFollowUp();
         const durableSession = sessionRef.current;
         if (durableSession)
             requestDurableCancellation(durableSession, turnId);
+        void queuedFollowUpWithdrawal.then((draft) => {
+            if (draft === undefined)
+                return;
+            onChange({
+                draftRestore: { id: createPendingTurnId(), text: draft },
+                updatedAt: Date.now(),
+            });
+        });
     };
     const submit = async (message) => {
         const text = expandPromptDirectives(message.text, commands, mentions).trim();
@@ -773,7 +809,10 @@ export function AgentThreadView({ client, commands, draftStorageKey, isRecoverin
     };
     const closeInputRequest = (requestId) => closeInputRequests([requestId]);
     const visibleQueuedTurns = thread.queuedTurns.filter((turn) => turn.intent !== "post-cancellation");
-    return (_jsx(AssistantRuntimeProvider, { runtime: assistantRuntime, children: _jsx("main", { className: "flex min-h-0 flex-1 flex-col overflow-hidden", children: _jsx(AssistantThreadSurface, { cancellationState: cancellationState, cancellationRevision: cancellationRevision, commands: commands, composerTop: visibleQueuedTurns.length > 0 || queueError ? (_jsx(FollowUpQueue, { error: queueError, messages: messages, onRemove: removeQueuedTurn, onRetry: markQueuedTurnForRetry, turns: visibleQueuedTurns })) : undefined, draftStorageKey: draftStorageKey, events: displayEvents, eveMessages: visibleMessages, fallbackStartedAt: thread.pendingTurn?.submittedAt, inputDisabled: inputLocked, isBusy: isBusy, locale: locale, mentions: mentions, messages: messages, models: models, onInputResponses: respond, onCloseInputRequest: closeInputRequest, onOpenSubagent: onOpenSubagent, onPreferencesChange: (preferences) => onChange({ preferences }), onRetryRuntimeError: recoveryError ? onRetryRecovery : undefined, closedInputRequestIds: closedInputRequestIdsRef.current, preferences: thread.preferences, reasoningLevels: reasoningLevels, runtimeError: runtimeError, usage: usage }) }) }));
+    return (_jsx(AssistantRuntimeProvider, { runtime: assistantRuntime, children: _jsx("main", { className: "flex min-h-0 flex-1 flex-col overflow-hidden", children: _jsx(AssistantThreadSurface, { cancellationState: cancellationState, commands: commands, composerTop: visibleQueuedTurns.length > 0 || queueError ? (_jsx(FollowUpQueue, { error: queueError, messages: messages, onRemove: removeQueuedTurn, onRetry: markQueuedTurnForRetry, turns: visibleQueuedTurns })) : undefined, draftStorageKey: draftStorageKey, events: displayEvents, eveMessages: visibleMessages, fallbackStartedAt: thread.pendingTurn?.submittedAt, inputDisabled: inputLocked, isBusy: isBusy, locale: locale, mentions: mentions, messages: messages, models: models, onInputResponses: respond, onCloseInputRequest: closeInputRequest, onOpenSubagent: onOpenSubagent, onPreferencesChange: (preferences) => onChange({ preferences }), onDraftRestoreConsumed: (id) => {
+                    if (thread.draftRestore?.id === id)
+                        onChange({ draftRestore: undefined });
+                }, onRetryRuntimeError: recoveryError ? onRetryRecovery : undefined, closedInputRequestIds: closedInputRequestIdsRef.current, preferences: thread.preferences, reasoningLevels: reasoningLevels, draftRestore: thread.draftRestore, runtimeError: runtimeError, usage: usage }) }) }));
 }
 function expandPromptDirectives(value, commands, mentions) {
     const segments = unstable_defaultDirectiveFormatter.parse(value);
@@ -1013,7 +1052,7 @@ function mailboxTurnState(status) {
 function mailboxTurnIsCancellable(turn) {
     if (turn.delivery !== "server")
         return true;
-    return turn.state === "queued" || turn.state === "delivery-failed";
+    return turn.state === "queued" || turn.state === "delivering" || turn.state === "delivery-failed";
 }
 function sameQueuedTurnSnapshots(left, right) {
     return left.length === right.length && left.every((turn, index) => {

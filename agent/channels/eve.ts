@@ -201,28 +201,21 @@ const mailboxRoute = POST(MAILBOX_ROUTE, async (request, {
   if (input.action === "inspect") {
     return Response.json({ ...boundary, ok: true }, { headers: { "cache-control": "no-store" } });
   }
-  if (boundary.state === "terminal" || boundary.state === "running" && !boundary.turnId) {
+  if (boundary.state === "terminal" || boundary.state === "running") {
     return mailboxProblem(
       boundary.state === "terminal" ? 410 : 409,
-      boundary.state === "terminal" ? "mailbox_session_terminal" : "mailbox_turn_pending",
+      boundary.state === "terminal" ? "mailbox_session_terminal" : "mailbox_turn_active",
       boundary.state === "terminal"
         ? "The Agent session is terminal."
-        : "The Agent session has not published its active turn boundary yet.",
+        : "The Agent session is still running. The queued message remains cancellable until it parks.",
     );
   }
-  const steer = boundary.state === "running" && boundary.turnId
-    ? {
-        clientMessageId: input.clientMessageId,
-        expectedTurnId: boundary.turnId,
-      }
-    : undefined;
   try {
     const accepted = await attachSession(input.sessionId).send(
       input.message,
       {
         auth: mailboxSessionAuth(input),
         ...(input.clientContext ? { clientContext: input.clientContext } : {}),
-        ...(steer ? { steer } : {}),
       },
     );
     if (accepted.status !== "accepted" || accepted.sessionId !== input.sessionId) {

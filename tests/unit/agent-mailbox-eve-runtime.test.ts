@@ -43,6 +43,20 @@ test("Eve mailbox runtime retains the active turn identity", async () => {
 });
 
 test("Eve mailbox runtime distinguishes rejection from ambiguous admission", async () => {
+  const busy = createEveAgentMailboxRuntime(environment, async () =>
+    Response.json({ code: "mailbox_turn_active", error: "Still running", ok: false }, { status: 409 })
+  );
+  await assert.rejects(
+    busy.deliver({
+      clientMessageId: "message-1",
+      itemId: "mail-1",
+      owner: owner(),
+      payload: { message: "Continue" },
+      sessionId: "session-1",
+    }),
+    (error: unknown) => error instanceof AgentMailboxAdmissionError && error.disposition === "busy",
+  );
+
   const rejected = createEveAgentMailboxRuntime(environment, async () =>
     Response.json({ code: "mailbox_session_running", error: "Still running", ok: false }, { status: 409 })
   );

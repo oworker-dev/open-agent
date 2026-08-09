@@ -88,6 +88,7 @@ function parseThread(value) {
     const session = isRecord(value.session) ? value.session : {};
     const status = isThreadStatus(value.status) ? value.status : "ready";
     const pendingTurn = parsePendingTurn(value.pendingTurn);
+    const draftRestore = parseDraftRestore(value.draftRestore);
     const closedInputRequestIds = Array.isArray(value.closedInputRequestIds)
         ? [...new Set(value.closedInputRequestIds.filter((id) => typeof id === "string" && id.trim().length > 0))].slice(-128)
         : [];
@@ -107,6 +108,7 @@ function parseThread(value) {
     return {
         createdAt,
         closedInputRequestIds,
+        ...(draftRestore ? { draftRestore } : {}),
         events: compactThreadEvents(rawEvents),
         ...(value.hydration === "summary" ? { hydration: "summary" } : {}),
         id: value.id,
@@ -131,6 +133,13 @@ function parseThread(value) {
         title: value.title,
         updatedAt,
     };
+}
+function parseDraftRestore(value) {
+    if (!isRecord(value) ||
+        typeof value.id !== "string" || !value.id ||
+        typeof value.text !== "string" || !value.text.trim())
+        return undefined;
+    return { id: value.id, text: value.text };
 }
 function parseQueuedTurn(value) {
     if (!isRecord(value))

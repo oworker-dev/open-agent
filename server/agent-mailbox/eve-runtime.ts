@@ -89,6 +89,9 @@ export function createEveAgentMailboxRuntime(
         return { sessionId: parsed.sessionId };
       }
       const message = problemMessage(parsed, `Mailbox admission failed with HTTP ${response.status}.`);
+      if (response.status === 409 && isRecord(parsed) && parsed.code === "mailbox_turn_active") {
+        throw new AgentMailboxAdmissionError("busy", message);
+      }
       const rejected = [400, 401, 403, 404, 409, 410, 413].includes(response.status) &&
         isRecord(parsed) && parsed.code !== "mailbox_session_identity_changed";
       throw new AgentMailboxAdmissionError(rejected ? "rejected" : "ambiguous", message);

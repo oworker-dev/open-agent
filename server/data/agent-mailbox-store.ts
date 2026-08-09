@@ -64,6 +64,7 @@ export interface AgentMailboxStore {
   claimNext(options?: { readonly leaseMs?: number }): Promise<AgentMailboxItem | undefined>;
   commit(itemId: string, acceptedSessionId: string): Promise<AgentMailboxItem>;
   defer(itemId: string, claimToken: string, availableAt: string, reason?: string): Promise<AgentMailboxItem>;
+  deferRejectedAdmission(itemId: string, claimToken: string, availableAt: string, reason?: string): Promise<AgentMailboxItem>;
   enqueue(input: {
     readonly clientMessageId: string;
     readonly owner: AgentSessionOwner;
@@ -246,6 +247,21 @@ function postgresAgentMailboxStore(
       );
       return toRecord(requireRow(result.rows[0]));
     },
+    async deferRejectedAdmission(itemId, claimToken, availableAt, reason) {
+      assertText(itemId, "itemId", 512);
+      assertText(claimToken, "claimToken", 512);
+      const timestamp = parseTimestamp(availableAt, "availableAt");
+      const result = await pool.query<AgentMailboxRow>(
+        `update ${mailboxTable}
+            set status = 'queued', claim_token = null, claim_expires_at = null,
+                admission_started_at = null,
+                available_at = $3, last_error = $4, updated_at = now()
+          where item_id = $1 and status = 'delivering' and claim_token = $2
+         returning ${selectColumns()}`,
+        [itemId, claimToken, timestamp, compactError(reason)],
+      );
+      return toRecord(requireRow(result.rows[0]));
+    },
     async accept(itemId, claimToken, acceptedSessionId) {
       assertText(acceptedSessionId, "acceptedSessionId", 512);
       const accepted = await claimedTransition(pool, mailboxTable, itemId, claimToken, {
@@ -306,9 +322,13 @@ function postgresAgentMailboxStore(
       assertText(itemId, "itemId", 512);
       const result = await pool.query<AgentMailboxRow>(
         `update ${mailboxTable}
-            set status = 'cancelled', last_error = null, updated_at = now()
+            set status = 'cancelled', claim_token = null, claim_expires_at = null,
+                admission_started_at = null, last_error = null, updated_at = now()
           where item_id = $1 and tenant_id = $2 and principal_id = $3
-            and status in ('queued', 'failed')
+            and (
+              status in ('queued', 'failed')
+              or (status = 'delivering' and admission_started_at is null)
+            )
          returning ${selectColumns()}`,
         [itemId, owner.tenantId, owner.principalId],
       );
