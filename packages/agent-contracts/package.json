@@ -24,6 +24,10 @@
       "types": "./dist/agent-session.d.ts",
       "import": "./dist/agent-session.js"
     },
+    "./client-context": {
+      "types": "./dist/client-context.d.ts",
+      "import": "./dist/client-context.js"
+    },
     "./embed": {
       "types": "./dist/agent-embed.d.ts",
       "import": "./dist/agent-embed.js"

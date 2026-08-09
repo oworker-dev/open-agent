@@ -41,8 +41,11 @@ export function StandaloneAgentWorkspace({
 }: StandaloneAgentWorkspaceProps) {
   const pathname = usePathname();
   const httpThreadStorage = useMemo(
-    () => createHttpAgentThreadStorage({ endpoint: "/api/standalone/thread-collections" }),
-    [],
+    () => createHttpAgentThreadStorage({
+      endpoint: "/api/standalone/thread-collections",
+      ...(initialThreadId ? { initialThreadId } : {}),
+    }),
+    [initialThreadId],
   );
   const mailbox = useMemo(
     () => storageMode === "server"

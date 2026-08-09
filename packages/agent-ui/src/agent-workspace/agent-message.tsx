@@ -23,10 +23,14 @@ import {
   TerminalIcon,
   FileSearchIcon,
   ListChecksIcon,
+  MessageCircleQuestionIcon,
+  ShieldCheckIcon,
+  WifiIcon,
   XCircleIcon,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import type { MessageStreamEvent } from "eve/client";
+import type { InputResponse, MessageStreamEvent } from "eve/client";
+import { useScrollLock } from "@assistant-ui/react";
 import { StaticMarkdownText } from "../assistant-ui/markdown-text.js";
 import { copyText } from "../assistant-ui/copy-text.js";
 import {
@@ -47,10 +51,22 @@ import {
 import { DiffViewer } from "../assistant-ui/diff-viewer.js";
 import { Button } from "../ui/button.js";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "../ui/collapsible.js";
+import {
+  Questionnaire,
+  QuestionnaireChoice,
+  QuestionnaireChoiceDescription,
+  QuestionnaireChoices,
+  QuestionnaireError,
+  QuestionnaireItem,
+  QuestionnaireSubmit,
+  QuestionnaireTitle,
+} from "../ui/questionnaire.js";
 import { cn } from "../utils.js";
 import type { AgentLocale } from "./i18n.js";
 import {
+  failureForTurn,
   presentAgentTurn,
+  presentAgentStep,
   presentSubagentCall,
   type AgentTurnPresentation,
   type AgentTurnStatus,
@@ -83,9 +99,11 @@ export type AgentInputResponse = {
 };
 
 type EveFilePart = Extract<EveMessagePart, { type: "file" }>;
+const EMPTY_CLOSED_INPUT_REQUEST_IDS: ReadonlySet<string> = new Set();
 
 export function AgentMessage({
   canRespond,
+  closedInputRequestIds = EMPTY_CLOSED_INPUT_REQUEST_IDS,
   events,
   fallbackStartedAt,
   isStreaming,
@@ -93,9 +111,11 @@ export function AgentMessage({
   message,
   onOpenSubagent,
   onInputResponses,
+  onCloseInputRequest = () => undefined,
   showCopyAction = true,
 }: {
   readonly canRespond: boolean;
+  readonly closedInputRequestIds?: ReadonlySet<string>;
   readonly events: readonly MessageStreamEvent[];
   readonly fallbackStartedAt?: number;
   readonly isStreaming: boolean;
@@ -103,10 +123,13 @@ export function AgentMessage({
   readonly message: EveMessage;
   readonly onOpenSubagent?: (sessionId: string) => void;
   readonly onInputResponses: (responses: readonly AgentInputResponse[]) => void | Promise<void>;
+  readonly onCloseInputRequest?: (requestId: string) => void;
   readonly showCopyAction?: boolean;
 }) {
-  const task = presentAgentTurn(message, events);
+  const task = presentAgentTurn(message, events, closedInputRequestIds);
   const responseText = task?.finalPart?.text ?? (task ? undefined : lastText(message.parts));
+  const failure = failureForTurn(events, message.metadata?.turnId);
+  const hasVisiblePart = message.parts.some((part) => part.type !== "step-start");
 
   return (
     <Message
@@ -114,10 +137,15 @@ export function AgentMessage({
       from={message.role}
     >
       <MessageContent className={message.role === "assistant" ? "w-full" : undefined}>
+        {message.role === "assistant" && isStreaming && !hasVisiblePart ? (
+          <ReasoningRoot className="mb-1" role="status" streaming variant="ghost">
+            <ReasoningTrigger active label={localize(locale, "Thinking", "正在思考")} />
+          </ReasoningRoot>
+        ) : null}
         {task ? (
           <>
             <ExecutionGroup
-              collapseWhenSettled={Boolean(
+              collapseWhenSettled={task.status === "completed" && Boolean(
                 task.finalPart?.text.trim() ||
                 hasLaterFinalDelivery(events, message.metadata?.turnId),
               )}
@@ -127,10 +155,12 @@ export function AgentMessage({
             >
               <ProcessParts
                 canRespond={canRespond}
+                closedInputRequestIds={closedInputRequestIds}
                 events={events}
                 inActiveExecution={task.status === "running" || task.status === "waiting"}
                 locale={locale}
                 onInputResponses={onInputResponses}
+                onCloseInputRequest={onCloseInputRequest}
                 onOpenSubagent={onOpenSubagent}
                 parts={task.processParts}
                 turnId={message.metadata?.turnId}
@@ -142,10 +172,12 @@ export function AgentMessage({
                   </p>
                   <AgentMessagePart
                     canRespond={canRespond}
+                    closedInputRequestIds={closedInputRequestIds}
                     events={events}
                     inActiveExecution
                     locale={locale}
                     onInputResponses={onInputResponses}
+                    onCloseInputRequest={onCloseInputRequest}
                     onOpenSubagent={onOpenSubagent}
                     part={part}
                     turnId={message.metadata?.turnId}
@@ -154,16 +186,19 @@ export function AgentMessage({
               ))}
             </ExecutionGroup>
             {task.finalPart ? (
-              <AgentMessagePart
-                canRespond={canRespond}
-                events={events}
-                inActiveExecution={false}
-                locale={locale}
-                onInputResponses={onInputResponses}
-                onOpenSubagent={onOpenSubagent}
-                part={task.finalPart}
-                turnId={message.metadata?.turnId}
-              />
+              <div className="pt-3">
+                <AgentMessagePart
+                  canRespond={canRespond}
+                  events={events}
+                  inActiveExecution={false}
+                  locale={locale}
+                  onInputResponses={onInputResponses}
+                  onCloseInputRequest={onCloseInputRequest}
+                  onOpenSubagent={onOpenSubagent}
+                  part={task.finalPart}
+                  turnId={message.metadata?.turnId}
+                />
+              </div>
             ) : null}
           </>
         ) : message.parts.map((part, index) => (
@@ -174,11 +209,13 @@ export function AgentMessage({
             key={partKey(part, index)}
             locale={locale}
             onInputResponses={onInputResponses}
+            onCloseInputRequest={onCloseInputRequest}
             onOpenSubagent={onOpenSubagent}
             part={part}
             turnId={message.metadata?.turnId}
           />
         ))}
+        {failure ? <TurnFailure failure={failure} locale={locale} /> : null}
       </MessageContent>
       {showCopyAction && message.role === "assistant" && responseText && !isStreaming ? (
         <CopyResponseAction locale={locale} text={responseText} />
@@ -189,20 +226,24 @@ export function AgentMessage({
 
 function AgentMessagePart({
   canRespond,
+  closedInputRequestIds = EMPTY_CLOSED_INPUT_REQUEST_IDS,
   events,
   inActiveExecution,
   locale,
   onOpenSubagent,
   onInputResponses,
+  onCloseInputRequest = () => undefined,
   part,
   turnId,
 }: {
   readonly canRespond: boolean;
+  readonly closedInputRequestIds?: ReadonlySet<string>;
   readonly events: readonly MessageStreamEvent[];
   readonly inActiveExecution: boolean;
   readonly locale: AgentLocale;
   readonly onOpenSubagent?: (sessionId: string) => void;
   readonly onInputResponses: (responses: readonly AgentInputResponse[]) => void | Promise<void>;
+  readonly onCloseInputRequest?: (requestId: string) => void;
   readonly part: EveMessagePart;
   readonly turnId?: string;
 }) {
@@ -224,34 +265,62 @@ function AgentMessagePart({
     case "authorization":
       return <AuthorizationPrompt locale={locale} part={part} />;
     case "dynamic-tool": {
-      return <ToolPart canRespond={canRespond} events={events} inActiveExecution={inActiveExecution} locale={locale} onInputResponses={onInputResponses} onOpenSubagent={onOpenSubagent} part={part} />;
+      return <ToolPart canRespond={canRespond} closedInputRequestIds={closedInputRequestIds} events={events} inActiveExecution={inActiveExecution} locale={locale} onCloseInputRequest={onCloseInputRequest} onInputResponses={onInputResponses} onOpenSubagent={onOpenSubagent} part={part} />;
     }
   }
 }
 
 function ProcessParts({
   canRespond,
+  closedInputRequestIds = EMPTY_CLOSED_INPUT_REQUEST_IDS,
   events,
   inActiveExecution,
   locale,
   onInputResponses,
+  onCloseInputRequest = () => undefined,
   onOpenSubagent,
   parts,
   turnId,
 }: {
   readonly canRespond: boolean;
+  readonly closedInputRequestIds?: ReadonlySet<string>;
   readonly events: readonly MessageStreamEvent[];
   readonly inActiveExecution: boolean;
   readonly locale: AgentLocale;
   readonly onInputResponses: (responses: readonly AgentInputResponse[]) => void | Promise<void>;
+  readonly onCloseInputRequest?: (requestId: string) => void;
   readonly onOpenSubagent?: (sessionId: string) => void;
   readonly parts: readonly EveMessagePart[];
   readonly turnId?: string;
 }) {
   const rendered: React.ReactNode[] = [];
+  let visualStepIndex = -1;
 
   for (let index = 0; index < parts.length;) {
     const part = parts[index]!;
+    if (part.type === "step-start") {
+      visualStepIndex += 1;
+      const nextStep = parts.findIndex((candidate, candidateIndex) =>
+        candidateIndex > index && candidate.type === "step-start"
+      );
+      const stepEnd = nextStep < 0 ? parts.length : nextStep;
+      const hasReasoning = parts.slice(index + 1, stepEnd).some((candidate) =>
+        candidate.type === "reasoning" && candidate.stepIndex === visualStepIndex
+      );
+      if (!hasReasoning) {
+        rendered.push(
+          <StepActivity
+            events={events}
+            key={`step-activity:${turnId}:${visualStepIndex}`}
+            locale={locale}
+            stepIndex={visualStepIndex}
+            turnId={turnId}
+          />,
+        );
+      }
+      index += 1;
+      continue;
+    }
     if (part.type !== "dynamic-tool") {
       rendered.push(
         <AgentMessagePart
@@ -261,6 +330,8 @@ function ProcessParts({
           key={partKey(part, index)}
           locale={locale}
           onInputResponses={onInputResponses}
+          onCloseInputRequest={onCloseInputRequest}
+          closedInputRequestIds={closedInputRequestIds}
           onOpenSubagent={onOpenSubagent}
           part={part}
           turnId={turnId}
@@ -276,25 +347,9 @@ function ProcessParts({
       toolParts.push(parts[cursor] as EveDynamicToolPart);
       cursor += 1;
     }
-    const active = toolParts.some((toolPart) => !isToolTerminal(toolPart.state));
-    const needsInput = toolParts.some((toolPart) =>
-      toolPart.state === "approval-requested" ||
-      Boolean(toolPart.toolMetadata?.eve?.inputRequest && !toolPart.toolMetadata.eve.inputResponse)
-    );
-    rendered.push(
-      <ToolGroupRoot defaultOpen={needsInput} key={`tools:${toolParts[0]?.toolCallId}`} variant="ghost">
-        <ToolGroupTrigger
-          active={active}
-          count={toolParts.length}
-          label={localize(
-            locale,
-            active
-              ? `Running ${toolParts.length} ${toolParts.length === 1 ? "tool" : "tools"}`
-              : `Ran ${toolParts.length} ${toolParts.length === 1 ? "tool" : "tools"}`,
-            active ? `正在运行 ${toolParts.length} 个工具` : `已运行 ${toolParts.length} 个工具`,
-          )}
-        />
-        <ToolGroupContent>
+    if (toolParts.every((toolPart) => Boolean(toolPart.toolMetadata?.eve?.inputRequest))) {
+      rendered.push(
+        <div className="space-y-2" key={`inputs:${toolParts[0]?.toolCallId}`}>
           {toolParts.map((toolPart) => (
             <AgentMessagePart
               canRespond={canRespond}
@@ -303,41 +358,137 @@ function ProcessParts({
               key={toolPart.toolCallId}
               locale={locale}
               onInputResponses={onInputResponses}
+              onCloseInputRequest={onCloseInputRequest}
+              closedInputRequestIds={closedInputRequestIds}
               onOpenSubagent={onOpenSubagent}
               part={toolPart}
               turnId={turnId}
             />
           ))}
-        </ToolGroupContent>
-      </ToolGroupRoot>,
+        </div>,
+      );
+      index = cursor;
+      continue;
+    }
+    const active = toolParts.some((toolPart) => !isToolTerminal(toolPart));
+    const needsInput = toolParts.some((toolPart) =>
+      toolPart.state === "approval-requested" ||
+      Boolean(toolPart.toolMetadata?.eve?.inputRequest && !toolPart.toolMetadata.eve.inputResponse)
     );
+    rendered.push(<ProcessToolGroup
+      active={active}
+      canRespond={canRespond}
+      closedInputRequestIds={closedInputRequestIds}
+      events={events}
+      inActiveExecution={inActiveExecution}
+      key={`tools:${toolParts[0]?.toolCallId}`}
+      locale={locale}
+      needsInput={needsInput}
+      onCloseInputRequest={onCloseInputRequest}
+      onInputResponses={onInputResponses}
+      onOpenSubagent={onOpenSubagent}
+      toolParts={toolParts}
+      turnId={turnId}
+    />);
     index = cursor;
   }
 
   return <>{rendered}</>;
 }
 
+function ProcessToolGroup({
+  active,
+  canRespond,
+  closedInputRequestIds,
+  events,
+  inActiveExecution,
+  locale,
+  needsInput,
+  onCloseInputRequest,
+  onInputResponses,
+  onOpenSubagent,
+  toolParts,
+  turnId,
+}: {
+  readonly active: boolean;
+  readonly canRespond: boolean;
+  readonly closedInputRequestIds: ReadonlySet<string>;
+  readonly events: readonly MessageStreamEvent[];
+  readonly inActiveExecution: boolean;
+  readonly locale: AgentLocale;
+  readonly needsInput: boolean;
+  readonly onCloseInputRequest: (requestId: string) => void;
+  readonly onInputResponses: (responses: readonly AgentInputResponse[]) => void | Promise<void>;
+  readonly onOpenSubagent?: (sessionId: string) => void;
+  readonly toolParts: readonly EveDynamicToolPart[];
+  readonly turnId?: string;
+}) {
+  const [open, setOpen] = useState(active || inActiveExecution || needsInput);
+  useEffect(() => {
+    if (active || inActiveExecution || needsInput) setOpen(true);
+  }, [active, inActiveExecution, needsInput]);
+  return (
+    <ToolGroupRoot onOpenChange={setOpen} open={open} variant="ghost">
+      <ToolGroupTrigger
+        active={active}
+        count={toolParts.length}
+        label={localize(
+          locale,
+          active
+            ? `Running ${toolParts.length} ${toolParts.length === 1 ? "tool" : "tools"}`
+            : `Ran ${toolParts.length} ${toolParts.length === 1 ? "tool" : "tools"}`,
+          active ? `正在运行 ${toolParts.length} 个工具` : `已运行 ${toolParts.length} 个工具`,
+        )}
+      />
+      <ToolGroupContent>
+        {toolParts.map((toolPart) => (
+          <AgentMessagePart
+            canRespond={canRespond}
+            closedInputRequestIds={closedInputRequestIds}
+            events={events}
+            inActiveExecution={inActiveExecution}
+            key={toolPart.toolCallId}
+            locale={locale}
+            onCloseInputRequest={onCloseInputRequest}
+            onInputResponses={onInputResponses}
+            onOpenSubagent={onOpenSubagent}
+            part={toolPart}
+            turnId={turnId}
+          />
+        ))}
+      </ToolGroupContent>
+    </ToolGroupRoot>
+  );
+}
+
 function ToolPart({
   canRespond,
+  closedInputRequestIds = EMPTY_CLOSED_INPUT_REQUEST_IDS,
   events,
   locale,
   onInputResponses,
+  onCloseInputRequest = () => undefined,
   onOpenSubagent,
   part,
 }: {
   readonly canRespond: boolean;
+  readonly closedInputRequestIds?: ReadonlySet<string>;
   readonly events: readonly MessageStreamEvent[];
   readonly inActiveExecution: boolean;
   readonly locale: AgentLocale;
   readonly onInputResponses: (responses: readonly AgentInputResponse[]) => void | Promise<void>;
+  readonly onCloseInputRequest?: (requestId: string) => void;
   readonly onOpenSubagent?: (sessionId: string) => void;
   readonly part: EveDynamicToolPart;
 }) {
-  const running = !isToolTerminal(part.state);
-  const defaultOpen = part.state === "approval-requested" ||
-    Boolean(part.toolMetadata?.eve?.inputRequest && !part.toolMetadata.eve.inputResponse);
+  const inputRequest = part.toolMetadata?.eve?.inputRequest;
+  if (inputRequest) {
+    return <InputRequestCard canRespond={canRespond} closed={closedInputRequestIds.has(inputRequest.requestId)} events={events} locale={locale} onClose={onCloseInputRequest} onInputResponses={onInputResponses} part={part} />;
+  }
+  const running = !isToolTerminal(part);
+  const defaultOpen = isTodoTool(part) || part.state === "approval-requested";
   const Icon = toolIcon(part);
-  const statusLabel = isFileMutationTool(part) ? undefined : toolStatusLabel(locale, part.state);
+  const statusLabel = isFileMutationTool(part) ? undefined : toolStatusLabel(locale, part);
 
   return (
     <ToolFallbackRoot className="my-0" defaultOpen={defaultOpen}>
@@ -351,7 +502,7 @@ function ToolPart({
         ) : (
           <Icon className="size-4 shrink-0" />
         )}
-        <span className="truncate">{toolTitle(locale, part)}</span>
+        <span className="truncate">{toolTitle(locale, part, events)}</span>
         {statusLabel ? (
           <span className={cn("shrink-0 text-xs", part.state === "output-error" && "text-destructive")}>
             {statusLabel}
@@ -361,7 +512,6 @@ function ToolPart({
       </CollapsibleTrigger>
       <ToolFallbackContent>
         <KnownToolContent events={events} locale={locale} onOpenSubagent={onOpenSubagent} part={part} />
-        <InputRequestActions canRespond={canRespond} locale={locale} onInputResponses={onInputResponses} part={part} />
         {part.errorText ? <p className="whitespace-pre-wrap text-xs text-destructive">{part.errorText}</p> : null}
       </ToolFallbackContent>
     </ToolFallbackRoot>
@@ -383,7 +533,7 @@ function KnownToolContent({
   const input = asRecord(part.input);
   const output = "output" in part ? part.output : undefined;
   const patch = toolPatch(part);
-  const fileChange = toolFileChange(part);
+  const fileChange = toolFileChange(part, events);
 
   if (part.toolMetadata?.eve?.kind === "subagent-call") {
     return <SubagentProgress events={events} locale={locale} onOpenSubagent={onOpenSubagent} part={part} />;
@@ -413,7 +563,7 @@ function KnownToolContent({
   if (["bash", "shell", "terminal", "exec_command"].includes(normalized)) {
     const command = firstString(input, ["command", "cmd"]);
     const result = shellOutput(output);
-    return <ShellToolContent command={command} locale={locale} output={output} result={result} running={!isToolTerminal(part.state)} />;
+    return <ShellToolContent command={command} locale={locale} output={output} result={result} running={!isToolTerminal(part)} />;
   }
 
   if (["read_file", "read", "view_file"].includes(normalized)) {
@@ -540,8 +690,9 @@ function toolIcon(part: EveDynamicToolPart): React.ComponentType<{ className?: s
   return BracesIcon;
 }
 
-function isToolTerminal(state: EveDynamicToolPart["state"]): boolean {
-  return state === "output-available" || state === "output-denied" || state === "output-error";
+function isToolTerminal(part: EveDynamicToolPart): boolean {
+  return part.state === "output-denied" || part.state === "output-error" ||
+    (part.state === "output-available" && part.partial !== true);
 }
 
 function normalizeToolName(toolName: string): string {
@@ -554,6 +705,10 @@ function isFileMutationTool(part: EveDynamicToolPart): boolean {
   );
 }
 
+function isTodoTool(part: EveDynamicToolPart): boolean {
+  return ["todo", "todo_write", "update_plan"].includes(normalizeToolName(part.toolName));
+}
+
 type FileMutationSummary = {
   readonly additions: number;
   readonly deletions: number;
@@ -561,15 +716,20 @@ type FileMutationSummary = {
   readonly path?: string;
 };
 
-function fileMutationSummary(part: EveDynamicToolPart): FileMutationSummary {
+function fileMutationSummary(
+  part: EveDynamicToolPart,
+  events: readonly MessageStreamEvent[] = [],
+): FileMutationSummary {
   const patch = toolPatch(part);
-  const change = toolFileChange(part);
+  const change = toolFileChange(part, events);
   const patchPath = patch ? patchFilePath(patch) : undefined;
   const path = change?.path ?? patchPath;
   const patchStats = patch ? patchLineStats(patch) : undefined;
   const additions = patchStats?.additions ?? countContentLines(change?.newContent);
   const deletions = patchStats?.deletions ?? countContentLines(change?.oldContent);
-  const operation = patch?.includes("--- /dev/null") || (change && change.oldContent.length === 0)
+  const output = part.state === "output-available" ? asRecord(part.output) : undefined;
+  const existed = typeof output?.existed === "boolean" ? output.existed : undefined;
+  const operation = patch?.includes("--- /dev/null") || existed === false || (change && change.oldContent.length === 0)
     ? "create"
     : patch?.includes("+++ /dev/null") || (change && change.newContent.length === 0)
       ? "delete"
@@ -577,9 +737,13 @@ function fileMutationSummary(part: EveDynamicToolPart): FileMutationSummary {
   return { additions, deletions, operation, ...(path ? { path } : {}) };
 }
 
-function fileMutationTitle(locale: AgentLocale, part: EveDynamicToolPart): string {
-  const running = !isToolTerminal(part.state);
-  const summary = fileMutationSummary(part);
+function fileMutationTitle(
+  locale: AgentLocale,
+  part: EveDynamicToolPart,
+  events: readonly MessageStreamEvent[] = [],
+): string {
+  const running = !isToolTerminal(part);
+  const summary = fileMutationSummary(part, events);
   const action = summary.operation === "create"
     ? running ? localize(locale, "Creating", "正在创建") : localize(locale, "Created", "已创建")
     : summary.operation === "delete"
@@ -613,6 +777,64 @@ function countContentLines(value: string | undefined): number {
   return value.endsWith("\n") ? value.slice(0, -1).split("\n").length : value.split("\n").length;
 }
 
+function StepActivity({
+  events,
+  locale,
+  stepIndex,
+  turnId,
+}: {
+  readonly events: readonly MessageStreamEvent[];
+  readonly locale: AgentLocale;
+  readonly stepIndex: number;
+  readonly turnId?: string;
+}) {
+  const step = presentAgentStep(events, turnId, stepIndex);
+  const durationSeconds = useElapsedSeconds(step.startedAt, step.endedAt);
+  return (
+    <>
+      {step.status === "running" && step.retry ? (
+        <RetryStatus locale={locale} retry={step.retry} />
+      ) : null}
+      <ReasoningRoot className="mb-1" role="status" streaming={step.status === "running"} variant="ghost">
+        <ReasoningTrigger
+          active={step.status === "running"}
+          duration={step.status === "completed" && durationSeconds > 0 ? durationSeconds : undefined}
+          hideChevron
+          label={step.status === "running"
+            ? localize(locale, "Thinking", "正在思考")
+            : localize(locale, "Reasoning complete", "思考完成")}
+        />
+      </ReasoningRoot>
+    </>
+  );
+}
+
+function RetryStatus({
+  locale,
+  retry,
+}: {
+  readonly locale: AgentLocale;
+  readonly retry: NonNullable<ReturnType<typeof presentAgentStep>["retry"]>;
+}) {
+  return (
+    <Collapsible className="mb-1 text-sm text-muted-foreground">
+      <CollapsibleTrigger className="group/retry flex max-w-full items-center gap-2 py-1.5 text-left hover:text-foreground">
+        <WifiIcon className="size-4 shrink-0" />
+        <span>{localize(locale, "Reconnecting", "正在重新连接")} {retry.attempt}/{retry.maximum}</span>
+        {retry.error ? <ChevronDownIcon className="size-3.5 -rotate-90 transition-transform group-data-[state=open]/retry:rotate-0" /> : null}
+      </CollapsibleTrigger>
+      {retry.error ? (
+        <CollapsibleContent className="overflow-hidden">
+          <div className="ml-6 rounded-lg border border-border/60 px-3 py-2 text-xs">
+            <p className="break-words text-foreground">{sanitizeFailureMessage(retry.error.message)}</p>
+            <code className="mt-1 block text-muted-foreground">{retry.error.code}</code>
+          </div>
+        </CollapsibleContent>
+      ) : null}
+    </Collapsible>
+  );
+}
+
 function ReasoningPart({
   events,
   locale,
@@ -625,21 +847,25 @@ function ReasoningPart({
   readonly turnId?: string;
 }) {
   const timing = reasoningTiming(events, turnId, part.stepIndex);
+  const step = presentAgentStep(events, turnId, part.stepIndex ?? 0);
   const durationSeconds = useElapsedSeconds(timing.startedAt, timing.endedAt);
   const streaming = part.state === "streaming";
   return (
-    <ReasoningRoot className="mb-1" defaultOpen={streaming} streaming={streaming} variant="ghost">
-      <ReasoningTrigger
-        active={streaming}
-        duration={!streaming && timing.startedAt && durationSeconds > 0 ? durationSeconds : undefined}
-        label={streaming
-          ? reasoningSummary(part.text) ?? localize(locale, "Thinking", "正在思考")
-          : localize(locale, "Reasoning complete", "思考完成")}
-      />
-      <ReasoningContent aria-busy={streaming}>
-        <ReasoningText><StaticMarkdownText text={part.text} /></ReasoningText>
-      </ReasoningContent>
-    </ReasoningRoot>
+    <>
+      {streaming && step.retry ? <RetryStatus locale={locale} retry={step.retry} /> : null}
+      <ReasoningRoot className="mb-1" streaming={streaming} variant="ghost">
+        <ReasoningTrigger
+          active={streaming}
+          duration={!streaming && timing.startedAt && durationSeconds > 0 ? durationSeconds : undefined}
+          label={streaming
+            ? reasoningSummary(part.text) ?? localize(locale, "Thinking", "正在思考")
+            : localize(locale, "Reasoning complete", "思考完成")}
+        />
+        <ReasoningContent aria-busy={streaming}>
+          <ReasoningText><StaticMarkdownText text={part.text} /></ReasoningText>
+        </ReasoningContent>
+      </ReasoningRoot>
+    </>
   );
 }
 
@@ -659,9 +885,9 @@ function reasoningTiming(
   stepIndex: number | undefined,
 ): { readonly endedAt?: number; readonly startedAt?: number } {
   const matching = events.filter((event) =>
-    (event.type === "reasoning.appended" || event.type === "reasoning.completed") &&
+    (event.type === "step.started" || event.type === "reasoning.appended" || event.type === "reasoning.completed") &&
     (turnId === undefined || event.data.turnId === turnId) &&
-    (stepIndex === undefined || event.data.stepIndex === stepIndex),
+    (stepIndex === undefined || ("stepIndex" in event.data && event.data.stepIndex === stepIndex)),
   );
   const startedAt = eventTime(matching[0]);
   const completed = [...matching].reverse().find((event) => event.type === "reasoning.completed");
@@ -684,14 +910,48 @@ type FileChange = {
   readonly path?: string;
 };
 
-function toolFileChange(part: EveDynamicToolPart): FileChange | undefined {
+function toolFileChange(
+  part: EveDynamicToolPart,
+  events: readonly MessageStreamEvent[] = [],
+): FileChange | undefined {
   const input = asRecord(part.input);
-  if (!input) return undefined;
-  const newContent = firstString(input, ["content", "newContent", "new_content", "new_string", "replacement"]);
+  const output = part.state === "output-available" ? asRecord(part.output) : undefined;
+  if (!input && !output) return undefined;
+  const newContent = firstString(output, ["content", "newContent", "new_content", "new_string", "replacement"])
+    ?? firstString(input, ["content", "newContent", "new_content", "new_string", "replacement"]);
   if (newContent === undefined) return undefined;
-  const oldContent = firstString(input, ["oldContent", "old_content", "old_string", "before"]) ?? "";
-  const path = firstString(input, ["path", "filePath", "file", "filename"]);
+  const path = firstString(output, ["path", "filePath", "file", "filename"])
+    ?? firstString(input, ["path", "filePath", "file", "filename"]);
+  const oldContent = firstString(output, ["oldContent", "old_content", "old_string", "before"])
+    ?? firstString(input, ["oldContent", "old_content", "old_string", "before"])
+    ?? previousFileContent(events, path, part.toolCallId)
+    ?? "";
   return { newContent, oldContent, ...(path ? { path } : {}) };
+}
+
+function previousFileContent(
+  events: readonly MessageStreamEvent[],
+  path: string | undefined,
+  currentCallId: string,
+): string | undefined {
+  if (!path) return undefined;
+  const reads = new Map<string, string>();
+  let latest: string | undefined;
+  for (const event of events) {
+    if (event.type === "actions.requested") {
+      for (const action of event.data.actions) {
+        if (action.callId === currentCallId) return latest;
+        if (action.kind !== "tool-call" || !["read_file", "read", "view_file"].includes(normalizeToolName(action.toolName))) continue;
+        const actionPath = firstString(asRecord(action.input), ["path", "filePath", "file", "filename"]);
+        if (actionPath === path) reads.set(action.callId, actionPath);
+      }
+      continue;
+    }
+    if (event.type !== "action.result" || event.data.result.kind !== "tool-result") continue;
+    if (!reads.has(event.data.result.callId)) continue;
+    latest = readableOutput(event.data.result.output) ?? latest;
+  }
+  return latest;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -940,6 +1200,8 @@ function ExecutionGroup({
   const [open, setOpen] = useState(!hasFinalDelivery);
   const previousStatus = useRef(task.status);
   const previousFinalDelivery = useRef(hasFinalDelivery);
+  const executionRef = useRef<HTMLDivElement>(null);
+  const lockScroll = useScrollLock(executionRef, 200);
   const startedAt = task.startedAt ?? fallbackStartedAt;
   const elapsedSeconds = useElapsedSeconds(startedAt, task.endedAt);
 
@@ -954,13 +1216,21 @@ function ExecutionGroup({
   }, [hasFinalDelivery, isActive, task.status]);
 
   return (
-    <Collapsible className="group/execution w-full" onOpenChange={setOpen} open={open}>
+    <Collapsible
+      className="group/execution w-full"
+      onOpenChange={(nextOpen) => {
+        lockScroll();
+        setOpen(nextOpen);
+      }}
+      open={open}
+      ref={executionRef}
+    >
       <CollapsibleTrigger asChild>
         <button
           className="flex w-full items-center gap-1.5 border-b border-border/60 py-1.5 text-left text-sm text-muted-foreground transition-colors hover:text-foreground"
           type="button"
         >
-          <span>{executionLabel(locale, task.status)}</span>
+          <span>{executionLabel(locale, task)}</span>
           {startedAt && elapsedSeconds > 0 ? <span className="tabular-nums">{formatDuration(elapsedSeconds)}</span> : null}
           <ChevronDownIcon className="size-3.5 transition-transform group-data-[state=open]/execution:rotate-180" />
         </button>
@@ -1027,11 +1297,15 @@ function useElapsedSeconds(startedAt: number | undefined, endedAt: number | unde
   return Math.max(0, Math.floor(((endedAt ?? now) - startedAt) / 1_000));
 }
 
-function executionLabel(locale: AgentLocale, status: AgentTurnStatus): string {
-  if (status === "running") return localize(locale, "Working", "正在处理");
-  if (status === "waiting") return localize(locale, "Waiting for approval", "等待批准");
-  if (status === "completed") return localize(locale, "Worked for", "已处理");
-  if (status === "cancelled") return localize(locale, "Stopped after", "已停止");
+function executionLabel(locale: AgentLocale, task: AgentTurnPresentation): string {
+  if (task.status === "running") return localize(locale, "Working", "正在处理");
+  if (task.status === "waiting") {
+    return task.waitingFor === "tool-approval"
+      ? localize(locale, "Waiting for approval", "等待批准")
+      : localize(locale, "Waiting for confirmation", "等待确认");
+  }
+  if (task.status === "completed") return localize(locale, "Worked for", "已处理");
+  if (task.status === "cancelled") return localize(locale, "Stopped after", "已停止");
   return localize(locale, "Failed after", "执行失败");
 }
 
@@ -1184,14 +1458,20 @@ function formatBytes(size: number | undefined): string | undefined {
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function InputRequestActions({
+function InputRequestCard({
   canRespond,
+  closed,
+  events,
   locale,
+  onClose,
   onInputResponses,
   part,
 }: {
   readonly canRespond: boolean;
+  readonly closed: boolean;
+  readonly events: readonly MessageStreamEvent[];
   readonly locale: AgentLocale;
+  readonly onClose: (requestId: string) => void;
   readonly onInputResponses: (responses: readonly AgentInputResponse[]) => void | Promise<void>;
   readonly part: EveDynamicToolPart;
 }) {
@@ -1205,46 +1485,294 @@ function InputRequestActions({
     (option) => option.id === inputResponse?.optionId,
   );
 
+  const isQuestion = inputRequest.kind === "question";
+  const isApproval = inputRequest.kind === "tool-approval";
+  const acceptsFreeform = isQuestion && (inputRequest.allowFreeform === true || !inputRequest.options?.length);
+  const Icon = isQuestion ? MessageCircleQuestionIcon : isApproval ? ShieldCheckIcon : CircleStopIcon;
+  const eyebrow = isQuestion
+    ? localize(locale, "Agent question", "Agent 需要确认")
+    : isApproval
+      ? localize(locale, "Approval required", "请求批准")
+      : localize(locale, "Session limit reached", "已达到会话限制");
+
+  const choices = inputRequest.options ?? [];
+
+  const settled = Boolean(inputResponse) || closed;
+  const [open, setOpen] = useState(!settled);
+  useEffect(() => {
+    if (settled) setOpen(false);
+  }, [settled]);
+  const status = closed
+    ? localize(locale, "Closed", "已关闭")
+    : inputResponse
+      ? localize(locale, "Responded", "已回复")
+      : isQuestion
+        ? localize(locale, "Waiting for confirmation", "等待确认")
+        : undefined;
+
   return (
-    <div className="space-y-3 rounded-md border border-yellow-500/30 bg-yellow-500/5 p-3">
-      <p className="text-muted-foreground text-sm">{inputRequest.prompt}</p>
-      {inputResponse ? (
-        <p className="font-medium text-sm">
-          {localize(locale, "Responded", "已回复")}: {selectedOption?.label ?? inputResponse.text ?? inputResponse.optionId}
-        </p>
-      ) : (
-        <div className="flex flex-wrap gap-2">
-          {inputRequest.options?.map((option) => (
-            <Button
-              disabled={!canRespond}
-              key={option.id}
-              onClick={() => {
-                void onInputResponses([
-                  {
-                    optionId: option.id,
-                    requestId: inputRequest.requestId,
-                  },
-                ]);
-              }}
-              size="sm"
-              type="button"
-              variant={option.style === "danger" ? "destructive" : "default"}
-            >
-              {option.label}
-            </Button>
-          ))}
+    <Collapsible className={cn("my-1 max-w-full transition-[width] duration-200", open ? "w-full max-w-xl" : "w-fit")} onOpenChange={setOpen} open={open}>
+      <section className="rounded-xl border border-border/70 bg-background px-3.5 py-3" data-input-request-kind={inputRequest.kind}>
+        <div className="flex items-start gap-2.5">
+          <Icon className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2">
+              <CollapsibleTrigger asChild>
+                <button className="group/request flex min-w-0 flex-1 items-center gap-1.5 text-left text-sm font-medium text-muted-foreground hover:text-foreground" type="button">
+                  <span className="truncate">{eyebrow}</span>
+                  {status ? <span className="shrink-0 font-normal text-muted-foreground/80">· {status}</span> : null}
+                  <ChevronDownIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]/request:rotate-180" />
+                </button>
+              </CollapsibleTrigger>
+              {!inputResponse && !closed && isQuestion ? <Button className="h-6 shrink-0 px-2 text-xs" onClick={() => onClose(inputRequest.requestId)} size="sm" type="button" variant="ghost">{localize(locale, "Close", "关闭")}</Button> : null}
+            </div>
+            <CollapsibleContent className="overflow-hidden">
+              <p className="mt-1 text-sm leading-6 text-foreground">{inputRequest.prompt}</p>
+              {isApproval ? <ApprovalActionPreview events={events} locale={locale} part={part} /> : null}
+              {settled ? (
+                <InputRequestReview
+                  closed={closed}
+                  inputResponse={inputResponse}
+                  locale={locale}
+                  options={choices}
+                  selectedOptionId={selectedOption?.id}
+                />
+              ) : (
+                <QuestionnaireResponseForm
+                  acceptsFreeform={acceptsFreeform}
+                  canRespond={canRespond}
+                  locale={locale}
+                  onInputResponses={onInputResponses}
+                  options={choices}
+                  prompt={inputRequest.prompt}
+                  requestId={inputRequest.requestId}
+                />
+              )}
+            </CollapsibleContent>
+          </div>
         </div>
-      )}
+      </section>
+    </Collapsible>
+  );
+}
+
+function ApprovalActionPreview({
+  events,
+  locale,
+  part,
+}: {
+  readonly events: readonly MessageStreamEvent[];
+  readonly locale: AgentLocale;
+  readonly part: EveDynamicToolPart;
+}) {
+  const normalized = normalizeToolName(part.toolName);
+  const input = asRecord(part.input);
+  if (["bash", "shell", "terminal", "exec_command"].includes(normalized)) {
+    return (
+      <div className="mt-3">
+        <ShellToolContent
+          command={firstString(input, ["command", "cmd"])}
+          locale={locale}
+          output={undefined}
+          running={false}
+        />
+      </div>
+    );
+  }
+  if (isFileMutationTool(part)) {
+    const patch = toolPatch(part);
+    const change = toolFileChange(part, events);
+    if (patch) {
+      return <div className="mt-3" data-tool-view="approval-diff"><DiffViewer contentClassName="max-h-56 overflow-auto" patch={patch} showIcon size="sm" variant="muted" /></div>;
+    }
+    if (change) {
+      return (
+        <div className="mt-3" data-tool-view="approval-diff">
+          <DiffViewer
+            contentClassName="max-h-56 overflow-auto"
+            newFile={{ content: change.newContent, name: change.path }}
+            oldFile={{ content: change.oldContent, name: change.path }}
+            showIcon
+            size="sm"
+            variant="muted"
+          />
+        </div>
+      );
+    }
+  }
+  return (
+    <pre className="mt-3 max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-md bg-muted/50 px-3 py-2.5 text-xs text-foreground" data-tool-view="approval-input">
+      {safeStringify(part.input)}
+    </pre>
+  );
+}
+
+function InputRequestReview({
+  closed,
+  inputResponse,
+  locale,
+  options,
+  selectedOptionId,
+}: {
+  readonly closed: boolean;
+  readonly inputResponse?: InputResponse;
+  readonly locale: AgentLocale;
+  readonly options: readonly { readonly description?: string; readonly id: string; readonly label: string }[];
+  readonly selectedOptionId?: string;
+}) {
+  return (
+    <div className="mt-3 space-y-2 text-sm" data-tool-view="input-review">
+      <p className="text-xs text-muted-foreground">
+        {closed
+          ? localize(locale, "This question was closed. The details remain available for review.", "此问题已关闭，详细内容仍可回看。")
+          : localize(locale, "Response", "回复")}
+      </p>
+      {options.length > 0 ? (
+        <ul className="space-y-1.5" aria-label={localize(locale, "Options", "选项")}>
+          {options.map((option) => (
+            <li
+              className={cn(
+                "flex items-start gap-2 rounded-md bg-muted/40 px-2.5 py-2",
+                selectedOptionId === option.id && "bg-accent/80 text-foreground",
+              )}
+              key={option.id}
+            >
+              <span className={cn("mt-1 size-2 shrink-0 rounded-full border border-muted-foreground/40", selectedOptionId === option.id && "border-primary bg-primary")} />
+              <span className="min-w-0">
+                <span className="block font-medium">{option.label}</span>
+                {option.description ? <span className="block text-xs leading-5 text-muted-foreground">{option.description}</span> : null}
+              </span>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+      <div className="rounded-md bg-muted/40 px-2.5 py-2">
+        <p className="text-xs text-muted-foreground">{localize(locale, "Additional information", "补充信息")}</p>
+        <p className="mt-1 whitespace-pre-wrap break-words text-foreground">
+          {inputResponse?.text?.trim() || localize(locale, "No additional information provided.", "未提供补充信息。")}
+        </p>
+      </div>
     </div>
   );
+}
+
+const FREEFORM_OPTION_ID = "__open_agent_freeform__";
+
+function QuestionnaireResponseForm({
+  acceptsFreeform,
+  canRespond,
+  locale,
+  onInputResponses,
+  options,
+  prompt,
+  requestId,
+}: {
+  readonly acceptsFreeform: boolean;
+  readonly canRespond: boolean;
+  readonly locale: AgentLocale;
+  readonly onInputResponses: (responses: readonly AgentInputResponse[]) => void | Promise<void>;
+  readonly options: readonly { readonly description?: string; readonly id: string; readonly label: string; readonly style?: "danger" | "default" | "primary" }[];
+  readonly prompt: string;
+  readonly requestId: string;
+}) {
+  const [freeformText, setFreeformText] = useState("");
+  const [selectedOptionId, setSelectedOptionId] = useState("");
+  const hasFreeformAnswer = acceptsFreeform && freeformText.trim().length > 0;
+  const questionnaireItems = [{
+    choices: [
+      ...options.map((option) => ({ value: option.id })),
+      ...(acceptsFreeform ? [{ value: FREEFORM_OPTION_ID }] : []),
+    ],
+    name: "response",
+    required: true,
+  }];
+
+  return (
+    <Questionnaire
+      className="mt-3"
+      items={questionnaireItems}
+      noValidate
+      onSubmit={(event) => {
+        event.preventDefault();
+        if (!canRespond) return;
+        const text = freeformText.trim();
+        if (!selectedOptionId && !text) return;
+        void onInputResponses([{
+          ...(selectedOptionId ? { optionId: selectedOptionId } : {}),
+          ...(text ? { text } : {}),
+          requestId,
+        }]);
+      }}
+    >
+      <QuestionnaireItem name="response" required>
+        <QuestionnaireTitle className="sr-only">{prompt}</QuestionnaireTitle>
+        <QuestionnaireChoices>
+          {options.map((option) => (
+            <QuestionnaireChoice
+              checked={selectedOptionId === option.id}
+              className={option.style === "danger" ? "border-destructive/40 data-checked:bg-destructive/10" : option.style === "primary" ? "data-checked:border-primary/50" : undefined}
+              disabled={!canRespond}
+              key={option.id}
+              onChange={(event) => setSelectedOptionId(event.currentTarget.checked ? option.id : "")}
+              value={option.id}
+            >
+              <span className={cn("min-w-0 break-words font-medium", option.style === "danger" && "text-destructive")}>{option.label}</span>
+              {option.description ? <QuestionnaireChoiceDescription>{option.description}</QuestionnaireChoiceDescription> : null}
+            </QuestionnaireChoice>
+          ))}
+          {acceptsFreeform ? (
+            <>
+              <QuestionnaireChoice checked={!selectedOptionId && hasFreeformAnswer} className="hidden" value={FREEFORM_OPTION_ID}>
+                {localize(locale, "Freeform answer", "补充回答")}
+              </QuestionnaireChoice>
+              <textarea
+                aria-label={options.length > 0 ? localize(locale, "Additional information", "补充信息") : localize(locale, "Answer", "回答")}
+                className="min-h-20 w-full resize-y rounded-lg border border-border/70 bg-transparent px-3 py-2 text-sm leading-5 outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={!canRespond}
+                onChange={(event) => setFreeformText(event.currentTarget.value)}
+                placeholder={options.length > 0 ? localize(locale, "Add context (optional)", "补充信息（可选）") : localize(locale, "Type your answer", "输入你的回答")}
+                value={freeformText}
+              />
+            </>
+          ) : null}
+        </QuestionnaireChoices>
+        <QuestionnaireError>{localize(locale, "Choose an option or add information to continue.", "请选择一个选项或补充信息后继续。")}</QuestionnaireError>
+      </QuestionnaireItem>
+      <div className="flex justify-end pt-1">
+        <QuestionnaireSubmit disabled={!canRespond}>{localize(locale, "Confirm", "确认")}</QuestionnaireSubmit>
+      </div>
+    </Questionnaire>
+  );
+}
+
+function TurnFailure({ failure, locale }: { readonly failure: { readonly code: string; readonly message: string }; readonly locale: AgentLocale }) {
+  return (
+    <div className="mt-2 flex items-start gap-3 rounded-xl border border-border/70 px-3.5 py-3 text-sm" role="alert">
+      <XCircleIcon className="mt-0.5 size-4 shrink-0 text-destructive" />
+      <div className="min-w-0 flex-1">
+        <p className="font-medium text-foreground">{localize(locale, "This turn failed", "本轮执行失败")}</p>
+        <p className="mt-1 break-words text-muted-foreground">{sanitizeFailureMessage(failure.message)}</p>
+        <code className="mt-1.5 block text-xs text-muted-foreground">{failure.code}</code>
+      </div>
+    </div>
+  );
+}
+
+function sanitizeFailureMessage(message: string): string {
+  return message
+    .replace(/(["']?base[_ -]?url["']?\s*[:=]\s*)["']?https?:\/\/[^\s,"'}]+["']?/giu, "$1[hidden]")
+    .replace(/https?:\/\/[^\s)\]}>"']+/giu, "[provider endpoint hidden]");
 }
 
 function localize(locale: AgentLocale, english: string, chinese: string): string {
   return locale === "zh-CN" ? chinese : english;
 }
 
-function toolStatusLabel(locale: AgentLocale, state: EveDynamicToolPart["state"]): string {
-  switch (state) {
+function toolStatusLabel(locale: AgentLocale, part: EveDynamicToolPart): string {
+  if (part.state === "output-available" && part.partial === true) {
+    return localize(locale, "Running", "运行中");
+  }
+  switch (part.state) {
     case "approval-requested":
       return localize(locale, "Awaiting approval", "等待批准");
     case "approval-responded":
@@ -1262,23 +1790,43 @@ function toolStatusLabel(locale: AgentLocale, state: EveDynamicToolPart["state"]
   }
 }
 
-function toolTitle(locale: AgentLocale, part: EveDynamicToolPart): string {
+function toolTitle(
+  locale: AgentLocale,
+  part: EveDynamicToolPart,
+  events: readonly MessageStreamEvent[] = [],
+): string {
   const kind = part.toolMetadata?.eve?.kind;
   if (kind === "load-skill") return localize(locale, "Loaded skill", "加载技能");
   if (kind === "subagent-call") return localize(locale, "Sub-agent", "子代理");
 
   const normalized = part.toolName.toLocaleLowerCase().replaceAll("-", "_");
-  if (isFileMutationTool(part)) return fileMutationTitle(locale, part);
-  if (["bash", "shell", "terminal", "exec_command"].includes(normalized)) return localize(locale, "Terminal command", "终端命令");
+  if (normalized === "ask_question") return localize(locale, "Question", "确认问题");
+  if (isFileMutationTool(part)) return fileMutationTitle(locale, part, events);
+  if (["bash", "shell", "terminal", "exec_command"].includes(normalized)) {
+    const command = firstString(asRecord(part.input), ["command", "cmd"]);
+    return [localize(locale, "Terminal command", "终端命令"), command].filter(Boolean).join(" ");
+  }
   if (["publish_preview", "website_preview"].includes(normalized)) return localize(locale, "Published preview", "发布网站预览");
   if (["publish_artifact", "artifact_publish"].includes(normalized)) return localize(locale, "Published artifact", "发布产物");
   if (["record_checkpoint", "checkpoint"].includes(normalized)) return localize(locale, "Saved checkpoint", "保存检查点");
-  if (["read_file", "read", "view_file"].includes(normalized)) return localize(locale, "Read file", "读取文件");
-  if (["glob", "find_files"].includes(normalized)) return localize(locale, "Found files", "查找文件");
-  if (["grep", "search_files"].includes(normalized)) return localize(locale, "Searched files", "搜索文件");
+  if (["read_file", "read", "view_file"].includes(normalized)) {
+    const path = firstString(asRecord(part.input), ["path", "file", "filename"]);
+    return [localize(locale, "Read file", "读取文件"), path].filter(Boolean).join(" ");
+  }
+  if (["glob", "find_files"].includes(normalized)) {
+    const query = firstString(asRecord(part.input), ["query", "pattern", "glob", "path"]);
+    return [localize(locale, "Found files", "查找文件"), query].filter(Boolean).join(" ");
+  }
+  if (["grep", "search_files"].includes(normalized)) {
+    const query = firstString(asRecord(part.input), ["query", "pattern", "path"]);
+    return [localize(locale, "Searched files", "搜索文件"), query].filter(Boolean).join(" ");
+  }
   if (["todo", "todo_write", "update_plan"].includes(normalized)) return localize(locale, "Updated tasks", "更新任务列表");
   if (["web_search", "search_web", "search"].includes(normalized)) return localize(locale, "Searched the web", "搜索网页");
-  if (["web_fetch", "fetch_url"].includes(normalized)) return localize(locale, "Fetched webpage", "读取网页");
+  if (["web_fetch", "fetch_url"].includes(normalized)) {
+    const url = firstString(asRecord(part.input), ["url"]);
+    return [localize(locale, "Fetched webpage", "读取网页"), url].filter(Boolean).join(" ");
+  }
   return part.toolName.replaceAll("_", " ");
 }
 

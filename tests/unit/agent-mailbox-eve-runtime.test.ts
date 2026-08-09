@@ -31,6 +31,17 @@ test("Eve mailbox runtime reads waiting boundaries and admits messages", async (
   assert.equal(requests.length, 2);
 });
 
+test("Eve mailbox runtime retains the active turn identity", async () => {
+  const runtime = createEveAgentMailboxRuntime(environment, async () =>
+    Response.json({ ok: true, state: "running", turnId: "turn-active" })
+  );
+
+  assert.deepEqual(await runtime.inspect({ owner: owner(), sessionId: "session-1" }), {
+    state: "running",
+    turnId: "turn-active",
+  });
+});
+
 test("Eve mailbox runtime distinguishes rejection from ambiguous admission", async () => {
   const rejected = createEveAgentMailboxRuntime(environment, async () =>
     Response.json({ code: "mailbox_session_running", error: "Still running", ok: false }, { status: 409 })

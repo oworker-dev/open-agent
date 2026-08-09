@@ -15,6 +15,6 @@ export declare function AgentSidebar({ activeThreadId, brand, deletingThreadIds,
     readonly onSettings: () => void;
     readonly open: boolean;
     readonly threads: readonly AgentThread[];
-    readonly variant?: "desktop" | "mobile";
+    readonly variant?: "desktop" | "floating" | "mobile";
 }): import("react/jsx-runtime").JSX.Element;
 //# sourceMappingURL=agent-sidebar.d.ts.map

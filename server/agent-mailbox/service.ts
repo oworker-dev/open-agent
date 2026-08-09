@@ -10,7 +10,7 @@ import type { AgentSessionOwner } from "../data/session-ownership-store.ts";
 const DEFAULT_BUSY_RETRY_MS = 2_000;
 
 export type AgentMailboxBoundary =
-  | { readonly state: "running" }
+  | { readonly state: "running"; readonly turnId?: string }
   | { readonly state: "waiting" }
   | { readonly state: "terminal" };
 
@@ -44,6 +44,7 @@ export class AgentMailboxAdmissionError extends Error {
 
 export async function enqueueAgentMailboxMessage(options: {
   readonly clientMessageId: string;
+  readonly clientContext?: AgentMailboxPayload["clientContext"];
   readonly message: string;
   readonly owner: AgentSessionOwner;
   readonly preferences?: AgentMailboxPayload["preferences"];
@@ -54,6 +55,7 @@ export async function enqueueAgentMailboxMessage(options: {
   const sessionId = parseSessionId(options.sessionId);
   const message = parseMessage(options.message);
   const payload = {
+    ...(options.clientContext ? { clientContext: options.clientContext } : {}),
     message,
     ...(options.preferences ? { preferences: options.preferences } : {}),
   } as const;
@@ -94,7 +96,7 @@ export async function dispatchNextAgentMailboxMessage(options: {
     return { item: deferred, status: "deferred" };
   }
 
-  if (boundary.state === "running") {
+  if (boundary.state === "running" && !boundary.turnId) {
     const deferred = await options.store.defer(
       item.itemId,
       claimToken,

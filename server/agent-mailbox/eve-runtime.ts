@@ -48,8 +48,14 @@ export function createEveAgentMailboxRuntime(
       if (!response.ok || !isRecord(parsed)) {
         throw new Error(problemMessage(parsed, `Mailbox inspection failed with HTTP ${response.status}.`));
       }
-      if (parsed.state === "running" || parsed.state === "terminal") {
-        return { state: parsed.state };
+      if (parsed.state === "running") {
+        return {
+          state: "running",
+          ...(validText(parsed.turnId) ? { turnId: parsed.turnId } : {}),
+        };
+      }
+      if (parsed.state === "terminal") {
+        return { state: "terminal" };
       }
       if (parsed.state === "waiting") {
         return { state: "waiting" };
@@ -62,6 +68,7 @@ export function createEveAgentMailboxRuntime(
         result = await request({
           action: "deliver",
           clientMessageId: input.clientMessageId,
+          ...(input.payload.clientContext ? { clientContext: input.payload.clientContext } : {}),
           itemId: input.itemId,
           ...(input.payload.preferences ?? {}),
           ...(input.owner.issuer ? { issuer: input.owner.issuer } : {}),

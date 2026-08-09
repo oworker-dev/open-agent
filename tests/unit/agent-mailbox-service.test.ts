@@ -51,7 +51,7 @@ test("mailbox enqueue is idempotent and rejects changed payload reuse", async ()
   assert.equal(store.items.length, 1);
 });
 
-test("dispatcher waits for session.waiting before delivering", async () => {
+test("dispatcher waits until a running session publishes its turn id", async () => {
   const store = await queuedStore();
   const runtime = new FakeMailboxRuntime({ state: "running" });
   const result = await dispatchNextAgentMailboxMessage({
@@ -65,6 +65,16 @@ test("dispatcher waits for session.waiting before delivering", async () => {
   assert.equal(runtime.deliveries.length, 0);
   assert.equal(store.items[0]?.status, "queued");
   assert.equal(store.items[0]?.availableAt, "2030-01-01T00:00:01.000Z");
+});
+
+test("dispatcher admits a message while the addressed turn is running", async () => {
+  const store = await queuedStore();
+  const runtime = new FakeMailboxRuntime({ state: "running", turnId: "turn-active" });
+  const result = await dispatchNextAgentMailboxMessage({ runtime, store });
+
+  assert.equal(result.status, "accepted");
+  assert.equal(store.items[0]?.status, "accepted");
+  assert.equal(runtime.deliveries.length, 1);
 });
 
 test("dispatcher admits exactly one message at a waiting boundary", async () => {

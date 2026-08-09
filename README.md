@@ -17,9 +17,11 @@ The project has a working Eve runtime and a reusable assistant-ui Web workspace:
 - multiple local threads, responsive navigation, English and Simplified Chinese;
 - immediate optimistic sending, visible thread selection, inline rename, and searchable model selection;
 - Context usage disclosure plus host-injected `/` Skill/command and `@` context discovery;
-- cancellation, failed-turn continuation, and hard-refresh recovery;
+- cancellation, failed-turn continuation, hard-refresh recovery, and supervised
+  half-open stream replacement from the last UI-observed cursor;
 - a server-owned follow-up mailbox with strict per-session FIFO, leases, and
-  ambiguous-admission protection;
+  ambiguous-admission protection, including Codex-style active-turn steering
+  at the next model-step boundary;
 - inspectable sub-agent sessions with Active/Done navigation, independent
   durable stream recovery, elapsed time, terminal-state repair, and explicit
   cancellation;
@@ -83,16 +85,21 @@ AGENT_MAILBOX_DISPATCH_SECRET='local-dispatch-secret-at-least-32-bytes' \
 ```
 
 The worker is application infrastructure, not part of Eve's model loop. Eve
-does not provide a durable FIFO for concurrent messages; the worker waits for
-`session.waiting` and dispatches one persisted item at a time. The browser
-fallback remains available for hosts that do not provide a mailbox, but it is
-not durable across a closed tab or process restart.
+does not provide the product-level durable FIFO for concurrent Web clients. The
+worker dispatches one persisted item at a time: a running session with a durable
+turn ID receives an `expectedTurnId` steering delivery at the next safe model
+boundary, while a waiting session receives a normal next-turn delivery. If the
+expected turn settles during admission, Eve removes the stale steering marker
+and preserves the message as an ordinary next turn. The browser fallback
+remains available for hosts that do not provide a mailbox, but it is not durable
+across a closed tab or process restart.
 
 The mailbox commit hook retries transient product-database failures before it
-fails the turn. A durable `message.received` is authoritative even when the
-dispatcher HTTP response was lost: it may atomically promote a
-`submission-ambiguous` item to `committed`, unblocking strict FIFO without
-replaying the message.
+fails the turn. Every delivery carries a stable `clientMessageId`; its durable
+`message.received` event is authoritative even when the dispatcher HTTP response
+was lost. The event may atomically promote a `submission-ambiguous` item to
+`committed`, unblocking strict FIFO without replaying the message. The composer
+removes the pending item only after observing that exact ID.
 
 For a remote development preview, bind Next to all interfaces and pass the
 current hostname or IP through `AGENT_DEV_ALLOWED_ORIGINS`. Keep that value in
@@ -426,21 +433,22 @@ const threadStorage = createHttpAgentThreadStorage({
     }),
   }}
   defaultPreferences={{ modelId: "provider/model", reasoning: "high" }}
-  models={[{ contextWindowTokens: 128000, id: "provider/model", label: "Model" }]}
+  models={[{ contextWindowTokens: 272000, id: "provider/model", label: "Model" }]}
   productName="Agent"
   reasoningLevels={["low", "medium", "high"]}
 />
 ```
 
 Hosts can also inject authenticated thread persistence. The storage adapter
-owns account/database access; `AgentWorkspace` only consumes versioned thread
-snapshots and serializes writes so rapid stream events cannot reorder them:
+owns account/database access; `AgentWorkspace` consumes a versioned thread
+index, hydrates selected transcripts on demand when the adapter supports it,
+and serializes writes so rapid stream events cannot reorder them:
 
 ```tsx
 <AgentWorkspace
   agentName="general-agent"
   defaultPreferences={{ modelId: "provider/model", reasoning: "high" }}
-  models={[{ contextWindowTokens: 128000, id: "provider/model", label: "Model" }]}
+  models={[{ contextWindowTokens: 272000, id: "provider/model", label: "Model" }]}
   productName="Agent"
   reasoningLevels={["low", "medium", "high"]}
   threadStorage={threadStorage}
@@ -454,9 +462,11 @@ retires Eve by that stable session ID first, then records a database-authorized
 sandbox tombstone for asynchronous reaping. A failed retirement leaves the
 thread and sandbox visible.
 
-The bundled HTTP adapter uses `If-Match` revisions. A competing client receives
-`409` and the workspace stops further writes, shows a visible persistence error,
-and requires an explicit reload; it never silently overwrites server state.
+The bundled HTTP adapter uses `If-Match` revisions and sends only changed thread
+documents. A competing client receives `409`; the workspace reloads the current
+index, merges by thread update time, and retries at most three times. Persistent
+conflicts remain visible through `onStorageError` and never become unbounded
+write loops.
 
 The server remains authoritative for identity, model entitlement, tool access,
 and billing. Browser headers and `clientContext` are untrusted input.
@@ -475,10 +485,11 @@ can inspect, reconnect to, and cancel that session. Eve's built-in `agent` copy
 shares the root sandbox; a declared specialist uses its own sandbox unless
 configured otherwise. Open Agent enables Eve 0.31.1 persistent subagent
 sessions: a completed child parks, receives a stable `agentId`, and can be
-continued by the parent on a later model step. Eve still does not expose
-Codex-style active-turn steering, detached/no-wait children, injection into a
-busy child, or a public close lifecycle. Open Agent does not replace Eve's loop
-or display fake controls for operations the framework cannot perform.
+continued by the parent on a later model step. Open Agent patches the Eve turn
+driver with Codex-style root-session steering at safe model boundaries; it still
+does not expose detached/no-wait children, injection into a busy child, or a
+public close lifecycle. Open Agent does not replace Eve's model loop or display
+fake controls for operations the runtime cannot perform.
 
 Run the deterministic Harness suite against a real Docker sandbox:
 

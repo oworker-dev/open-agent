@@ -1,7 +1,13 @@
 import type { AgentThreadCollection } from "@oworker/open-agent-ui/agent-workspace";
-import { parseThreadCollection } from "@oworker/open-agent-ui/agent-workspace";
+import { AGENT_THREAD_STORAGE_VERSION } from "@oworker/open-agent-ui/agent-workspace";
 import { createPostgresThreadCollectionStoreFromEnvironment } from "@/server/data/thread-collection-store";
 import { authenticateStandaloneRequest } from "@/server/http/standalone-request-auth";
+import {
+  applyThreadCollectionPatch,
+  parseStrictThreadCollection,
+  parseThreadCollectionPatch,
+  summarizeThreadCollection,
+} from "@/server/http/thread-collection-contract";
 
 export const runtime = "nodejs";
 
@@ -22,8 +28,19 @@ export async function GET(request: Request, context: RouteContext): Promise<Resp
   );
   const collection = record?.collection ?? { threads: [], version: 2 };
   const revision = record?.revision ?? 0;
+  const url = new URL(request.url);
+  const threadId = url.searchParams.get("threadId");
+  if (threadId && url.searchParams.get("view") !== "index") {
+    return Response.json(
+      { thread: collection.threads.find((thread) => thread.id === threadId) ?? null, revision },
+      { headers: responseHeaders(revision, authenticated.setCookie) },
+    );
+  }
+  const responseCollection = url.searchParams.get("view") === "index"
+    ? summarizeThreadCollection(collection, threadId ?? undefined)
+    : collection;
   return Response.json(
-    { collection, revision },
+    { collection: responseCollection, revision },
     { headers: responseHeaders(revision, authenticated.setCookie) },
   );
 }
@@ -78,19 +95,72 @@ export async function PUT(request: Request, context: RouteContext): Promise<Resp
     );
   }
   return Response.json(
-    { collection: result.record.collection, revision: result.record.revision },
+    { revision: result.record.revision },
     { headers: responseHeaders(result.record.revision, authenticated.setCookie) },
   );
 }
 
-function parseStrictThreadCollection(value: unknown): AgentThreadCollection | undefined {
-  if (
-    !isRecord(value) ||
-    value.version !== 1 && value.version !== 2 ||
-    !Array.isArray(value.threads)
-  ) return undefined;
-  const parsed = parseThreadCollection(value);
-  return parsed.threads.length === value.threads.length ? parsed : undefined;
+export async function PATCH(request: Request, context: RouteContext): Promise<Response> {
+  const authenticated = authenticateStandaloneRequest(request);
+  if (!store) return databaseUnavailable(authenticated.setCookie);
+
+  const expectedRevision = parseExpectedRevision(request.headers.get("if-match"));
+  if (expectedRevision === undefined) {
+    return problem(428, "revision_required", "If-Match must contain the loaded collection revision.", authenticated.setCookie);
+  }
+  const input = await readJsonWithinLimit(request, authenticated.setCookie);
+  if (input instanceof Response) return input;
+  const patch = parseThreadCollectionPatch(input);
+  if (!patch) {
+    return problem(400, "invalid_collection_patch", "The thread collection patch is invalid.", authenticated.setCookie);
+  }
+
+  const { storageKey } = await context.params;
+  const current = await store.load(
+    authenticated.identity.tenantId,
+    authenticated.identity.principalId,
+    storageKey,
+  );
+  const collection = applyThreadCollectionPatch(
+    current?.collection ?? { threads: [], version: AGENT_THREAD_STORAGE_VERSION },
+    patch,
+  );
+  const result = await store.save(
+    authenticated.identity.tenantId,
+    authenticated.identity.principalId,
+    storageKey,
+    expectedRevision,
+    collection,
+  );
+  if (result.status === "conflict") {
+    return problem(
+      409,
+      "thread_collection_conflict",
+      "The thread collection changed in another client.",
+      authenticated.setCookie,
+      responseHeaders(result.currentRevision),
+    );
+  }
+  return Response.json(
+    { revision: result.record.revision },
+    { headers: responseHeaders(result.record.revision, authenticated.setCookie) },
+  );
+}
+
+async function readJsonWithinLimit(request: Request, setCookie?: string): Promise<unknown | Response> {
+  const contentLength = Number(request.headers.get("content-length") ?? "0");
+  if (Number.isFinite(contentLength) && contentLength > MAX_COLLECTION_BYTES) {
+    return problem(413, "collection_too_large", "The thread collection patch exceeds 5 MiB.", setCookie);
+  }
+  try {
+    const text = await request.text();
+    if (Buffer.byteLength(text) > MAX_COLLECTION_BYTES) {
+      return problem(413, "collection_too_large", "The thread collection patch exceeds 5 MiB.", setCookie);
+    }
+    return JSON.parse(text) as unknown;
+  } catch {
+    return problem(400, "invalid_json", "The request body must be valid JSON.", setCookie);
+  }
 }
 
 function parseExpectedRevision(value: string | null): number | undefined {

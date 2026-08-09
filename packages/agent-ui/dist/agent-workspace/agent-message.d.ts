@@ -6,8 +6,9 @@ export type AgentInputResponse = {
     readonly requestId: string;
     readonly text?: string;
 };
-export declare function AgentMessage({ canRespond, events, fallbackStartedAt, isStreaming, locale, message, onOpenSubagent, onInputResponses, showCopyAction, }: {
+export declare function AgentMessage({ canRespond, closedInputRequestIds, events, fallbackStartedAt, isStreaming, locale, message, onOpenSubagent, onInputResponses, onCloseInputRequest, showCopyAction, }: {
     readonly canRespond: boolean;
+    readonly closedInputRequestIds?: ReadonlySet<string>;
     readonly events: readonly MessageStreamEvent[];
     readonly fallbackStartedAt?: number;
     readonly isStreaming: boolean;
@@ -15,6 +16,7 @@ export declare function AgentMessage({ canRespond, events, fallbackStartedAt, is
     readonly message: EveMessage;
     readonly onOpenSubagent?: (sessionId: string) => void;
     readonly onInputResponses: (responses: readonly AgentInputResponse[]) => void | Promise<void>;
+    readonly onCloseInputRequest?: (requestId: string) => void;
     readonly showCopyAction?: boolean;
 }): import("react/jsx-runtime").JSX.Element;
 //# sourceMappingURL=agent-message.d.ts.map

@@ -8,7 +8,43 @@ test.beforeEach(async ({ page }) => {
   };
   threadStores.set(page, store);
   await page.route("**/api/standalone/thread-collections/**", async (route) => {
-    if (route.request().method() === "PUT") {
+    const requestUrl = new URL(route.request().url());
+    const requestedThreadId = requestUrl.searchParams.get("threadId");
+    if (
+      route.request().method() === "GET" &&
+      requestedThreadId &&
+      requestUrl.searchParams.get("view") !== "index"
+    ) {
+      await route.fulfill({
+        body: JSON.stringify({
+          revision: store.revision,
+          thread: store.collection.threads.find((thread) => thread.id === requestedThreadId) ?? null,
+        }),
+        contentType: "application/json",
+        headers: { etag: `"${store.revision}"` },
+        status: 200,
+      });
+      return;
+    }
+    if (route.request().method() === "GET" && requestUrl.searchParams.get("view") === "index") {
+      await route.fulfill({
+        body: JSON.stringify({
+          collection: {
+            ...(store.collection.activeThreadId ? { activeThreadId: store.collection.activeThreadId } : {}),
+            threads: store.collection.threads.map((thread) => thread.id === requestedThreadId
+              ? thread
+              : { ...thread, events: [], hydration: "summary" }),
+            version: 2,
+          },
+          revision: store.revision,
+        }),
+        contentType: "application/json",
+        headers: { etag: `"${store.revision}"` },
+        status: 200,
+      });
+      return;
+    }
+    if (route.request().method() === "PUT" || route.request().method() === "PATCH") {
       if ((store.conflictsRemaining ?? 0) > 0) {
         store.conflictsRemaining = (store.conflictsRemaining ?? 0) - 1;
         store.revision += 1;
@@ -30,8 +66,30 @@ test.beforeEach(async ({ page }) => {
         });
         return;
       }
-      const body = route.request().postDataJSON() as { collection: unknown };
-      store.collection = body.collection as FakeThreadCollection;
+      const body = route.request().postDataJSON() as {
+        activeThreadId?: string | null;
+        collection?: unknown;
+        deletedThreadIds?: readonly string[];
+        upsertThreads?: FakeThreadCollection["threads"];
+      };
+      if (route.request().method() === "PATCH") {
+        const deleted = new Set(body.deletedThreadIds ?? []);
+        const replacements = new Map((body.upsertThreads ?? []).map((thread) => [thread.id, thread]));
+        const retained = store.collection.threads
+          .filter((thread) => !deleted.has(thread.id))
+          .map((thread) => replacements.get(thread.id) ?? thread);
+        const retainedIds = new Set(retained.map((thread) => thread.id));
+        store.collection = {
+          ...(body.activeThreadId ? { activeThreadId: body.activeThreadId } : {}),
+          threads: [
+            ...(body.upsertThreads ?? []).filter((thread) => !retainedIds.has(thread.id)),
+            ...retained,
+          ],
+          version: 2,
+        };
+      } else {
+        store.collection = body.collection as FakeThreadCollection;
+      }
       store.revision += 1;
     }
     await route.fulfill({
@@ -52,6 +110,7 @@ test("wide workspace supports navigation, search, settings, and a single draft s
   await expect(page.getByRole("textbox", { name: "Do anything" })).toBeVisible();
   await expect(page.getByText(/Changes could not be saved|当前更改暂未保存/)).toHaveCount(0);
   await expect(page.locator('[data-slot="model-selector-value"]')).toHaveCSS("font-size", "12px");
+  await expect(page.locator('[data-workbench-panel]')).toHaveCSS("padding-top", "8px");
   await expect(page.locator('[data-slot="agent-workbench"]')).toHaveCSS("border-top-left-radius", "16px");
   await expect(page).toHaveURL(/\/$/);
 
@@ -125,6 +184,43 @@ test("root stays clean and an unsent draft survives refresh", async ({ page }) =
   await expect(page.getByRole("textbox", { name: "Do anything" })).toHaveText("Keep this draft across refresh");
 });
 
+test("the thread index hydrates only the transcript selected from the sidebar", async ({ page }) => {
+  const now = Date.now();
+  const events = mockSuccessfulTurn("Stored request", "Stored response")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as unknown);
+  setFakeThreadCollection(page, {
+    activeThreadId: "stored-thread",
+    threads: [{
+      closedInputRequestIds: [],
+      createdAt: now,
+      events,
+      id: "stored-thread",
+      preferences: { executionMode: "standard", modelId: "gpt-5.6-sol", reasoning: "medium" },
+      queuedTurns: [],
+      session: { sessionId: "stored-session", streamIndex: events.length },
+      status: "ready",
+      title: "Stored history",
+      updatedAt: now,
+    }],
+    version: 2,
+  });
+  const transcriptRequests: string[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.pathname.includes("/thread-collections/") && url.searchParams.get("threadId")) {
+      transcriptRequests.push(url.search);
+    }
+  });
+
+  await page.goto("/");
+  await expect(page.getByText("Stored response", { exact: true })).toHaveCount(0);
+  await page.locator("aside").getByRole("button", { name: /Stored history/ }).click();
+  await expect(page.getByText("Stored response", { exact: true })).toBeVisible();
+  expect(transcriptRequests.filter((search) => !search.includes("view=index"))).toHaveLength(1);
+});
+
 test("composer exposes assistant-ui attachments, permissions, and safe trigger selection", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByRole("button", { name: "Add files" })).toBeVisible();
@@ -138,9 +234,9 @@ test("composer exposes assistant-ui attachments, permissions, and safe trigger s
   });
   await expect(page.getByText("brief.txt", { exact: true })).toBeVisible();
 
-  await page.getByRole("button", { name: "Execution mode" }).click();
-  await expect(page.getByText("Work autonomously and ask before sensitive operations.")).toBeVisible();
-  await expect(page.getByText("Run sandbox workspace operations without approval; external sensitive actions remain gated.")).toBeVisible();
+  await page.getByRole("button", { name: "Approval mode" }).click();
+  await expect(page.getByText("Ask before commands and file changes.")).toBeVisible();
+  await expect(page.getByText("Approve sandbox work automatically and ask before sensitive external actions.")).toBeVisible();
   await page.keyboard.press("Escape");
 
   const composer = page.getByRole("textbox", { name: "Do anything" });
@@ -203,6 +299,81 @@ test("small workspace keeps the conversation focused and opens navigation on dem
   await page.screenshot({ fullPage: true, path: "/tmp/open-agent-small.png" });
 });
 
+test("desktop workbench keeps fullscreen transitions stable and exposes a resizable hover sidebar", async ({ page }) => {
+  await page.setViewportSize({ height: 900, width: 1440 });
+  await page.goto("/");
+
+  const workspace = page.locator(".open-agent-ui");
+  const sidebar = page.locator("[data-sidebar-panel] aside");
+  const separator = page.locator("[data-main-resize-handle]");
+  const toggle = page.getByRole("button", { name: "Toggle navigation" });
+  const workbench = page.locator("[data-workbench-panel]");
+
+  await toggle.click();
+  await expect(workspace).toHaveAttribute("data-workbench-mode", "collapsing");
+  await expect(workspace).toHaveAttribute("data-workbench-mode", "fullscreen", { timeout: 1_000 });
+  await expect(workspace).toHaveAttribute("data-workbench-fullscreen", "true");
+  await expect.poll(async () => (await sidebar.boundingBox())?.width ?? 0).toBeLessThan(1);
+  await expect(workbench).toHaveCSS("padding-top", "0px");
+  await expect(separator).toHaveAttribute("aria-disabled", "true");
+
+  await page.waitForTimeout(450);
+  await expect(workspace).toHaveAttribute("data-workbench-mode", "fullscreen");
+
+  const fullscreenWorkbenchWidth = (await workbench.boundingBox())?.width ?? 0;
+  const floatingSidebar = page.locator("[data-floating-sidebar]");
+  await expect(floatingSidebar).toHaveAttribute("data-open", "false");
+  await page.mouse.move(1, 450);
+  await expect(floatingSidebar).toHaveAttribute("data-open", "true");
+
+  const floatingHandle = page.locator("[data-floating-sidebar-handle]");
+  await expect.poll(async () => (await floatingHandle.boundingBox())?.x ?? 0).toBeGreaterThan(280);
+  const floatingPanel = page.locator("[data-floating-sidebar-panel]");
+  const floatingBefore = await floatingPanel.boundingBox();
+  expect(floatingBefore).not.toBeNull();
+  const floatingHandleBox = await floatingHandle.boundingBox();
+  expect(floatingHandleBox).not.toBeNull();
+  await page.mouse.move(floatingHandleBox!.x + floatingHandleBox!.width / 2, 450);
+  await page.mouse.down();
+  await page.mouse.move(floatingHandleBox!.x + 72, 450, { steps: 6 });
+  await page.mouse.up();
+
+  await expect.poll(async () => (await floatingPanel.boundingBox())?.width ?? 0).toBeGreaterThan((floatingBefore?.width ?? 0) + 50);
+  await expect.poll(async () => (await workbench.boundingBox())?.width ?? 0).toBeCloseTo(fullscreenWorkbenchWidth, 0);
+
+  await page.mouse.move(900, 450);
+  await expect(floatingSidebar).toHaveAttribute("data-open", "false");
+
+  await toggle.click();
+  await expect(workspace).toHaveAttribute("data-workbench-mode", "expanding");
+  await expect(workspace).toHaveAttribute("data-workbench-mode", "split", { timeout: 1_000 });
+  await expect(workspace).toHaveAttribute("data-workbench-fullscreen", "false");
+  await expect(workbench).toHaveCSS("padding-top", "8px");
+  await expect.poll(async () => (await sidebar.boundingBox())?.width ?? 0).toBeGreaterThan(200);
+
+  const separatorBox = await separator.boundingBox();
+  expect(separatorBox).not.toBeNull();
+
+  await page.mouse.move(separatorBox!.x, separatorBox!.y + separatorBox!.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(0, separatorBox!.y + separatorBox!.height / 2, { steps: 8 });
+  await expect(workspace).toHaveAttribute("data-panel-resizing", "true");
+  await expect(workspace).toHaveAttribute("data-workbench-mode", "split");
+  await expect(workbench).toHaveCSS("padding-top", "8px");
+  await page.mouse.up();
+
+  await expect.poll(async () => (await sidebar.boundingBox())?.width ?? 0).toBeLessThan(1);
+  await expect(workspace).toHaveAttribute("data-workbench-fullscreen", "true", { timeout: 1_000 });
+  await expect(workbench).toHaveCSS("padding-top", "0px");
+  await page.mouse.move(900, 450);
+  await expect(floatingSidebar).toHaveAttribute("data-open", "false");
+  await toggle.click();
+  await expect(workspace).toHaveAttribute("data-workbench-mode", "split", { timeout: 1_000 });
+  await expect(workspace).toHaveAttribute("data-workbench-fullscreen", "false");
+  await expect(workbench).toHaveCSS("padding-top", "8px");
+  await expect.poll(async () => (await sidebar.boundingBox())?.width ?? 0).toBeGreaterThan(200);
+});
+
 test("narrow mobile workspace keeps menus inside the viewport", async ({ page }) => {
   await page.setViewportSize({ height: 844, width: 390 });
   await page.goto("/");
@@ -216,6 +387,9 @@ test("narrow mobile workspace keeps menus inside the viewport", async ({ page })
   const effortGroup = page.getByRole("radiogroup", { name: "Reasoning" });
   await expect(effortGroup).toBeVisible();
   await expect(effortGroup.getByText("X high", { exact: true })).toBeVisible();
+  const effortName = effortGroup.getByText("X high", { exact: true });
+  await expect(modelDialog.locator('[data-slot="model-selector-item-name"]').first()).toHaveCSS("font-size", "13px");
+  await expect(effortName).toHaveCSS("font-size", "13px");
   const dialogBox = await modelDialog.boundingBox();
   const effortBox = await effortGroup.boundingBox();
   expect(dialogBox?.x).toBeGreaterThanOrEqual(0);
@@ -342,6 +516,129 @@ test("tool work collapses into one timed execution cycle and keeps the final del
   await expect(page.locator('[data-slot="tool-group-root"][data-variant="ghost"]')).toBeVisible();
 });
 
+test("ask_question renders a localized question card instead of raw tool JSON", async ({ page }) => {
+  const sessionId = "mock-question-session";
+  let inputResponseBody: unknown;
+  let streamCalls = 0;
+  await page.route("**/eve/v1/session", async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({ sessionId }),
+      contentType: "application/json",
+      headers: { "x-eve-session-id": sessionId },
+      status: 200,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}`, async (route) => {
+    const body = route.request().postDataJSON();
+    if (body.inputResponses) inputResponseBody = body;
+    await route.fulfill({
+      body: JSON.stringify({ sessionId }),
+      contentType: "application/json",
+      headers: { "x-eve-session-id": sessionId },
+      status: 200,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
+    streamCalls += 1;
+    await route.fulfill({
+      body: streamCalls === 1 ? mockQuestionTurn() : mockContinuationTurn("继续新的需求", "已进入新的请求。"),
+      contentType: "application/x-ndjson",
+      status: 200,
+    });
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Settings" }).click();
+  await page.getByRole("button", { name: "简体中文" }).click();
+  await page.keyboard.press("Escape");
+
+  const composer = page.getByRole("textbox", { name: "做点什么" });
+  await composer.fill("帮我确定网站的视觉方向");
+  await composer.press("Enter");
+
+  const question = page.locator('[data-input-request-kind="question"]');
+  await expect(question).toBeVisible();
+  await expect(question.getByText("Agent 需要确认", { exact: true })).toBeVisible();
+  await expect(question.getByRole("paragraph").filter({ hasText: "你更喜欢哪种视觉方向？" })).toBeVisible();
+  await expect(question.locator('[data-slot="questionnaire-choices"]')).toHaveCSS("display", "flex");
+  await expect(question.locator('[data-slot="questionnaire-choice"]:not(.hidden)')).toHaveCount(3);
+  await expect(question.getByText("极简现代", { exact: true })).toBeVisible();
+  await expect(question.getByText("留白充足，突出品牌内容", { exact: true })).toBeVisible();
+  const supplementary = question.getByRole("textbox", { name: "补充信息" });
+  await expect(supplementary).toBeEditable();
+  await expect(question.getByRole("button", { name: /等待确认/u })).toBeVisible();
+  await question.getByRole("radio", { name: /极简现代/u }).click();
+  await page.waitForTimeout(100);
+  expect(inputResponseBody).toBeUndefined();
+  await supplementary.fill("同时保持温暖的品牌语气");
+  expect(inputResponseBody).toBeUndefined();
+  await question.getByRole("button", { name: "确认", exact: true }).click();
+  await expect.poll(() => inputResponseBody).toMatchObject({
+    inputResponses: [{
+      optionId: "minimal",
+      requestId: "call-question",
+      text: "同时保持温暖的品牌语气",
+    }],
+  });
+  await expect(question.getByText("参数", { exact: true })).toHaveCount(0);
+  await expect(question.getByText(/allowFreeform|optionId|requestId/u)).toHaveCount(0);
+  await expect(page.getByText("正在运行 1 个工具", { exact: true })).toHaveCount(0);
+  await expect(composer).toBeEditable();
+  await page.screenshot({ path: "/tmp/open-agent-ask-question.png" });
+});
+
+test("a normal composer message bypasses a pending Agent question", async ({ page }) => {
+  const sessionId = "mock-question-bypass-session";
+  let followUpBody: unknown;
+  let streamCalls = 0;
+  await page.route("**/eve/v1/session", (route) => route.fulfill({
+    body: JSON.stringify({ sessionId }),
+    contentType: "application/json",
+    headers: { "x-eve-session-id": sessionId },
+    status: 200,
+  }));
+  await page.route(`**/eve/v1/session/${sessionId}`, async (route) => {
+    followUpBody = route.request().postDataJSON();
+    await route.fulfill({
+      body: JSON.stringify({ sessionId }),
+      contentType: "application/json",
+      headers: { "x-eve-session-id": sessionId },
+      status: 200,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
+    streamCalls += 1;
+    await route.fulfill({
+      body: streamCalls === 1 ? mockQuestionTurn() : mockContinuationTurn("继续新的需求", "已进入新的请求。"),
+      contentType: "application/x-ndjson",
+      status: 200,
+    });
+  });
+
+  await page.goto("/");
+  const composer = page.getByRole("textbox", { name: "Do anything" });
+  await composer.fill("Help me choose a visual direction");
+  await composer.press("Enter");
+  const question = page.locator('[data-input-request-kind="question"]');
+  await expect(question).toBeVisible();
+  await question.getByRole("button", { name: "Close", exact: true }).click();
+  const closedTrigger = question.getByRole("button", { name: /Closed/u });
+  await expect(closedTrigger).toBeVisible();
+  await expect(question.getByText("极简现代", { exact: true })).toBeHidden();
+  await closedTrigger.click();
+  await expect(question.getByText("极简现代", { exact: true })).toBeVisible();
+  await expect(question.getByText("No additional information provided.", { exact: true })).toBeVisible();
+  expect(followUpBody).toBeUndefined();
+  await composer.fill("Ignore that question and create the content plan first");
+  await composer.press("Enter");
+  await expect.poll(() => followUpBody).toMatchObject({
+    message: "Ignore that question and create the content plan first",
+  });
+  expect(followUpBody).not.toMatchObject({ inputResponses: expect.anything() });
+  await page.getByRole("button", { name: /Worked for/u }).first().click();
+  await expect(question.getByRole("button", { name: /Closed/u })).toBeVisible();
+});
+
 test("assistant content keeps markdown, reasoning state, and action affordances", async ({ page }) => {
   const sessionId = "mock-rich-message-session";
   await page.route("**/eve/v1/session", async (route) => {
@@ -377,12 +674,36 @@ test("assistant content keeps markdown, reasoning state, and action affordances"
   await expect(page.getByRole("button", { name: "Edit message" })).toBeVisible();
 });
 
-test("editing the latest user turn waits for the clear boundary and resends on the same session", async ({ page }) => {
-  const sessionId = "mock-edit-session";
+for (const editScenario of [
+  {
+    editedReply: "Edited delivery.",
+    editedRequest: "Edited request",
+    label: "changed content",
+    sessionId: "mock-edit-changed-session",
+  },
+  {
+    editedReply: "Repeated delivery.",
+    editedRequest: "Original request",
+    label: "unchanged content",
+    sessionId: "mock-edit-unchanged-session",
+  },
+] as const) {
+test(`editing the latest user turn with ${editScenario.label} waits for clear and resends on the same session`, async ({ page }) => {
+  const { editedReply, editedRequest, sessionId } = editScenario;
   let streamCalls = 0;
   let clearCalls = 0;
   let clearBoundaryPending = false;
+  let clearStreamStartIndex = -1;
+  const resendStreamStartIndexes: number[] = [];
   let turnCalls = 0;
+  let releaseClear: (() => void) | undefined;
+  let releaseEditedStream: (() => void) | undefined;
+  const clearMayComplete = new Promise<void>((resolve) => {
+    releaseClear = resolve;
+  });
+  const editedStreamMayComplete = new Promise<void>((resolve) => {
+    releaseEditedStream = resolve;
+  });
   await page.route("**/eve/v1/session", async (route) => {
     await route.fulfill({
       body: JSON.stringify({ sessionId }),
@@ -394,6 +715,7 @@ test("editing the latest user turn waits for the clear boundary and resends on t
   await page.route(`**/eve/v1/session/${sessionId}/clear`, async (route) => {
     clearCalls += 1;
     clearBoundaryPending = true;
+    await clearMayComplete;
     await route.fulfill({
       body: JSON.stringify({ ok: true, sessionId, status: "accepted" }),
       contentType: "application/json",
@@ -413,6 +735,7 @@ test("editing the latest user turn waits for the clear boundary and resends on t
     const url = new URL(route.request().url());
     if (clearBoundaryPending && !url.searchParams.has("includeTailIndex")) {
       clearBoundaryPending = false;
+      clearStreamStartIndex = Number(url.searchParams.get("startIndex") ?? "0");
       const at = new Date().toISOString();
       await route.fulfill({
         body: `${[
@@ -434,9 +757,11 @@ test("editing the latest user turn waits for the clear boundary and resends on t
       return;
     }
     const startIndex = Number(url.searchParams.get("startIndex") ?? "0");
+    if (turnCalls > 0) resendStreamStartIndexes.push(startIndex);
+    if (turnCalls > 0) await editedStreamMayComplete;
     const body = startIndex === 0
       ? mockSuccessfulTurn("Original request", "Original delivery.")
-      : mockContinuationTurn("Edited request", "Edited delivery.", 1);
+      : mockContinuationTurn(editedRequest, editedReply, 1);
     await route.fulfill({
       body,
       contentType: "application/x-ndjson",
@@ -457,18 +782,38 @@ test("editing the latest user turn waits for the clear boundary and resends on t
   const original = page.getByRole("log").getByText("Original request", { exact: true });
   await original.hover();
   await page.getByRole("button", { name: "Edit message" }).click();
-  const editInput = page.getByRole("textbox").filter({ hasText: "Original request" });
+  const editComposer = page.locator("[data-agent-edit-composer]");
+  const editInput = editComposer.getByRole("textbox");
   await expect(editInput).toBeVisible();
-  await editInput.fill("Edited request");
-  await page.getByRole("button", { name: "Send", exact: true }).first().click();
+  await expect(editInput).toHaveValue("Original request");
+  if (editedRequest !== "Original request") {
+    await editInput.fill("");
+    await editInput.pressSequentially(editedRequest);
+  }
+  await editComposer.getByRole("button", { name: "Send", exact: true }).click();
 
-  await expect(page.getByText("Edited delivery.", { exact: true })).toBeVisible();
+  // The visible revision changes atomically; Eve's clear/rebuild transport may
+  // continue in the background without making the edited message disappear.
+  await expect(page.getByRole("log").getByText(editedRequest, { exact: true })).toBeVisible({ timeout: 300 });
   await expect(page.getByRole("log").getByText("Original delivery.", { exact: true })).toHaveCount(0);
-  await expect(page.getByRole("log").getByText("Edited request", { exact: true })).toBeVisible();
+  releaseClear?.();
+  await expect.poll(() => turnCalls).toBe(1);
+  await page.waitForTimeout(250);
+  await expect(page.getByRole("log").getByText(editedRequest, { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: editedRequest, exact: true })).toBeVisible();
+  releaseEditedStream?.();
+  await expect(page.getByText(editedReply, { exact: true })).toBeVisible();
+  await expect(page.getByRole("log").getByText("Original delivery.", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("log").getByText(editedRequest, { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: editedRequest, exact: true })).toBeVisible();
   await expect.poll(() => clearCalls).toBe(1);
+  await page.waitForTimeout(250);
+  expect(clearCalls).toBe(1);
+  expect(resendStreamStartIndexes).toContain(clearStreamStartIndex + 2);
   expect(turnCalls).toBe(1);
   expect(streamCalls).toBeGreaterThanOrEqual(2);
 });
+}
 
 test("file patch tools render with the assistant-ui diff viewer", async ({ page }) => {
   const sessionId = "mock-patch-viewer-session";
@@ -526,8 +871,8 @@ test("a live autonomous website task survives refresh and publishes a usable pre
     "Work autonomously and finish by giving me the working preview link.",
   ].join(" ");
   const composer = page.getByRole("textbox", { name: "Do anything" });
-  await page.getByRole("button", { name: "Execution mode" }).click();
-  await page.getByRole("menuitemradio").filter({ hasText: "Automation" }).click();
+  await page.getByRole("button", { name: "Approval mode" }).click();
+  await page.getByRole("menuitemradio").filter({ hasText: "Full access" }).click();
   await composer.fill(prompt);
   await composer.press("Enter");
   await expect(composer).toHaveText("", { timeout: 1_000 });
@@ -624,18 +969,15 @@ test("a slow Provider does not force the live Agent stream into recovery", async
   await expect(page.getByRole("textbox", { name: "Do anything" })).toBeEnabled();
 });
 
-test("follow-up messages queue during a run and deliver in order at the waiting boundary", async ({ page }) => {
+test("a follow-up is admitted into the active turn at the next model boundary", async ({ page }) => {
   const sessionId = "mock-follow-up-session";
   let continuationRequests = 0;
   let continuationAvailable = false;
   let mailboxBody: Record<string, unknown> | undefined;
   let mailboxRequests = 0;
   const initialEvents = eventsFromNdjson(
-    mockSuccessfulTurn("Start the long task", "First turn completed."),
-  );
-  const continuationEvents = eventsFromNdjson(
-    mockContinuationTurn("Add the requested footer", "Footer added."),
-  );
+    mockToolTurn("Start the long task", "Unused terminal reply."),
+  ).slice(0, 8);
 
   await page.route("**/eve/v1/session", async (route) => {
     await route.fulfill({
@@ -698,7 +1040,15 @@ test("follow-up messages queue during a run and deliver in order at the waiting 
       return;
     }
     const availableEvents = continuationAvailable
-      ? [...initialEvents, ...continuationEvents]
+      ? [
+          ...initialEvents,
+          ...mockSteeredTurnRemainder(
+            "turn_tool",
+            mailboxBody?.clientMessageId,
+            "Add the requested footer",
+            "Footer added.",
+          ),
+        ]
       : initialEvents;
     await route.fulfill({
       body: ndjson(availableEvents.slice(startIndex)),
@@ -718,10 +1068,10 @@ test("follow-up messages queue during a run and deliver in order at the waiting 
   await expect(page.getByRole("button", { name: "Queue follow-up" })).toBeVisible();
   await composer.press("Enter");
 
-  await expect(page.getByRole("button", { name: /Queued follow-ups/u })).toBeVisible();
+  await expect(page.locator("[data-agent-steer-queue]")).toContainText("Queued follow-ups");
   await expect(page.getByText("Add the requested footer", { exact: true })).toBeVisible();
   await expect(page.getByText("Footer added.", { exact: true })).toBeVisible({ timeout: 10_000 });
-  await expect(page.getByRole("button", { name: /Queued follow-ups/u })).toBeHidden();
+  await expect(page.locator("[data-agent-steer-queue]")).toBeHidden();
   expect(continuationRequests).toBe(0);
   expect(mailboxRequests).toBe(1);
   expect(mailboxBody).toMatchObject({
@@ -804,7 +1154,7 @@ test("cancelling a queued follow-up prevents browser delivery before admission",
   await expect.poll(() => mailboxEnqueues).toBe(1);
   await expect.poll(() => mailboxInspections).toBeGreaterThan(0);
   await page.getByRole("button", { name: "Remove queued message" }).click();
-  await expect(page.getByRole("button", { name: /Queued follow-ups/u })).toBeHidden();
+  await expect(page.locator("[data-agent-steer-queue]")).toBeHidden();
   await expect(page.getByText("Cancellable work completed.", { exact: true })).toBeVisible({ timeout: 10_000 });
   expect(cancellationRequests).toBe(1);
   expect(continuationRequests).toBe(0);
@@ -877,19 +1227,23 @@ test("a persisted follow-up survives recovery and dispatches after the durable b
       });
       return;
     }
-    const body = mockContinuationTurn("Add the persisted footer", "Persisted footer added.");
-    const eventCount = eventsFromNdjson(body).length;
+    const continuationEvents = withClientMessageId(
+      eventsFromNdjson(
+        mockContinuationTurn("Add the persisted footer", "Persisted footer added."),
+      ),
+      "queued-persisted-footer",
+    );
     await route.fulfill({
-      body,
+      body: ndjson(continuationEvents),
       contentType: "application/x-ndjson",
-      headers: { "x-eve-stream-tail-index": String(startIndex + eventCount - 1) },
+      headers: { "x-eve-stream-tail-index": String(startIndex + continuationEvents.length - 1) },
       status: 200,
     });
   });
 
   await page.goto("/threads/persisted-follow-up-thread");
   await expect(page.getByText("Persisted footer added.", { exact: true })).toBeVisible({ timeout: 15_000 });
-  await expect(page.getByRole("button", { name: /Queued follow-ups/u })).toBeHidden();
+  await expect(page.locator("[data-agent-steer-queue]")).toBeHidden();
   expect(continuationRequests).toBe(0);
   expect(mailboxEnqueues).toBe(0);
 });
@@ -897,8 +1251,14 @@ test("a persisted follow-up survives recovery and dispatches after the durable b
 test("two persisted follow-ups remain separate and recover in strict FIFO order", async ({ page }) => {
   const sessionId = "mock-fifo-follow-up-session";
   const initialEvents = eventsFromNdjson(mockSuccessfulTurn("Prepare the workspace", "Workspace prepared."));
-  const firstEvents = eventsFromNdjson(mockContinuationTurn("Add the header", "Header added.", 1));
-  const secondEvents = eventsFromNdjson(mockContinuationTurn("Add the footer", "Footer added.", 2));
+  const firstEvents = withClientMessageId(
+    eventsFromNdjson(mockContinuationTurn("Add the header", "Header added.", 1)),
+    "queued-fifo-header",
+  );
+  const secondEvents = withClientMessageId(
+    eventsFromNdjson(mockContinuationTurn("Add the footer", "Footer added.", 2)),
+    "queued-fifo-footer",
+  );
   const firstCursor = initialEvents.length;
   const secondCursor = firstCursor + firstEvents.length;
   let continuationRequests = 0;
@@ -976,12 +1336,12 @@ test("two persisted follow-ups remain separate and recover in strict FIFO order"
   await page.goto("/threads/fifo-follow-up-thread");
   await expect(page.getByText("Header added.", { exact: true })).toBeVisible({ timeout: 15_000 });
   await expect(page.getByText("Footer added.", { exact: true })).toBeVisible({ timeout: 15_000 });
-  await expect(page.getByRole("button", { name: /Queued follow-ups/u })).toBeHidden();
+  await expect(page.locator("[data-agent-steer-queue]")).toBeHidden();
 
-  const storedMessages = threadEvents(page)
+  await expect.poll(() => threadEvents(page)
     .filter((event) => isEventType(event, "message.received"))
-    .map((event) => (event as { data: { message: string } }).data.message);
-  expect(storedMessages).toEqual(["Prepare the workspace", "Add the header", "Add the footer"]);
+    .map((event) => (event as { data: { message: string } }).data.message)
+  ).toEqual(["Prepare the workspace", "Add the header", "Add the footer"]);
   expect(continuationRequests).toBe(0);
   expect(mailboxInspections).toContain("mail-fifo-header");
   expect(mailboxInspections).toContain("mail-fifo-footer");
@@ -1046,12 +1406,16 @@ test("a failed queued follow-up remains retryable without duplicating the accept
   });
   await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
     const startIndex = Number(new URL(route.request().url()).searchParams.get("startIndex") ?? "0");
-    const body = mockContinuationTurn("Retry the footer", "Retried footer added.");
-    const eventCount = eventsFromNdjson(body).length;
+    const continuationEvents = withClientMessageId(
+      eventsFromNdjson(
+        mockContinuationTurn("Retry the footer", "Retried footer added."),
+      ),
+      "queued-retry-footer",
+    );
     await route.fulfill({
-      body,
+      body: ndjson(continuationEvents),
       contentType: "application/x-ndjson",
-      headers: { "x-eve-stream-tail-index": String(startIndex + eventCount - 1) },
+      headers: { "x-eve-stream-tail-index": String(startIndex + continuationEvents.length - 1) },
       status: 200,
     });
   });
@@ -1060,7 +1424,7 @@ test("a failed queued follow-up remains retryable without duplicating the accept
   await expect(page.getByText("Delivery failed", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Retry queued message" }).click();
   await expect(page.getByText("Retried footer added.", { exact: true })).toBeVisible({ timeout: 15_000 });
-  await expect(page.getByRole("button", { name: /Queued follow-ups/u })).toBeHidden();
+  await expect(page.locator("[data-agent-steer-queue]")).toBeHidden();
   expect(continuationRequests).toBe(1);
 });
 
@@ -1160,15 +1524,25 @@ test("a proxied child approval stays attached to the parent task and resumes it"
   await page.goto("/threads/child-approval-thread");
   await expect(page.getByText("Waiting for approval", { exact: true })).toBeVisible();
   await expect(page.getByText("A delegated task needs your approval", { exact: true })).toBeVisible();
-  const approve = page.getByRole("button", { name: "Approve", exact: true });
+  await expect(page.getByText("npm test && rm -f /tmp/css-classes", { exact: true })).toBeVisible();
+  const editMessage = page.getByRole("button", { name: "Edit message", exact: true });
+  await expect(editMessage).toBeVisible();
+  await editMessage.click();
+  const editComposer = page.locator("[data-agent-edit-composer]");
+  await expect(editComposer).toBeVisible();
+  await expect(editComposer.getByRole("button", { name: "Send", exact: true })).toBeEnabled();
+  await editComposer.getByRole("button", { name: "Cancel", exact: true }).click();
+  const approve = page.getByRole("radio", { name: "Approve", exact: true });
   await expect(approve).toBeEnabled();
   await expect(page.getByRole("textbox", { name: "Do anything" })).toBeDisabled();
 
   await approve.click();
+  await page.getByRole("button", { name: "Confirm", exact: true }).click();
   await expect.poll(() => responseBody).toMatchObject({
     inputResponses: [{ optionId: "approve", requestId: "request-child-bash" }],
   });
   await expect(page.getByText("The delegated task resumed and completed.", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Worked for/u })).toHaveCount(1);
   await page.getByRole("button", { name: /Worked for/ }).click();
   await page.getByRole("button", { name: /(?:Ran|Running) 1 tool/u }).click();
   await page.getByRole("button", { name: /Sub-agent/u }).click();
@@ -1184,7 +1558,7 @@ test("a proxied child approval stays attached to the parent task and resumes it"
   await expect(page.getByRole("textbox", { name: "Do anything" })).toBeEnabled();
 });
 
-test("an original page catches up through bounded reads when live streams stop receiving durable progress", async ({ page }) => {
+test("an original page catches up through Eve's native stream reconnect", async ({ page }) => {
   const sessionId = "mock-stalled-browser-session";
   const at = new Date().toISOString();
   const turnId = "turn_0";
@@ -1214,7 +1588,9 @@ test("an original page catches up through bounded reads when live streams stop r
     if (url.searchParams.get("includeTailIndex") !== "1") {
       liveRequests += 1;
       const startIndex = Number(url.searchParams.get("startIndex") ?? "0");
-      const acceptedEvents = recoveredEvents.slice(startIndex, 4);
+      const acceptedEvents = liveRequests === 1
+        ? recoveredEvents.slice(startIndex, 4)
+        : recoveredEvents.slice(startIndex);
       await route.fulfill({
         body: acceptedEvents.length > 0
           ? `${acceptedEvents.map((event) => JSON.stringify(event)).join("\n")}\n`
@@ -1243,11 +1619,106 @@ test("an original page catches up through bounded reads when live streams stop r
   await expect(page.getByRole("textbox", { name: "Do anything" })).toBeVisible();
   await expect(page.getByText("Durable progress recovered.", { exact: true })).toBeVisible({ timeout: 20_000 });
   await expect(page.getByRole("button", { name: "Send" })).toBeVisible();
-  expect(liveRequests).toBeGreaterThanOrEqual(1);
-  expect(boundedRequests).toBeGreaterThanOrEqual(1);
+  expect(liveRequests).toBeGreaterThanOrEqual(2);
+  expect(boundedRequests).toBe(0);
 });
 
-test("large legacy incremental history hydrates quickly and is compacted", async ({ page }) => {
+test("a half-open live stream is replaced from the last event observed by the UI", async ({ page }) => {
+  test.setTimeout(40_000);
+  const sessionId = "mock-half-open-session";
+  const at = new Date().toISOString();
+  const turnId = "turn_half_open";
+  const durableEvents = [
+    { data: { runtime: { agentId: "open-agent", agentName: "open-agent", eveVersion: "test", modelId: "mock/model" } }, meta: { at, id: "evt-half-session" }, type: "session.started" },
+    { data: { sequence: 0, turnId }, meta: { at, id: "evt-half-turn" }, type: "turn.started" },
+    { data: { message: "Keep this long task live", parts: [{ text: "Keep this long task live", type: "text" }], sequence: 0, turnId }, meta: { at, id: "evt-half-user" }, type: "message.received" },
+    { data: { sequence: 0, stepIndex: 0, turnId }, meta: { at, id: "evt-half-step-0" }, type: "step.started" },
+    { data: { finishReason: "tool-calls", message: null, sequence: 0, stepIndex: 0, turnId }, meta: { at, id: "evt-half-message-0" }, type: "message.completed" },
+    { data: { actions: [{ callId: "call-half", input: { command: "npm test" }, kind: "tool-call", toolName: "bash" }], sequence: 0, stepIndex: 0, turnId }, meta: { at, id: "evt-half-actions" }, type: "actions.requested" },
+    {
+      data: {
+        result: { callId: "call-half", kind: "tool-result", output: "tests passed", toolName: "bash" },
+        sequence: 0,
+        status: "completed",
+        stepIndex: 0,
+        turnId,
+      },
+      meta: { at, id: "evt-half-result" },
+      type: "action.result",
+    },
+    { data: { finishReason: "tool-calls", sequence: 0, stepIndex: 0, turnId, usage: { inputTokens: 10, outputTokens: 4 } }, meta: { at, id: "evt-half-step-completed-0" }, type: "step.completed" },
+    { data: { sequence: 0, stepIndex: 1, turnId }, meta: { at, id: "evt-half-step-1" }, type: "step.started" },
+    { data: { finishReason: "stop", message: "Recovered without a page refresh.", sequence: 0, stepIndex: 1, turnId }, meta: { at, id: "evt-half-message-1" }, type: "message.completed" },
+    { data: { finishReason: "stop", sequence: 0, stepIndex: 1, turnId, usage: { inputTokens: 12, outputTokens: 5 } }, meta: { at, id: "evt-half-step-completed-1" }, type: "step.completed" },
+    { data: { sequence: 0, turnId }, meta: { at, id: "evt-half-completed" }, type: "turn.completed" },
+    { data: { wait: "next-user-message" }, meta: { at, id: "evt-half-waiting" }, type: "session.waiting" },
+  ];
+
+  await page.addInitScript(({ events, targetSessionId }) => {
+    const nativeFetch = window.fetch.bind(window);
+    let liveRequests = 0;
+    window.fetch = async (input, init) => {
+      const requestUrl = new URL(
+        typeof input === "string" || input instanceof URL ? input.toString() : input.url,
+        window.location.href,
+      );
+      if (requestUrl.pathname !== `/eve/v1/session/${targetSessionId}/stream`) {
+        return await nativeFetch(input, init);
+      }
+      const startIndex = Number(requestUrl.searchParams.get("startIndex") ?? "0");
+      if (requestUrl.searchParams.get("includeTailIndex") === "1") {
+        return new Response(`${events.slice(startIndex).map((event) => JSON.stringify(event)).join("\n")}\n`, {
+          headers: {
+            "content-type": "application/x-ndjson",
+            "x-eve-stream-tail-index": String(events.length - 1),
+          },
+          status: 200,
+        });
+      }
+      liveRequests += 1;
+      if (liveRequests > 1) {
+        return new Response(`${events.slice(startIndex).map((event) => JSON.stringify(event)).join("\n")}\n`, {
+          headers: { "content-type": "application/x-ndjson" },
+          status: 200,
+        });
+      }
+
+      const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+      const body = new ReadableStream({
+        start(controller) {
+          const prefix = `${events.slice(startIndex, 4).map((event) => JSON.stringify(event)).join("\n")}\n`;
+          controller.enqueue(new TextEncoder().encode(prefix));
+          signal?.addEventListener("abort", () => controller.error(new DOMException("Aborted", "AbortError")), { once: true });
+        },
+      });
+      return new Response(body, {
+        headers: { "content-type": "application/x-ndjson" },
+        status: 200,
+      });
+    };
+  }, { events: durableEvents, targetSessionId: sessionId });
+
+  await page.route("**/eve/v1/session", async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({ sessionId }),
+      contentType: "application/json",
+      headers: { "x-eve-session-id": sessionId },
+      status: 200,
+    });
+  });
+
+  await page.goto("/");
+  const composer = page.getByRole("textbox", { name: "Do anything" });
+  await composer.fill("Keep this long task live");
+  await composer.press("Enter");
+
+  await expect(page.getByRole("status").filter({ hasText: "Thinking" })).toBeVisible();
+  await expect(page.getByText("Recovered without a page refresh.", { exact: true })).toBeVisible({ timeout: 25_000 });
+  await expect(page.getByRole("button", { name: "Send" })).toBeVisible();
+  await expect.poll(() => threadEvents(page).some((event) => isEventType(event, "session.waiting"))).toBeTruthy();
+});
+
+test("large legacy incremental history hydrates quickly without an eager writeback", async ({ page }) => {
   const at = new Date().toISOString();
   const events = Array.from({ length: 3_000 }, (_, index) => ({
     data: {
@@ -1279,7 +1750,9 @@ test("large legacy incremental history hydrates quickly and is compacted", async
   await page.goto("/threads/legacy-thread");
   await expect(page.getByRole("textbox", { name: "Do anything" })).toBeVisible({ timeout: 5_000 });
   expect(Date.now() - startedAt).toBeLessThan(5_000);
-  await expect.poll(() => threadEvents(page).length).toBe(1);
+  // Opening history is read-only. The in-memory parser compacts the transcript,
+  // while the legacy server document is rewritten only with its next real patch.
+  expect(threadEvents(page)).toHaveLength(events.length);
 });
 
 test("a persisted cursor past a missing UI boundary repairs from the durable tail", async ({ page }) => {
@@ -1368,7 +1841,7 @@ test("an in-flight turn reconnects after a hard refresh", async ({ page }) => {
   await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
     const url = new URL(route.request().url());
     const startIndex = Number(url.searchParams.get("startIndex") ?? "0");
-    if (url.searchParams.get("includeTailIndex") === "1") {
+    if (url.searchParams.get("includeTailIndex") === "1" || startIndex > 0) {
       await recoveryReleased;
       await route.fulfill({
         body: `${completedEvents.slice(startIndex).map((event) => JSON.stringify(event)).join("\n")}\n`,
@@ -1402,9 +1875,10 @@ test("an in-flight turn reconnects after a hard refresh", async ({ page }) => {
   await expect.poll(() => JSON.stringify(threadEvents(page)).includes('"session.waiting"')).toBeTruthy();
 });
 
-test("stop cancels server work and returns the thread to an interactive state", async ({ page }) => {
+test("stop immediately returns the thread to an interactive state while server cancellation settles", async ({ page }) => {
   const sessionId = "mock-cancel-session";
   let finishCancellation: (() => void) | undefined;
+  let cancelledTurnId: string | undefined;
   const cancelled = new Promise<void>((resolve) => {
     finishCancellation = resolve;
   });
@@ -1417,6 +1891,7 @@ test("stop cancels server work and returns the thread to an interactive state", 
     });
   });
   await page.route(`**/eve/v1/session/${sessionId}/cancel`, async (route) => {
+    cancelledTurnId = (route.request().postDataJSON() as { turnId?: string }).turnId;
     await new Promise((resolve) => setTimeout(resolve, 150));
     finishCancellation?.();
     await route.fulfill({
@@ -1457,14 +1932,315 @@ test("stop cancels server work and returns the thread to an interactive state", 
   const composer = page.getByRole("textbox", { name: "Do anything" });
   await composer.fill("Wait");
   await composer.press("Enter");
-  const stop = page.getByRole("button", { name: "Stop" });
+  const stop = page.getByRole("button", { name: "Stop", exact: true });
   await expect(stop).toBeVisible();
   await stop.click();
 
-  await expect(page.getByRole("button", { name: "Stopping" })).toBeVisible({ timeout: 300 });
+  await expect(page.getByRole("button", { name: "Send" })).toBeVisible({ timeout: 100 });
+  await cancelled;
+  expect(cancelledTurnId).toBe("turn_0");
+});
 
-  await expect(page.getByRole("button", { name: "Send" })).toBeVisible({ timeout: 30_000 });
-  await expect(page.getByRole("button", { name: "Send" })).toBeVisible();
+test("a follow-up after cancellation receives the interrupted task and completed tool context", async ({ page }) => {
+  const sessionId = "mock-cancel-context-session";
+  const at = new Date().toISOString();
+  const turnId = "turn_0";
+  const initialEvents = [
+    { data: { runtime: { agentId: "open-agent", agentName: "open-agent", eveVersion: "test", modelId: "mock/model" } }, meta: { at }, type: "session.started" },
+    { data: { sequence: 0, turnId }, meta: { at }, type: "turn.started" },
+    { data: { message: "Build a clothing brand website", parts: [{ text: "Build a clothing brand website", type: "text" }], sequence: 0, turnId }, meta: { at }, type: "message.received" },
+    { data: { sequence: 0, stepIndex: 0, turnId }, meta: { at }, type: "step.started" },
+    { data: { finishReason: "tool-calls", message: "I will inspect the workspace first.", sequence: 0, stepIndex: 0, turnId }, meta: { at }, type: "message.completed" },
+    { data: { actions: [{ callId: "call-todo", input: { todos: [{ content: "Inspect workspace", status: "in_progress" }] }, kind: "tool-call", toolName: "todo" }], sequence: 0, stepIndex: 0, turnId }, meta: { at }, type: "actions.requested" },
+    { data: { result: { callId: "call-todo", kind: "tool-result", output: { completed: true }, toolName: "todo" }, sequence: 0, status: "completed", stepIndex: 0, turnId }, meta: { at }, type: "action.result" },
+    { data: { finishReason: "tool-calls", sequence: 0, stepIndex: 0, turnId, usage: { inputTokens: 100, outputTokens: 20 } }, meta: { at }, type: "step.completed" },
+  ];
+  const cancelledEvents = [
+    ...initialEvents,
+    { data: { sequence: 0, turnId }, meta: { at }, type: "turn.cancelled" },
+    { data: { wait: "next-user-message" }, meta: { at }, type: "session.waiting" },
+  ];
+  const completedEvents = [
+    ...cancelledEvents,
+    { data: { sequence: 1, turnId: "turn_1" }, meta: { at }, type: "turn.started" },
+    { data: { message: "Continue", parts: [{ text: "Continue", type: "text" }], sequence: 1, turnId: "turn_1" }, meta: { at }, type: "message.received" },
+    { data: { sequence: 1, stepIndex: 0, turnId: "turn_1" }, meta: { at }, type: "step.started" },
+    { data: { finishReason: "stop", message: "Resuming the clothing website.", sequence: 1, stepIndex: 0, turnId: "turn_1" }, meta: { at }, type: "message.completed" },
+    { data: { finishReason: "stop", sequence: 1, stepIndex: 0, turnId: "turn_1", usage: { inputTokens: 120, outputTokens: 12 } }, meta: { at }, type: "step.completed" },
+    { data: { sequence: 1, turnId: "turn_1" }, meta: { at }, type: "turn.completed" },
+    { data: { wait: "next-user-message" }, meta: { at }, type: "session.waiting" },
+  ];
+  let cancelRequested = false;
+  let followUpBody: Record<string, unknown> | undefined;
+
+  await page.route("**/eve/v1/session", (route) => route.fulfill({
+    body: JSON.stringify({ sessionId }),
+    contentType: "application/json",
+    headers: { "x-eve-session-id": sessionId },
+    status: 200,
+  }));
+  await page.route(`**/eve/v1/session/${sessionId}/cancel`, async (route) => {
+    cancelRequested = true;
+    await route.fulfill({
+      body: JSON.stringify({ ok: true, sessionId, status: "accepted" }),
+      contentType: "application/json",
+      status: 202,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}`, async (route) => {
+    followUpBody = route.request().postDataJSON() as Record<string, unknown>;
+    await route.fulfill({
+      body: JSON.stringify({ sessionId }),
+      contentType: "application/json",
+      status: 202,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
+    const startIndex = Number(new URL(route.request().url()).searchParams.get("startIndex") ?? "0");
+    const events = startIndex === 0
+      ? initialEvents
+      : followUpBody
+        ? completedEvents.slice(startIndex)
+        : cancelledEvents.slice(startIndex);
+    await route.fulfill({
+      body: `${events.map((event) => JSON.stringify(event)).join("\n")}\n`,
+      contentType: "application/x-ndjson",
+      status: 200,
+    });
+  });
+
+  await page.goto("/");
+  const composer = page.getByRole("textbox", { name: "Do anything" });
+  await composer.fill("Build a clothing brand website");
+  await composer.press("Enter");
+  await expect(page.getByRole("button", { name: "Stop", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Stop", exact: true }).click();
+  await expect.poll(() => cancelRequested).toBeTruthy();
+  await expect.poll(() => {
+    const context = firstStoredThread(page)?.retainedContext;
+    return Array.isArray(context) ? context.join("\n") : "";
+  }).toContain("Original user request: Build a clothing brand website");
+  await expect.poll(() => threadEvents(page).some((event) => isEventType(event, "session.waiting"))).toBeTruthy();
+
+  await composer.fill("Continue");
+  await composer.press("Enter");
+  await expect.poll(() => followUpBody).toBeDefined();
+  expect(followUpBody).toMatchObject({ message: "Continue" });
+  expect(JSON.stringify(followUpBody?.clientContext)).toContain("Original user request: Build a clothing brand website");
+  expect(JSON.stringify(followUpBody?.clientContext)).toContain("Completed tool todo");
+});
+
+test("a historical cancelled thread backfills recovery context before its next follow-up", async ({ page }) => {
+  const threadId = "historical-cancelled-thread";
+  const sessionId = "historical-cancelled-session";
+  const turnId = "turn_0";
+  const at = new Date().toISOString();
+  const events = [
+    { data: { runtime: { agentId: "open-agent", agentName: "open-agent", eveVersion: "test", modelId: "mock/model" } }, meta: { at }, type: "session.started" },
+    { data: { sequence: 0, turnId }, meta: { at }, type: "turn.started" },
+    { data: { message: "Build a durable company website", parts: [{ text: "Build a durable company website", type: "text" }], sequence: 0, turnId }, meta: { at }, type: "message.received" },
+    { data: { sequence: 0, stepIndex: 0, turnId }, meta: { at }, type: "step.started" },
+    { data: { finishReason: "tool-calls", message: "I started inspecting the workspace.", sequence: 0, stepIndex: 0, turnId }, meta: { at }, type: "message.completed" },
+    { data: { actions: [{ callId: "call-glob", input: { pattern: "**/*" }, kind: "tool-call", toolName: "glob" }], sequence: 0, stepIndex: 0, turnId }, meta: { at }, type: "actions.requested" },
+    { data: { result: { callId: "call-glob", kind: "tool-result", output: { files: ["package.json"] }, toolName: "glob" }, sequence: 0, status: "completed", stepIndex: 0, turnId }, meta: { at }, type: "action.result" },
+    { data: { finishReason: "tool-calls", sequence: 0, stepIndex: 0, turnId, usage: { inputTokens: 100, outputTokens: 20 } }, meta: { at }, type: "step.completed" },
+    { data: { sequence: 0, turnId }, meta: { at }, type: "turn.cancelled" },
+    { data: { wait: "next-user-message" }, meta: { at }, type: "session.waiting" },
+  ];
+  let followUpBody: Record<string, unknown> | undefined;
+  setFakeThreadCollection(page, {
+    activeThreadId: threadId,
+    threads: [{
+      closedInputRequestIds: [],
+      createdAt: Date.now(),
+      events,
+      id: threadId,
+      preferences: { executionMode: "standard", modelId: "gpt-5.6-sol", reasoning: "medium" },
+      queuedTurns: [],
+      session: { sessionId, streamIndex: events.length },
+      status: "ready",
+      title: "Company website",
+      updatedAt: Date.now(),
+    }],
+    version: 2,
+  });
+  await page.route(`**/eve/v1/session/${sessionId}`, async (route) => {
+    followUpBody = route.request().postDataJSON() as Record<string, unknown>;
+    await route.fulfill({
+      body: JSON.stringify({ sessionId }),
+      contentType: "application/json",
+      status: 202,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}/stream**`, (route) => route.fulfill({
+    body: mockContinuationTurn("Continue", "The website work is continuing.", 1),
+    contentType: "application/x-ndjson",
+    status: 200,
+  }));
+
+  await page.goto(`/threads/${threadId}`);
+  await expect.poll(() => {
+    const context = firstStoredThread(page)?.retainedContext;
+    return Array.isArray(context) ? context.join("\n") : "";
+  }).toContain("Original user request: Build a durable company website");
+  const composer = page.getByRole("textbox", { name: "Do anything" });
+  await composer.fill("Continue");
+  await composer.press("Enter");
+  await expect.poll(() => followUpBody).toBeDefined();
+  expect(JSON.stringify(followUpBody?.clientContext)).toContain("Original user request: Build a durable company website");
+  expect(JSON.stringify(followUpBody?.clientContext)).toContain("Completed tool glob");
+});
+
+test("stop before turn admission stays immediate and retries against the authoritative turn id", async ({ page }) => {
+  const sessionId = "mock-cancel-race-session";
+  const turnId = "turn-race";
+  const cancellations: Array<{ turnId?: string }> = [];
+  let releaseStreams: (() => void) | undefined;
+  const streamsMayFinish = new Promise<void>((resolve) => {
+    releaseStreams = resolve;
+  });
+  await page.route("**/eve/v1/session", async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({ sessionId }),
+      contentType: "application/json",
+      headers: { "x-eve-session-id": sessionId },
+      status: 200,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}/cancel`, async (route) => {
+    cancellations.push((route.request().postDataJSON() ?? {}) as { turnId?: string });
+    if (cancellations.length === 1) releaseStreams?.();
+    await route.fulfill({
+      body: JSON.stringify({ ok: true, sessionId, status: "accepted" }),
+      contentType: "application/json",
+      status: 202,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
+    await streamsMayFinish;
+    const at = new Date().toISOString();
+    await route.fulfill({
+      body: `${[
+        { data: { runtime: { agentId: "open-agent", agentName: "open-agent", eveVersion: "test", modelId: "mock/model" } }, meta: { at }, type: "session.started" },
+        { data: { sequence: 0, turnId }, meta: { at }, type: "turn.started" },
+        { data: { message: "Stop before admission", parts: [{ text: "Stop before admission", type: "text" }], sequence: 0, turnId }, meta: { at }, type: "message.received" },
+        { data: { finishReason: "stop", message: "LATE RESPONSE", sequence: 0, stepIndex: 0, turnId }, meta: { at }, type: "message.completed" },
+        { data: { sequence: 0, turnId }, meta: { at }, type: "turn.cancelled" },
+        { data: { wait: "next-user-message" }, meta: { at }, type: "session.waiting" },
+      ].map((event) => JSON.stringify(event)).join("\n")}\n`,
+      contentType: "application/x-ndjson",
+      status: 200,
+    });
+  });
+
+  await page.goto("/");
+  const composer = page.getByRole("textbox", { name: "Do anything" });
+  await composer.fill("Stop before admission");
+  await composer.press("Enter");
+  const stop = page.getByRole("button", { name: "Stop", exact: true });
+  await expect(stop).toBeVisible();
+  await stop.click();
+
+  await expect(page.getByRole("button", { name: "Send" })).toBeVisible({ timeout: 100 });
+  await expect.poll(() => cancellations.some((entry) => entry.turnId === turnId)).toBeTruthy();
+  expect(cancellations[0]?.turnId).toBeUndefined();
+  await expect(page.getByText("LATE RESPONSE", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("log").getByText("Stop before admission", { exact: true })).toBeVisible();
+});
+
+test("stop before session admission preserves the optimistic user message", async ({ page }) => {
+  await page.route("**/eve/v1/session", async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    await route.fulfill({
+      body: JSON.stringify({ sessionId: "late-session-admission" }),
+      contentType: "application/json",
+      headers: { "x-eve-session-id": "late-session-admission" },
+      status: 200,
+    });
+  });
+
+  await page.goto("/");
+  const composer = page.getByRole("textbox", { name: "Do anything" });
+  await composer.fill("Keep this message after stopping");
+  await composer.press("Enter");
+  await page.getByRole("button", { name: "Stop", exact: true }).click();
+
+  await expect(page.getByRole("button", { name: "Send", exact: true })).toBeVisible({ timeout: 200 });
+  await expect(page.getByRole("log").getByText("Keep this message after stopping", { exact: true })).toBeVisible();
+  await expect.poll(() => {
+    const pending = firstStoredThread(page)?.pendingTurn;
+    if (typeof pending !== "object" || pending === null) return "";
+    const record = pending as Record<string, unknown>;
+    return `${String(record.state)}:${String(record.text)}`;
+  }).toBe("interrupted:Keep this message after stopping");
+});
+
+test("stop cancels a recovered long-running turn after one bounded catch-up", async ({ page }) => {
+  const sessionId = "mock-recovery-cancel-session";
+  const turnId = "turn-recovery-cancel";
+  const at = new Date().toISOString();
+  const runningEvents = [
+    { data: { runtime: { agentId: "open-agent", agentName: "open-agent", eveVersion: "test", modelId: "mock/model" } }, meta: { at, id: "evt-session" }, type: "session.started" },
+    { data: { sequence: 0, turnId }, meta: { at, id: "evt-turn" }, type: "turn.started" },
+    { data: { message: "Stop recovered work", parts: [{ text: "Stop recovered work", type: "text" }], sequence: 0, turnId }, meta: { at, id: "evt-message" }, type: "message.received" },
+    { data: { sequence: 0, stepIndex: 0, turnId }, meta: { at, id: "evt-step" }, type: "step.started" },
+  ];
+  const cancelledEvents = [
+    ...runningEvents,
+    { data: { sequence: 0, turnId }, meta: { at, id: "evt-cancelled" }, type: "turn.cancelled" },
+    { data: { wait: "next-user-message" }, meta: { at, id: "evt-waiting" }, type: "session.waiting" },
+  ];
+  let cancelRequested = false;
+  let boundedTailRequests = 0;
+  let releaseStreams: (() => void) | undefined;
+  const streamsMayFinish = new Promise<void>((resolve) => {
+    releaseStreams = resolve;
+  });
+
+  setFakeThreadCollection(page, {
+    activeThreadId: "recovery-cancel-thread",
+    threads: [{
+      closedInputRequestIds: [],
+      createdAt: Date.now(),
+      events: runningEvents,
+      id: "recovery-cancel-thread",
+      preferences: { executionMode: "standard", modelId: "gpt-5.6-sol", reasoning: "medium" },
+      queuedTurns: [],
+      session: { sessionId, streamIndex: runningEvents.length },
+      status: "streaming",
+      title: "Recovered work",
+      updatedAt: Date.now(),
+    }],
+    version: 2,
+  });
+  await page.route(`**/eve/v1/session/${sessionId}/cancel`, async (route) => {
+    cancelRequested = true;
+    releaseStreams?.();
+    expect((route.request().postDataJSON() as { turnId?: string }).turnId).toBe(turnId);
+    await route.fulfill({
+      body: JSON.stringify({ ok: true, sessionId, status: "accepted" }),
+      contentType: "application/json",
+      status: 202,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.has("includeTailIndex")) boundedTailRequests += 1;
+    await streamsMayFinish;
+    const startIndex = Number(url.searchParams.get("startIndex") ?? "0");
+    await route.fulfill({
+      body: `${cancelledEvents.slice(startIndex).map((event) => JSON.stringify(event)).join("\n")}\n`,
+      contentType: "application/x-ndjson",
+      status: 200,
+    });
+  });
+
+  await page.goto("/threads/recovery-cancel-thread");
+  await page.getByRole("button", { name: "Stop", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Send", exact: true })).toBeVisible({ timeout: 300 });
+  await expect.poll(() => cancelRequested).toBeTruthy();
+  await expect.poll(() => firstStoredThread(page)?.status).toBe("ready");
+  expect(boundedTailRequests).toBe(1);
 });
 
 function mockSuccessfulTurn(message: string, reply: string, sequence = 0): string {
@@ -1541,6 +2317,51 @@ function mockReasoningMarkdownTurn(): string {
   return `${events.map((event) => JSON.stringify(event)).join("\n")}\n`;
 }
 
+function mockQuestionTurn(): string {
+  const base = Date.now();
+  const at = (offset: number) => new Date(base + offset).toISOString();
+  const turnId = "turn_question";
+  const request = {
+    action: {
+      callId: "call-question",
+      input: {
+        allowFreeform: true,
+        options: [
+          { description: "留白充足，突出品牌内容", id: "minimal", label: "极简现代" },
+          { description: "使用鲜明色彩和强烈层次", id: "bold", label: "大胆活力" },
+          { description: "使用克制色彩和精致字体，适合高端品牌的长标题描述", id: "editorial", label: "编辑设计" },
+        ],
+        prompt: "你更喜欢哪种视觉方向？",
+      },
+      kind: "tool-call",
+      toolName: "ask_question",
+    },
+    allowFreeform: true,
+    display: "select",
+    kind: "question",
+    options: [
+      { description: "留白充足，突出品牌内容", id: "minimal", label: "极简现代" },
+      { description: "使用鲜明色彩和强烈层次", id: "bold", label: "大胆活力" },
+      { description: "使用克制色彩和精致字体，适合高端品牌的长标题描述", id: "editorial", label: "编辑设计" },
+    ],
+    prompt: "你更喜欢哪种视觉方向？",
+    requestId: "call-question",
+  };
+  const events = [
+    { data: { runtime: { agentId: "open-agent", agentName: "open-agent", eveVersion: "test", modelId: "mock/model" } }, meta: { at: at(0) }, type: "session.started" },
+    { data: { sequence: 0, turnId }, meta: { at: at(100) }, type: "turn.started" },
+    { data: { message: "帮我确定网站的视觉方向", parts: [{ text: "帮我确定网站的视觉方向", type: "text" }], sequence: 0, turnId }, meta: { at: at(200) }, type: "message.received" },
+    { data: { sequence: 0, stepIndex: 0, turnId }, meta: { at: at(300) }, type: "step.started" },
+    { data: { finishReason: "tool-calls", message: null, sequence: 0, stepIndex: 0, turnId }, meta: { at: at(400) }, type: "message.completed" },
+    { data: { actions: [request.action], sequence: 0, stepIndex: 0, turnId }, meta: { at: at(500) }, type: "actions.requested" },
+    { data: { finishReason: "tool-calls", sequence: 0, stepIndex: 0, turnId, usage: { inputTokens: 120, outputTokens: 24 } }, meta: { at: at(600) }, type: "step.completed" },
+    { data: { requests: [request], sequence: 0, stepIndex: 0, turnId }, meta: { at: at(700) }, type: "input.requested" },
+    { data: { sequence: 0, turnId }, meta: { at: at(800) }, type: "turn.completed" },
+    { data: { wait: "input" }, meta: { at: at(900) }, type: "session.waiting" },
+  ];
+  return `${events.map((event) => JSON.stringify(event)).join("\n")}\n`;
+}
+
 function mockContinuationTurn(message: string, reply: string, sequence = 1): string {
   const at = new Date().toISOString();
   const turnId = `turn_${sequence}`;
@@ -1557,11 +2378,72 @@ function mockContinuationTurn(message: string, reply: string, sequence = 1): str
 }
 
 function eventsFromNdjson(payload: string): readonly unknown[] {
-  return payload.trim().split("\n").map((line) => JSON.parse(line) as unknown);
+  return payload
+    .split("\n")
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line) as unknown);
 }
 
 function ndjson(events: readonly unknown[]): string {
   return events.length > 0 ? `${events.map((event) => JSON.stringify(event)).join("\n")}\n` : "";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function withClientMessageId(
+  events: readonly unknown[],
+  clientMessageId: string,
+): readonly unknown[] {
+  return events.map((event) => {
+    if (!isRecord(event) || event.type !== "message.received" || !isRecord(event.data)) return event;
+    return { ...event, data: { ...event.data, clientMessageId } };
+  });
+}
+
+function mockSteeredTurnRemainder(
+  turnId: string,
+  clientMessageId: unknown,
+  message: string,
+  reply: string,
+): readonly unknown[] {
+  const at = new Date().toISOString();
+  const durableClientMessageId = typeof clientMessageId === "string" && clientMessageId
+    ? clientMessageId
+    : "missing-client-message-id";
+  return [
+    {
+      data: {
+        clientMessageId: durableClientMessageId,
+        message,
+        parts: [{ text: message, type: "text" }],
+        sequence: 0,
+        turnId,
+      },
+      meta: { at },
+      type: "message.received",
+    },
+    { data: { sequence: 0, stepIndex: 1, turnId }, meta: { at }, type: "step.started" },
+    {
+      data: { finishReason: "stop", message: reply, sequence: 0, stepIndex: 1, turnId },
+      meta: { at },
+      type: "message.completed",
+    },
+    {
+      data: {
+        finishReason: "stop",
+        sequence: 0,
+        stepIndex: 1,
+        turnId,
+        usage: { inputTokens: 2, outputTokens: 2 },
+      },
+      meta: { at },
+      type: "step.completed",
+    },
+    { data: { sequence: 0, turnId }, meta: { at }, type: "turn.completed" },
+    { data: { wait: "next-user-message" }, meta: { at }, type: "session.waiting" },
+  ];
 }
 
 function mockChildApprovalEvents(): readonly unknown[] {
@@ -1596,6 +2478,7 @@ function mockChildApprovalEvents(): readonly unknown[] {
         requests: [{
           action: { callId: "call-child-bash", input: { command: "npm test && rm -f /tmp/css-classes" }, kind: "tool-call", toolName: "bash" },
           display: "confirmation",
+          kind: "tool-approval",
           options: [
             { id: "approve", label: "Approve", style: "primary" },
             { id: "deny", label: "Deny", style: "danger" },
@@ -1633,6 +2516,7 @@ function mockChildApprovalResumeEvents(): string {
 
 type FakeStoredThread = {
   readonly events?: readonly unknown[];
+  readonly id: string;
   readonly session?: {
     readonly sessionId?: string;
     readonly streamIndex?: number;

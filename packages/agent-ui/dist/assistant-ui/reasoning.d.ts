@@ -10,13 +10,14 @@ export type ReasoningRootProps = Omit<React.ComponentProps<typeof Collapsible>, 
     defaultOpen?: boolean;
     streaming?: boolean;
 };
-declare function ReasoningRoot({ className, variant, open: controlledOpen, onOpenChange: controlledOnOpenChange, defaultOpen, streaming, children, ...props }: ReasoningRootProps): import("react/jsx-runtime").JSX.Element;
+declare function ReasoningRoot({ className, variant, open: controlledOpen, onOpenChange: controlledOnOpenChange, defaultOpen, streaming: _streaming, children, ...props }: ReasoningRootProps): import("react/jsx-runtime").JSX.Element;
 declare function ReasoningFade({ side, className, ...props }: React.ComponentProps<"div"> & {
     side?: "top" | "bottom";
 }): import("react/jsx-runtime").JSX.Element;
-declare function ReasoningTrigger({ active, duration, label, className, ...props }: React.ComponentProps<typeof CollapsibleTrigger> & {
+declare function ReasoningTrigger({ active, duration, hideChevron, label, className, ...props }: React.ComponentProps<typeof CollapsibleTrigger> & {
     active?: boolean;
     duration?: number;
+    hideChevron?: boolean;
     label?: React.ReactNode;
 }): import("react/jsx-runtime").JSX.Element;
 declare function ReasoningContent({ className, children, ...props }: React.ComponentProps<typeof CollapsibleContent>): import("react/jsx-runtime").JSX.Element;

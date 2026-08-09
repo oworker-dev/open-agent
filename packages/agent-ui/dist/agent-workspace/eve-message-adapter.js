@@ -147,18 +147,7 @@ function filePart(part) {
     };
 }
 function userContent(parts) {
-    const content = [];
-    for (const part of parts) {
-        if (part.type === "text") {
-            content.push({ text: part.text, type: "text" });
-            continue;
-        }
-        if (part.type === "file") {
-            const file = filePart(part);
-            if (file)
-                content.push(file);
-        }
-    }
+    const content = parts.flatMap((part) => part.type === "text" ? [{ text: part.text, type: "text" }] : []);
     return content.length > 0 ? content : [{ text: "", type: "text" }];
 }
 function userAttachments(parts) {
@@ -170,9 +159,7 @@ function userAttachments(parts) {
             return [];
         const image = file.mimeType.startsWith("image/");
         return [{
-                content: [image
-                        ? { image: file.data, ...(part.filename ? { filename: part.filename } : {}), type: "image" }
-                        : file],
+                content: [file],
                 contentType: file.mimeType,
                 id: String(index),
                 name: part.filename ?? "file",

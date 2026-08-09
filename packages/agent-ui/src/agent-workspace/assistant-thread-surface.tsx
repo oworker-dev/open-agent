@@ -18,16 +18,20 @@ import {
   ArrowUpIcon,
   AtSignIcon,
   CheckIcon,
+  CircleGaugeIcon,
+  CircleXIcon,
   CopyIcon,
+  LockKeyholeIcon,
   LoaderCircleIcon,
   PlusIcon,
   PencilIcon,
+  RotateCcwIcon,
   ShieldCheckIcon,
   SlashIcon,
   SquareIcon,
   WrenchIcon,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type FormEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { ComposerTriggerPopover } from "../assistant-ui/composer-trigger-popover.js";
 import { ContextDisplay } from "../assistant-ui/context-display.js";
 import { copyText } from "../assistant-ui/copy-text.js";
@@ -46,7 +50,6 @@ import {
   DropdownMenuRadioItem,
   DropdownMenuTrigger,
 } from "../ui/dropdown-menu.js";
-import { AgentActivity } from "./agent-activity.js";
 import { AgentMessage, type AgentInputResponse } from "./agent-message.js";
 import type { AgentExecutionMode, AgentModelOption, AgentPromptMenuItem, AgentThreadPreferences } from "./contracts.js";
 import type { AgentLocale, AgentMessages } from "./i18n.js";
@@ -55,44 +58,55 @@ import type { AgentUsageSummary } from "./usage.js";
 export type AgentCancellationState = "idle" | "requested" | "cancelling";
 
 export function AssistantThreadSurface({
+  cancellationRevision,
   cancellationState,
+  closedInputRequestIds,
   commands,
+  composerTop,
   draftStorageKey,
   events,
   eveMessages,
   fallbackStartedAt,
+  inputDisabled,
   isBusy,
   locale,
   mentions,
   messages,
   models,
   onInputResponses,
+  onCloseInputRequest,
   onOpenSubagent,
   onPreferencesChange,
-  pendingTurnText,
+  onRetryRuntimeError,
   preferences,
-  quietActivity,
   reasoningLevels,
+  runtimeError,
   usage,
 }: {
+  readonly cancellationRevision: number;
   readonly cancellationState: AgentCancellationState;
+  readonly closedInputRequestIds: ReadonlySet<string>;
   readonly commands: readonly AgentPromptMenuItem[];
+  readonly composerTop?: ReactNode;
   readonly draftStorageKey: string;
   readonly events: readonly MessageStreamEvent[];
   readonly eveMessages: readonly EveMessage[];
   readonly fallbackStartedAt?: number;
+  /** Locks the main composer without disabling assistant-ui's edit composer. */
+  readonly inputDisabled?: boolean;
   readonly isBusy: boolean;
   readonly locale: AgentLocale;
   readonly mentions: readonly AgentPromptMenuItem[];
   readonly messages: AgentMessages;
   readonly models: readonly AgentModelOption[];
   readonly onInputResponses: (responses: readonly AgentInputResponse[]) => void | Promise<void>;
+  readonly onCloseInputRequest: (requestId: string) => void;
   readonly onOpenSubagent?: (sessionId: string) => void;
   readonly onPreferencesChange: (preferences: AgentThreadPreferences) => void;
-  readonly pendingTurnText?: string;
+  readonly onRetryRuntimeError?: () => void;
   readonly preferences: AgentThreadPreferences;
-  readonly quietActivity: boolean;
   readonly reasoningLevels: readonly string[];
+  readonly runtimeError?: string;
   readonly usage: AgentUsageSummary;
 }) {
   const eveMessagesById = useMemo(
@@ -100,6 +114,13 @@ export function AssistantThreadSurface({
     [eveMessages],
   );
   const lastMessageId = eveMessages.at(-1)?.id;
+  const canRespondToInputRequest = eveMessages.some((message) =>
+    message.parts.some((part) =>
+      part.type === "dynamic-tool" &&
+      Boolean(part.toolMetadata?.eve?.inputRequest) &&
+      part.toolMetadata?.eve?.inputResponse === undefined,
+    ),
+  );
 
   return (
     <ThreadPrimitive.Root
@@ -111,6 +132,7 @@ export function AssistantThreadSurface({
         autoScroll
         turnAnchor="top"
         className="relative flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-auto px-3 pt-3 sm:px-4 sm:pt-4"
+        data-slot="thread-viewport"
         role="log"
       >
         <div className="mx-auto flex w-full max-w-(--thread-max-width) flex-col gap-6 empty:hidden">
@@ -121,7 +143,7 @@ export function AssistantThreadSurface({
               <UserMessage messages={messages} />
             ) : (
               <AssistantMessage
-                canRespond={!isBusy}
+                canRespond={!isBusy || canRespondToInputRequest}
                 events={events}
                 fallbackStartedAt={fallbackStartedAt}
                 isStreaming={isBusy && message.id === lastMessageId}
@@ -129,18 +151,24 @@ export function AssistantThreadSurface({
                 message={eveMessagesById.get(message.id)}
                 messages={messages}
                 onInputResponses={onInputResponses}
+                onCloseInputRequest={onCloseInputRequest}
                 onOpenSubagent={onOpenSubagent}
+                closedInputRequestIds={closedInputRequestIds}
               />
-            )}
+          )}
           </ThreadPrimitive.Messages>
-          {pendingTurnText ? <PendingUserTurn text={pendingTurnText} /> : null}
-          {isBusy && !hasCurrentTurnVisibleProcess(events) ? (
-            <AgentActivity events={events} messages={messages} quietUntilSlow={quietActivity} />
+          {runtimeError ? (
+            <RuntimeErrorMessage
+              locale={locale}
+              message={runtimeError}
+              messages={messages}
+              onRetry={onRetryRuntimeError}
+            />
           ) : null}
         </div>
 
         <ThreadPrimitive.Empty>
-          {!pendingTurnText && !isBusy ? <AssistantEmptyState messages={messages} /> : null}
+          {!isBusy ? <AssistantEmptyState messages={messages} /> : null}
         </ThreadPrimitive.Empty>
 
         <ThreadPrimitive.ViewportFooter className="sticky bottom-0 z-20 mx-auto mt-auto flex w-full max-w-(--thread-max-width) flex-col bg-background pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-2 sm:pb-4 md:pb-5">
@@ -155,8 +183,11 @@ export function AssistantThreadSurface({
           </ThreadPrimitive.ScrollToBottom>
           <AssistantComposer
             cancellationState={cancellationState}
+            cancellationRevision={cancellationRevision}
             commands={commands}
+            composerTop={composerTop}
             draftStorageKey={draftStorageKey}
+            inputDisabled={inputDisabled}
             locale={locale}
             mentions={mentions}
             messages={messages}
@@ -172,21 +203,41 @@ export function AssistantThreadSurface({
   );
 }
 
-function hasCurrentTurnVisibleProcess(events: readonly MessageStreamEvent[]): boolean {
-  const turnId = [...events].reverse().find((event) => event.type === "turn.started")?.data.turnId;
-  if (!turnId) return false;
-  return events.some((event) =>
-    (
-      event.type === "reasoning.appended" ||
-      event.type === "reasoning.completed" ||
-      event.type === "message.appended" ||
-      event.type === "message.completed" ||
-      event.type === "actions.requested"
-    ) && event.data.turnId === turnId,
+function RuntimeErrorMessage({
+  locale,
+  message,
+  messages,
+  onRetry,
+}: {
+  readonly locale: AgentLocale;
+  readonly message: string;
+  readonly messages: AgentMessages;
+  readonly onRetry?: () => void;
+}) {
+  return (
+    <article className="mx-auto flex w-full max-w-(--thread-max-width) flex-col" data-agent-message-error role="alert">
+      <div className="flex items-start gap-3 px-1 text-sm">
+        <CircleXIcon className="mt-0.5 size-4 shrink-0 text-destructive" />
+        <div className="min-w-0 flex-1">
+          <p className="font-medium text-foreground">
+            {locale === "zh-CN" ? "本轮执行失败" : messages.requestFailed}
+          </p>
+          <p className="mt-1 break-words text-muted-foreground">{message}</p>
+          <p className="mt-1 text-muted-foreground">{messages.requestPreserved}</p>
+          {onRetry ? (
+            <Button className="mt-2 h-7 px-2.5 text-xs" onClick={onRetry} size="sm" variant="outline">
+              <RotateCcwIcon className="size-3.5" />
+              {messages.retry}
+            </Button>
+          ) : null}
+        </div>
+      </div>
+    </article>
   );
 }
 
 function UserMessage({ messages }: { readonly messages: AgentMessages }) {
+  const [actionsVisible, setActionsVisible] = useState(false);
   const isLastUserMessage = useAuiState((state) => {
     const lastUser = [...state.thread.messages].reverse().find((message) => message.role === "user");
     return lastUser?.id === state.message.id;
@@ -198,19 +249,24 @@ function UserMessage({ messages }: { readonly messages: AgentMessages }) {
 
   return (
     <MessagePrimitive.Root className="group mx-auto flex w-full max-w-(--thread-max-width) flex-col items-end">
-      <div className="max-w-[min(44rem,88%)] rounded-2xl bg-muted/75 px-4 py-3 text-[15px] leading-6 text-foreground">
+      <div
+        className="max-w-[min(44rem,88%)] rounded-2xl bg-muted/75 px-4 py-3 text-[15px] leading-6 text-foreground"
+        onClick={() => {
+          if (window.matchMedia("(pointer: coarse)").matches) setActionsVisible((visible) => !visible);
+        }}
+      >
         <MessagePrimitive.Parts components={{ Text: DirectiveText }} />
       </div>
-      <div className="mt-0.5 flex min-h-7 items-center opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
-          <CopyTextAction label={messages.copyResponse} text={userText} />
-          <ActionBarPrimitive.Root className="flex min-h-7 items-center">
+      <div className={cn("mt-0.5 flex min-h-7 items-center transition-opacity", actionsVisible ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100")}>
+        <CopyTextAction label={messages.copyResponse} text={userText} />
+        <ActionBarPrimitive.Root className="flex min-h-7 items-center">
           <ActionBarPrimitive.Edit
             aria-label={messages.editMessage}
             className={`inline-flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground ${isLastUserMessage ? "" : "invisible pointer-events-none"}`}
           >
             <PencilIcon className="size-3.5" />
           </ActionBarPrimitive.Edit>
-          </ActionBarPrimitive.Root>
+        </ActionBarPrimitive.Root>
       </div>
     </MessagePrimitive.Root>
   );
@@ -218,6 +274,7 @@ function UserMessage({ messages }: { readonly messages: AgentMessages }) {
 
 function AssistantMessage({
   canRespond,
+  closedInputRequestIds,
   events,
   fallbackStartedAt,
   isStreaming,
@@ -225,9 +282,11 @@ function AssistantMessage({
   message,
   messages,
   onInputResponses,
+  onCloseInputRequest,
   onOpenSubagent,
 }: {
   readonly canRespond: boolean;
+  readonly closedInputRequestIds: ReadonlySet<string>;
   readonly events: readonly MessageStreamEvent[];
   readonly fallbackStartedAt?: number;
   readonly isStreaming: boolean;
@@ -235,6 +294,7 @@ function AssistantMessage({
   readonly message?: EveMessage;
   readonly messages: AgentMessages;
   readonly onInputResponses: (responses: readonly AgentInputResponse[]) => void | Promise<void>;
+  readonly onCloseInputRequest: (requestId: string) => void;
   readonly onOpenSubagent?: (sessionId: string) => void;
 }) {
   return (
@@ -243,12 +303,14 @@ function AssistantMessage({
         {message ? (
           <AgentMessage
             canRespond={canRespond}
+            closedInputRequestIds={closedInputRequestIds}
             events={events}
             fallbackStartedAt={fallbackStartedAt}
             isStreaming={isStreaming}
             locale={locale}
             message={message}
             onInputResponses={onInputResponses}
+            onCloseInputRequest={onCloseInputRequest}
             onOpenSubagent={onOpenSubagent}
             showCopyAction
           />
@@ -261,28 +323,33 @@ function AssistantMessage({
   );
 }
 
-function PendingUserTurn({ text }: { readonly text: string }) {
-  return (
-    <div className="flex w-full justify-end" data-optimistic="true">
-      <div className="max-w-[min(44rem,88%)] rounded-2xl bg-muted/75 px-4 py-3 text-[15px] leading-6 text-foreground">
-        <p className="whitespace-pre-wrap break-words">{text}</p>
-      </div>
-    </div>
-  );
-}
-
 function EditMessage({ messages }: { readonly messages: AgentMessages }) {
+  const aui = useAui();
+  const canSend = useAuiState((state) => state.composer.canSend);
+
+  const resendFromHere = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!canSend) return;
+    // Editing rewinds and reruns from this message. assistant-ui otherwise
+    // treats unchanged content as a no-op and never calls the host onEdit.
+    aui.composer.send({ startRun: true });
+  };
+
   return (
-    <MessagePrimitive.Root className="mx-auto w-full max-w-(--thread-max-width)">
-      <ComposerPrimitive.Root className="rounded-[1.25rem] border border-border/70 bg-background px-4 py-3 shadow-[0_8px_26px_-14px_rgba(0,0,0,0.28)]">
-        <ComposerPrimitive.Input autoFocus className="min-h-12 w-full resize-none border-0 bg-transparent text-[15px] leading-6 outline-none" />
+    <MessagePrimitive.Root className="mx-auto w-full max-w-(--thread-max-width)" data-agent-edit-composer>
+      <ComposerPrimitive.Root className="rounded-2xl bg-muted/70 px-4 py-3" onSubmit={resendFromHere}>
+        <ComposerPrimitive.Input
+          autoComplete="off"
+          autoFocus
+          className="min-h-12 w-full resize-none border-0 bg-transparent text-[15px] leading-6 outline-none"
+          id="agent-edit-message"
+          name="agent-edit-message"
+        />
         <div className="mt-2 flex justify-end gap-2">
           <ComposerPrimitive.Cancel asChild>
-            <Button size="sm" variant="outline">{messages.cancelEdit}</Button>
+            <Button className="h-7 bg-background px-2.5 text-xs" size="sm" variant="ghost">{messages.cancelEdit}</Button>
           </ComposerPrimitive.Cancel>
-          <ComposerPrimitive.Send asChild>
-            <Button size="sm">{messages.send}</Button>
-          </ComposerPrimitive.Send>
+          <Button className="h-7 px-2.5 text-xs" disabled={!canSend} size="sm" type="submit">{messages.send}</Button>
         </div>
       </ComposerPrimitive.Root>
     </MessagePrimitive.Root>
@@ -290,8 +357,10 @@ function EditMessage({ messages }: { readonly messages: AgentMessages }) {
 }
 
 export function AssistantComposer({
+  cancellationRevision,
   cancellationState,
   commands,
+  composerTop,
   draftStorageKey,
   inputDisabled = false,
   locale,
@@ -303,8 +372,10 @@ export function AssistantComposer({
   reasoningLevels,
   usage,
 }: {
+  readonly cancellationRevision: number;
   readonly cancellationState: AgentCancellationState;
   readonly commands: readonly AgentPromptMenuItem[];
+  readonly composerTop?: ReactNode;
   readonly draftStorageKey: string;
   readonly inputDisabled?: boolean;
   readonly locale: AgentLocale;
@@ -328,6 +399,16 @@ export function AssistantComposer({
   const draftHydrationRef = useRef<{ readonly key: string; readonly text: string } | undefined>(undefined);
   const previousDraftKeyRef = useRef<string | undefined>(undefined);
   auiRef.current = aui;
+  const previousCancellationRevision = useRef(cancellationRevision);
+  useEffect(() => {
+    if (previousCancellationRevision.current !== cancellationRevision) {
+      aui.composer.setText("");
+      previousCancellationRevision.current = cancellationRevision;
+    }
+  }, [aui, cancellationRevision]);
+  useEffect(() => {
+    if (cancellationState !== "idle") aui.composer.setText("");
+  }, [aui, cancellationState]);
   useEffect(() => {
     if (previousDraftKeyRef.current && previousDraftKeyRef.current !== draftStorageKey) {
       window.localStorage.removeItem(previousDraftKeyRef.current);
@@ -412,10 +493,14 @@ export function AssistantComposer({
         className="relative flex w-full flex-col"
         onSubmit={(event) => {
           event.preventDefault();
-          if (!composerDisabled) aui.composer.send();
+          if (!composerDisabled) {
+            aui.composer.send();
+            blurComposerOnTouch(composerInputRef);
+          }
         }}
       >
-        <div className="flex w-full flex-col gap-2 rounded-[1.25rem] border border-border/70 bg-background p-2.5 shadow-[0_8px_26px_-14px_rgba(0,0,0,0.28)]">
+        <div className="flex w-full flex-col gap-2 rounded-[1.5rem] border border-border/70 bg-background p-2.5 shadow-[0_8px_24px_-16px_rgba(0,0,0,0.24)]">
+          {composerTop}
           <ComposerPrimitive.Attachments>
             {({ attachment }) => (
               <AttachmentPrimitive.Root className="group/attachment mr-1.5 inline-flex max-w-full items-center gap-2 rounded-lg bg-muted px-2.5 py-1.5 text-xs">
@@ -429,7 +514,7 @@ export function AssistantComposer({
           <LexicalComposerInput
             aria-disabled={composerDisabled}
             directiveChip={DirectiveChip}
-            placeholder={`${messages.inputPlaceholder}  (@ /)`}
+            placeholder={messages.inputPlaceholder}
             ref={composerInputRef}
             onKeyDownCapture={(event) => {
               if (!isRunning || event.key !== "Enter" || event.shiftKey || composerDisabled || composerIsEmpty) return;
@@ -441,6 +526,7 @@ export function AssistantComposer({
               if (pickerOpen) return;
               event.preventDefault();
               aui.composer.send();
+              blurComposerOnTouch(composerInputRef);
             }}
             className="aui-composer-input relative max-h-40 min-h-12 w-full resize-none overflow-y-auto bg-transparent px-2 py-1 text-[15px] leading-6 outline-none aria-disabled:pointer-events-none aria-disabled:opacity-50 [&_.aui-directive-chip]:inline-flex [&_.aui-directive-chip]:items-center [&_.aui-directive-chip]:gap-1 [&_.aui-directive-chip]:rounded-md [&_.aui-directive-chip]:bg-muted [&_.aui-directive-chip]:px-1.5 [&_.aui-directive-chip]:py-0.5 [&_.aui-directive-chip]:text-[13px] [&_.aui-directive-chip]:font-medium [&_.aui-directive-chip]:text-foreground [&_.aui-directive-chip-icon]:text-muted-foreground [&_.aui-lexical-input]:min-h-6 [&_.aui-lexical-input]:outline-none [&_.aui-lexical-placeholder]:pointer-events-none [&_.aui-lexical-placeholder]:absolute [&_.aui-lexical-placeholder]:inset-x-0 [&_.aui-lexical-placeholder]:top-0 [&_.aui-lexical-placeholder]:truncate [&_.aui-lexical-placeholder]:px-2 [&_.aui-lexical-placeholder]:py-1 [&_.aui-lexical-placeholder]:text-muted-foreground"
           />
@@ -468,7 +554,7 @@ export function AssistantComposer({
               triggerLabel={messages.model}
             />
             <span className="ml-auto flex min-w-0 items-center gap-0.5 sm:gap-1">
-              {model ? (
+              {model && usage.contextInputTokens > 0 ? (
                 <ContextDisplay.Ring
                   className="h-9 shrink-0 rounded-full px-1.5 sm:h-8"
                   label={messages.context}
@@ -500,7 +586,10 @@ export function AssistantComposer({
                   aria-label={isRunning ? messages.queueFollowUp : messages.send}
                   className="size-9 shrink-0 rounded-full sm:size-8"
                   disabled={composerDisabled}
-                  onClick={() => aui.composer.send()}
+                  onClick={() => {
+                    aui.composer.send();
+                    blurComposerOnTouch(composerInputRef);
+                  }}
                   size="icon-sm"
                   type="button"
                 >
@@ -516,6 +605,13 @@ export function AssistantComposer({
       </ComposerPrimitive.Root>
     </ComposerPrimitive.Unstable_TriggerPopoverRoot>
   );
+}
+
+function blurComposerOnTouch(inputRef: React.RefObject<HTMLDivElement | null>) {
+  if (!window.matchMedia("(pointer: coarse)").matches) return;
+  window.requestAnimationFrame(() => {
+    inputRef.current?.querySelector<HTMLElement>('[role="textbox"]')?.blur();
+  });
 }
 
 function DirectiveChip({ directiveId, directiveType, label }: DirectiveChipProps) {
@@ -539,12 +635,13 @@ function ExecutionModeMenu({
 }) {
   const options: readonly {
     readonly description: string;
+    readonly icon: React.ComponentType<{ className?: string }>;
     readonly label: string;
     readonly value: AgentExecutionMode;
   }[] = [
-    { description: messages.executionStandardDescription, label: messages.executionStandard, value: "standard" },
-    { description: messages.executionAutomationDescription, label: messages.executionAutomation, value: "automation" },
-    { description: messages.executionCautiousDescription, label: messages.executionCautious, value: "cautious" },
+    { description: messages.executionStandardDescription, icon: ShieldCheckIcon, label: messages.executionStandard, value: "standard" },
+    { description: messages.executionAutomationDescription, icon: CircleGaugeIcon, label: messages.executionAutomation, value: "automation" },
+    { description: messages.executionCautiousDescription, icon: LockKeyholeIcon, label: messages.executionCautious, value: "cautious" },
   ];
   const selected = options.find((option) => option.value === value) ?? options[0]!;
   return (
@@ -558,14 +655,18 @@ function ExecutionModeMenu({
       <DropdownMenuContent align="start" className="w-80 max-w-[calc(100vw-1.5rem)]" side="top">
         <DropdownMenuLabel>{messages.executionMode}</DropdownMenuLabel>
         <DropdownMenuRadioGroup onValueChange={(next) => onChange(next as AgentExecutionMode)} value={value}>
-          {options.map((option) => (
-            <DropdownMenuRadioItem className="items-start py-2" key={option.value} value={option.value}>
-              <span className="min-w-0">
-                <span className="block font-medium text-foreground">{option.label}</span>
-                <span className="mt-0.5 block whitespace-normal text-xs leading-4 text-muted-foreground">{option.description}</span>
-              </span>
-            </DropdownMenuRadioItem>
-          ))}
+          {options.map((option) => {
+            const Icon = option.icon;
+            return (
+              <DropdownMenuRadioItem className="items-start py-2" key={option.value} value={option.value}>
+                <Icon className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
+                <span className="min-w-0">
+                  <span className="block text-xs font-medium text-foreground">{option.label}</span>
+                  <span className="mt-0.5 block whitespace-normal text-xs leading-4 text-muted-foreground">{option.description}</span>
+                </span>
+              </DropdownMenuRadioItem>
+            );
+          })}
         </DropdownMenuRadioGroup>
       </DropdownMenuContent>
     </DropdownMenu>

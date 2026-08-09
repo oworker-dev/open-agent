@@ -1,21 +1,26 @@
 "use client";
 
 import { ClientError, type ClientSession, type MessageStreamEvent } from "eve/client";
-import { AlertCircleIcon, ArrowLeftIcon, MenuIcon, PanelLeftCloseIcon, PanelLeftIcon, RotateCcwIcon, ServerOffIcon } from "lucide-react";
+import { AlertCircleIcon, ArrowLeftIcon, MenuIcon, PanelLeftCloseIcon, PanelLeftIcon, ServerOffIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "../ui/button.js";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "../ui/resizable.js";
-import { usePanelRef } from "react-resizable-panels";
+import {
+  usePanelRef,
+  type Layout,
+  type LayoutChangedMeta,
+  type PanelSize,
+} from "react-resizable-panels";
 import { attachAgentSession, createAgentSession } from "./agent-client.js";
 import { AgentChildSessionView } from "./agent-child-session.js";
 import { AgentSettingsDialog } from "./agent-settings-dialog.js";
 import { AgentSidebar } from "./agent-sidebar.js";
 import { AgentSubagentMenu } from "./agent-subagent-menu.js";
 import { AgentThreadView } from "./agent-thread.js";
+import { cn } from "../utils.js";
 import type { AgentModelOption, AgentQueuedTurn, AgentThread, AgentThreadPatch, AgentThreadPreferences, AgentWorkspaceClientConfig, AgentWorkspaceMailbox } from "./contracts.js";
-import { sanitizeAgentError } from "./error-presentation.js";
 import { AgentThreadStorageConflictError } from "./http-thread-storage.js";
-import { messagesFor, resolveBrowserLocale, type AgentLocale } from "./i18n.js";
+import { messagesFor, resolveBrowserLocale, type AgentLocale, type AgentMessages } from "./i18n.js";
 import {
   AGENT_THREAD_STORAGE_VERSION,
   browserThreadStorage,
@@ -31,7 +36,16 @@ import {
 } from "./turn-presentation.js";
 
 const DEFAULT_STORAGE_KEY = "open-agent:threads:v1";
-const STORAGE_SAVE_DELAY_MS = 250;
+const STORAGE_URGENT_SAVE_DELAY_MS = 50;
+const STORAGE_STREAM_CHECKPOINT_MS = 15_000;
+const WORKBENCH_TRANSITION_MS = 300;
+const SIDEBAR_MIN_WIDTH = 220;
+const SIDEBAR_MAX_WIDTH = 420;
+const SIDEBAR_DEFAULT_WIDTH = 252;
+const SIDEBAR_COLLAPSED_THRESHOLD = 1;
+const FLOATING_SIDEBAR_DEFAULT_WIDTH = 288;
+
+type WorkbenchLayoutMode = "split" | "collapsing" | "fullscreen" | "expanding";
 
 export function AgentWorkspace({
   client,
@@ -94,38 +108,60 @@ export function AgentWorkspace({
   const [isHydrated, setIsHydrated] = useState(false);
   const [recoveringIds, setRecoveringIds] = useState<Set<string>>(new Set());
   const [recoveryErrors, setRecoveryErrors] = useState<Map<string, string>>(new Map());
+  const [hydratingThreadIds, setHydratingThreadIds] = useState<Set<string>>(new Set());
+  const [threadHydrationErrors, setThreadHydrationErrors] = useState<Map<string, string>>(new Map());
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [workbenchMode, setWorkbenchMode] = useState<WorkbenchLayoutMode>("split");
+  const [panelResizing, setPanelResizing] = useState(false);
   const [desktopLayout, setDesktopLayout] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [deletionIssue, setDeletionIssue] = useState(false);
   const [deletingThreadIds, setDeletingThreadIds] = useState<Set<string>>(new Set());
-  const [storageIssue, setStorageIssue] = useState(false);
   const [ephemeralThreadIds, setEphemeralThreadIds] = useState<Set<string>>(new Set());
   const [locale, setLocale] = useState<AgentLocale>("en");
   const recoveryStarted = useRef(new Set<string>());
   const recoveryControllers = useRef(new Map<string, AbortController>());
   const storageSaveQueue = useRef<Promise<void>>(Promise.resolve());
   const storageSaveTimer = useRef<number | undefined>(undefined);
+  const storageSaveDueAt = useRef<number | undefined>(undefined);
+  const workbenchTransitionTimer = useRef<number | undefined>(undefined);
+  const workbenchTransition = useRef<"collapsing" | "expanding" | undefined>(undefined);
+  const lastSidebarWidth = useRef(SIDEBAR_DEFAULT_WIDTH);
   const pendingCollection = useRef<AgentThreadCollection | undefined>(undefined);
   const messages = messagesFor(locale);
   const sidebarPanelRef = usePanelRef();
 
   useEffect(() => {
-    if (!desktopLayout || !sidebarPanelRef.current) return;
-    if (sidebarOpen) sidebarPanelRef.current.expand();
-    else sidebarPanelRef.current.collapse();
-  }, [desktopLayout, sidebarOpen, sidebarPanelRef]);
-
-  useEffect(() => {
     const media = window.matchMedia("(min-width: 1024px)");
     const synchronizeLayout = () => {
-      setDesktopLayout(media.matches);
-      setSidebarOpen(media.matches);
+      const nextDesktopLayout = media.matches;
+      window.clearTimeout(workbenchTransitionTimer.current);
+      workbenchTransitionTimer.current = undefined;
+      workbenchTransition.current = undefined;
+      setDesktopLayout(nextDesktopLayout);
+      setSidebarOpen(nextDesktopLayout);
+      setWorkbenchMode("split");
+      setPanelResizing(false);
     };
     synchronizeLayout();
     media.addEventListener("change", synchronizeLayout);
     return () => media.removeEventListener("change", synchronizeLayout);
   }, []);
+
+  useEffect(() => () => window.clearTimeout(workbenchTransitionTimer.current), []);
+
+  useEffect(() => {
+    if (!panelResizing) return;
+    const finishResize = () => setPanelResizing(false);
+    window.addEventListener("pointerup", finishResize, { once: true });
+    window.addEventListener("pointercancel", finishResize, { once: true });
+    window.addEventListener("blur", finishResize, { once: true });
+    return () => {
+      window.removeEventListener("pointerup", finishResize);
+      window.removeEventListener("pointercancel", finishResize);
+      window.removeEventListener("blur", finishResize);
+    };
+  }, [panelResizing]);
 
   useEffect(() => {
     threadsRef.current = threads;
@@ -137,7 +173,6 @@ export function AgentWorkspace({
     void Promise.resolve(threadStorage.load(storageKey))
       .then((collection) => {
         if (cancelled) return;
-        setStorageIssue(false);
         const storedThreads = collection.threads.map((thread) =>
           normalizeThreadPreferences(thread, models, reasoningLevels, stableDefaults)
         );
@@ -164,6 +199,12 @@ export function AgentWorkspace({
         setSidebarOpen(window.matchMedia("(min-width: 1024px)").matches);
         setIsHydrated(true);
 
+        pendingCollection.current = {
+          ...(requestedActive ? { activeThreadId: requestedActive } : {}),
+          threads: storedThreads,
+          version: AGENT_THREAD_STORAGE_VERSION,
+        };
+
         const busyThreads = restoredThreads.filter(threadNeedsRecovery);
         if (busyThreads.length > 0) {
           setRecoveringIds(new Set(busyThreads.map((thread) => thread.id)));
@@ -171,7 +212,6 @@ export function AgentWorkspace({
       })
       .catch((error: unknown) => {
         if (cancelled) return;
-        setStorageIssue(true);
         onStorageError?.(error);
         const fallback = createAgentThread(Date.now(), messagesFor(restoredLocale).newTask, stableDefaults);
         setThreads([fallback]);
@@ -216,10 +256,23 @@ export function AgentWorkspace({
       threads: persistedThreads,
       version: AGENT_THREAD_STORAGE_VERSION,
     } as const;
+    const previousCollection = pendingCollection.current;
+    if (previousCollection && sameThreadCollection(previousCollection, collection)) return;
     pendingCollection.current = collection;
-    if (storageSaveTimer.current !== undefined) return;
+    const saveDelay = isUrgentPersistenceChange(previousCollection, collection)
+      ? STORAGE_URGENT_SAVE_DELAY_MS
+      : STORAGE_STREAM_CHECKPOINT_MS;
+    const dueAt = Date.now() + saveDelay;
+    if (
+      storageSaveTimer.current !== undefined &&
+      storageSaveDueAt.current !== undefined &&
+      storageSaveDueAt.current <= dueAt
+    ) return;
+    window.clearTimeout(storageSaveTimer.current);
+    storageSaveDueAt.current = dueAt;
     storageSaveTimer.current = window.setTimeout(() => {
       storageSaveTimer.current = undefined;
+      storageSaveDueAt.current = undefined;
       const nextCollection = pendingCollection.current;
       if (!nextCollection) return;
       storageSaveQueue.current = storageSaveQueue.current
@@ -233,13 +286,11 @@ export function AgentWorkspace({
           if (!sameThreadCollection(saved, nextCollection)) {
             setThreads((current) => mergeVisibleThreads(current, saved.threads, ephemeralThreadIds));
           }
-          setStorageIssue(false);
         })
         .catch((error: unknown) => {
-          setStorageIssue(true);
           onStorageError?.(error);
         });
-    }, STORAGE_SAVE_DELAY_MS);
+    }, saveDelay);
   }, [activeThreadId, ephemeralThreadIds, isHydrated, onStorageError, storageKey, threadStorage, threads]);
 
   const updateThread = useCallback((threadId: string, patch: AgentThreadPatch) => {
@@ -248,7 +299,11 @@ export function AgentWorkspace({
     }
     setThreads((current) => {
       const next = current.map((thread) => thread.id === threadId
-        ? { ...thread, ...patch, updatedAt: patch.updatedAt ?? Date.now() }
+        ? {
+            ...thread,
+            ...patch,
+            updatedAt: patch.updatedAt ?? Math.max(Date.now(), thread.updatedAt + 1),
+          }
         : thread);
       threadsRef.current = next;
       return next;
@@ -322,6 +377,66 @@ export function AgentWorkspace({
     }
   }, [threads]);
 
+  const finishWorkbenchTransition = useCallback((transition: "collapsing" | "expanding", nextMode: "fullscreen" | "split") => {
+    window.clearTimeout(workbenchTransitionTimer.current);
+    workbenchTransitionTimer.current = window.setTimeout(() => {
+      if (workbenchTransition.current !== transition) return;
+      workbenchTransition.current = undefined;
+      workbenchTransitionTimer.current = undefined;
+      setWorkbenchMode(nextMode);
+    }, WORKBENCH_TRANSITION_MS + 40);
+  }, []);
+
+  const toggleDesktopSidebar = useCallback(() => {
+    const panel = sidebarPanelRef.current;
+    if (!desktopLayout || !panel) return;
+
+    if (workbenchMode === "split") {
+      const currentWidth = panel.getSize().inPixels;
+      if (currentWidth >= SIDEBAR_MIN_WIDTH) lastSidebarWidth.current = currentWidth;
+      workbenchTransition.current = "collapsing";
+      setWorkbenchMode("collapsing");
+      setSidebarOpen(false);
+      panel.collapse();
+      finishWorkbenchTransition("collapsing", "fullscreen");
+      return;
+    }
+
+    if (workbenchMode === "fullscreen") {
+      workbenchTransition.current = "expanding";
+      setWorkbenchMode("expanding");
+      setSidebarOpen(true);
+      panel.resize(`${clamp(lastSidebarWidth.current, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH)}px`);
+      finishWorkbenchTransition("expanding", "split");
+    }
+  }, [desktopLayout, finishWorkbenchTransition, sidebarPanelRef, workbenchMode]);
+
+  const handleSidebarResize = useCallback((size: PanelSize) => {
+    if (size.inPixels >= SIDEBAR_MIN_WIDTH) {
+      lastSidebarWidth.current = clamp(size.inPixels, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+    }
+  }, []);
+
+  const handleDesktopLayoutChanged = useCallback((layout: Layout, meta: LayoutChangedMeta) => {
+    if (!desktopLayout || !meta.isUserInteraction) return;
+    window.clearTimeout(workbenchTransitionTimer.current);
+    workbenchTransitionTimer.current = undefined;
+    workbenchTransition.current = undefined;
+    setPanelResizing(false);
+
+    const sidebarWidth = sidebarPanelRef.current?.getSize().inPixels ?? 0;
+    const sidebarPercentage = layout["agent-sidebar"] ?? 0;
+    if (sidebarWidth <= SIDEBAR_COLLAPSED_THRESHOLD || sidebarPercentage <= 0.05) {
+      setSidebarOpen(false);
+      setWorkbenchMode("fullscreen");
+      return;
+    }
+
+    lastSidebarWidth.current = clamp(sidebarWidth, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+    setSidebarOpen(true);
+    setWorkbenchMode("split");
+  }, [desktopLayout, sidebarPanelRef]);
+
   const renameThread = useCallback((threadId: string, title: string) => {
     const normalized = title.trim();
     if (!normalized) return;
@@ -333,7 +448,48 @@ export function AgentWorkspace({
     setRecoveringIds((current) => new Set(current).add(threadId));
   }, []);
 
+  const cancelThreadRecovery = useCallback((threadId: string) => {
+    recoveryControllers.current.get(threadId)?.abort();
+    setRecoveringIds((current) => withoutSetValue(current, threadId));
+  }, []);
+
   const activeThread = threads.find((thread) => thread.id === activeThreadId) ?? threads[0];
+  const hydrateThread = useCallback((thread: AgentThread) => {
+    if (thread.hydration !== "summary" || !threadStorage.loadThread) return;
+    setThreadHydrationErrors((current) => withoutMapKey(current, thread.id));
+    setHydratingThreadIds((current) => new Set(current).add(thread.id));
+    void Promise.resolve(threadStorage.loadThread(storageKey, thread.id))
+      .then((hydrated) => {
+        if (!hydrated) throw new Error("The selected Agent session no longer exists.");
+        setThreads((current) => {
+          const next = current.map((candidate) => candidate.id === thread.id ? hydrated : candidate);
+          threadsRef.current = next;
+          return next;
+        });
+        if (threadNeedsRecovery(hydrated)) {
+          setRecoveringIds((current) => new Set(current).add(thread.id));
+        }
+      })
+      .catch((error: unknown) => {
+        onStorageError?.(error);
+        setThreadHydrationErrors((current) => new Map(current).set(
+          thread.id,
+          error instanceof Error ? error.message : messages.recoveryFailed,
+        ));
+      })
+      .finally(() => setHydratingThreadIds((current) => withoutSetValue(current, thread.id)));
+  }, [messages.recoveryFailed, onStorageError, storageKey, threadStorage]);
+
+  useEffect(() => {
+    if (
+      !activeThread ||
+      activeThread.hydration !== "summary" ||
+      hydratingThreadIds.has(activeThread.id) ||
+      threadHydrationErrors.has(activeThread.id)
+    ) return;
+    hydrateThread(activeThread);
+  }, [activeThread, hydrateThread, hydratingThreadIds, threadHydrationErrors]);
+
   const activeSubagent = activeThread && activeSubagentSessionId
     ? findSubagentSession(activeThread.events, activeSubagentSessionId, locale)
     : undefined;
@@ -362,13 +518,23 @@ export function AgentWorkspace({
     const recoveredCursor = thread.session.streamIndex;
     const connection = createAgentSession(client, thread.preferences, { ...thread.session, streamIndex: recoveredCursor });
     const session = attachAgentSession(connection, connection.initialSession);
-    if (!session) return;
+    if (!session) {
+      recoveryStarted.current.delete(thread.id);
+      recoveryControllers.current.delete(thread.id);
+      setRecoveringIds((current) => withoutSetValue(current, thread.id));
+      return;
+    }
     let cursor = recoveredCursor;
     let events = [...thread.events];
     let checkedTailBoundary = false;
+    let needsBoundedCatchUp = true;
+    let reconnectAttempt = 0;
     let pendingTurn = thread.pendingTurn;
     let queuedTurns = thread.queuedTurns;
     let settled = false;
+    const currentClosedInputRequestIds = () => new Set(
+      threadsRef.current.find((candidate) => candidate.id === thread.id)?.closedInputRequestIds ?? thread.closedInputRequestIds,
+    );
 
     const refreshMailboxQueue = async () => {
       queuedTurns = threadsRef.current.find((candidate) => candidate.id === thread.id)?.queuedTurns ?? queuedTurns;
@@ -411,22 +577,30 @@ export function AgentWorkspace({
             settled = true;
             break;
           }
-
           let consumed = 0;
-          for await (const event of session.stream({ follow: false, signal: controller.signal, startIndex: cursor })) {
+          const follow = !needsBoundedCatchUp;
+          needsBoundedCatchUp = false;
+          for await (const event of session.stream({
+            follow,
+            signal: controller.signal,
+            startIndex: cursor,
+            ...(follow ? { streamReconnectPolicy: RECOVERY_STREAM_RECONNECT_POLICY } : {}),
+          })) {
             events = [...appendThreadEvent(events, event)];
             cursor += 1;
             consumed += 1;
             onEvent?.(event);
             if (event.type === "message.received") {
-              const wasPendingTurn = Boolean(pendingTurn);
-              pendingTurn = undefined;
-              if (!wasPendingTurn) {
-                const nextServerTurn = queuedTurns.find((turn) =>
-                  turn.delivery === "server" && turn.state === "queued" && Boolean(turn.mailboxItemId),
-                );
-                if (nextServerTurn) {
-                  queuedTurns = queuedTurns.filter((turn) => turn.id !== nextServerTurn.id);
+              const clientMessageId = event.data.clientMessageId;
+              if (clientMessageId) {
+                queuedTurns = queuedTurns.filter((turn) => turn.id !== clientMessageId);
+                if (pendingTurn?.id === clientMessageId) pendingTurn = undefined;
+              } else if (pendingTurn) {
+                pendingTurn = undefined;
+              } else {
+                const nextBrowserTurn = queuedTurns.find((turn) => turn.delivery !== "server");
+                if (nextBrowserTurn) {
+                  queuedTurns = queuedTurns.filter((turn) => turn.id !== nextBrowserTurn.id);
                 }
               }
             }
@@ -435,7 +609,7 @@ export function AgentWorkspace({
               pendingTurn,
               queuedTurns,
               session: { ...session.state, streamIndex: cursor },
-              status: statusFromEvents(events),
+              status: statusFromEvents(events, currentClosedInputRequestIds()),
             });
             if (isRecoveryBoundary(event)) {
               await refreshMailboxQueue();
@@ -443,7 +617,17 @@ export function AgentWorkspace({
               break;
             }
           }
-          if (!settled && consumed === 0 && !checkedTailBoundary && events.length > 0 && !isRecoveryBoundary(events.at(-1)!)) {
+          await refreshMailboxQueue();
+          // A tail lookup repairs a persisted cursor that already moved past a
+          // boundary missing from the UI history. It must only run after the
+          // ordered range at `cursor` proves empty; otherwise a settled tail
+          // would skip durable model/tool events that the UI has not seen yet.
+          if (
+            consumed === 0 &&
+            !checkedTailBoundary &&
+            events.length > 0 &&
+            !isRecoveryBoundary(events.at(-1)!)
+          ) {
             checkedTailBoundary = true;
             const missingBoundary = await readTailBoundary(session, controller.signal);
             if (missingBoundary) {
@@ -454,19 +638,25 @@ export function AgentWorkspace({
                 pendingTurn,
                 queuedTurns,
                 session: { ...session.state, streamIndex: cursor },
-                status: statusFromEvents(events),
+                status: statusFromEvents(events, currentClosedInputRequestIds()),
               });
               settled = missingBoundary.type !== "session.waiting" || !hasPendingServerQueue();
             }
           }
-          await refreshMailboxQueue();
           if (!settled && currentBoundarySettles()) settled = true;
+          reconnectAttempt = consumed > 0 ? 0 : reconnectAttempt + 1;
           setRecoveryErrors((current) => withoutMapKey(current, thread.id));
         } catch (error) {
           if (controller.signal.aborted || isAbortError(error)) return;
           if (!isRetryableRecoveryError(error)) throw error;
+          reconnectAttempt += 1;
         }
-        if (!settled && !controller.signal.aborted) await waitForRecoveryPoll(controller.signal);
+        if (reconnectAttempt > MAX_RECOVERY_RECONNECT_ATTEMPTS) {
+          throw new Error("The active Agent stream could not be reconnected after repeated transport failures.");
+        }
+        if (!settled && !controller.signal.aborted) {
+          await waitForRecoveryRetry(controller.signal, reconnectAttempt);
+        }
       }
       if (controller.signal.aborted) return;
       if (!settled) throw new Error("The active Agent stream ended before reaching a durable boundary.");
@@ -475,7 +665,7 @@ export function AgentWorkspace({
         pendingTurn,
         queuedTurns,
         session: { ...session.state, streamIndex: cursor },
-        status: statusFromEvents(events),
+        status: statusFromEvents(events, currentClosedInputRequestIds()),
       });
     } catch (error) {
       if (controller.signal.aborted || isAbortError(error)) return;
@@ -507,29 +697,39 @@ export function AgentWorkspace({
   }, [isHydrated, recoverThread, recoveringIds, threads]);
 
   const activeIsRecovering = activeThread ? recoveringIds.has(activeThread.id) : false;
-  const retryStorageSave = useCallback(() => {
-    setStorageIssue(false);
-    setThreads((current) => [...current]);
-  }, []);
-
+  const activeIsHydrating = activeThread?.hydration === "summary";
   if (!isHydrated || !activeThread) return <div className="flex h-dvh items-center justify-center bg-background text-muted-foreground">{messages.loading}</div>;
 
+  const workbenchFullscreen = desktopLayout && workbenchMode === "fullscreen";
+  const workbenchTransitioning = workbenchMode === "collapsing" || workbenchMode === "expanding";
+
   return (
-    <div className="open-agent-ui relative h-dvh overflow-hidden bg-sidebar text-foreground">
+    <div
+      className="open-agent-ui relative h-dvh overflow-hidden bg-sidebar text-foreground"
+      data-panel-resizing={panelResizing ? "true" : "false"}
+      data-workbench-fullscreen={workbenchFullscreen ? "true" : "false"}
+      data-workbench-mode={desktopLayout ? workbenchMode : "mobile"}
+    >
       {!desktopLayout ? <AgentSidebar activeThreadId={activeThread.id} brand={productName} deletingThreadIds={deletingThreadIds} hostFooter={hostSlots?.sidebarFooter} locale={locale} messages={messages} onClose={() => setSidebarOpen(false)} onDelete={deleteThread} onNew={createThread} onRename={renameThread} onSelect={selectThread} onSettings={() => setSettingsOpen(true)} open={sidebarOpen} threads={threads} variant="mobile" /> : null}
-      <ResizablePanelGroup className="h-full" orientation="horizontal">
+      <ResizablePanelGroup
+        className="h-full"
+        onLayoutChanged={handleDesktopLayoutChanged}
+        orientation="horizontal"
+      >
         {desktopLayout ? (
-          <ResizablePanel className="block" collapsedSize="0px" collapsible defaultSize="252px" id="agent-sidebar" maxSize="420px" minSize="220px" panelRef={sidebarPanelRef}>
+          <ResizablePanel className="block" collapsedSize="0px" collapsible data-sidebar-panel defaultSize={`${SIDEBAR_DEFAULT_WIDTH}px`} id="agent-sidebar" maxSize={`${SIDEBAR_MAX_WIDTH}px`} minSize={`${SIDEBAR_MIN_WIDTH}px`} onResize={handleSidebarResize} panelRef={sidebarPanelRef}>
             <AgentSidebar activeThreadId={activeThread.id} brand={productName} deletingThreadIds={deletingThreadIds} hostFooter={hostSlots?.sidebarFooter} locale={locale} messages={messages} onClose={() => setSidebarOpen(false)} onDelete={deleteThread} onNew={createThread} onRename={renameThread} onSelect={selectThread} onSettings={() => setSettingsOpen(true)} open={sidebarOpen} threads={threads} variant="desktop" />
           </ResizablePanel>
         ) : null}
-        {desktopLayout ? <ResizableHandle className="flex bg-transparent after:w-2" /> : null}
-        <ResizablePanel className="min-w-0" defaultSize="100%" id="agent-workbench" minSize="0px">
-      <section className="flex h-full min-w-0 flex-col overflow-hidden bg-card lg:mt-2 lg:rounded-tl-2xl lg:shadow-[-10px_-8px_32px_-18px_rgba(15,23,42,0.38)]" data-slot="agent-workbench">
+        {desktopLayout ? <ResizableHandle className="flex bg-transparent after:w-2" data-main-resize-handle disabled={workbenchMode !== "split"} onPointerDown={() => {
+          if (workbenchMode === "split") setPanelResizing(true);
+        }} /> : null}
+        <ResizablePanel className="min-w-0 p-0" data-workbench-panel defaultSize="100%" id="agent-workbench" minSize="0px">
+      <section className="flex h-full min-w-0 flex-col overflow-hidden bg-card" data-slot="agent-workbench">
         <header className="flex h-12 shrink-0 items-center justify-between border-b border-border/70 px-3 lg:h-13 lg:px-4">
           <div className="flex min-w-0 items-center gap-2">
             <Button aria-label={messages.openNavigation} className="lg:hidden" onClick={() => setSidebarOpen(true)} size="icon-sm" variant="ghost"><MenuIcon className="size-4" /></Button>
-            <Button aria-label={messages.toggleNavigation} className="hidden lg:inline-flex" onClick={() => setSidebarOpen((open) => !open)} size="icon-sm" variant="ghost">{sidebarOpen ? <PanelLeftCloseIcon className="size-4" /> : <PanelLeftIcon className="size-4" />}</Button>
+            <Button aria-label={messages.toggleNavigation} className="hidden lg:inline-flex" disabled={workbenchTransitioning} onClick={toggleDesktopSidebar} size="icon-sm" variant="ghost">{workbenchMode === "split" ? <PanelLeftCloseIcon className="size-4" /> : <PanelLeftIcon className="size-4" />}</Button>
             {activeSubagentSessionId ? (
               <Button aria-label={messages.backToTask} onClick={closeSubagent} size="icon-sm" variant="ghost">
                 <ArrowLeftIcon className="size-4" />
@@ -549,16 +749,6 @@ export function AgentWorkspace({
             {hostSlots?.threadHeaderEnd}
           </div>
         </header>
-        {storageIssue ? (
-          <div className="flex shrink-0 items-center gap-3 border-b border-destructive/30 bg-destructive/5 px-4 py-2.5 text-sm" role="alert">
-            <AlertCircleIcon className="size-4 shrink-0 text-destructive" />
-            <p className="min-w-0 flex-1 text-foreground">{messages.storageUnavailable}</p>
-            <Button onClick={retryStorageSave} size="sm" variant="outline">
-              <RotateCcwIcon className="size-4" />
-              {messages.retry}
-            </Button>
-          </div>
-        ) : null}
         {deletionIssue ? (
           <div className="flex shrink-0 items-center gap-3 border-b border-destructive/30 bg-destructive/5 px-4 py-2.5 text-sm" role="alert">
             <AlertCircleIcon className="size-4 shrink-0 text-destructive" />
@@ -572,7 +762,23 @@ export function AgentWorkspace({
             <p className="min-w-0 flex-1 text-foreground">{runtimeStatus.provider === "mock" ? messages.mockProvider : messages.providerUnconfigured}</p>
           </div>
         ) : null}
-        {activeSubagentSessionId ? (
+        {activeIsHydrating ? (
+          <main className="flex min-h-0 flex-1 items-center justify-center bg-background px-6">
+            {threadHydrationErrors.has(activeThread.id) ? (
+              <div className="max-w-md text-center" role="alert">
+                <AlertCircleIcon className="mx-auto size-5 text-destructive" />
+                <p className="mt-3 text-sm text-muted-foreground">
+                  {threadHydrationErrors.get(activeThread.id) ?? messages.recoveryFailed}
+                </p>
+                <Button className="mt-4" onClick={() => hydrateThread(activeThread)} size="sm" variant="outline">
+                  {messages.retry}
+                </Button>
+              </div>
+            ) : (
+              <p className="text-sm text-muted-foreground" role="status">{messages.loading}</p>
+            )}
+          </main>
+        ) : activeSubagentSessionId ? (
           activeSubagent ? (
             <AgentChildSessionView
               client={client}
@@ -585,16 +791,6 @@ export function AgentWorkspace({
           )
         ) : (
           <div className="flex min-h-0 flex-1 flex-col">
-            {recoveryErrors.get(activeThread.id) ? (
-              <div className="flex shrink-0 items-center gap-3 border-b border-destructive/30 bg-destructive/5 px-4 py-2.5 text-sm" role="alert">
-                <AlertCircleIcon className="size-4 shrink-0 text-destructive" />
-                <p className="min-w-0 flex-1 break-words text-foreground">{sanitizeAgentError(recoveryErrors.get(activeThread.id)!)}</p>
-                <Button onClick={() => requestThreadRecovery(activeThread.id)} size="sm" variant="outline">
-                  <RotateCcwIcon className="size-4" />
-                  {messages.retry}
-                </Button>
-              </div>
-            ) : null}
             <AgentThreadView
               client={client}
               commands={commands}
@@ -607,11 +803,14 @@ export function AgentWorkspace({
               mailbox={mailbox}
               mentions={mentions}
               models={models}
+              onCancelRecovery={() => cancelThreadRecovery(activeThread.id)}
               onChange={changeActiveThread}
               onEvent={onEvent}
               onOpenSubagent={openSubagent}
+              onRetryRecovery={() => requestThreadRecovery(activeThread.id)}
               onRecoveryNeeded={recoverActiveThread}
               providerReady={runtimeStatus.provider !== "unconfigured"}
+              recoveryError={recoveryErrors.get(activeThread.id)}
               reasoningLevels={reasoningLevels}
               thread={activeThread}
             />
@@ -620,8 +819,152 @@ export function AgentWorkspace({
       </section>
         </ResizablePanel>
       </ResizablePanelGroup>
+      {workbenchFullscreen ? (
+        <FloatingAgentSidebar
+          activeThreadId={activeThread.id}
+          brand={productName}
+          deletingThreadIds={deletingThreadIds}
+          hostFooter={hostSlots?.sidebarFooter}
+          locale={locale}
+          messages={messages}
+          onDelete={deleteThread}
+          onNew={createThread}
+          onRename={renameThread}
+          onSelect={selectThread}
+          onSettings={() => setSettingsOpen(true)}
+          threads={threads}
+        />
+      ) : null}
       <AgentSettingsDialog extensions={extensions} locale={locale} messages={messages} onLocaleChange={setLocale} onOpenChange={setSettingsOpen} open={settingsOpen} />
     </div>
+  );
+}
+
+function FloatingAgentSidebar({
+  activeThreadId,
+  brand,
+  deletingThreadIds,
+  hostFooter,
+  locale,
+  messages,
+  onDelete,
+  onNew,
+  onRename,
+  onSelect,
+  onSettings,
+  threads,
+}: {
+  readonly activeThreadId: string | undefined;
+  readonly brand: string;
+  readonly deletingThreadIds: ReadonlySet<string>;
+  readonly hostFooter?: React.ReactNode;
+  readonly locale: AgentLocale;
+  readonly messages: AgentMessages;
+  readonly onDelete: (threadId: string) => void;
+  readonly onNew: () => void;
+  readonly onRename: (threadId: string, title: string) => void;
+  readonly onSelect: (threadId: string) => void;
+  readonly onSettings: () => void;
+  readonly threads: readonly AgentThread[];
+}) {
+  const [open, setOpen] = useState(false);
+  const [resizing, setResizing] = useState(false);
+  const sidebarPanelRef = usePanelRef();
+
+  useEffect(() => {
+    if (!open) return;
+    const closeWhenPointerLeaves = (event: PointerEvent) => {
+      if (resizing) return;
+      const sidebarWidth = sidebarPanelRef.current?.getSize().inPixels ?? FLOATING_SIDEBAR_DEFAULT_WIDTH;
+      if (event.clientX > sidebarWidth + 8) setOpen(false);
+    };
+    window.addEventListener("pointermove", closeWhenPointerLeaves);
+    return () => window.removeEventListener("pointermove", closeWhenPointerLeaves);
+  }, [open, resizing, sidebarPanelRef]);
+
+  return (
+    <>
+      {!open ? (
+        <div
+          aria-hidden
+          className="fixed inset-y-0 left-0 z-50 w-3"
+          data-floating-sidebar-trigger
+          onMouseEnter={() => setOpen(true)}
+        />
+      ) : null}
+      <div
+        className="fixed inset-y-0 left-0 z-40"
+        data-floating-sidebar
+        data-open={open ? "true" : "false"}
+        data-resizing={resizing ? "true" : "false"}
+        onFocusCapture={() => setOpen(true)}
+      >
+      <ResizablePanelGroup
+        className="h-full w-[min(420px,100vw)] pointer-events-none"
+        data-floating-sidebar-group
+        orientation="horizontal"
+      >
+        <ResizablePanel
+          className="block min-w-0 pointer-events-auto"
+          data-floating-sidebar-panel
+          defaultSize={`${FLOATING_SIDEBAR_DEFAULT_WIDTH}px`}
+          id="floating-agent-sidebar"
+          maxSize={`${SIDEBAR_MAX_WIDTH}px`}
+          minSize={`${SIDEBAR_MIN_WIDTH}px`}
+          panelRef={sidebarPanelRef}
+        >
+          <div
+            className="h-full min-w-0"
+            onMouseEnter={() => setOpen(true)}
+          >
+            <AgentSidebar
+              activeThreadId={activeThreadId}
+              brand={brand}
+              deletingThreadIds={deletingThreadIds}
+              hostFooter={hostFooter}
+              locale={locale}
+              messages={messages}
+              onClose={() => setOpen(false)}
+              onDelete={onDelete}
+              onNew={() => {
+                onNew();
+                setOpen(false);
+              }}
+              onRename={onRename}
+              onSelect={(threadId) => {
+                onSelect(threadId);
+                setOpen(false);
+              }}
+              onSettings={() => {
+                onSettings();
+                setOpen(false);
+              }}
+              open={open}
+              threads={threads}
+              variant="floating"
+            />
+          </div>
+        </ResizablePanel>
+        <ResizableHandle
+          className="pointer-events-auto flex bg-transparent after:w-2"
+          data-floating-sidebar-handle
+          onPointerDown={() => {
+            setOpen(true);
+            setResizing(true);
+          }}
+          onPointerUp={() => setResizing(false)}
+        />
+        <ResizablePanel
+          aria-hidden
+          className="pointer-events-none min-w-0 bg-transparent"
+          data-floating-sidebar-spacer
+          defaultSize={`${SIDEBAR_MAX_WIDTH - FLOATING_SIDEBAR_DEFAULT_WIDTH}px`}
+          id="floating-agent-sidebar-spacer"
+          minSize="0px"
+        />
+      </ResizablePanelGroup>
+      </div>
+    </>
   );
 }
 
@@ -664,8 +1007,23 @@ function UnavailableSubagentView({
   );
 }
 
-const RECOVERY_POLL_INTERVAL_MS = 1_500;
 const RECOVERY_TAIL_LOOKUP_TIMEOUT_MS = 1_500;
+const MAX_RECOVERY_RECONNECT_ATTEMPTS = 6;
+const RECOVERY_RETRY_BASE_DELAY_MS = 750;
+const RECOVERY_RETRY_MAX_DELAY_MS = 15_000;
+const RECOVERY_STREAM_RECONNECT_POLICY = {
+  retryableErrorStatuses: [404, 409, 425, 429, 500, 502, 503, 504],
+  streamIdleReconnectPolicy: {
+    baseDelayMs: 750,
+    maxAttempts: 8,
+    maxDelayMs: 15_000,
+  },
+  streamOpenReconnectPolicy: {
+    baseDelayMs: 500,
+    maxAttempts: 8,
+    maxDelayMs: 15_000,
+  },
+} as const;
 
 async function readTailBoundary(
   session: ClientSession,
@@ -692,7 +1050,7 @@ async function readTailBoundary(
   return undefined;
 }
 
-function waitForRecoveryPoll(signal: AbortSignal): Promise<void> {
+function waitForRecoveryRetry(signal: AbortSignal, attempt: number): Promise<void> {
   if (signal.aborted) return Promise.resolve();
   return new Promise((resolve) => {
     const finish = () => {
@@ -700,7 +1058,11 @@ function waitForRecoveryPoll(signal: AbortSignal): Promise<void> {
       signal.removeEventListener("abort", finish);
       resolve();
     };
-    const timeout = window.setTimeout(finish, RECOVERY_POLL_INTERVAL_MS);
+    const delay = Math.min(
+      RECOVERY_RETRY_MAX_DELAY_MS,
+      RECOVERY_RETRY_BASE_DELAY_MS * 2 ** Math.max(0, attempt - 1),
+    );
+    const timeout = window.setTimeout(finish, delay);
     signal.addEventListener("abort", finish, { once: true });
   });
 }
@@ -709,14 +1071,17 @@ function isRecoveryBoundary(event: MessageStreamEvent): boolean {
   return event.type === "session.waiting" || event.type === "session.completed" || event.type === "session.failed";
 }
 
-function statusFromEvents(events: readonly MessageStreamEvent[]): AgentThread["status"] {
+function statusFromEvents(
+  events: readonly MessageStreamEvent[],
+  closedInputRequestIds: ReadonlySet<string> = new Set(),
+): AgentThread["status"] {
   const last = events.at(-1);
   if (!last) return "ready";
   if (last.type === "session.failed") return "error";
   const latestTurnBoundary = [...events].reverse().find((event) => event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled");
   if (latestTurnBoundary?.type === "turn.failed") return "error";
   if (last.type === "session.waiting") {
-    return hasUnresolvedInputRequests(events) ? "waiting" : "ready";
+    return hasUnresolvedInputRequests(events, closedInputRequestIds) ? "waiting" : "ready";
   }
   if (last.type === "session.completed") return "ready";
   if (last.type === "turn.started" || last.type === "step.started" || last.type === "message.appended" || last.type === "reasoning.appended") return "streaming";
@@ -786,10 +1151,17 @@ function withoutMapKey<K, V>(source: Map<K, V>, key: K): Map<K, V> {
 }
 
 function threadNeedsRecovery(thread: AgentThread): boolean {
+  if (thread.hydration === "summary") return false;
   if (!thread.session.sessionId) return false;
   if (thread.queuedTurns.some((turn) =>
     turn.delivery === "server" && turn.state === "queued" && Boolean(turn.mailboxItemId)
   )) return true;
+  const pendingTurnInFlight = thread.pendingTurn?.state === "clearing" ||
+    thread.pendingTurn?.state === "resubmitting" ||
+    thread.pendingTurn?.state === "submitting";
+  if (!pendingTurnInFlight && thread.status !== "streaming" && thread.status !== "submitted") {
+    return false;
+  }
   const lastEvent = thread.events.at(-1);
   return !lastEvent || !isRecoveryBoundary(lastEvent);
 }
@@ -890,7 +1262,77 @@ function sameThreadCollection(
     });
 }
 
+function isUrgentPersistenceChange(
+  previous: AgentThreadCollection | undefined,
+  next: AgentThreadCollection,
+): boolean {
+  if (!previous || previous.activeThreadId !== next.activeThreadId) return true;
+  if (previous.threads.length !== next.threads.length) return true;
+  const previousThreads = new Map(previous.threads.map((thread) => [thread.id, thread]));
+  for (const thread of next.threads) {
+    const prior = previousThreads.get(thread.id);
+    if (!prior) return true;
+    if (
+      prior.title !== thread.title ||
+      prior.revision !== thread.revision ||
+      prior.session.sessionId !== thread.session.sessionId ||
+      prior.preferences.executionMode !== thread.preferences.executionMode ||
+      prior.preferences.modelId !== thread.preferences.modelId ||
+      prior.preferences.reasoning !== thread.preferences.reasoning ||
+      !samePendingTurn(prior.pendingTurn, thread.pendingTurn) ||
+      !sameQueuedTurns(prior.queuedTurns, thread.queuedTurns) ||
+      !sameStringList(prior.closedInputRequestIds, thread.closedInputRequestIds) ||
+      !sameStringList(prior.retainedContext ?? [], thread.retainedContext ?? [])
+    ) return true;
+    if (
+      prior.status !== thread.status &&
+      (thread.status === "error" || thread.status === "ready" || thread.status === "waiting")
+    ) return true;
+    const lastEvent = thread.events.at(-1);
+    const priorLastEvent = prior.events.at(-1);
+    if (
+      lastEvent?.meta.id !== priorLastEvent?.meta.id &&
+      lastEvent && isUrgentPersistenceEvent(lastEvent)
+    ) return true;
+  }
+  return false;
+}
+
+function samePendingTurn(
+  left: AgentThread["pendingTurn"],
+  right: AgentThread["pendingTurn"],
+): boolean {
+  if (!left || !right) return left === right;
+  return left.id === right.id &&
+    left.state === right.state &&
+    left.submittedAt === right.submittedAt &&
+    left.text === right.text &&
+    JSON.stringify(left.files ?? []) === JSON.stringify(right.files ?? []);
+}
+
+function sameStringList(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function isUrgentPersistenceEvent(event: MessageStreamEvent): boolean {
+  return event.type === "authorization.completed" ||
+    event.type === "authorization.required" ||
+    event.type === "compaction.completed" ||
+    event.type === "input.requested" ||
+    event.type === "message.received" ||
+    event.type === "session.completed" ||
+    event.type === "session.failed" ||
+    event.type === "session.waiting" ||
+    event.type === "turn.cancelled" ||
+    event.type === "turn.completed" ||
+    event.type === "turn.failed";
+}
+
 function loadLocale(storageKey: string): AgentLocale {
   const stored = window.localStorage.getItem(`${storageKey}:locale`);
   return stored === "en" || stored === "zh-CN" ? stored : resolveBrowserLocale();
+}
+
+function clamp(value: number, minimum: number, maximum: number): number {
+  return Math.min(maximum, Math.max(minimum, value));
 }

@@ -206,17 +206,8 @@ function filePart(part: Extract<EveMessagePart, { type: "file" }>): FileMessageP
 }
 
 function userContent(parts: readonly EveMessagePart[]): readonly ThreadUserMessagePart[] {
-  const content: ThreadUserMessagePart[] = [];
-  for (const part of parts) {
-    if (part.type === "text") {
-      content.push({ text: part.text, type: "text" });
-      continue;
-    }
-    if (part.type === "file") {
-      const file = filePart(part);
-      if (file) content.push(file);
-    }
-  }
+  const content = parts.flatMap((part) =>
+    part.type === "text" ? [{ text: part.text, type: "text" as const }] : []);
   return content.length > 0 ? content : [{ text: "", type: "text" }];
 }
 
@@ -227,9 +218,7 @@ function userAttachments(parts: readonly EveMessagePart[]): CompleteAttachment[]
     if (!file) return [];
     const image = file.mimeType.startsWith("image/");
     return [{
-      content: [image
-        ? { image: file.data, ...(part.filename ? { filename: part.filename } : {}), type: "image" as const }
-        : file],
+      content: [file],
       contentType: file.mimeType,
       id: String(index),
       name: part.filename ?? "file",

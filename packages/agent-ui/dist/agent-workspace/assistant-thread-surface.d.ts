@@ -1,34 +1,42 @@
 import type { MessageStreamEvent } from "eve/client";
 import type { EveMessage } from "eve/react";
+import { type ReactNode } from "react";
 import { type AgentInputResponse } from "./agent-message.js";
 import type { AgentModelOption, AgentPromptMenuItem, AgentThreadPreferences } from "./contracts.js";
 import type { AgentLocale, AgentMessages } from "./i18n.js";
 import type { AgentUsageSummary } from "./usage.js";
 export type AgentCancellationState = "idle" | "requested" | "cancelling";
-export declare function AssistantThreadSurface({ cancellationState, commands, draftStorageKey, events, eveMessages, fallbackStartedAt, isBusy, locale, mentions, messages, models, onInputResponses, onOpenSubagent, onPreferencesChange, pendingTurnText, preferences, quietActivity, reasoningLevels, usage, }: {
+export declare function AssistantThreadSurface({ cancellationRevision, cancellationState, closedInputRequestIds, commands, composerTop, draftStorageKey, events, eveMessages, fallbackStartedAt, inputDisabled, isBusy, locale, mentions, messages, models, onInputResponses, onCloseInputRequest, onOpenSubagent, onPreferencesChange, onRetryRuntimeError, preferences, reasoningLevels, runtimeError, usage, }: {
+    readonly cancellationRevision: number;
     readonly cancellationState: AgentCancellationState;
+    readonly closedInputRequestIds: ReadonlySet<string>;
     readonly commands: readonly AgentPromptMenuItem[];
+    readonly composerTop?: ReactNode;
     readonly draftStorageKey: string;
     readonly events: readonly MessageStreamEvent[];
     readonly eveMessages: readonly EveMessage[];
     readonly fallbackStartedAt?: number;
+    readonly inputDisabled?: boolean;
     readonly isBusy: boolean;
     readonly locale: AgentLocale;
     readonly mentions: readonly AgentPromptMenuItem[];
     readonly messages: AgentMessages;
     readonly models: readonly AgentModelOption[];
     readonly onInputResponses: (responses: readonly AgentInputResponse[]) => void | Promise<void>;
+    readonly onCloseInputRequest: (requestId: string) => void;
     readonly onOpenSubagent?: (sessionId: string) => void;
     readonly onPreferencesChange: (preferences: AgentThreadPreferences) => void;
-    readonly pendingTurnText?: string;
+    readonly onRetryRuntimeError?: () => void;
     readonly preferences: AgentThreadPreferences;
-    readonly quietActivity: boolean;
     readonly reasoningLevels: readonly string[];
+    readonly runtimeError?: string;
     readonly usage: AgentUsageSummary;
 }): import("react/jsx-runtime").JSX.Element;
-export declare function AssistantComposer({ cancellationState, commands, draftStorageKey, inputDisabled, locale, mentions, messages, models, onPreferencesChange, preferences, reasoningLevels, usage, }: {
+export declare function AssistantComposer({ cancellationRevision, cancellationState, commands, composerTop, draftStorageKey, inputDisabled, locale, mentions, messages, models, onPreferencesChange, preferences, reasoningLevels, usage, }: {
+    readonly cancellationRevision: number;
     readonly cancellationState: AgentCancellationState;
     readonly commands: readonly AgentPromptMenuItem[];
+    readonly composerTop?: ReactNode;
     readonly draftStorageKey: string;
     readonly inputDisabled?: boolean;
     readonly locale: AgentLocale;

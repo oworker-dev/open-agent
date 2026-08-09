@@ -349,7 +349,7 @@ function cancellationGraceRemaining(
 
 function cancellationGraceMs(): number {
   const value = process.env.AGENT_RUN_CANCELLATION_GRACE_MS?.trim();
-  if (!value) return 1_000;
+  if (!value) return 100;
   const milliseconds = Number(value);
   if (!Number.isInteger(milliseconds) || milliseconds < 100 || milliseconds > 10_000) {
     throw new Error("AGENT_RUN_CANCELLATION_GRACE_MS must be an integer from 100 to 10000.");

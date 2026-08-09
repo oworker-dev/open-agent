@@ -86,3 +86,59 @@ test("hydrates queued follow-ups from the v2 collection without accepting malfor
     { id: "queued-1", state: "queued", submittedAt: 2, text: "Continue" },
   ]);
 });
+
+test("hydrates bounded retained context used after an edited turn", () => {
+  const collection = parseThreadCollection({
+    threads: [{
+      createdAt: 1,
+      events: [],
+      id: "thread-context",
+      preferences: { modelId: "model", reasoning: "medium" },
+      retainedContext: ["User: Keep the original architecture", "Assistant: The architecture is retained."],
+      session: { streamIndex: 0 },
+      status: "ready",
+      title: "Context",
+      updatedAt: 1,
+    }],
+    version: 2,
+  });
+
+  assert.deepEqual(collection.threads[0]?.retainedContext, [
+    "User: Keep the original architecture",
+    "Assistant: The architecture is retained.",
+  ]);
+});
+
+test("preserves validated attachments for a durable edited-turn retry", () => {
+  const collection = parseThreadCollection({
+    threads: [{
+      createdAt: 1,
+      events: [],
+      id: "thread-edit-attachment",
+      pendingTurn: {
+        files: [
+          { filename: "reference.png", mediaType: "image/png", url: "data:image/png;base64,AA==" },
+          { filename: "invalid.png", mediaType: "image/png" },
+        ],
+        id: "pending-edit",
+        state: "resubmitting",
+        submittedAt: 2,
+        text: "",
+      },
+      preferences: { modelId: "model", reasoning: "medium" },
+      session: { sessionId: "session-edit", streamIndex: 0 },
+      status: "submitted",
+      title: "Attachment edit",
+      updatedAt: 1,
+    }],
+    version: 2,
+  });
+
+  assert.deepEqual(collection.threads[0]?.pendingTurn, {
+    files: [{ filename: "reference.png", mediaType: "image/png", url: "data:image/png;base64,AA==" }],
+    id: "pending-edit",
+    state: "resubmitting",
+    submittedAt: 2,
+    text: "",
+  });
+});

@@ -49,8 +49,8 @@ export function bashApprovalDecision(input: {
     input.executionMode === "cautious"
     || input.mode === "always"
     || (input.mode === "risky"
-      && risk !== "none"
-      && !(input.executionMode === "automation" && risk === "sandbox-local"));
+      && risk === "external-side-effect"
+      && input.executionMode !== "automation");
   if (!requiresApproval) return "not-applicable";
   if (input.actorType === "service" || input.principalType === "runtime") {
     return {

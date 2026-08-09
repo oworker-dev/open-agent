@@ -21,11 +21,34 @@ export type AgentTurnPresentation = {
     readonly processParts: readonly EveMessagePart[];
     readonly startedAt?: number;
     readonly status: AgentTurnStatus;
+    readonly waitingFor?: InputRequest["kind"];
 };
-export declare function presentAgentTurn(message: EveMessage, events: readonly MessageStreamEvent[]): AgentTurnPresentation | undefined;
+export type AgentTurnFailure = {
+    readonly code: string;
+    readonly message: string;
+};
+export type AgentStepPresentation = {
+    readonly endedAt?: number;
+    readonly retry?: {
+        readonly attempt: number;
+        readonly error?: AgentTurnFailure;
+        readonly maximum: number;
+    };
+    readonly startedAt?: number;
+    readonly status: "completed" | "failed" | "running";
+};
+export type AgentDisplayProjection = {
+    readonly events: readonly MessageStreamEvent[];
+    readonly messages: readonly EveMessage[];
+};
+export declare function projectAgentDisplayTimeline(messages: readonly EveMessage[], events: readonly MessageStreamEvent[]): AgentDisplayProjection;
+export declare function presentAgentStep(events: readonly MessageStreamEvent[], turnId: string | undefined, stepIndex: number): AgentStepPresentation;
+export declare function presentAgentTurn(message: EveMessage, events: readonly MessageStreamEvent[], closedInputRequestIds?: ReadonlySet<string>): AgentTurnPresentation | undefined;
 export declare function isProxiedInputOnlyMessage(message: EveMessage, events: readonly MessageStreamEvent[]): boolean;
-export declare function unresolvedInputRequests(events: readonly MessageStreamEvent[]): readonly InputRequest[];
-export declare function hasUnresolvedInputRequests(events: readonly MessageStreamEvent[]): boolean;
+export declare function unresolvedInputRequests(events: readonly MessageStreamEvent[], closedInputRequestIds?: ReadonlySet<string>): readonly InputRequest[];
+export declare function hasUnresolvedInputRequests(events: readonly MessageStreamEvent[], closedInputRequestIds?: ReadonlySet<string>): boolean;
+export declare function hasSettledLatestTurn(events: readonly MessageStreamEvent[]): boolean;
+export declare function failureForTurn(events: readonly MessageStreamEvent[], turnId: string | undefined): AgentTurnFailure | undefined;
 export declare function eventsBeforeLastUserTurn(events: readonly MessageStreamEvent[]): readonly MessageStreamEvent[];
 export declare function presentSubagentCall(events: readonly MessageStreamEvent[], callId: string): SubagentCallPresentation;
 export declare function presentSubagentSessions(events: readonly MessageStreamEvent[]): readonly SubagentSessionPresentation[];

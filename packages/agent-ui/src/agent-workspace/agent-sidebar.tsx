@@ -53,7 +53,7 @@ export function AgentSidebar({
   readonly onSettings: () => void;
   readonly open: boolean;
   readonly threads: readonly AgentThread[];
-  readonly variant?: "desktop" | "mobile";
+  readonly variant?: "desktop" | "floating" | "mobile";
 }) {
   const [searchOpen, setSearchOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -88,8 +88,8 @@ export function AgentSidebar({
     <AssistantRuntimeProvider runtime={listRuntime}>
       {variant === "mobile" ? <div className={cn("fixed inset-0 z-30 bg-black/20 backdrop-blur-[1px] lg:hidden", open ? "block" : "hidden")} onClick={onClose} /> : null}
       <aside aria-label={messages.threads} className={cn(
-        "overflow-hidden bg-sidebar text-sidebar-foreground",
-        variant === "desktop"
+        "overflow-hidden border-0 bg-sidebar text-sidebar-foreground",
+        variant === "desktop" || variant === "floating"
           ? "h-full w-full"
           : "fixed inset-y-0 left-0 z-40 w-[min(84vw,320px)] shadow-xl transition-transform duration-200 lg:hidden",
         variant === "mobile" && (open ? "translate-x-0" : "-translate-x-full"),
@@ -180,7 +180,7 @@ function SidebarThreadItems({
                 <ThreadListItemPrimitive.Root
                   className={cn(
                     "group relative flex min-h-9 items-center gap-0.5 rounded-md transition-colors hover:bg-foreground/[0.045]",
-                    thread.id === activeThreadId && "bg-background text-foreground hover:bg-background",
+                    thread.id === activeThreadId && "bg-foreground/[0.045] text-foreground",
                   )}
                 >
                   {editingThreadId === thread.id ? (

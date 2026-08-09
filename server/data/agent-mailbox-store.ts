@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isBoundedAgentClientContext } from "@oworker/open-agent-contracts/client-context";
 import type { Pool, PoolClient } from "pg";
 import {
   getAgentDatabasePool,
@@ -18,6 +19,7 @@ export type AgentMailboxStatus =
   | "submission-ambiguous";
 
 export type AgentMailboxPayload = {
+  readonly clientContext?: readonly string[];
   readonly message: string;
   readonly preferences?: {
     readonly executionMode: "automation" | "cautious" | "standard";
@@ -474,6 +476,9 @@ function assertOwner(owner: AgentSessionOwner): void {
 
 function assertPayload(payload: AgentMailboxPayload): void {
   assertText(payload.message, "payload.message", 65_536);
+  if (payload.clientContext && !isBoundedAgentClientContext(payload.clientContext)) {
+    throw new Error("payload.clientContext exceeds the 20k-token transport budget.");
+  }
   if (payload.preferences) {
     assertText(payload.preferences.modelId, "payload.preferences.modelId", 200);
     assertText(payload.preferences.reasoning, "payload.preferences.reasoning", 100);

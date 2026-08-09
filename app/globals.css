@@ -111,9 +111,3 @@ body {
   background: var(--background);
   font-family: var(--font-sans);
 }
-
-button,
-input,
-textarea {
-  font: inherit;
-}

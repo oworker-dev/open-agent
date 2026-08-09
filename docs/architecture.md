@@ -49,40 +49,84 @@ Do not use user-wide or canvas-wide state as the implicit Agent history.
 Eve exposes one stable `sessionId` handle for messages, controls, and the durable
 event stream. No operation follows or replaces that identity implicitly.
 
-`turn.completed` is not a safe continuation boundary. A client may submit the
-next turn only after `session.waiting`. Terminal alternatives are
-`session.completed` and `session.failed`.
+`turn.completed` is not a safe boundary for an ordinary next turn. A normal
+follow-up starts only after `session.waiting`; terminal alternatives are
+`session.completed` and `session.failed`. Active-turn steering is a separate
+operation: it targets an already durable `turnId` and becomes user input inside
+that same turn at a model-step boundary rather than opening a second turn.
 
 The authoritative browser cursor is `session.streamIndex`, the absolute number
 of consumed server events. It is deliberately independent from the UI event
 snapshot: cumulative `message.appended` and `reasoning.appended` deltas are
 compacted to their latest projection so long conversations do not grow
 quadratically in browser storage. During an active request, the workspace
-advances the absolute cursor for every consumed event and persists an accepted
-`sessionId` before replacing an idle browser stream. Recovery uses bounded
-`session.stream({ follow: false })` reads to catch up to each durable tail until
-it observes a session boundary. If a previous browser persisted the absolute
-cursor but missed the final UI event, a tail-relative lookup repairs only that
-missing boundary without replaying the turn or advancing the absolute cursor.
+advances the absolute cursor for every consumed event and promptly persists an
+accepted `sessionId`. Normal turns use one Eve-managed live stream; Eve owns its
+transport backoff. Recovery first performs one bounded ordered catch-up from the
+persisted cursor so it cannot skip durable model or tool events. Only when that
+range is empty may one tail-relative lookup repair a previous browser that
+persisted a cursor past a missing final UI boundary. If the session is still
+active, recovery then attaches one live following stream from the resulting
+cursor. Browser supervision measures the last event React actually observed;
+a half-open transport is replaced from that cursor, not from a reader-local
+index that the UI may never have rendered.
+
+Stopping is two-phase. The browser immediately detaches its local stream and
+keeps an unadmitted optimistic user message as an editable `interrupted` row.
+It also posts Eve's cooperative session cancellation and consumes the durable
+`turn.cancelled` then `session.waiting` boundary. Recovery streams are aborted
+before the cancellation consumer attaches, so one session never accumulates
+competing stream readers.
+
+Eve remains the source of truth for normal conversation history and automatic
+compaction. The browser adds a recovery checkpoint only because Eve excludes an
+unsettled cancelled turn from the next model history. That checkpoint follows
+the same budget shape as Codex: the default GPT-5.6 model window is 272k tokens,
+automatic compaction starts at 90%, recent recovery context is capped at 20k
+approximate tokens, and one tool observation at 10k. Smaller Host models scale
+the recovery allowance down with their declared context window. Tool reducers
+retain actionable state instead of blindly slicing JSON: Shell keeps the exact
+command, exit status, and output tail; file writes keep the path and payload
+statistics so the Agent re-reads authoritative workspace state; file reads,
+searches, and Web fetches keep their source metadata and bounded observations.
+Oversized observations preserve both head and tail with an omission marker.
+The full durable event remains stored separately and is never replaced by this
+model-facing checkpoint.
 
 The reference app stores thread data in `localStorage` through the default
 `AgentThreadStorage`. That is a UX cache, not production persistence. Hosts can
-inject an authenticated database adapter without forking the workspace; writes
-are serialized and retain the same versioned `{ events, session }` snapshot
-contract. The bundled PostgreSQL adapter scopes every collection by verified
-`tenantId + principalId + storageKey`, increments a server revision, and requires
-`If-Match` on replacement. Conflicts are surfaced as `409`; the Web workspace
-blocks further writes and displays a reload action instead of silently merging
-or overwriting another client's state.
+inject an authenticated database adapter without forking the workspace. The
+bundled PostgreSQL adapter scopes every collection by verified
+`tenantId + principalId + storageKey`. Its first response contains lightweight
+thread metadata plus only the URL-selected transcript; selecting another thread
+hydrates that transcript on demand. Writes are serialized `PATCH` requests that
+carry changed threads and deleted IDs rather than every conversation history.
+Pending messages, accepted session IDs, input pauses, errors, and turn/session
+boundaries are persisted promptly; streaming-only deltas use a periodic
+checkpoint because Eve can replay their absolute cursor after refresh. Every
+patch requires `If-Match`; a `409` reloads the current index, merges by thread
+revision/update time, and retries at most three times instead of overwriting a
+newer client indefinitely.
 
 ### Follow-up mailbox
 
 Eve accepts ID-addressed follow-ups but does not provide the product-level FIFO,
 client idempotency, and delivery audit required by a multi-client Web product.
-The Web client therefore uses an application-owned `agent_mailbox_items` table
-when a host provides `AgentWorkspaceMailbox`. A follow-up is accepted by the Web
-API with a stable `clientMessageId`, then a separate mailbox worker leases and
-delivers it only after the Eve session reports `session.waiting`.
+The published Eve 0.31.1 API also does not expose Open Agent's same-turn Web
+steering contract. Open Agent therefore carries a reproducible `patch-package`
+patch and uses an application-owned `agent_mailbox_items` table when a host
+provides `AgentWorkspaceMailbox`. A follow-up is accepted by the Web API with a
+stable `clientMessageId`, then a separate mailbox worker leases one item and
+inspects the current durable session boundary.
+
+When the session is running and has published a `turnId`, delivery includes
+`expectedTurnId`. The Eve driver performs a non-blocking steering poll after a
+completed model step and before the next one, emits the accepted input as a
+durable `message.received` inside the same turn, and continues with the updated
+history. A waiting session receives an ordinary next-turn delivery. If the
+expected turn settles in the admission race, the driver strips the stale
+steering precondition and queues the payload as a normal next turn, so user
+input is never discarded merely because a boundary moved.
 
 The mailbox is strictly ordered per session. A later item cannot be leased while
 an earlier item is queued, delivering, accepted, failed, or
@@ -104,8 +148,9 @@ persistent database failure still fails closed and leaves the item blocking
 FIFO instead of guessing. The hook is bookkeeping for delivery certainty, not a
 replacement for Eve's model loop.
 
-The browser removes one queued item only when the corresponding future
-`message.received` arrives. Refresh, a closed tab, or a second browser observes
+The browser removes one queued item only when `message.received` carries its
+exact `clientMessageId`. This keeps multiple steered messages distinct and
+preserves strict FIFO across refreshes. A closed tab or a second browser observes
 the same server queue and cannot submit another Eve message directly. Without a
 mailbox, the SDK sends directly to the stable session ID; that mode is intended
 for the standalone single-client product and does not claim server-side queue
@@ -219,7 +264,9 @@ history must never become the source of truth.
 Model catalog, credentials, context windows, pricing, and availability must move
 to a host-controlled model registry. The standalone kernel should consume a
 validated model capability descriptor rather than import Muses administration
-code.
+code. The standalone fallback catalog mirrors Codex's current GPT-5.6 Sol and
+Terra context specification (272k); an authenticated Host snapshot can replace
+that catalog for a Provider with different limits.
 
 ## Sandbox boundary
 
@@ -474,26 +521,29 @@ pretending that unavailable child events were observed.
 Eve 0.31.1 owns parent waiting, recursive cancellation, child task results, and
 durable child sessions. Open Agent enables its persistent-subagent option, so a
 parked child keeps a stable `agentId` and the parent can continue it on a later
-model step. The public client still does not expose the Codex App Server
-equivalents of `turn/steer` or `thread/inject_items`, detached/no-wait child
-execution, injection into a busy child, or a public close/archive lifecycle.
-Those are supervisor protocol capabilities, not presentation controls. Open
-Agent keeps Eve's native loop intact and must not simulate them with browser
+model step. Open Agent's patched root-session protocol now provides the useful
+Codex `turn/steer` equivalent without cancelling the current model step: Web
+messages enter at the next safe model boundary. It does not yet expose general
+`thread/inject_items`, detached/no-wait child execution, injection into a busy
+child, or a public close/archive lifecycle. Those remain supervisor protocol
+capabilities, not presentation controls, and must not be simulated with browser
 state.
 
 Browser recovery is evidence-driven. A live stream with no new events may mean
-either a slow Provider or a stale transport, so the client periodically probes
-the durable stream tail without changing the visible run state. It enters the
-bounded catch-up path only when the probe finds missing events. Provider retry
-remains owned by Eve; UI elapsed-time messages describe waiting and durability
-without claiming an unobserved retry attempt.
+either a slow Provider or a stale transport. The UI supervises its observed-event
+timestamp, replaces a half-open stream when that timestamp expires, performs a
+bounded ordered catch-up from the observed cursor, and resumes live following.
+It never skips directly to the tail when the ordered range contains events.
+Provider retry remains owned by Eve; UI elapsed-time messages describe waiting
+and durability without claiming an unobserved retry attempt.
 
-Recovery also polls the server mailbox while following durable stream boundaries.
-It keeps waiting across successive `session.waiting` events until the queued
-server items are consumed, while definitive delivery failures remain retryable
-and ambiguous admissions remain visible for operator resolution. The current
-contract intentionally delivers at the next Eve boundary; it does not replace
-Eve's native loop with same-turn steering or conversation branching.
+Recovery also inspects the server mailbox while following durable stream
+boundaries. It stays attached while queued server items are admitted, whether
+they enter the active turn through steering or start after `session.waiting`.
+Definitive delivery failures remain retryable and ambiguous admissions remain
+visible for operator resolution. This extends Eve's durable driver with a small
+turn-boundary input lane; it does not branch conversations or replace the Eve
+model loop.
 
 ## Release gates
 

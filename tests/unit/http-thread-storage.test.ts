@@ -8,6 +8,7 @@ import {
 import {
   AGENT_THREAD_STORAGE_VERSION,
   createAgentThread,
+  type AgentThreadCollection,
 } from "@oworker/open-agent-ui/agent-workspace";
 
 test("persists a loaded collection and advances its optimistic revision", async () => {
@@ -64,15 +65,44 @@ test("supports same-origin cookie authentication without an authorization header
   assert.equal(authorization, null);
 });
 
+test("loads a lightweight thread index before fetching one transcript", async () => {
+  const thread = createAgentThread(100, "Lazy thread");
+  const requestedUrls: string[] = [];
+  const storage = createHttpAgentThreadStorage({
+    fetch: (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      requestedUrls.push(url);
+      const search = new URL(url, "http://agent.test").searchParams;
+      if (search.get("view") === "index") {
+        return Response.json({
+          collection: {
+            threads: [{ ...thread, events: [], hydration: "summary" }],
+            version: AGENT_THREAD_STORAGE_VERSION,
+          },
+          revision: 4,
+        });
+      }
+      return Response.json({ revision: 4, thread });
+    }) as typeof fetch,
+  });
+
+  const index = await storage.load("workspace-lazy");
+  assert.equal(index.threads[0]?.hydration, "summary");
+  const hydrated = await storage.loadThread?.("workspace-lazy", thread.id);
+  assert.equal(hydrated?.title, "Lazy thread");
+  assert.match(requestedUrls[0] ?? "", /view=index/);
+  assert.match(requestedUrls[1] ?? "", new RegExp(`threadId=${thread.id}`));
+});
+
 function fakeThreadServer() {
   let revision = 0;
-  let collection = { threads: [], version: AGENT_THREAD_STORAGE_VERSION } as const;
+  let collection: AgentThreadCollection = { threads: [], version: AGENT_THREAD_STORAGE_VERSION };
 
   return {
     collection: () => collection as { readonly threads: readonly ReturnType<typeof createAgentThread>[] },
     fetch: (async (_input: RequestInfo | URL, init?: RequestInit) => {
       assert.match(new Headers(init?.headers).get("authorization") ?? "", /^Bearer /);
-      if (init?.method !== "PUT") {
+      if (init?.method !== "PUT" && init?.method !== "PATCH") {
         return Response.json({ collection, revision }, { headers: { etag: `"${revision}"` } });
       }
       const expected = Number((new Headers(init.headers).get("if-match") ?? "").replaceAll('"', ""));
@@ -82,8 +112,30 @@ function fakeThreadServer() {
           { status: 409, headers: { etag: `"${revision}"` } },
         );
       }
-      const body = JSON.parse(String(init.body)) as { collection: typeof collection };
-      collection = body.collection;
+      const body = JSON.parse(String(init.body)) as {
+        activeThreadId?: string | null;
+        collection?: typeof collection;
+        deletedThreadIds?: readonly string[];
+        upsertThreads?: readonly ReturnType<typeof createAgentThread>[];
+      };
+      if (init.method === "PATCH") {
+        const deleted = new Set(body.deletedThreadIds ?? []);
+        const replacements = new Map((body.upsertThreads ?? []).map((thread) => [thread.id, thread]));
+        const retained = collection.threads
+          .filter((thread) => !deleted.has(thread.id))
+          .map((thread) => replacements.get(thread.id) ?? thread);
+        const retainedIds = new Set(retained.map((thread) => thread.id));
+        collection = {
+          ...(body.activeThreadId ? { activeThreadId: body.activeThreadId } : {}),
+          threads: [
+            ...(body.upsertThreads ?? []).filter((thread) => !retainedIds.has(thread.id)),
+            ...retained,
+          ],
+          version: AGENT_THREAD_STORAGE_VERSION,
+        };
+      } else {
+        collection = body.collection!;
+      }
       revision += 1;
       return Response.json({ collection, revision }, { headers: { etag: `"${revision}"` } });
     }) as typeof fetch,

@@ -185,11 +185,13 @@ export function AgentChildSessionView({
           {visibleMessages.map((message, index) => (
             <AgentMessage
               canRespond={false}
+              closedInputRequestIds={new Set()}
               events={events}
               isStreaming={isActive && index === visibleMessages.length - 1}
               key={message.id}
               locale={locale}
               message={message}
+              onCloseInputRequest={() => undefined}
               onInputResponses={() => undefined}
             />
           ))}

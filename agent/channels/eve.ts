@@ -18,6 +18,7 @@ import {
   resolveAgentRunPolicy,
 } from "../../lib/agent-extension-catalog";
 import type { AgentRunPolicy } from "@oworker/open-agent-contracts/agent-run";
+import { isBoundedAgentClientContext } from "@oworker/open-agent-contracts/client-context";
 import { createPostgresSessionOwnershipStoreFromEnvironment } from "../../server/data/session-ownership-store";
 import { createPostgresAgentExtensionStoreFromEnvironment } from "../../server/data/agent-extension-store";
 import { hostJwtAuthFromEnvironment } from "../lib/host-auth";
@@ -200,20 +201,28 @@ const mailboxRoute = POST(MAILBOX_ROUTE, async (request, {
   if (input.action === "inspect") {
     return Response.json({ ...boundary, ok: true }, { headers: { "cache-control": "no-store" } });
   }
-  if (boundary.state !== "waiting") {
+  if (boundary.state === "terminal" || boundary.state === "running" && !boundary.turnId) {
     return mailboxProblem(
       boundary.state === "terminal" ? 410 : 409,
-      boundary.state === "terminal" ? "mailbox_session_terminal" : "mailbox_session_running",
+      boundary.state === "terminal" ? "mailbox_session_terminal" : "mailbox_turn_pending",
       boundary.state === "terminal"
         ? "The Agent session is terminal."
-        : "The Agent session has not reached a waiting boundary.",
+        : "The Agent session has not published its active turn boundary yet.",
     );
   }
+  const steer = boundary.state === "running" && boundary.turnId
+    ? {
+        clientMessageId: input.clientMessageId,
+        expectedTurnId: boundary.turnId,
+      }
+    : undefined;
   try {
     const accepted = await attachSession(input.sessionId).send(
       input.message,
       {
         auth: mailboxSessionAuth(input),
+        ...(input.clientContext ? { clientContext: input.clientContext } : {}),
+        ...(steer ? { steer } : {}),
       },
     );
     if (accepted.status !== "accepted" || accepted.sessionId !== input.sessionId) {
@@ -244,7 +253,7 @@ export default {
 };
 
 type MailboxBoundary =
-  | { readonly state: "running" }
+  | { readonly state: "running"; readonly turnId?: string }
   | { readonly state: "waiting" }
   | { readonly state: "terminal" };
 
@@ -256,6 +265,7 @@ type MailboxInspectRequest = {
 type MailboxDeliverRequest = {
   readonly action: "deliver";
   readonly clientMessageId: string;
+  readonly clientContext?: readonly string[];
   readonly executionMode?: AgentRunPolicy["executionMode"];
   readonly issuer?: string;
   readonly itemId: string;
@@ -291,11 +301,13 @@ function parseMailboxRequest(body: string): MailboxInspectRequest | MailboxDeliv
     value.executionMode !== undefined &&
       value.executionMode !== "automation" &&
       value.executionMode !== "cautious" &&
-      value.executionMode !== "standard"
+      value.executionMode !== "standard" ||
+    value.clientContext !== undefined && !validClientContext(value.clientContext)
   ) return undefined;
   return {
     action: "deliver",
     clientMessageId: value.clientMessageId,
+    ...(value.clientContext ? { clientContext: value.clientContext } : {}),
     ...(value.executionMode ? { executionMode: value.executionMode } : {}),
     ...(value.issuer ? { issuer: value.issuer } : {}),
     itemId: value.itemId,
@@ -307,6 +319,10 @@ function parseMailboxRequest(body: string): MailboxInspectRequest | MailboxDeliv
     sessionId: value.sessionId,
     tenantId: value.tenantId,
   };
+}
+
+function validClientContext(value: unknown): value is readonly string[] {
+  return isBoundedAgentClientContext(value);
 }
 
 async function inspectMailboxBoundary(
@@ -323,7 +339,11 @@ async function inspectMailboxBoundary(
     if (latest.value.type === "session.completed" || latest.value.type === "session.failed") {
       return { state: "terminal" };
     }
-    return { state: "running" };
+    const turnId = "turnId" in latest.value.data &&
+        validText(latest.value.data.turnId, 512)
+      ? latest.value.data.turnId
+      : undefined;
+    return { state: "running", ...(turnId ? { turnId } : {}) };
   } finally {
     void reader.cancel().catch(() => undefined);
     reader.releaseLock();

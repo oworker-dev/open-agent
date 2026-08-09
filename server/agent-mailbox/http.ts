@@ -1,4 +1,5 @@
 import type { AgentRuntimeConfigSnapshot } from "../../lib/agent-runtime-config.ts";
+import { isBoundedAgentClientContext } from "@oworker/open-agent-contracts/client-context";
 import {
   findAgentRuntimeModel,
   isAgentReasoningLevelForModel,
@@ -80,6 +81,10 @@ function parseEnqueueRequest(
   if (!isRecord(value.preferences)) {
     return { error: "A validated Agent preference snapshot is required.", ok: false };
   }
+  const clientContext = parseClientContext(value.clientContext);
+  if (value.clientContext !== undefined && !clientContext) {
+    return { error: "The mailbox client context is invalid.", ok: false };
+  }
   const modelId = value.preferences.modelId;
   const reasoning = value.preferences.reasoning;
   const executionMode = value.preferences.executionMode;
@@ -96,11 +101,17 @@ function parseEnqueueRequest(
     ok: true,
     value: {
       clientMessageId: value.clientMessageId,
+      ...(clientContext ? { clientContext } : {}),
       message: value.message,
       preferences: { executionMode, modelId, reasoning },
       sessionId: value.sessionId,
     },
   };
+}
+
+function parseClientContext(value: unknown): readonly string[] | undefined {
+  if (value === undefined) return undefined;
+  return isBoundedAgentClientContext(value) ? value : undefined;
 }
 
 function mailboxResponse(

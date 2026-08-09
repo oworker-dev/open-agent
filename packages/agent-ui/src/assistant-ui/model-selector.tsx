@@ -358,9 +358,9 @@ function ModelSelectorValue({
       className={cn("flex min-w-0 items-center gap-1", className)}
     >
       {selectedModel.icon && <ModelIcon>{selectedModel.icon}</ModelIcon>}
-      <span className="truncate font-medium">{selectedModel.name}</span>
+      <span className="truncate text-xs font-normal">{selectedModel.name}</span>
       {effortName && (
-        <span className="text-muted-foreground truncate">
+        <span className="text-muted-foreground truncate text-xs">
           {effortName}
         </span>
       )}
@@ -592,7 +592,7 @@ function ModelSelectorItem({
             <ModelIcon className="mt-[3px]">{model.icon}</ModelIcon>
           )}
           <span className="flex min-w-0 flex-col">
-            <span className="truncate text-[13px] leading-5 font-medium">{model.name}</span>
+            <span className="truncate text-[13px] leading-5 font-medium" data-slot="model-selector-item-name">{model.name}</span>
             {model.description && (
               <span className="text-muted-foreground truncate text-xs">
                 {model.description}
@@ -628,7 +628,7 @@ function ModelSelectorEffort({
     <div
       data-slot="model-selector-effort"
       className={cn(
-        "flex cursor-default flex-col items-stretch gap-1.5 border-t px-3 py-2",
+        "flex cursor-default flex-col items-stretch gap-1 border-t px-2.5 py-1.5",
         className,
       )}
       onKeyDown={(e) => {
@@ -650,20 +650,20 @@ function ModelSelectorEffort({
       }}
       {...props}
     >
-      <span className="text-muted-foreground text-xs">{label}</span>
+      <span className="text-muted-foreground text-[10px] leading-3.5">{label}</span>
       <RadioGroupPrimitive.Root
         value={effort ?? ""}
         onValueChange={setEffort}
         orientation="horizontal"
         aria-label={typeof label === "string" ? label : "Reasoning effort"}
-        className="grid w-full grid-cols-4 gap-1"
+        className="grid w-full grid-cols-4 gap-0.5"
       >
         {efforts.map((option) => (
           <RadioGroupPrimitive.Item
             key={option.id}
             value={option.id}
             className={cn(
-              "focus-visible:ring-ring/50 text-muted-foreground hover:text-foreground min-w-0 truncate rounded-md px-1.5 py-1 text-center text-xs transition-colors outline-none focus-visible:ring-2",
+              "focus-visible:ring-ring/50 text-muted-foreground hover:text-foreground min-w-0 truncate rounded-md px-1 py-0.5 text-center text-[13px] leading-5 font-medium transition-colors outline-none focus-visible:ring-2",
               "data-[state=checked]:bg-accent data-[state=checked]:text-accent-foreground data-[state=checked]:font-medium",
             )}
           >

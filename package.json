@@ -40,6 +40,7 @@
     "verify:muses-host-e2e": "node scripts/verify-muses-host-e2e.mjs",
     "mock:openai": "node scripts/mock-openai-responses.mjs",
     "mock:otlp": "node scripts/mock-otlp-json.mjs",
+    "postinstall": "patch-package",
     "reap:sandboxes": "node scripts/reap-docker-sandboxes.mjs",
     "verify:otel": "node scripts/verify-otel-export.mjs",
     "verify:extensions": "node scripts/verify-extension-lifecycle.mjs",
@@ -97,6 +98,7 @@
     "@types/react": "19.2.15",
     "@types/react-dom": "19.2.3",
     "@modelcontextprotocol/sdk": "1.30.0",
+    "patch-package": "^8.0.0",
     "typescript": "6.0.3"
   },
   "overrides": {

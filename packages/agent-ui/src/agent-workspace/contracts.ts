@@ -19,8 +19,9 @@ export type AgentThreadPreferences = {
 };
 
 export type AgentPendingTurn = {
+  readonly files?: PromptInputMessage["files"];
   readonly id: string;
-  readonly state: "delivery-failed" | "resubmitting" | "submitting";
+  readonly state: "clearing" | "delivery-failed" | "interrupted" | "resubmitting" | "submitting";
   readonly submittedAt: number;
   readonly text: string;
 };
@@ -54,6 +55,7 @@ export interface AgentWorkspaceMailbox {
   cancel(itemId: string): Promise<AgentMailboxReceipt>;
   enqueue(input: {
     readonly clientMessageId: string;
+    readonly clientContext?: readonly string[];
     readonly message: string;
     readonly preferences: AgentThreadPreferences;
     readonly sessionId: string;
@@ -109,10 +111,15 @@ export type AgentThreadSessionState = {
 
 export type AgentThread = {
   readonly createdAt: number;
+  readonly closedInputRequestIds: readonly string[];
   readonly events: readonly MessageStreamEvent[];
+  /** Server-backed indexes omit the event transcript until the thread is opened. */
+  readonly hydration?: "summary";
   readonly id: string;
   readonly pendingTurn?: AgentPendingTurn;
   readonly preferences: AgentThreadPreferences;
+  /** Token-bounded settled history retained across an Eve context rewrite. */
+  readonly retainedContext?: readonly string[];
   readonly queuedTurns: readonly AgentQueuedTurn[];
   readonly revision?: number;
   readonly session: AgentThreadSessionState;

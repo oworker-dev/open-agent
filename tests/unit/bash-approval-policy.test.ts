@@ -28,13 +28,25 @@ test("classifies destructive and external side-effecting shell commands", () => 
   }
 });
 
-test("requires a person for risky commands and denies unattended approval", () => {
+test("standard mode auto-approves sandbox-local changes but gates external side effects", () => {
   assert.equal(
     bashApprovalDecision({ command: "rm -f output.txt", mode: "risky" }),
+    "not-applicable",
+  );
+  assert.equal(
+    bashApprovalDecision({ actorType: "service", command: "rm -f output.txt", mode: "risky" }),
+    "not-applicable",
+  );
+  assert.equal(
+    bashApprovalDecision({ command: "curl -X POST https://example.com/jobs", mode: "risky" }),
     "user-approval",
   );
   assert.deepEqual(
-    bashApprovalDecision({ actorType: "service", command: "rm -f output.txt", mode: "risky" }),
+    bashApprovalDecision({
+      actorType: "service",
+      command: "curl -X POST https://example.com/jobs",
+      mode: "risky",
+    }),
     {
       type: "denied",
       reason: "Unattended Agent sessions cannot approve a high-impact shell command.",
@@ -57,7 +69,7 @@ test("cautious execution mode gates otherwise safe shell commands", () => {
   );
 });
 
-test("automation permits sandbox-local cleanup but keeps external side effects gated", () => {
+test("automation permits shell commands while the always policy remains an explicit override", () => {
   assert.equal(
     bashApprovalDecision({
       command: 'kill "$server_pid"',
@@ -71,6 +83,14 @@ test("automation permits sandbox-local cleanup but keeps external side effects g
       command: "curl -X POST https://example.com/jobs",
       executionMode: "automation",
       mode: "risky",
+    }),
+    "not-applicable",
+  );
+  assert.equal(
+    bashApprovalDecision({
+      command: "npm test",
+      executionMode: "automation",
+      mode: "always",
     }),
     "user-approval",
   );

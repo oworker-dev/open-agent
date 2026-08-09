@@ -8,6 +8,7 @@ export type AgentThreadCollection = {
 };
 export type AgentThreadStorage = {
     load(storageKey: string): AgentThreadCollection | Promise<AgentThreadCollection>;
+    loadThread?(storageKey: string, threadId: string): AgentThread | undefined | Promise<AgentThread | undefined>;
     save(storageKey: string, collection: AgentThreadCollection): void | Promise<void>;
 };
 export declare const browserThreadStorage: AgentThreadStorage;

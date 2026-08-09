@@ -13,16 +13,16 @@ export function AgentActivity({
   events,
   messages,
   mode = "live",
-  quietUntilSlow = false,
 }: {
   readonly events: readonly MessageStreamEvent[];
   readonly messages: AgentMessages;
   readonly mode?: "live" | "recovery";
-  readonly quietUntilSlow?: boolean;
 }) {
   const mountedAt = useRef(Date.now());
   const label = activityLabel(events, messages, { mode, mountedAt: mountedAt.current, now: Date.now() });
-  if (quietUntilSlow) return null;
+  // Keep one calm reasoning disclosure visible from admission onward. The
+  // label intentionally stays provider-neutral; transport retries belong in
+  // the error/reconnect projection, not in the conversation body.
   return (
     <ReasoningRoot className="mb-1" role="status" streaming variant="ghost">
       <ReasoningTrigger active label={label} />

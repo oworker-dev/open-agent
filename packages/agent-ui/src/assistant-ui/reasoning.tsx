@@ -1,12 +1,8 @@
 "use client";
 
 import {
-  createContext,
   memo,
   useCallback,
-  useContext,
-  useEffect,
-  useLayoutEffect,
   useRef,
   useState,
 } from "react";
@@ -25,8 +21,6 @@ import {
 import { cn } from "../utils.js";
 
 const ANIMATION_DURATION = 200;
-
-const ReasoningPreviewContext = createContext(false);
 
 const reasoningVariants = cva("aui-reasoning-root mb-4 w-full", {
   variants: {
@@ -49,15 +43,7 @@ export type ReasoningRootProps = Omit<
     open?: boolean;
     onOpenChange?: (open: boolean) => void;
     defaultOpen?: boolean;
-    /**
-     * Whether the reasoning is currently streaming. While `true` the
-     * disclosure is held open with a bottom-pinned live preview; when
-     * streaming ends it returns to `defaultOpen`, and the first manual
-     * toggle takes over the open/close state permanently. The live preview
-     * keeps following the newest tokens while the disclosure is open during
-     * streaming, even after a manual toggle, and pauses while the reader is
-     * scrolled up.
-     */
+    /** Used for the trigger state only; streaming never forces disclosure open. */
     streaming?: boolean;
   };
 
@@ -67,37 +53,24 @@ function ReasoningRoot({
   open: controlledOpen,
   onOpenChange: controlledOnOpenChange,
   defaultOpen = false,
-  streaming,
+  streaming: _streaming,
   children,
   ...props
 }: ReasoningRootProps) {
   const collapsibleRef = useRef<HTMLDivElement>(null);
-  const initialOpenRef = useRef(defaultOpen);
-  const [userOpen, setUserOpen] = useState<boolean | null>(null);
+  const [uncontrolledOpen, setUncontrolledOpen] = useState(defaultOpen);
   const lockScroll = useScrollLock(collapsibleRef, ANIMATION_DURATION);
 
   const isControlled = controlledOpen !== undefined;
   const isOpen = isControlled
     ? controlledOpen
-    : (userOpen ?? (streaming || initialOpenRef.current));
-  const isPreview = streaming === true && isOpen;
-
-  const prevStreamingRef = useRef(streaming);
-  useLayoutEffect(() => {
-    if (prevStreamingRef.current === streaming) return;
-    prevStreamingRef.current = streaming;
-    // A streaming transition only animates the panel when the resting state
-    // is collapsed; with `defaultOpen` the disclosure stays open across it.
-    if (!isControlled && userOpen === null && !initialOpenRef.current) {
-      lockScroll();
-    }
-  }, [streaming, isControlled, userOpen, lockScroll]);
+    : uncontrolledOpen;
 
   const handleOpenChange = useCallback(
     (open: boolean) => {
       lockScroll();
       if (!isControlled) {
-        setUserOpen(open);
+        setUncontrolledOpen(open);
       }
       controlledOnOpenChange?.(open);
     },
@@ -122,9 +95,7 @@ function ReasoningRoot({
       }
       {...props}
     >
-      <ReasoningPreviewContext.Provider value={isPreview}>
-        {children}
-      </ReasoningPreviewContext.Provider>
+      {children}
     </Collapsible>
   );
 }
@@ -170,13 +141,15 @@ function ReasoningFade({
 function ReasoningTrigger({
   active,
   duration,
+  hideChevron = false,
   label = "Reasoning",
   className,
   ...props
-}: React.ComponentProps<typeof CollapsibleTrigger> & {
-  active?: boolean;
-  duration?: number;
-  label?: React.ReactNode;
+  }: React.ComponentProps<typeof CollapsibleTrigger> & {
+    active?: boolean;
+    duration?: number;
+    hideChevron?: boolean;
+    label?: React.ReactNode;
 }) {
   const durationText = duration !== undefined && duration > 0 ? ` ${duration}s` : "";
   const displayLabel = typeof label === "string" ? `${label}${durationText}` : label;
@@ -194,21 +167,23 @@ function ReasoningTrigger({
         data-slot="reasoning-trigger-label"
         className={cn(
           "aui-reasoning-trigger-label-wrapper relative inline-block whitespace-nowrap leading-none tabular-nums",
-          active && "shimmer motion-reduce:animate-none",
+          active && "text-foreground/80",
         )}
       >
         <span>{displayLabel}</span>
       </span>
-      <ChevronDownIcon
-        data-slot="reasoning-trigger-chevron"
-        className={cn(
-          "aui-reasoning-trigger-chevron mt-0.5 size-4 shrink-0",
-          "transition-transform duration-(--animation-duration) ease-[cubic-bezier(0.32,0.72,0,1)] motion-reduce:transition-none",
-          "-rotate-90",
-          "group-data-open/trigger:rotate-0",
-          "group-data-panel-open/trigger:rotate-0",
-        )}
-      />
+      {!hideChevron ? (
+        <ChevronDownIcon
+          data-slot="reasoning-trigger-chevron"
+          className={cn(
+            "aui-reasoning-trigger-chevron mt-0.5 size-4 shrink-0",
+            "transition-transform duration-(--animation-duration) ease-[cubic-bezier(0.32,0.72,0,1)] motion-reduce:transition-none",
+            "-rotate-90",
+            "group-data-open/trigger:rotate-0",
+            "group-data-panel-open/trigger:rotate-0",
+          )}
+        />
+      ) : null}
     </CollapsibleTrigger>
   );
 }
@@ -218,8 +193,6 @@ function ReasoningContent({
   children,
   ...props
 }: React.ComponentProps<typeof CollapsibleContent>) {
-  const isPreview = useContext(ReasoningPreviewContext);
-
   return (
     <CollapsibleContent
       data-slot="reasoning-content"
@@ -238,7 +211,6 @@ function ReasoningContent({
     >
       <ReasoningFade side="top" />
       {children}
-      {isPreview ? <ReasoningFade /> : null}
     </CollapsibleContent>
   );
 }
@@ -248,57 +220,8 @@ function ReasoningText({
   children,
   ...props
 }: React.ComponentProps<"div">) {
-  const isPreview = useContext(ReasoningPreviewContext);
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const contentRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!isPreview) return;
-    const scrollEl = scrollRef.current;
-    const contentEl = contentRef.current;
-    if (!scrollEl || !contentEl) return;
-
-    let pinned = true;
-    let lastScrollTop = scrollEl.scrollTop;
-    let lastScrollHeight = scrollEl.scrollHeight;
-    const isAtBottom = () =>
-      Math.abs(
-        scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight,
-      ) <= 1 || scrollEl.scrollHeight <= scrollEl.clientHeight;
-
-    const pin = () => {
-      if (!pinned) return;
-      scrollEl.scrollTop = scrollEl.scrollHeight;
-    };
-    // A pin's own scroll event can arrive after new content grew the scroll
-    // height and read as "not at bottom"; only an upward move at unchanged
-    // scroll height is user intent.
-    const onScroll = () => {
-      if (isAtBottom()) {
-        pinned = true;
-      } else if (
-        scrollEl.scrollTop < lastScrollTop &&
-        scrollEl.scrollHeight === lastScrollHeight
-      ) {
-        pinned = false;
-      }
-      lastScrollTop = scrollEl.scrollTop;
-      lastScrollHeight = scrollEl.scrollHeight;
-    };
-
-    pin();
-    scrollEl.addEventListener("scroll", onScroll);
-    const observer = new ResizeObserver(pin);
-    observer.observe(contentEl);
-    return () => {
-      scrollEl.removeEventListener("scroll", onScroll);
-      observer.disconnect();
-    };
-  }, [isPreview]);
-
   return (
     <div
-      ref={scrollRef}
       data-slot="reasoning-text"
       className={cn(
         "aui-reasoning-text relative z-0 max-h-64 overflow-y-auto ps-6 pt-2 pb-2 leading-relaxed text-pretty",
@@ -318,7 +241,7 @@ function ReasoningText({
       )}
       {...props}
     >
-      <div ref={contentRef} className="aui-reasoning-text-content space-y-4">
+      <div className="aui-reasoning-text-content space-y-4">
         {children}
       </div>
     </div>

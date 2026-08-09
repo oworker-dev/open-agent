@@ -174,7 +174,7 @@ test("allows a loopback Muses Provider broker but rejects plaintext remote Provi
 });
 
 test("bounds the test-only context window override", () => {
-  assert.equal(readAgentEvalContextWindowTokens({}), 128_000);
+  assert.equal(readAgentEvalContextWindowTokens({}), 272_000);
   assert.equal(
     readAgentEvalContextWindowTokens({ AGENT_EVAL_CONTEXT_WINDOW_TOKENS: "4096" }),
     4_096,

@@ -23,7 +23,7 @@ export function AgentPage() {
       defaultPreferences={{ modelId: "provider/model", reasoning: "high" }}
       extensions={[{ id: "software-task", kind: "skill", label: "Software task", status: "available" }]}
       mentions={[{ id: "workspace", label: "Workspace", value: "@workspace" }]}
-      models={[{ id: "provider/model", label: "Model", contextWindowTokens: 128000 }]}
+      models={[{ id: "provider/model", label: "Model", contextWindowTokens: 272000 }]}
       productName="Agent"
       reasoningLevels={["low", "medium", "high"]}
     />

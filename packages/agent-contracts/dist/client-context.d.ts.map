@@ -1,0 +1,1 @@
+{"version":3,"file":"client-context.d.ts","sourceRoot":"","sources":["../src/client-context.ts"],"names":[],"mappings":"AAAA,eAAO,MAAM,gCAAgC,KAAK,CAAC;AACnD,eAAO,MAAM,+BAA+B,QAAS,CAAC;AACtD,eAAO,MAAM,iCAAiC,IAAI,CAAC;AACnD,eAAO,MAAM,8BAA8B,QAC0B,CAAC;AAEtE,wGAAwG;AACxG,wBAAgB,2BAA2B,CAAC,KAAK,EAAE,OAAO,GAAG,KAAK,IAAI,SAAS,MAAM,EAAE,CAStF"}

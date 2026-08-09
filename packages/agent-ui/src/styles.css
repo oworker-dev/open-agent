@@ -1,7 +1,6 @@
 @import "tailwindcss/theme.css" layer(theme);
 @import "tailwindcss/utilities.css" layer(utilities);
 @import "tw-shimmer";
-@import "@assistant-ui/react-markdown/styles/dot.css";
 
 @custom-variant dark (&:is(.dark *));
 @source "./**/*.{ts,tsx}";
@@ -30,7 +29,7 @@
   --radius-md: calc(var(--radius, 0.625rem) - 2px);
   --radius-lg: var(--radius, 0.625rem);
   --radius-xl: calc(var(--radius, 0.625rem) + 4px);
-  --font-sans: var(--agent-ui-font-sans, ui-sans-serif, system-ui, sans-serif);
+  --font-sans: var(--agent-ui-font-sans, Inter, "SF Pro Text", "Segoe UI", "PingFang SC", "Microsoft YaHei", ui-sans-serif, system-ui, sans-serif);
   --font-mono: var(--agent-ui-font-mono, ui-monospace, monospace);
   --color-sidebar-ring: var(--sidebar-ring);
   --color-sidebar-border: var(--sidebar-border);
@@ -59,9 +58,146 @@
 }
 
 .open-agent-ui {
-  background: var(--background, oklch(1 0 0));
+  background: var(--sidebar, oklch(0.968 0 0));
   color: var(--foreground, oklch(0.16 0 0));
-  font-family: var(--agent-ui-font-sans, ui-sans-serif, system-ui, sans-serif);
+  font-family: var(--agent-ui-font-sans, Inter, "SF Pro Text", "Segoe UI", "PingFang SC", "Microsoft YaHei", ui-sans-serif, system-ui, sans-serif);
+  font-size: 14px;
+}
+
+.open-agent-ui [data-slot="resizable-handle"] {
+  position: relative;
+  z-index: 3;
+  width: 0;
+  min-width: 0;
+  flex: 0 0 0;
+  overflow: visible;
+  border: 0;
+  outline: 0;
+}
+
+.open-agent-ui [data-slot="resizable-handle"]::after {
+  width: 12px;
+  background: transparent;
+  box-shadow: none;
+}
+
+.open-agent-ui [data-sidebar-panel],
+.open-agent-ui [data-workbench-panel] {
+  transition:
+    flex-grow 300ms cubic-bezier(0.32, 0.72, 0, 1),
+    flex-basis 300ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+.open-agent-ui[data-panel-resizing="true"] [data-sidebar-panel],
+.open-agent-ui[data-panel-resizing="true"] [data-workbench-panel] {
+  transition: none;
+}
+
+.open-agent-ui [data-workbench-panel] {
+  position: relative;
+  z-index: 1;
+  transition:
+    flex-grow 300ms cubic-bezier(0.32, 0.72, 0, 1),
+    flex-basis 300ms cubic-bezier(0.32, 0.72, 0, 1),
+    padding-top 300ms cubic-bezier(0.32, 0.72, 0, 1),
+    box-shadow 300ms cubic-bezier(0.32, 0.72, 0, 1);
+  box-shadow: -8px 0 18px -14px color-mix(in srgb, var(--foreground) 28%, transparent);
+}
+
+.open-agent-ui [data-slot="agent-workbench"] {
+  border-top-left-radius: 1rem;
+  box-shadow: 0 -8px 20px -16px color-mix(in srgb, var(--foreground) 22%, transparent);
+  transition:
+    border-radius 300ms cubic-bezier(0.32, 0.72, 0, 1),
+    box-shadow 300ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+.open-agent-ui:is([data-workbench-mode="collapsing"], [data-workbench-mode="fullscreen"]) [data-workbench-panel],
+.open-agent-ui:is([data-workbench-mode="collapsing"], [data-workbench-mode="fullscreen"]) [data-slot="agent-workbench"] {
+  box-shadow: none;
+  border-radius: 0;
+}
+
+.open-agent-ui [data-floating-sidebar] {
+  width: min(420px, 100vw);
+  pointer-events: none;
+  transform: translate3d(-100%, 0, 0);
+  transition: transform 220ms cubic-bezier(0.32, 0.72, 0, 1);
+  will-change: transform;
+}
+
+.open-agent-ui [data-floating-sidebar-trigger] {
+  pointer-events: auto;
+}
+
+.open-agent-ui [data-floating-sidebar][data-open="true"] {
+  transform: translate3d(0, 0, 0);
+}
+
+.open-agent-ui [data-floating-sidebar][data-resizing="true"] {
+  transition: none;
+}
+
+.open-agent-ui [data-floating-sidebar-panel] {
+  pointer-events: auto;
+}
+
+.open-agent-ui [data-floating-sidebar-panel] aside {
+  box-shadow: 6px 0 18px -16px color-mix(in srgb, var(--foreground) 24%, transparent);
+}
+
+.open-agent-ui [data-floating-sidebar-spacer] {
+  pointer-events: none;
+}
+
+.open-agent-ui [data-floating-sidebar-handle] {
+  pointer-events: auto;
+}
+
+.open-agent-ui [data-floating-sidebar][data-open="false"] [data-floating-sidebar-panel] aside {
+  pointer-events: none;
+  box-shadow: none;
+}
+
+.open-agent-ui [data-floating-sidebar-handle]::before {
+  position: absolute;
+  inset-block: 0;
+  left: 50%;
+  width: 1px;
+  content: "";
+  background: color-mix(in srgb, var(--foreground) 16%, transparent);
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.open-agent-ui [data-floating-sidebar-handle]:is(:hover, :focus-visible)::before,
+.open-agent-ui [data-floating-sidebar][data-resizing="true"] [data-floating-sidebar-handle]::before {
+  opacity: 1;
+}
+
+@media (max-width: 1023px) {
+  .open-agent-ui [data-slot="agent-workbench"] {
+    box-shadow: none;
+    border-radius: 0;
+  }
+
+  .open-agent-ui [data-workbench-panel] {
+    box-shadow: none;
+  }
+}
+
+@media (min-width: 1024px) {
+  .open-agent-ui [data-workbench-panel] {
+    padding-top: 0.5rem !important;
+  }
+
+  .open-agent-ui:is([data-workbench-mode="collapsing"], [data-workbench-mode="fullscreen"]) [data-workbench-panel] {
+    padding-top: 0 !important;
+  }
+}
+
+.open-agent-ui [data-slot="thread-viewport"] {
+  scrollbar-gutter: stable;
 }
 
 .open-agent-ui .aui-md-pre > .aui-md-inline-code {

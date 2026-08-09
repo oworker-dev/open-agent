@@ -1,4 +1,4 @@
-import { parseThreadCollection, } from "./thread-storage.js";
+import { AGENT_THREAD_STORAGE_VERSION, parseThreadCollection, } from "./thread-storage.js";
 export class AgentThreadStorageConflictError extends Error {
     currentRevision;
     expectedRevision;
@@ -21,34 +21,71 @@ export function createHttpAgentThreadStorage(options) {
     const endpoint = (options.endpoint ?? "/api/agent/thread-collections").replace(/\/$/, "");
     const fetchImplementation = options.fetch ?? globalThis.fetch;
     const revisions = new Map();
+    const baselines = new Map();
+    let preferredThreadId = options.initialThreadId;
     return {
         async load(storageKey) {
-            const response = await request(fetchImplementation, options, collectionUrl(endpoint, storageKey));
+            const response = await request(fetchImplementation, options, collectionUrl(endpoint, storageKey, {
+                ...(preferredThreadId ? { threadId: preferredThreadId } : {}),
+                view: "index",
+            }));
             await requireOk(response);
             const body = await readCollectionResponse(response);
             revisions.set(storageKey, body.revision);
+            baselines.set(storageKey, body.collection);
             return body.collection;
         },
+        async loadThread(storageKey, threadId) {
+            preferredThreadId = threadId;
+            const response = await request(fetchImplementation, options, collectionUrl(endpoint, storageKey, { threadId }));
+            await requireOk(response);
+            const body = await response.json();
+            if (!Number.isSafeInteger(body.revision) || body.revision < 0) {
+                throw new Error("Agent thread storage returned an invalid revision.");
+            }
+            if (body.thread == null)
+                return undefined;
+            return parseThreadCollection({
+                threads: [body.thread],
+                version: AGENT_THREAD_STORAGE_VERSION,
+            }).threads[0];
+        },
         async save(storageKey, collection) {
+            preferredThreadId = collection.activeThreadId;
             const expectedRevision = revisions.get(storageKey);
-            if (expectedRevision === undefined) {
+            const baseline = baselines.get(storageKey);
+            if (expectedRevision === undefined || baseline === undefined) {
                 throw new Error("Agent thread storage must be loaded before it can be saved.");
             }
+            const patch = createCollectionPatch(baseline, collection);
             const response = await request(fetchImplementation, options, collectionUrl(endpoint, storageKey), {
-                body: JSON.stringify({ collection }),
+                body: JSON.stringify(patch),
                 headers: {
                     "content-type": "application/json",
                     "if-match": `"${expectedRevision}"`,
                 },
-                method: "PUT",
+                method: "PATCH",
             });
             if (response.status === 409) {
                 throw new AgentThreadStorageConflictError(expectedRevision, revisionFromEtag(response.headers.get("etag")));
             }
             await requireOk(response);
-            const body = await readCollectionResponse(response);
-            revisions.set(storageKey, body.revision);
+            revisions.set(storageKey, await readRevisionResponse(response));
+            baselines.set(storageKey, collection);
         },
+    };
+}
+function createCollectionPatch(baseline, collection) {
+    const previousThreads = new Map(baseline.threads.map((thread) => [thread.id, thread]));
+    const nextIds = new Set(collection.threads.map((thread) => thread.id));
+    return {
+        activeThreadId: collection.activeThreadId ?? null,
+        deletedThreadIds: baseline.threads.flatMap((thread) => nextIds.has(thread.id) ? [] : [thread.id]),
+        upsertThreads: collection.threads.filter((thread) => {
+            const previous = previousThreads.get(thread.id);
+            return !previous || previous !== thread;
+        }),
+        version: collection.version,
     };
 }
 async function request(fetchImplementation, options, url, init) {
@@ -78,6 +115,13 @@ async function requireOk(response) {
     }
     throw new AgentThreadStorageHttpError(response.status, message);
 }
+async function readRevisionResponse(response) {
+    const body = await response.json();
+    if (!Number.isSafeInteger(body.revision) || body.revision < 0) {
+        throw new Error("Agent thread storage returned an invalid revision.");
+    }
+    return body.revision;
+}
 async function readCollectionResponse(response) {
     const body = await response.json();
     if (!Number.isSafeInteger(body.revision) || body.revision < 0) {
@@ -86,8 +130,12 @@ async function readCollectionResponse(response) {
     const collection = parseThreadCollection(body.collection);
     return { collection, revision: body.revision };
 }
-function collectionUrl(endpoint, storageKey) {
-    return `${endpoint}/${encodeURIComponent(storageKey)}`;
+function collectionUrl(endpoint, storageKey, query) {
+    const url = `${endpoint}/${encodeURIComponent(storageKey)}`;
+    if (!query)
+        return url;
+    const search = new URLSearchParams(query);
+    return `${url}?${search.toString()}`;
 }
 function revisionFromEtag(value) {
     const match = value ? /^(?:W\/)?"(\d+)"$/.exec(value.trim()) : undefined;

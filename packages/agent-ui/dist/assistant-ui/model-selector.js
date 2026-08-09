@@ -134,7 +134,7 @@ function ModelSelectorValue({ placeholder = "Select model", showEffort = true, c
     const effortName = showEffort && effort !== undefined
         ? efforts?.find((e) => e.id === effort)?.name
         : undefined;
-    return (_jsxs("span", { "data-slot": "model-selector-value", className: cn("flex min-w-0 items-center gap-1", className), children: [selectedModel.icon && _jsx(ModelIcon, { children: selectedModel.icon }), _jsx("span", { className: "truncate font-medium", children: selectedModel.name }), effortName && (_jsx("span", { className: "text-muted-foreground truncate", children: effortName }))] }));
+    return (_jsxs("span", { "data-slot": "model-selector-value", className: cn("flex min-w-0 items-center gap-1", className), children: [selectedModel.icon && _jsx(ModelIcon, { children: selectedModel.icon }), _jsx("span", { className: "truncate text-xs font-normal", children: selectedModel.name }), effortName && (_jsx("span", { className: "text-muted-foreground truncate text-xs", children: effortName }))] }));
 }
 function useLazyFlipSide() {
     const [side, setSide] = useState();
@@ -193,13 +193,13 @@ function ModelSelectorItem({ model, className, children, onSelect, ...props }) {
             setValue(model.id);
             setOpen(false);
             onSelect?.(selectedValue);
-        }, className: cn("relative items-start gap-2 rounded-lg py-2 ps-3 pe-9 [&_svg:not([class*='size-'])]:size-3.5", className), ...props, children: [children ?? (_jsxs(_Fragment, { children: [model.icon && (_jsx(ModelIcon, { className: "mt-[3px]", children: model.icon })), _jsxs("span", { className: "flex min-w-0 flex-col", children: [_jsx("span", { className: "truncate text-[13px] leading-5 font-medium", children: model.name }), model.description && (_jsx("span", { className: "text-muted-foreground truncate text-xs", children: model.description }))] })] })), isSelected && (_jsx("span", { className: "absolute end-3 top-2.5 flex size-4 items-center justify-center", children: _jsx(CheckIcon, { className: "size-4" }) }))] }));
+        }, className: cn("relative items-start gap-2 rounded-lg py-2 ps-3 pe-9 [&_svg:not([class*='size-'])]:size-3.5", className), ...props, children: [children ?? (_jsxs(_Fragment, { children: [model.icon && (_jsx(ModelIcon, { className: "mt-[3px]", children: model.icon })), _jsxs("span", { className: "flex min-w-0 flex-col", children: [_jsx("span", { className: "truncate text-[13px] leading-5 font-medium", "data-slot": "model-selector-item-name", children: model.name }), model.description && (_jsx("span", { className: "text-muted-foreground truncate text-xs", children: model.description }))] })] })), isSelected && (_jsx("span", { className: "absolute end-3 top-2.5 flex size-4 items-center justify-center", children: _jsx(CheckIcon, { className: "size-4" }) }))] }));
 }
 function ModelSelectorEffort({ label = "Thinking", className, onKeyDown, ...props }) {
     const { efforts, effort, setEffort } = useModelSelectorEfforts();
     if (!efforts?.length)
         return null;
-    return (_jsxs("div", { "data-slot": "model-selector-effort", className: cn("flex cursor-default flex-col items-stretch gap-1.5 border-t px-3 py-2", className), onKeyDown: (e) => {
+    return (_jsxs("div", { "data-slot": "model-selector-effort", className: cn("flex cursor-default flex-col items-stretch gap-1 border-t px-2.5 py-1.5", className), onKeyDown: (e) => {
             onKeyDown?.(e);
             if (e.defaultPrevented)
                 return;
@@ -211,7 +211,7 @@ function ModelSelectorEffort({ label = "Thinking", className, onKeyDown, ...prop
                     ?.querySelector("[cmdk-input]")
                     ?.focus();
             }
-        }, ...props, children: [_jsx("span", { className: "text-muted-foreground text-xs", children: label }), _jsx(RadioGroupPrimitive.Root, { value: effort ?? "", onValueChange: setEffort, orientation: "horizontal", "aria-label": typeof label === "string" ? label : "Reasoning effort", className: "grid w-full grid-cols-4 gap-1", children: efforts.map((option) => (_jsx(RadioGroupPrimitive.Item, { value: option.id, className: cn("focus-visible:ring-ring/50 text-muted-foreground hover:text-foreground min-w-0 truncate rounded-md px-1.5 py-1 text-center text-xs transition-colors outline-none focus-visible:ring-2", "data-[state=checked]:bg-accent data-[state=checked]:text-accent-foreground data-[state=checked]:font-medium"), children: option.name }, option.id))) })] }));
+        }, ...props, children: [_jsx("span", { className: "text-muted-foreground text-[10px] leading-3.5", children: label }), _jsx(RadioGroupPrimitive.Root, { value: effort ?? "", onValueChange: setEffort, orientation: "horizontal", "aria-label": typeof label === "string" ? label : "Reasoning effort", className: "grid w-full grid-cols-4 gap-0.5", children: efforts.map((option) => (_jsx(RadioGroupPrimitive.Item, { value: option.id, className: cn("focus-visible:ring-ring/50 text-muted-foreground hover:text-foreground min-w-0 truncate rounded-md px-1 py-0.5 text-center text-[13px] leading-5 font-medium transition-colors outline-none focus-visible:ring-2", "data-[state=checked]:bg-accent data-[state=checked]:text-accent-foreground data-[state=checked]:font-medium"), children: option.name }, option.id))) })] }));
 }
 function ModelSelectorModelContext() {
     const { value, effort } = useModelSelectorContext();
