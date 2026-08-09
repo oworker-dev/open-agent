@@ -531,13 +531,52 @@ export function AgentWorkspace({
     let reconnectAttempt = 0;
     let pendingTurn = thread.pendingTurn;
     let queuedTurns = thread.queuedTurns;
+    const recoveryOwnedQueuedTurnIds = new Set(queuedTurns.map((turn) => turn.id));
+    const consumedQueuedTurnIds = new Set<string>();
+    const recoveryOwnedPendingTurnId = pendingTurn?.id;
+    const consumedPendingTurnIds = new Set<string>();
     let settled = false;
     const currentClosedInputRequestIds = () => new Set(
       threadsRef.current.find((candidate) => candidate.id === thread.id)?.closedInputRequestIds ?? thread.closedInputRequestIds,
     );
 
+    const mergeLiveAdmissions = () => {
+      const liveThread = threadsRef.current.find((candidate) => candidate.id === thread.id);
+      if (!liveThread) return;
+
+      const liveQueuedTurnIds = new Set(liveThread.queuedTurns.map((turn) => turn.id));
+      queuedTurns = queuedTurns.filter((turn) =>
+        !consumedQueuedTurnIds.has(turn.id) &&
+        (recoveryOwnedQueuedTurnIds.has(turn.id) || liveQueuedTurnIds.has(turn.id))
+      );
+      const localQueuedTurnIds = new Set(queuedTurns.map((turn) => turn.id));
+      for (const turn of liveThread.queuedTurns) {
+        if (
+          !localQueuedTurnIds.has(turn.id) &&
+          !consumedQueuedTurnIds.has(turn.id)
+        ) {
+          queuedTurns = [...queuedTurns, turn];
+          localQueuedTurnIds.add(turn.id);
+        }
+      }
+
+      const livePendingTurn = liveThread.pendingTurn;
+      if (
+        livePendingTurn &&
+        livePendingTurn.id !== recoveryOwnedPendingTurnId &&
+        !consumedPendingTurnIds.has(livePendingTurn.id)
+      ) {
+        pendingTurn = livePendingTurn;
+      } else if (
+        pendingTurn &&
+        pendingTurn.id !== recoveryOwnedPendingTurnId &&
+        (!livePendingTurn || consumedPendingTurnIds.has(pendingTurn.id))
+      ) {
+        pendingTurn = undefined;
+      }
+    };
     const refreshMailboxQueue = async () => {
-      queuedTurns = threadsRef.current.find((candidate) => candidate.id === thread.id)?.queuedTurns ?? queuedTurns;
+      mergeLiveAdmissions();
       if (!mailbox) return;
       const updates = new Map<string, AgentQueuedTurn["state"] | "remove">();
       await Promise.all(queuedTurns.map(async (turn) => {
@@ -561,7 +600,7 @@ export function AgentWorkspace({
       updateThread(thread.id, { queuedTurns });
     };
     const hasPendingServerQueue = () => queuedTurns.some((turn) =>
-      turn.delivery === "server" && turn.state === "queued" && Boolean(turn.mailboxItemId),
+      turn.delivery === "server" && mailboxTurnAwaitsAdmission(turn) && Boolean(turn.mailboxItemId),
     );
     const currentBoundarySettles = () => {
       const last = events.at(-1);
@@ -586,6 +625,10 @@ export function AgentWorkspace({
             startIndex: cursor,
             ...(follow ? { streamReconnectPolicy: RECOVERY_STREAM_RECONNECT_POLICY } : {}),
           })) {
+            // User submissions can land between any two events in one streamed
+            // recovery response. Merge them before every event so an older
+            // recovery snapshot can never erase a newly staged turn.
+            mergeLiveAdmissions();
             events = [...appendThreadEvent(events, event)];
             cursor += 1;
             consumed += 1;
@@ -593,13 +636,21 @@ export function AgentWorkspace({
             if (event.type === "message.received") {
               const clientMessageId = event.data.clientMessageId;
               if (clientMessageId) {
+                consumedQueuedTurnIds.add(clientMessageId);
                 queuedTurns = queuedTurns.filter((turn) => turn.id !== clientMessageId);
-                if (pendingTurn?.id === clientMessageId) pendingTurn = undefined;
+                if (pendingTurn?.id === clientMessageId) {
+                  consumedPendingTurnIds.add(clientMessageId);
+                  pendingTurn = undefined;
+                }
               } else if (pendingTurn) {
+                consumedPendingTurnIds.add(pendingTurn.id);
                 pendingTurn = undefined;
               } else {
-                const nextBrowserTurn = queuedTurns.find((turn) => turn.delivery !== "server");
+                const nextBrowserTurn = queuedTurns.find((turn) =>
+                  turn.delivery !== "server" && turn.text.trim() === event.data.message.trim()
+                );
                 if (nextBrowserTurn) {
+                  consumedQueuedTurnIds.add(nextBrowserTurn.id);
                   queuedTurns = queuedTurns.filter((turn) => turn.id !== nextBrowserTurn.id);
                 }
               }
@@ -660,6 +711,7 @@ export function AgentWorkspace({
       }
       if (controller.signal.aborted) return;
       if (!settled) throw new Error("The active Agent stream ended before reaching a durable boundary.");
+      mergeLiveAdmissions();
       updateThread(thread.id, {
         events: compactThreadEvents(events),
         pendingTurn,
@@ -1080,6 +1132,10 @@ function statusFromEvents(
   if (last.type === "session.failed") return "error";
   const latestTurnBoundary = [...events].reverse().find((event) => event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled");
   if (latestTurnBoundary?.type === "turn.failed") return "error";
+  // Eve accepts cancellation before the session is parked. Keep this distinct
+  // from an active submitted turn so a message sent in that interval becomes
+  // the next normal turn rather than mailbox steering.
+  if (last.type === "turn.cancelled") return "cancelling";
   if (last.type === "session.waiting") {
     return hasUnresolvedInputRequests(events, closedInputRequestIds) ? "waiting" : "ready";
   }
@@ -1154,13 +1210,14 @@ function threadNeedsRecovery(thread: AgentThread): boolean {
   if (thread.hydration === "summary") return false;
   if (!thread.session.sessionId) return false;
   if (thread.queuedTurns.some((turn) =>
-    turn.delivery === "server" && turn.state === "queued" && Boolean(turn.mailboxItemId)
+    (turn.delivery === "server" && mailboxTurnAwaitsAdmission(turn) && Boolean(turn.mailboxItemId)) ||
+    turn.intent === "post-cancellation"
   )) return true;
   const pendingTurnInFlight = thread.pendingTurn?.state === "clearing" ||
     thread.pendingTurn?.state === "resubmitting" ||
     thread.pendingTurn?.state === "submitting";
   if (!pendingTurnInFlight && thread.status !== "streaming" && thread.status !== "submitted") {
-    return false;
+    return thread.status === "cancelling";
   }
   const lastEvent = thread.events.at(-1);
   return !lastEvent || !isRecoveryBoundary(lastEvent);
@@ -1180,6 +1237,8 @@ function sameQueuedTurns(
   return left.length === right.length && left.every((turn, index) => {
     const candidate = right[index];
     return candidate?.id === turn.id &&
+      candidate.delivery === turn.delivery &&
+      candidate.intent === turn.intent &&
       candidate.mailboxItemId === turn.mailboxItemId &&
       candidate.state === turn.state;
   });
@@ -1191,7 +1250,12 @@ function mailboxQueueState(
   if (status === "failed") return "delivery-failed";
   if (status === "submission-ambiguous") return "admission-ambiguous";
   if (status === "cancelled") return "cancelled";
-  return "queued";
+  return status;
+}
+
+function mailboxTurnAwaitsAdmission(turn: AgentQueuedTurn): boolean {
+  return turn.state === "queued" || turn.state === "delivering" ||
+    turn.state === "accepted" || turn.state === "committed";
 }
 
 async function saveThreadCollectionWithConflictRecovery(
@@ -1286,7 +1350,8 @@ function isUrgentPersistenceChange(
     ) return true;
     if (
       prior.status !== thread.status &&
-      (thread.status === "error" || thread.status === "ready" || thread.status === "waiting")
+      (thread.status === "cancelling" || thread.status === "error" ||
+        thread.status === "ready" || thread.status === "waiting")
     ) return true;
     const lastEvent = thread.events.at(-1);
     const priorLastEvent = prior.events.at(-1);

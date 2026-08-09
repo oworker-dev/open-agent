@@ -1,7 +1,7 @@
 import type { ClientAuth, ClientRedirectPolicy, MessageStreamEvent, HeadersValue, PrepareSend } from "eve/client";
 import type { ReactNode } from "react";
 import type { AgentThreadStorage } from "./thread-storage.js";
-export type AgentThreadStatus = "error" | "ready" | "streaming" | "submitted" | "waiting";
+export type AgentThreadStatus = "cancelling" | "error" | "ready" | "streaming" | "submitted" | "waiting";
 export type AgentExecutionMode = "automation" | "cautious" | "standard";
 export type AgentThreadPreferences = {
     readonly executionMode?: AgentExecutionMode;
@@ -18,8 +18,9 @@ export type AgentPendingTurn = {
 export type AgentQueuedTurn = {
     readonly delivery?: "browser" | "server";
     readonly id: string;
+    readonly intent?: "active-turn" | "post-cancellation";
     readonly mailboxItemId?: string;
-    readonly state: "admission-ambiguous" | "delivery-failed" | "queued";
+    readonly state: "accepted" | "admission-ambiguous" | "committed" | "delivering" | "delivery-failed" | "queued";
     readonly submittedAt: number;
     readonly text: string;
 };

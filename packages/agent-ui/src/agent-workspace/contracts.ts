@@ -8,7 +8,7 @@ import type {
 import type { ReactNode } from "react";
 import type { AgentThreadStorage } from "./thread-storage.js";
 
-export type AgentThreadStatus = "error" | "ready" | "streaming" | "submitted" | "waiting";
+export type AgentThreadStatus = "cancelling" | "error" | "ready" | "streaming" | "submitted" | "waiting";
 
 export type AgentExecutionMode = "automation" | "cautious" | "standard";
 
@@ -29,8 +29,16 @@ export type AgentPendingTurn = {
 export type AgentQueuedTurn = {
   readonly delivery?: "browser" | "server";
   readonly id: string;
+  /** A post-cancellation message is a normal next turn staged until Eve parks. */
+  readonly intent?: "active-turn" | "post-cancellation";
   readonly mailboxItemId?: string;
-  readonly state: "admission-ambiguous" | "delivery-failed" | "queued";
+  readonly state:
+    | "accepted"
+    | "admission-ambiguous"
+    | "committed"
+    | "delivering"
+    | "delivery-failed"
+    | "queued";
   readonly submittedAt: number;
   readonly text: string;
 };

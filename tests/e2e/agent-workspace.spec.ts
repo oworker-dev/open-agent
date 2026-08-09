@@ -1160,6 +1160,99 @@ test("cancelling a queued follow-up prevents browser delivery before admission",
   expect(continuationRequests).toBe(0);
 });
 
+test("a mailbox cancellation race reconciles committed admission without a stale cancel error", async ({ page }) => {
+  const sessionId = "mock-mailbox-cancel-race-session";
+  const clientMessageId = "queued-mailbox-cancel-race";
+  const itemId = "mailbox-cancel-race";
+  const settledEvents = eventsFromNdjson(mockSuccessfulTurn("Prepare mailbox race", "Ready."));
+  const admittedEvents = withClientMessageId(
+    eventsFromNdjson(mockContinuationTurn("Committed follow-up", "Committed follow-up completed.")),
+    clientMessageId,
+  ).map((event, index) => isRecord(event) && isRecord(event.meta)
+    ? { ...event, meta: { ...event.meta, id: `evt-mailbox-cancel-race-${index}` } }
+    : event);
+  let cancelAttempted = false;
+  let mailboxInspections = 0;
+  let releaseAdmission: (() => void) | undefined;
+  const admissionReleased = new Promise<void>((resolve) => {
+    releaseAdmission = resolve;
+  });
+
+  setFakeThreadCollection(page, {
+    activeThreadId: "mailbox-cancel-race-thread",
+    threads: [{
+      createdAt: Date.now(),
+      events: settledEvents,
+      id: "mailbox-cancel-race-thread",
+      preferences: { executionMode: "standard", modelId: "gpt-5.6-sol", reasoning: "medium" },
+      queuedTurns: [{
+        delivery: "server",
+        id: clientMessageId,
+        intent: "active-turn",
+        mailboxItemId: itemId,
+        state: "queued",
+        submittedAt: Date.now(),
+        text: "Committed follow-up",
+      }],
+      session: { sessionId, streamIndex: settledEvents.length },
+      status: "ready",
+      title: "Mailbox cancellation race",
+      updatedAt: Date.now(),
+    }],
+    version: 2,
+  });
+  await page.route(`**/api/standalone/mailbox/${itemId}`, async (route) => {
+    if (route.request().method() === "DELETE") {
+      cancelAttempted = true;
+      await route.fulfill({
+        body: JSON.stringify({
+          code: "mailbox_item_not_cancellable",
+          error: "This mailbox item can no longer be cancelled.",
+          ok: false,
+        }),
+        contentType: "application/json",
+        status: 409,
+      });
+      return;
+    }
+    mailboxInspections += 1;
+    await route.fulfill({
+      body: JSON.stringify({
+        item: {
+          clientMessageId,
+          itemId,
+          status: cancelAttempted ? "committed" : "queued",
+        },
+        ok: true,
+      }),
+      contentType: "application/json",
+      status: 200,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
+    await admissionReleased;
+    const startIndex = Number(new URL(route.request().url()).searchParams.get("startIndex") ?? "0");
+    const events = startIndex <= settledEvents.length ? admittedEvents : [];
+    await route.fulfill({
+      body: ndjson(events),
+      contentType: "application/x-ndjson",
+      headers: { "x-eve-stream-tail-index": String(settledEvents.length + admittedEvents.length - 1) },
+      status: 200,
+    });
+  });
+
+  await page.goto("/threads/mailbox-cancel-race-thread");
+  await page.getByRole("button", { name: "Remove queued message" }).click();
+  await expect.poll(() => cancelAttempted).toBeTruthy();
+  await expect(page.getByText("This mailbox item can no longer be cancelled.")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Remove queued message" })).toHaveCount(0);
+
+  releaseAdmission?.();
+  await expect(page.getByText("Committed follow-up completed.", { exact: true })).toBeVisible({ timeout: 15_000 });
+  await expect(page.locator("[data-agent-steer-queue]")).toBeHidden();
+  expect(mailboxInspections).toBeLessThanOrEqual(5);
+});
+
 test("a persisted follow-up survives recovery and dispatches after the durable boundary", async ({ page }) => {
   const sessionId = "mock-persisted-follow-up-session";
   const initialTurn = eventsFromNdjson(mockSuccessfulTurn("Start persisted work", "Persisted work completed."));
@@ -1939,6 +2032,208 @@ test("stop immediately returns the thread to an interactive state while server c
   await expect(page.getByRole("button", { name: "Send" })).toBeVisible({ timeout: 100 });
   await cancelled;
   expect(cancelledTurnId).toBe("turn_0");
+});
+
+test("a message sent while cancellation settles becomes the next normal turn instead of mailbox steering", async ({ page }) => {
+  const sessionId = "mock-post-cancel-follow-up-session";
+  const at = new Date().toISOString();
+  const turnId = "turn_0";
+  const initialEvents = [
+    { data: { runtime: { agentId: "open-agent", agentName: "open-agent", eveVersion: "test", modelId: "mock/model" } }, meta: { at }, type: "session.started" },
+    { data: { sequence: 0, turnId }, meta: { at }, type: "turn.started" },
+    { data: { message: "Start long work", parts: [{ text: "Start long work", type: "text" }], sequence: 0, turnId }, meta: { at }, type: "message.received" },
+  ];
+  const cancelledEvents = [
+    ...initialEvents,
+    { data: { sequence: 0, turnId }, meta: { at }, type: "turn.cancelled" },
+    { data: { wait: "next-user-message" }, meta: { at }, type: "session.waiting" },
+  ];
+  const continuationEvents = eventsFromNdjson(
+    mockContinuationTurn("Continue as a normal turn", "Normal continuation completed."),
+  );
+  let releaseCancellation: (() => void) | undefined;
+  const cancellationReleased = new Promise<void>((resolve) => {
+    releaseCancellation = resolve;
+  });
+  let followUpBody: Record<string, unknown> | undefined;
+  let mailboxEnqueues = 0;
+
+  await page.route("**/eve/v1/session", (route) => route.fulfill({
+    body: JSON.stringify({ sessionId }),
+    contentType: "application/json",
+    headers: { "x-eve-session-id": sessionId },
+    status: 202,
+  }));
+  await page.route(`**/eve/v1/session/${sessionId}/cancel`, async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({ ok: true, sessionId, status: "accepted" }),
+      contentType: "application/json",
+      status: 202,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}`, async (route) => {
+    followUpBody = route.request().postDataJSON() as Record<string, unknown>;
+    await route.fulfill({
+      body: JSON.stringify({ sessionId }),
+      contentType: "application/json",
+      status: 202,
+    });
+  });
+  await page.route("**/api/standalone/mailbox", async (route) => {
+    mailboxEnqueues += 1;
+    await route.fulfill({
+      body: JSON.stringify({
+        item: {
+          clientMessageId: "unexpected-mailbox-message",
+          itemId: "unexpected-mailbox-item",
+          status: "queued",
+        },
+        ok: true,
+      }),
+      contentType: "application/json",
+      status: 202,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
+    const startIndex = Number(new URL(route.request().url()).searchParams.get("startIndex") ?? "0");
+    if (startIndex === 0) {
+      await route.fulfill({ body: ndjson(initialEvents), contentType: "application/x-ndjson", status: 200 });
+      return;
+    }
+    await cancellationReleased;
+    const events = followUpBody
+      ? continuationEvents
+      : cancelledEvents.slice(startIndex);
+    await route.fulfill({
+      body: ndjson(events),
+      contentType: "application/x-ndjson",
+      headers: { "x-eve-stream-tail-index": String(startIndex + events.length - 1) },
+      status: 200,
+    });
+  });
+
+  await page.goto("/");
+  const composer = page.getByRole("textbox", { name: "Do anything" });
+  await composer.fill("Start long work");
+  await composer.press("Enter");
+  await expect(page.getByRole("button", { name: "Stop", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Stop", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Send" })).toBeVisible();
+
+  await composer.fill("Continue as a normal turn");
+  await composer.press("Enter");
+  await expect(page.getByText("Continue as a normal turn", { exact: true })).toBeVisible();
+  await expect(page.locator("[data-agent-steer-queue]")).toBeHidden();
+  expect(mailboxEnqueues).toBe(0);
+  expect(followUpBody).toBeUndefined();
+
+  releaseCancellation?.();
+  await expect.poll(() => followUpBody).toMatchObject({ message: "Continue as a normal turn" });
+  await expect(page.getByText("Normal continuation completed.", { exact: true })).toBeVisible({ timeout: 15_000 });
+  await expect(page.locator("[data-agent-steer-queue]")).toBeHidden();
+  expect(mailboxEnqueues).toBe(0);
+});
+
+test("a post-cancellation message survives a recovery event arriving in the same stream batch", async ({ page }) => {
+  const threadId = "mid-batch-post-cancel-thread";
+  const sessionId = "mock-mid-batch-post-cancel-session";
+  const at = new Date().toISOString();
+  const turnId = "turn_0";
+  const initialEvents = [
+    { data: { runtime: { agentId: "open-agent", agentName: "open-agent", eveVersion: "test", modelId: "mock/model" } }, meta: { at }, type: "session.started" },
+    { data: { sequence: 0, turnId }, meta: { at }, type: "turn.started" },
+    { data: { message: "Start interrupted work", parts: [{ text: "Start interrupted work", type: "text" }], sequence: 0, turnId }, meta: { at }, type: "message.received" },
+  ];
+  const cancellationEvents = [
+    { data: { sequence: 0, turnId }, meta: { at }, type: "turn.cancelled" },
+    { data: { wait: "next-user-message" }, meta: { at }, type: "session.waiting" },
+  ];
+  const continuationEvents = eventsFromNdjson(
+    mockContinuationTurn("Continue after the boundary", "Boundary continuation completed."),
+  );
+  let followUpBody: Record<string, unknown> | undefined;
+
+  setFakeThreadCollection(page, {
+    activeThreadId: threadId,
+    threads: [{
+      createdAt: Date.now(),
+      events: initialEvents,
+      id: threadId,
+      preferences: { executionMode: "standard", modelId: "gpt-5.6-sol", reasoning: "medium" },
+      queuedTurns: [],
+      session: { sessionId, streamIndex: initialEvents.length },
+      status: "cancelling",
+      title: "Mid-batch cancellation",
+      updatedAt: Date.now(),
+    }],
+    version: 2,
+  });
+  await page.addInitScript(({ boundaryEvents, targetSessionId }) => {
+    const nativeFetch = window.fetch.bind(window);
+    let intercepted = false;
+    window.fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (!intercepted && url.includes(`/eve/v1/session/${targetSessionId}/stream`)) {
+        intercepted = true;
+        const encoder = new TextEncoder();
+        let releaseBoundary: (() => void) | undefined;
+        const boundaryReleased = new Promise<void>((resolve) => {
+          releaseBoundary = resolve;
+        });
+        Reflect.set(window, "__openAgentReleaseRecoveryBoundary", releaseBoundary);
+        return new Response(new ReadableStream<Uint8Array>({
+          async start(controller) {
+            controller.enqueue(encoder.encode(`${JSON.stringify(boundaryEvents[0])}\n`));
+            Reflect.set(window, "__openAgentRecoveryMidBatch", true);
+            await boundaryReleased;
+            controller.enqueue(encoder.encode(`${JSON.stringify(boundaryEvents[1])}\n`));
+            controller.close();
+          },
+        }), {
+          headers: {
+            "content-type": "application/x-ndjson",
+            "x-eve-stream-tail-index": "4",
+          },
+          status: 200,
+        });
+      }
+      return nativeFetch(input, init);
+    };
+  }, { boundaryEvents: cancellationEvents, targetSessionId: sessionId });
+  await page.route(`**/eve/v1/session/${sessionId}`, async (route) => {
+    followUpBody = route.request().postDataJSON() as Record<string, unknown>;
+    await route.fulfill({
+      body: JSON.stringify({ sessionId }),
+      contentType: "application/json",
+      status: 202,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
+    const startIndex = Number(new URL(route.request().url()).searchParams.get("startIndex") ?? "0");
+    const events = followUpBody ? continuationEvents : [];
+    await route.fulfill({
+      body: ndjson(events),
+      contentType: "application/x-ndjson",
+      headers: { "x-eve-stream-tail-index": String(startIndex + events.length - 1) },
+      status: 200,
+    });
+  });
+
+  await page.goto(`/threads/${threadId}`);
+  await page.waitForFunction(() => Reflect.get(window, "__openAgentRecoveryMidBatch") === true);
+  await expect.poll(() => threadEvents(page).some((event) => isEventType(event, "turn.cancelled"))).toBeTruthy();
+  const composer = page.getByRole("textbox", { name: "Do anything" });
+  await composer.fill("Continue after the boundary");
+  await composer.press("Enter");
+  await expect(page.getByText("Continue after the boundary", { exact: true })).toBeVisible();
+  await page.evaluate(() => {
+    const release = Reflect.get(window, "__openAgentReleaseRecoveryBoundary");
+    if (typeof release === "function") release();
+  });
+
+  await expect.poll(() => followUpBody).toMatchObject({ message: "Continue after the boundary" });
+  await expect(page.getByText("Boundary continuation completed.", { exact: true })).toBeVisible({ timeout: 15_000 });
+  await expect(page.locator("[data-agent-steer-queue]")).toBeHidden();
 });
 
 test("a follow-up after cancellation receives the interrupted task and completed tool context", async ({ page }) => {

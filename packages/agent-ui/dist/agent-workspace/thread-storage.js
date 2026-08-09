@@ -138,7 +138,21 @@ function parseQueuedTurn(value) {
     if (typeof value.id !== "string" || !value.id ||
         typeof value.text !== "string" || !value.text.trim() ||
         typeof value.submittedAt !== "number" || !Number.isFinite(value.submittedAt) ||
-        (value.state !== "queued" && value.state !== "delivery-failed" && value.state !== "admission-ambiguous")) {
+        (value.state !== "queued" && value.state !== "delivering" &&
+            value.state !== "accepted" && value.state !== "committed" &&
+            value.state !== "delivery-failed" && value.state !== "admission-ambiguous")) {
+        return undefined;
+    }
+    const mailboxItemId = typeof value.mailboxItemId === "string" && value.mailboxItemId
+        ? value.mailboxItemId
+        : undefined;
+    const durableDeliveryPhase = value.state === "delivering" ||
+        value.state === "accepted" || value.state === "committed";
+    if (durableDeliveryPhase && (value.delivery !== "server" || !mailboxItemId)) {
+        return undefined;
+    }
+    if (value.intent === "post-cancellation" &&
+        (value.delivery !== "browser" || value.state !== "queued" || mailboxItemId)) {
         return undefined;
     }
     return {
@@ -146,9 +160,10 @@ function parseQueuedTurn(value) {
             ? { delivery: value.delivery }
             : {}),
         id: value.id,
-        ...(typeof value.mailboxItemId === "string" && value.mailboxItemId
-            ? { mailboxItemId: value.mailboxItemId }
+        ...(value.intent === "active-turn" || value.intent === "post-cancellation"
+            ? { intent: value.intent }
             : {}),
+        ...(mailboxItemId ? { mailboxItemId } : {}),
         state: value.state,
         submittedAt: value.submittedAt,
         text: value.text,
@@ -255,7 +270,8 @@ function isRecord(value) {
     return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function isThreadStatus(value) {
-    return value === "error" || value === "ready" || value === "streaming" || value === "submitted" || value === "waiting";
+    return value === "cancelling" || value === "error" || value === "ready" ||
+        value === "streaming" || value === "submitted" || value === "waiting";
 }
 function numberOrNow(value) {
     return typeof value === "number" && Number.isFinite(value) ? value : Date.now();

@@ -40,6 +40,8 @@ declare const translations: {
         readonly providerStillWaiting: "Still waiting. The run remains active and transient failures retry automatically.";
         readonly queuedFollowUps: "Queued follow-ups";
         readonly queueDeliveryFailed: "Delivery failed";
+        readonly queueDelivering: "Sending";
+        readonly queueAccepted: "Accepted";
         readonly queueAdmissionAmbiguous: "Admission needs review";
         readonly queueAttachmentsUnsupported: "Attachments can be sent after the current turn finishes.";
         readonly queueFollowUp: "Queue follow-up";
@@ -154,6 +156,8 @@ declare const translations: {
         readonly providerStillWaiting: "仍在等待。任务保持运行，短暂故障会自动重试。";
         readonly queuedFollowUps: "待发送的后续消息";
         readonly queueDeliveryFailed: "投递失败";
+        readonly queueDelivering: "正在发送";
+        readonly queueAccepted: "已接纳";
         readonly queueAdmissionAmbiguous: "接纳状态待确认";
         readonly queueAttachmentsUnsupported: "附件需要等当前轮次结束后发送。";
         readonly queueFollowUp: "发送后续消息";

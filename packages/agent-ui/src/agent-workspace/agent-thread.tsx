@@ -14,6 +14,7 @@ import type { AgentInputResponse } from "./agent-message.js";
 import { AssistantThreadSurface } from "./assistant-thread-surface.js";
 import type { AgentModelOption, AgentPromptMenuItem, AgentQueuedTurn, AgentThread, AgentThreadPatch, AgentWorkspaceClientConfig, AgentWorkspaceMailbox, PromptInputMessage } from "./contracts.js";
 import { sanitizeAgentError } from "./error-presentation.js";
+import { AgentMailboxHttpError } from "./http-agent-mailbox.js";
 import { messagesFor, type AgentLocale, type AgentMessages } from "./i18n.js";
 import {
   interruptedTurnContextFromEvents,
@@ -106,6 +107,7 @@ export function AgentThreadView({
   const mailboxEnqueueIdsRef = useRef(new Set<string>());
   const editStagePendingRef = useRef(false);
   const turnAdmissionBusyRef = useRef(false);
+  const cancellationRecoveryRef = useRef<() => void>(() => undefined);
   const [cancellationState, setCancellationState] = useState<"idle" | "requested" | "cancelling">("idle");
   const [cancellationRevision, setCancellationRevision] = useState(0);
   const [localInterruption, setLocalInterruption] = useState<LocalInterruption>();
@@ -163,11 +165,15 @@ export function AgentThreadView({
       cancellation.sentSessionId = durableSession.state.sessionId;
     }
 
-    void durableSession.cancel(turnId ? { turnId } : undefined).catch((error: unknown) => {
-      cancellationRef.current = { requested: false, turnId };
-      setCancellationError(error instanceof Error ? error.message : "Unable to stop this turn.");
-      setCancellationState("idle");
-    });
+    void durableSession.cancel(turnId ? { turnId } : undefined)
+      .then(() => {
+        if (cancellationRef.current.requested) cancellationRecoveryRef.current();
+      })
+      .catch((error: unknown) => {
+        cancellationRef.current = { requested: false, turnId };
+        setCancellationError(error instanceof Error ? error.message : "Unable to stop this turn.");
+        setCancellationState("idle");
+      });
   }, []);
 
   const handleEvent = useCallback(
@@ -221,13 +227,13 @@ export function AgentThreadView({
   // A durable turn boundary is authoritative. React stream state can remain
   // stale after a reconnect even though Eve has already parked the session.
   const pendingTurnInFlight = isPendingTurnInFlight(thread.pendingTurn);
-  const durableTurnSettled = !pendingTurnInFlight && thread.queuedTurns.length === 0 &&
-    hasSettledLatestTurn(agent.events);
-  const agentIsBusy = runtimeIsBusy && !localInterruption && !durableTurnSettled;
+  const durableTurnSettled = !pendingTurnInFlight && hasSettledLatestTurn(agent.events);
+  const cancellationSettling = cancellationRef.current.requested || thread.status === "cancelling";
+  const agentIsBusy = runtimeIsBusy && !localInterruption && !cancellationSettling && !durableTurnSettled;
   const isBusy = pendingTurnInFlight || agentIsBusy ||
-    (isRecovering && !localInterruption && !durableTurnSettled);
+    (isRecovering && !localInterruption && !cancellationSettling && !durableTurnSettled);
   const admissionBusy = pendingTurnInFlight || (!durableTurnSettled &&
-    (runtimeIsBusy || isRecovering || cancellationRef.current.requested));
+    (runtimeIsBusy || isRecovering || cancellationSettling));
   const pendingInputRequests = unresolvedInputRequests(agent.events, closedInputRequestIdsRef.current);
   const awaitingInput = pendingInputRequests.length > 0;
   // Questions are non-blocking from the composer: a new message is a normal
@@ -261,10 +267,15 @@ export function AgentThreadView({
       streamIndex: initialStreamIndexRef.current + consumedEvents,
     };
     recoveryRequestedRef.current = true;
-    onChange({ session: currentSession, status: "streaming", updatedAt: Date.now() });
+    onChange({
+      session: currentSession,
+      status: cancellationRef.current.requested ? "cancelling" : "streaming",
+      updatedAt: Date.now(),
+    });
     stopAgent();
     onRecoveryNeeded();
   }, [agent.events.length, agent.session, onChange, onRecoveryNeeded, stopAgent]);
+  cancellationRecoveryRef.current = requestRecovery;
 
   useEffect(() => {
     const lastEvent = agent.events.at(-1);
@@ -376,7 +387,9 @@ export function AgentThreadView({
       ...(acceptedQueuedTurn ? { queuedTurns: queuedTurnsRef.current } : {}),
       ...(cancelledTurn ? { retainedContext } : {}),
       session: agent.session ? { ...agent.session, streamIndex } : { streamIndex },
-      status: turnError ? "error" : awaitingInput ? "waiting" : agent.status,
+      status: cancellationRef.current.requested
+        ? "cancelling"
+        : turnError ? "error" : awaitingInput ? "waiting" : agent.status,
       updatedAt: Date.now(),
     });
   }, [agent.events, agent.session, agent.status, awaitingInput, isRecovering, onChange, recoveryContextWindowTokens, turnError]);
@@ -420,6 +433,7 @@ export function AgentThreadView({
   };
 
   const updateQueuedTurns = (queuedTurns: readonly AgentQueuedTurn[]) => {
+    if (sameQueuedTurnSnapshots(queuedTurnsRef.current, queuedTurns)) return;
     queuedTurnsRef.current = queuedTurns;
     onChange({ queuedTurns, updatedAt: Date.now() });
   };
@@ -449,17 +463,42 @@ export function AgentThreadView({
     const turn = queuedTurnsRef.current.find((candidate) => candidate.id === turnId);
     if (!turn) return;
     if (turn.delivery === "server" && turn.mailboxItemId && mailbox) {
+      if (!mailboxTurnIsCancellable(turn)) return;
       void mailbox.cancel(turn.mailboxItemId)
-        .then(() => updateQueuedTurns(
-          queuedTurnsRef.current.filter((candidate) => candidate.id !== turnId),
-        ))
-        .catch((error: unknown) => setQueueError(
-          error instanceof Error ? error.message : messages.queueDeliveryFailed,
-        ));
+        .then((receipt) => reconcileMailboxReceipt(turnId, receipt))
+        .catch(async (error: unknown) => {
+          if (
+            error instanceof AgentMailboxHttpError &&
+            error.code === "mailbox_item_not_cancellable"
+          ) {
+            try {
+              const receipt = await mailbox.inspect(turn.mailboxItemId!);
+              reconcileMailboxReceipt(turnId, receipt);
+              return;
+            } catch {
+              // Fall through to the actionable delivery error below.
+            }
+          }
+          setQueueError(error instanceof Error ? error.message : messages.queueDeliveryFailed);
+        });
       return;
     }
     updateQueuedTurns(queuedTurnsRef.current.filter((candidate) => candidate.id !== turnId));
   };
+
+  function reconcileMailboxReceipt(
+    turnId: string,
+    receipt: import("./contracts.js").AgentMailboxReceipt,
+  ) {
+    const state = mailboxTurnState(receipt.status);
+    updateQueuedTurns(state === "cancelled"
+      ? queuedTurnsRef.current.filter((candidate) => candidate.id !== turnId)
+      : queuedTurnsRef.current.map((candidate) =>
+          candidate.id === turnId
+            ? { ...candidate, mailboxItemId: receipt.itemId, state }
+            : candidate,
+        ));
+  }
 
   const requestCancellation = () => {
     if (!isBusy || cancellationRef.current.requested) return;
@@ -500,7 +539,7 @@ export function AgentThreadView({
       events: latestEventsRef.current,
       pendingTurn: interruptedPendingTurn,
       retainedContext,
-      status: "ready",
+      status: "cancelling",
       updatedAt: Date.now(),
     });
     const durableSession = sessionRef.current;
@@ -514,6 +553,31 @@ export function AgentThreadView({
     closeInputRequests(pendingInputRequests
       .filter((request) => request.kind === "question")
       .map((request) => request.requestId));
+    if (cancellationSettling) {
+      if (message.files.length > 0) {
+        setQueueError(messages.queueAttachmentsUnsupported);
+        return;
+      }
+      if (queuedTurnsRef.current.length >= MAX_QUEUED_FOLLOW_UPS) {
+        setQueueError(messages.queueFull);
+        return;
+      }
+      if (text.length > 0) {
+        setQueueError(undefined);
+        updateQueuedTurns([
+          ...queuedTurnsRef.current,
+          {
+            delivery: "browser",
+            id: createPendingTurnId(),
+            intent: "post-cancellation",
+            state: "queued",
+            submittedAt: Date.now(),
+            text,
+          },
+        ]);
+      }
+      return;
+    }
     if (admissionBusy || turnAdmissionBusyRef.current) {
       if (message.files.length > 0) {
         setQueueError(messages.queueAttachmentsUnsupported);
@@ -530,6 +594,7 @@ export function AgentThreadView({
           {
             ...(mailbox ? { delivery: "server" as const } : {}),
             id: createPendingTurnId(),
+            intent: "active-turn",
             state: "queued",
             submittedAt: Date.now(),
             text,
@@ -558,11 +623,14 @@ export function AgentThreadView({
     await sendPrompt(agent.send, { files: message.files, text }, thread.retainedContext);
   };
 
-  const projectedMessages = localInterruption?.messages ?? ensureActiveAssistantMessage(
-    agent.data.messages,
-    agent.events,
-    isBusy || thread.pendingTurn?.state === "resubmitting" || Boolean(latestTurnFailure(agent.events)),
-    thread.pendingTurn,
+  const projectedMessages = projectStagedUserMessages(
+    localInterruption?.messages ?? ensureActiveAssistantMessage(
+      agent.data.messages,
+      agent.events,
+      isBusy || thread.pendingTurn?.state === "resubmitting" || Boolean(latestTurnFailure(agent.events)),
+      thread.pendingTurn,
+    ),
+    thread.queuedTurns.filter((turn) => turn.intent === "post-cancellation"),
   );
   const ungroupedVisibleMessages = projectedMessages.filter((message) =>
     !isProxiedInputOnlyMessage(message, agent.events),
@@ -590,7 +658,7 @@ export function AgentThreadView({
     enqueue: (message) => {
       void submit(promptFromAssistantMessage(getEveMessageContent(message)));
     },
-    items: thread.queuedTurns.map((turn) => ({
+    items: thread.queuedTurns.filter((turn) => turn.intent !== "post-cancellation").map((turn) => ({
       id: turn.id,
       parts: [{ text: turn.text, type: "text" }],
       prompt: turn.text,
@@ -749,6 +817,7 @@ export function AgentThreadView({
     if (!mailbox || !agent.session?.sessionId) return;
     const next = queuedTurnsRef.current.find((turn) =>
       turn.delivery === "server" &&
+      turn.intent !== "post-cancellation" &&
       turn.state === "queued" &&
       !turn.mailboxItemId &&
       !mailboxEnqueueIdsRef.current.has(turn.id)
@@ -783,9 +852,10 @@ export function AgentThreadView({
   }, [agent.session?.sessionId, mailbox, messages.queueDeliveryFailed, thread.queuedTurns]);
 
   useEffect(() => {
-    if (!mailbox) return;
+    if (!mailbox || isRecovering) return;
     const tracked = queuedTurnsRef.current.filter((turn) =>
-      turn.delivery === "server" && turn.mailboxItemId && turn.state === "queued"
+      turn.delivery === "server" && Boolean(turn.mailboxItemId) &&
+      turn.state !== "delivery-failed"
     );
     if (tracked.length === 0) return;
     let disposed = false;
@@ -813,17 +883,20 @@ export function AgentThreadView({
       disposed = true;
       window.clearInterval(timer);
     };
-  }, [mailbox, thread.queuedTurns]);
+  }, [isRecovering, mailbox, thread.queuedTurns]);
 
   useEffect(() => {
-    if (
-      !mailbox || admissionBusy || inputLocked || recoveryRequestedRef.current ||
-      !queuedTurnsRef.current.some((turn) =>
-        turn.delivery === "server" && turn.state === "queued" && Boolean(turn.mailboxItemId)
-      )
-    ) return;
+    if (!mailbox || isRecovering || inputLocked || recoveryRequestedRef.current) return;
+    const serverTurns = queuedTurnsRef.current.filter((turn) =>
+      turn.delivery === "server" && Boolean(turn.mailboxItemId)
+    );
+    const committedAdmission = serverTurns.some((turn) => turn.state === "committed");
+    const parkedDelivery = !admissionBusy && serverTurns.some((turn) =>
+      turn.state === "queued" || turn.state === "delivering" || turn.state === "accepted"
+    );
+    if (!committedAdmission && !parkedDelivery) return;
     requestRecovery();
-  }, [admissionBusy, inputLocked, mailbox, requestRecovery, thread.queuedTurns]);
+  }, [admissionBusy, inputLocked, isRecovering, mailbox, requestRecovery, thread.queuedTurns]);
 
   useEffect(() => {
     if (
@@ -870,6 +943,10 @@ export function AgentThreadView({
 
   const closeInputRequest = (requestId: string) => closeInputRequests([requestId]);
 
+  const visibleQueuedTurns = thread.queuedTurns.filter((turn) =>
+    turn.intent !== "post-cancellation"
+  );
+
   return (
     <AssistantRuntimeProvider runtime={assistantRuntime}>
       <main className="flex min-h-0 flex-1 flex-col overflow-hidden">
@@ -877,13 +954,13 @@ export function AgentThreadView({
           cancellationState={cancellationState}
           cancellationRevision={cancellationRevision}
           commands={commands}
-          composerTop={thread.queuedTurns.length > 0 || queueError ? (
+          composerTop={visibleQueuedTurns.length > 0 || queueError ? (
             <FollowUpQueue
               error={queueError}
               messages={messages}
               onRemove={removeQueuedTurn}
               onRetry={markQueuedTurnForRetry}
-              turns={thread.queuedTurns}
+              turns={visibleQueuedTurns}
             />
           ) : undefined}
           draftStorageKey={draftStorageKey}
@@ -954,9 +1031,9 @@ export function FollowUpQueue({
           <div className="flex min-w-0 items-center gap-2 rounded-lg px-1 py-1 hover:bg-muted/55" key={turn.id}>
             <span className={cn("size-1.5 shrink-0 rounded-full", turn.state === "delivery-failed" ? "bg-destructive" : "bg-amber-500")} />
             <span className="min-w-0 flex-1 truncate text-[13px]">{turn.text}</span>
-            {turn.state === "delivery-failed" ? <span className="shrink-0 text-xs text-destructive">{messages.queueDeliveryFailed}</span> : turn.state === "admission-ambiguous" ? <span className="shrink-0 text-xs text-amber-700 dark:text-amber-300">{messages.queueAdmissionAmbiguous}</span> : null}
+            {turn.state === "delivery-failed" ? <span className="shrink-0 text-xs text-destructive">{messages.queueDeliveryFailed}</span> : turn.state === "admission-ambiguous" ? <span className="shrink-0 text-xs text-amber-700 dark:text-amber-300">{messages.queueAdmissionAmbiguous}</span> : turn.state === "delivering" ? <span className="shrink-0 text-xs text-muted-foreground">{messages.queueDelivering}</span> : turn.state === "accepted" || turn.state === "committed" ? <span className="shrink-0 text-xs text-muted-foreground">{messages.queueAccepted}</span> : null}
             {turn.state === "delivery-failed" ? <Button aria-label={messages.retryQueuedMessage} className="size-7" onClick={() => onRetry(turn.id)} size="icon-sm" variant="ghost"><RotateCcwIcon className="size-3.5" /></Button> : null}
-            {turn.state !== "admission-ambiguous" ? <Button aria-label={messages.removeQueuedMessage} className="size-7" onClick={() => onRemove(turn.id)} size="icon-sm" variant="ghost"><XIcon className="size-3.5" /></Button> : null}
+            {mailboxTurnIsCancellable(turn) ? <Button aria-label={messages.removeQueuedMessage} className="size-7" onClick={() => onRemove(turn.id)} size="icon-sm" variant="ghost"><XIcon className="size-3.5" /></Button> : null}
           </div>
         ))}
       </div>
@@ -1016,6 +1093,24 @@ function projectPendingUserMessage(
       role: "user" as const,
     },
   ];
+}
+
+function projectStagedUserMessages(
+  messages: readonly EveMessage[],
+  turns: readonly AgentQueuedTurn[],
+): readonly EveMessage[] {
+  if (turns.length === 0) return messages;
+  const projected = [...messages];
+  for (const turn of turns) {
+    const id = `${turn.id}:user`;
+    if (projected.some((message) => message.id === id)) continue;
+    projected.push({
+      id,
+      parts: [{ text: turn.text, type: "text" }],
+      role: "user",
+    });
+  }
+  return projected;
 }
 
 function pendingTurnMatchesMessage(
@@ -1206,7 +1301,28 @@ function mailboxTurnState(
   if (status === "failed") return "delivery-failed";
   if (status === "submission-ambiguous") return "admission-ambiguous";
   if (status === "cancelled") return "cancelled";
-  return "queued";
+  return status;
+}
+
+function mailboxTurnIsCancellable(turn: AgentQueuedTurn): boolean {
+  if (turn.delivery !== "server") return true;
+  return turn.state === "queued" || turn.state === "delivery-failed";
+}
+
+function sameQueuedTurnSnapshots(
+  left: readonly AgentQueuedTurn[],
+  right: readonly AgentQueuedTurn[],
+): boolean {
+  return left.length === right.length && left.every((turn, index) => {
+    const candidate = right[index];
+    return candidate?.id === turn.id &&
+      candidate.delivery === turn.delivery &&
+      candidate.intent === turn.intent &&
+      candidate.mailboxItemId === turn.mailboxItemId &&
+      candidate.state === turn.state &&
+      candidate.submittedAt === turn.submittedAt &&
+      candidate.text === turn.text;
+  });
 }
 
 async function hasDurableProgressAfter(

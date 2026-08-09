@@ -440,10 +440,41 @@ export function AgentWorkspace({ client, commands = [], defaultPreferences, exte
         let reconnectAttempt = 0;
         let pendingTurn = thread.pendingTurn;
         let queuedTurns = thread.queuedTurns;
+        const recoveryOwnedQueuedTurnIds = new Set(queuedTurns.map((turn) => turn.id));
+        const consumedQueuedTurnIds = new Set();
+        const recoveryOwnedPendingTurnId = pendingTurn?.id;
+        const consumedPendingTurnIds = new Set();
         let settled = false;
         const currentClosedInputRequestIds = () => new Set(threadsRef.current.find((candidate) => candidate.id === thread.id)?.closedInputRequestIds ?? thread.closedInputRequestIds);
+        const mergeLiveAdmissions = () => {
+            const liveThread = threadsRef.current.find((candidate) => candidate.id === thread.id);
+            if (!liveThread)
+                return;
+            const liveQueuedTurnIds = new Set(liveThread.queuedTurns.map((turn) => turn.id));
+            queuedTurns = queuedTurns.filter((turn) => !consumedQueuedTurnIds.has(turn.id) &&
+                (recoveryOwnedQueuedTurnIds.has(turn.id) || liveQueuedTurnIds.has(turn.id)));
+            const localQueuedTurnIds = new Set(queuedTurns.map((turn) => turn.id));
+            for (const turn of liveThread.queuedTurns) {
+                if (!localQueuedTurnIds.has(turn.id) &&
+                    !consumedQueuedTurnIds.has(turn.id)) {
+                    queuedTurns = [...queuedTurns, turn];
+                    localQueuedTurnIds.add(turn.id);
+                }
+            }
+            const livePendingTurn = liveThread.pendingTurn;
+            if (livePendingTurn &&
+                livePendingTurn.id !== recoveryOwnedPendingTurnId &&
+                !consumedPendingTurnIds.has(livePendingTurn.id)) {
+                pendingTurn = livePendingTurn;
+            }
+            else if (pendingTurn &&
+                pendingTurn.id !== recoveryOwnedPendingTurnId &&
+                (!livePendingTurn || consumedPendingTurnIds.has(pendingTurn.id))) {
+                pendingTurn = undefined;
+            }
+        };
         const refreshMailboxQueue = async () => {
-            queuedTurns = threadsRef.current.find((candidate) => candidate.id === thread.id)?.queuedTurns ?? queuedTurns;
+            mergeLiveAdmissions();
             if (!mailbox)
                 return;
             const updates = new Map();
@@ -471,7 +502,7 @@ export function AgentWorkspace({ client, commands = [], defaultPreferences, exte
             queuedTurns = next;
             updateThread(thread.id, { queuedTurns });
         };
-        const hasPendingServerQueue = () => queuedTurns.some((turn) => turn.delivery === "server" && turn.state === "queued" && Boolean(turn.mailboxItemId));
+        const hasPendingServerQueue = () => queuedTurns.some((turn) => turn.delivery === "server" && mailboxTurnAwaitsAdmission(turn) && Boolean(turn.mailboxItemId));
         const currentBoundarySettles = () => {
             const last = events.at(-1);
             if (!last || !isRecoveryBoundary(last))
@@ -495,6 +526,7 @@ export function AgentWorkspace({ client, commands = [], defaultPreferences, exte
                         startIndex: cursor,
                         ...(follow ? { streamReconnectPolicy: RECOVERY_STREAM_RECONNECT_POLICY } : {}),
                     })) {
+                        mergeLiveAdmissions();
                         events = [...appendThreadEvent(events, event)];
                         cursor += 1;
                         consumed += 1;
@@ -502,16 +534,21 @@ export function AgentWorkspace({ client, commands = [], defaultPreferences, exte
                         if (event.type === "message.received") {
                             const clientMessageId = event.data.clientMessageId;
                             if (clientMessageId) {
+                                consumedQueuedTurnIds.add(clientMessageId);
                                 queuedTurns = queuedTurns.filter((turn) => turn.id !== clientMessageId);
-                                if (pendingTurn?.id === clientMessageId)
+                                if (pendingTurn?.id === clientMessageId) {
+                                    consumedPendingTurnIds.add(clientMessageId);
                                     pendingTurn = undefined;
+                                }
                             }
                             else if (pendingTurn) {
+                                consumedPendingTurnIds.add(pendingTurn.id);
                                 pendingTurn = undefined;
                             }
                             else {
-                                const nextBrowserTurn = queuedTurns.find((turn) => turn.delivery !== "server");
+                                const nextBrowserTurn = queuedTurns.find((turn) => turn.delivery !== "server" && turn.text.trim() === event.data.message.trim());
                                 if (nextBrowserTurn) {
+                                    consumedQueuedTurnIds.add(nextBrowserTurn.id);
                                     queuedTurns = queuedTurns.filter((turn) => turn.id !== nextBrowserTurn.id);
                                 }
                             }
@@ -572,6 +609,7 @@ export function AgentWorkspace({ client, commands = [], defaultPreferences, exte
                 return;
             if (!settled)
                 throw new Error("The active Agent stream ended before reaching a durable boundary.");
+            mergeLiveAdmissions();
             updateThread(thread.id, {
                 events: compactThreadEvents(events),
                 pendingTurn,
@@ -739,6 +777,8 @@ function statusFromEvents(events, closedInputRequestIds = new Set()) {
     const latestTurnBoundary = [...events].reverse().find((event) => event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled");
     if (latestTurnBoundary?.type === "turn.failed")
         return "error";
+    if (last.type === "turn.cancelled")
+        return "cancelling";
     if (last.type === "session.waiting") {
         return hasUnresolvedInputRequests(events, closedInputRequestIds) ? "waiting" : "ready";
     }
@@ -802,13 +842,14 @@ function threadNeedsRecovery(thread) {
         return false;
     if (!thread.session.sessionId)
         return false;
-    if (thread.queuedTurns.some((turn) => turn.delivery === "server" && turn.state === "queued" && Boolean(turn.mailboxItemId)))
+    if (thread.queuedTurns.some((turn) => (turn.delivery === "server" && mailboxTurnAwaitsAdmission(turn) && Boolean(turn.mailboxItemId)) ||
+        turn.intent === "post-cancellation"))
         return true;
     const pendingTurnInFlight = thread.pendingTurn?.state === "clearing" ||
         thread.pendingTurn?.state === "resubmitting" ||
         thread.pendingTurn?.state === "submitting";
     if (!pendingTurnInFlight && thread.status !== "streaming" && thread.status !== "submitted") {
-        return false;
+        return thread.status === "cancelling";
     }
     const lastEvent = thread.events.at(-1);
     return !lastEvent || !isRecoveryBoundary(lastEvent);
@@ -823,6 +864,8 @@ function sameQueuedTurns(left, right) {
     return left.length === right.length && left.every((turn, index) => {
         const candidate = right[index];
         return candidate?.id === turn.id &&
+            candidate.delivery === turn.delivery &&
+            candidate.intent === turn.intent &&
             candidate.mailboxItemId === turn.mailboxItemId &&
             candidate.state === turn.state;
     });
@@ -834,7 +877,11 @@ function mailboxQueueState(status) {
         return "admission-ambiguous";
     if (status === "cancelled")
         return "cancelled";
-    return "queued";
+    return status;
+}
+function mailboxTurnAwaitsAdmission(turn) {
+    return turn.state === "queued" || turn.state === "delivering" ||
+        turn.state === "accepted" || turn.state === "committed";
 }
 async function saveThreadCollectionWithConflictRecovery(storageKey, collection, storage) {
     let candidate = collection;
@@ -907,7 +954,8 @@ function isUrgentPersistenceChange(previous, next) {
             !sameStringList(prior.retainedContext ?? [], thread.retainedContext ?? []))
             return true;
         if (prior.status !== thread.status &&
-            (thread.status === "error" || thread.status === "ready" || thread.status === "waiting"))
+            (thread.status === "cancelling" || thread.status === "error" ||
+                thread.status === "ready" || thread.status === "waiting"))
             return true;
         const lastEvent = thread.events.at(-1);
         const priorLastEvent = prior.events.at(-1);
