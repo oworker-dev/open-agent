@@ -19,6 +19,11 @@ export type AgentComposerDraftRestore = {
     readonly id: string;
     readonly text: string;
 };
+export type AgentInterruptedTurn = {
+    readonly eventCount: number;
+    readonly streamIndex: number;
+    readonly turnId: string;
+};
 export type AgentQueuedTurn = {
     readonly delivery?: "browser" | "server";
     readonly id: string;
@@ -93,6 +98,7 @@ export type AgentThread = {
     readonly draftRestore?: AgentComposerDraftRestore;
     readonly hydration?: "summary";
     readonly id: string;
+    readonly interruptedTurns?: readonly AgentInterruptedTurn[];
     readonly pendingTurn?: AgentPendingTurn;
     readonly preferences: AgentThreadPreferences;
     readonly retainedContext?: readonly string[];

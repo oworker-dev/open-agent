@@ -1,5 +1,6 @@
 import type { MessageStreamEvent, InputRequest } from "eve/client";
 import type { EveDynamicToolPart, EveMessage, EveMessagePart } from "eve/react";
+import type { AgentInterruptedTurn } from "./contracts.js";
 
 export type AgentTurnStatus = "cancelled" | "completed" | "failed" | "running" | "waiting";
 
@@ -48,6 +49,42 @@ export type AgentDisplayProjection = {
 };
 
 const MAX_DURABLE_STEP_RETRIES = 3;
+
+export function shouldSuppressInterruptedTurnDisplayEvent(
+  event: MessageStreamEvent,
+  eventIndex: number,
+  turns: readonly AgentInterruptedTurn[],
+): boolean {
+  return shouldSuppressInterruptedTurnEvent(event, turns, (turn) =>
+    eventIndex >= turn.eventCount
+  );
+}
+
+export function shouldSuppressInterruptedTurnStreamEvent(
+  event: MessageStreamEvent,
+  streamIndex: number,
+  turns: readonly AgentInterruptedTurn[],
+): boolean {
+  return shouldSuppressInterruptedTurnEvent(event, turns, (turn) =>
+    streamIndex >= turn.streamIndex
+  );
+}
+
+function shouldSuppressInterruptedTurnEvent(
+  event: MessageStreamEvent,
+  turns: readonly AgentInterruptedTurn[],
+  isAfterCancellation: (turn: AgentInterruptedTurn) => boolean,
+): boolean {
+  if (
+    event.type === "message.received" ||
+    event.type === "turn.cancelled" ||
+    event.type === "turn.started"
+  ) return false;
+  const turnId = eventTurnId(event);
+  if (!turnId) return false;
+  const interrupted = turns.find((turn) => turn.turnId === turnId);
+  return Boolean(interrupted && isAfterCancellation(interrupted));
+}
 
 /**
  * Eve resumes a structured HITL response in a continuation turn without a new

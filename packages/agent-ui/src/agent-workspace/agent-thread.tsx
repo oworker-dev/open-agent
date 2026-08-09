@@ -1,7 +1,7 @@
 "use client";
 
 import type { UserContent } from "ai";
-import { isCurrentTurnBoundaryEvent, type ClientSession, type MessageStreamEvent } from "eve/client";
+import { defaultMessageReducer, isCurrentTurnBoundaryEvent, type ClientSession, type MessageStreamEvent } from "eve/client";
 import { useEveAgent, type EveMessage } from "eve/react";
 import { AssistantRuntimeProvider, unstable_defaultDirectiveFormatter, useExternalStoreRuntime, type AppendMessage, type AttachmentAdapter, type CompleteAttachment, type ExternalThreadQueueAdapter, type PendingAttachment } from "@assistant-ui/react";
 import { AlertCircleIcon, Clock3Icon, HammerIcon, RotateCcwIcon, SearchIcon, ShieldCheckIcon, SparklesIcon, XIcon } from "lucide-react";
@@ -12,7 +12,7 @@ import { attachAgentSession, createAgentSession } from "./agent-client.js";
 import { convertEveMessages, getEveMessageContent } from "./eve-message-adapter.js";
 import type { AgentInputResponse } from "./agent-message.js";
 import { AssistantThreadSurface } from "./assistant-thread-surface.js";
-import type { AgentModelOption, AgentPromptMenuItem, AgentQueuedTurn, AgentThread, AgentThreadPatch, AgentWorkspaceClientConfig, AgentWorkspaceMailbox, PromptInputMessage } from "./contracts.js";
+import type { AgentInterruptedTurn, AgentModelOption, AgentPromptMenuItem, AgentQueuedTurn, AgentThread, AgentThreadPatch, AgentWorkspaceClientConfig, AgentWorkspaceMailbox, PromptInputMessage } from "./contracts.js";
 import { sanitizeAgentError } from "./error-presentation.js";
 import { AgentMailboxHttpError } from "./http-agent-mailbox.js";
 import { messagesFor, type AgentLocale, type AgentMessages } from "./i18n.js";
@@ -27,6 +27,7 @@ import {
   hasSettledLatestTurn,
   isProxiedInputOnlyMessage,
   projectAgentDisplayTimeline,
+  shouldSuppressInterruptedTurnDisplayEvent,
   unresolvedInputRequests,
 } from "./turn-presentation.js";
 import { summarizeUsage } from "./usage.js";
@@ -41,13 +42,14 @@ type Cancellation = {
 
 type LocalInterruption = {
   readonly events: readonly MessageStreamEvent[];
-  readonly messages: readonly EveMessage[];
+  readonly streamIndex: number;
   readonly turnId: string;
 };
 
 // An edit remounts the runtime at each durable checkpoint. Operation claims
 // outlive a component instance so only one mount advances a given checkpoint.
 const activeEditedTurnOperations = new Set<string>();
+const CANCELLATION_STREAM_REATTACH_AFTER_MS = 5_000;
 
 export function AgentThreadView({
   client,
@@ -90,8 +92,13 @@ export function AgentThreadView({
 }) {
   const preferencesRef = useRef(thread.preferences);
   const latestEventsRef = useRef<readonly MessageStreamEvent[]>(thread.events);
-  const latestMessagesRef = useRef<readonly EveMessage[]>([]);
-  const cancellationRef = useRef<Cancellation>({ requested: false });
+  const persistedCancellationTurnId = thread.status === "cancelling"
+    ? latestStartedTurnId(thread.events)
+    : undefined;
+  const cancellationRef = useRef<Cancellation>({
+    ...(persistedCancellationTurnId ? { turnId: persistedCancellationTurnId } : {}),
+    requested: thread.status === "cancelling",
+  });
   const recoveryRequestedRef = useRef(false);
   const initialEventCountRef = useRef(thread.events.length);
   const initialStreamIndexRef = useRef(thread.session.streamIndex);
@@ -102,6 +109,7 @@ export function AgentThreadView({
   const queuedTurnsRef = useRef<readonly AgentQueuedTurn[]>(thread.queuedTurns);
   const pendingTurnRef = useRef(thread.pendingTurn);
   const retainedContextRef = useRef(thread.retainedContext);
+  const interruptedTurnsRef = useRef<readonly AgentInterruptedTurn[]>(thread.interruptedTurns ?? []);
   const closedInputRequestIdsRef = useRef<ReadonlySet<string>>(new Set(thread.closedInputRequestIds));
   const dispatchingQueuedTurnIdRef = useRef<string | undefined>(undefined);
   const mailboxEnqueueIdsRef = useRef(new Set<string>());
@@ -129,6 +137,10 @@ export function AgentThreadView({
   useEffect(() => {
     pendingTurnRef.current = thread.pendingTurn;
   }, [thread.pendingTurn]);
+
+  useEffect(() => {
+    interruptedTurnsRef.current = thread.interruptedTurns ?? [];
+  }, [thread.interruptedTurns]);
 
   useEffect(() => {
     const recoveredContext = interruptedTurnContextsFromEvents(
@@ -165,9 +177,6 @@ export function AgentThreadView({
     }
 
     void durableSession.cancel(turnId ? { turnId } : undefined)
-      .then(() => {
-        if (cancellationRef.current.requested) cancellationRecoveryRef.current();
-      })
       .catch((error: unknown) => {
         cancellationRef.current = { requested: false, turnId };
         setCancellationError(error instanceof Error ? error.message : "Unable to stop this turn.");
@@ -179,7 +188,21 @@ export function AgentThreadView({
     (event: MessageStreamEvent) => {
       lastObservedEventAtRef.current = Date.now();
       if (event.type === "turn.started") {
-        cancellationRef.current.turnId = event.data.turnId;
+        const cancellation = cancellationRef.current;
+        cancellation.turnId = event.data.turnId;
+        if (cancellation.requested && cancellation.localTurnId) {
+          const interruptedTurns = retargetInterruptedTurn(
+            interruptedTurnsRef.current,
+            cancellation.localTurnId,
+            event.data.turnId,
+          );
+          interruptedTurnsRef.current = interruptedTurns;
+          cancellation.localTurnId = event.data.turnId;
+          setLocalInterruption((current) => current
+            ? { ...current, turnId: event.data.turnId }
+            : current);
+          onChange({ interruptedTurns, updatedAt: Date.now() });
+        }
         const durableSession = sessionRef.current;
         if (durableSession) requestDurableCancellation(durableSession, event.data.turnId);
       }
@@ -198,7 +221,7 @@ export function AgentThreadView({
       }
       onEvent?.(event);
     },
-    [onEvent, requestDurableCancellation],
+    [onChange, onEvent, requestDurableCancellation],
   );
 
   const agent = useEveAgent({
@@ -222,7 +245,6 @@ export function AgentThreadView({
 
   const runtimeIsBusy = agent.status === "submitted" || agent.status === "streaming";
   latestEventsRef.current = agent.events;
-  latestMessagesRef.current = agent.data.messages;
   // A durable turn boundary is authoritative. React stream state can remain
   // stale after a reconnect even though Eve has already parked the session.
   const pendingTurnInFlight = isPendingTurnInFlight(thread.pendingTurn);
@@ -277,6 +299,20 @@ export function AgentThreadView({
   cancellationRecoveryRef.current = requestRecovery;
 
   useEffect(() => {
+    if (
+      isRecovering || !cancellationSettling || !agent.session?.sessionId ||
+      recoveryRequestedRef.current
+    ) return;
+    const timer = window.setTimeout(() => {
+      if (
+        cancellationRef.current.requested &&
+        Date.now() - lastObservedEventAtRef.current >= CANCELLATION_STREAM_REATTACH_AFTER_MS
+      ) requestRecovery();
+    }, CANCELLATION_STREAM_REATTACH_AFTER_MS);
+    return () => window.clearTimeout(timer);
+  }, [agent.events.length, agent.session?.sessionId, cancellationSettling, isRecovering, requestRecovery]);
+
+  useEffect(() => {
     const lastEvent = agent.events.at(-1);
     if (
       agent.session?.sessionId &&
@@ -326,6 +362,20 @@ export function AgentThreadView({
   useEffect(() => {
     if (isRecovering) return;
     const newEvents = agent.events.slice(processedEventCountRef.current);
+    const persistenceInterruptedTurns = localInterruption
+      ? upsertInterruptedTurn(interruptedTurnsRef.current, {
+          eventCount: localInterruption.events.length,
+          streamIndex: localInterruption.streamIndex,
+          turnId: localInterruption.turnId,
+        })
+      : interruptedTurnsRef.current;
+    const persistableNewEvents = newEvents.filter((event, index) =>
+      !shouldSuppressInterruptedTurnDisplayEvent(
+        event,
+        processedEventCountRef.current + index,
+        persistenceInterruptedTurns,
+      )
+    );
     const consumedEvents = Math.max(0, agent.events.length - initialEventCountRef.current);
     const streamIndex = Math.max(
       agent.session?.streamIndex ?? 0,
@@ -334,13 +384,13 @@ export function AgentThreadView({
     if (agent.events.length < processedEventCountRef.current) {
       compactedEventsRef.current = agent.events;
     } else {
-      for (const event of newEvents) {
+      for (const event of persistableNewEvents) {
         compactedEventsRef.current = appendThreadEvent(compactedEventsRef.current, event);
       }
     }
     processedEventCountRef.current = agent.events.length;
-    const acceptedMessages = newEvents.filter((event) => event.type === "message.received");
-    const cancelledTurn = newEvents.findLast((event) => event.type === "turn.cancelled");
+    const acceptedMessages = persistableNewEvents.filter((event) => event.type === "message.received");
+    const cancelledTurn = persistableNewEvents.findLast((event) => event.type === "turn.cancelled");
     let retainedContext = retainedContextRef.current;
     if (cancelledTurn?.type === "turn.cancelled") {
       retainedContext = interruptedTurnContextFromEvents(
@@ -391,7 +441,7 @@ export function AgentThreadView({
         : turnError ? "error" : awaitingInput ? "waiting" : agent.status,
       updatedAt: Date.now(),
     });
-  }, [agent.events, agent.session, agent.status, awaitingInput, isRecovering, onChange, recoveryContextWindowTokens, turnError]);
+  }, [agent.events, agent.session, agent.status, awaitingInput, isRecovering, localInterruption, onChange, recoveryContextWindowTokens, turnError]);
 
   const latestTurnId = [...agent.events].reverse().find((event) => event.type === "turn.started")?.data.turnId;
   const hasTurnFailure = Boolean(latestTurnId && latestTurnFailureForId(agent.events, latestTurnId));
@@ -538,10 +588,6 @@ export function AgentThreadView({
     const interruptedPendingTurn = pendingAtInterruption
       ? { ...pendingAtInterruption, state: "interrupted" as const }
       : undefined;
-    const messagesAtInterruption = projectPendingUserMessage(
-      latestMessagesRef.current,
-      pendingAtInterruption,
-    );
     const retainedContext = interruptedTurnContextFromEvents(
       latestEventsRef.current,
       turnId ?? "pending",
@@ -550,6 +596,20 @@ export function AgentThreadView({
       pendingAtInterruption?.text,
     );
     retainedContextRef.current = retainedContext;
+    const interruptionStreamIndex = initialStreamIndexRef.current + Math.max(
+      0,
+      latestEventsRef.current.length - initialEventCountRef.current,
+    );
+    const interruptedTurn = {
+      eventCount: compactedEventsRef.current.length,
+      streamIndex: interruptionStreamIndex,
+      turnId: visibleTurnId,
+    };
+    const interruptedTurns = upsertInterruptedTurn(
+      interruptedTurnsRef.current,
+      interruptedTurn,
+    );
+    interruptedTurnsRef.current = interruptedTurns;
     cancellationRef.current = {
       ...cancellationRef.current,
       localTurnId: visibleTurnId,
@@ -558,14 +618,15 @@ export function AgentThreadView({
     setCancellationError(undefined);
     setLocalInterruption({
       events: latestEventsRef.current,
-      messages: messagesAtInterruption,
+      streamIndex: interruptionStreamIndex,
       turnId: visibleTurnId,
     });
     onCancelRecovery?.();
     setCancellationState("idle");
     pendingTurnRef.current = interruptedPendingTurn;
     onChange({
-      events: latestEventsRef.current,
+      events: compactedEventsRef.current,
+      interruptedTurns,
       pendingTurn: interruptedPendingTurn,
       retainedContext,
       status: "cancelling",
@@ -660,11 +721,37 @@ export function AgentThreadView({
     await sendPrompt(agent.send, { files: message.files, text }, thread.retainedContext);
   };
 
+  const displayInterruptedTurns = useMemo(
+    () => localInterruption
+      ? upsertInterruptedTurn(thread.interruptedTurns ?? [], {
+          eventCount: localInterruption.events.length,
+          streamIndex: localInterruption.streamIndex,
+          turnId: localInterruption.turnId,
+        })
+      : thread.interruptedTurns ?? [],
+    [localInterruption, thread.interruptedTurns],
+  );
+  const interruptedDisplayEvents = useMemo(() => {
+    if (displayInterruptedTurns.length === 0) return agent.events;
+    let visible: readonly MessageStreamEvent[] = agent.events.filter((event, index) =>
+      !shouldSuppressInterruptedTurnDisplayEvent(event, index, displayInterruptedTurns)
+    );
+    for (const interruptedTurn of displayInterruptedTurns) {
+      visible = withLocalInterruptedBoundary(visible, interruptedTurn.turnId);
+    }
+    return visible;
+  }, [agent.events, displayInterruptedTurns]);
+  const projectedRuntimeMessages = useMemo(
+    () => displayInterruptedTurns.length > 0
+      ? messagesFromEvents(interruptedDisplayEvents)
+      : agent.data.messages,
+    [agent.data.messages, displayInterruptedTurns.length, interruptedDisplayEvents],
+  );
   const projectedMessages = projectStagedUserMessages(
-    localInterruption?.messages ?? ensureActiveAssistantMessage(
-      agent.data.messages,
-      agent.events,
-      isBusy || thread.pendingTurn?.state === "resubmitting" || Boolean(latestTurnFailure(agent.events)),
+    ensureActiveAssistantMessage(
+      projectedRuntimeMessages,
+      interruptedDisplayEvents,
+      isBusy || thread.pendingTurn?.state === "resubmitting" || Boolean(latestTurnFailure(interruptedDisplayEvents)),
       thread.pendingTurn,
     ),
     thread.queuedTurns.filter((turn) => turn.intent === "post-cancellation"),
@@ -672,12 +759,7 @@ export function AgentThreadView({
   const ungroupedVisibleMessages = projectedMessages.filter((message) =>
     !isProxiedInputOnlyMessage(message, agent.events),
   );
-  const ungroupedDisplayEvents = useMemo(
-    () => localInterruption
-      ? withLocalInterruptedBoundary(localInterruption.events, localInterruption.turnId)
-      : agent.events,
-    [agent.events, localInterruption],
-  );
+  const ungroupedDisplayEvents = interruptedDisplayEvents;
   const displayTimeline = useMemo(
     () => projectAgentDisplayTimeline(ungroupedVisibleMessages, ungroupedDisplayEvents),
     [ungroupedDisplayEvents, ungroupedVisibleMessages],
@@ -937,7 +1019,7 @@ export function AgentThreadView({
 
   useEffect(() => {
     if (
-      admissionBusy || inputLocked || !providerReady ||
+      admissionBusy || runtimeIsBusy || inputLocked || !providerReady ||
       dispatchingQueuedTurnIdRef.current ||
       !agent.session?.sessionId
     ) return;
@@ -963,15 +1045,22 @@ export function AgentThreadView({
       submittedAt: next.submittedAt,
       text: next.text,
     };
-    void agent.send(next.text, retainedContextOptions(thread.retainedContext)).catch(() => {
+    void agent.send(next.text, retainedContextOptions(thread.retainedContext)).catch((error: unknown) => {
+      dispatchingQueuedTurnIdRef.current = undefined;
+      turnAdmissionBusyRef.current = false;
+      pendingTurnRef.current = undefined;
+      if (isAgentTurnBusyError(error)) {
+        onChange({ pendingTurn: undefined, queuedTurns: queuedTurnsRef.current });
+        return;
+      }
       const queuedTurns = queuedTurnsRef.current.map((turn) =>
         turn.id === next.id ? { ...turn, state: "delivery-failed" as const } : turn,
       );
       queuedTurnsRef.current = queuedTurns;
-      dispatchingQueuedTurnIdRef.current = undefined;
       onChange({ pendingTurn: undefined, queuedTurns });
+      setTurnError(error instanceof Error ? error.message : messages.queueDeliveryFailed);
     });
-  }, [admissionBusy, agent, agent.session?.sessionId, inputLocked, onChange, providerReady, thread.queuedTurns]);
+  }, [admissionBusy, agent, agent.session?.sessionId, inputLocked, messages.queueDeliveryFailed, onChange, providerReady, runtimeIsBusy, thread.queuedTurns]);
 
   const respond = (inputResponses: readonly AgentInputResponse[]) => {
     prepareTurn();
@@ -1175,13 +1264,53 @@ function isPendingTurnInFlight(pendingTurn?: AgentThread["pendingTurn"]): boolea
 }
 
 function latestActiveTurnId(events: readonly MessageStreamEvent[]): string | undefined {
-  const latestStarted = events.findLast((event) => event.type === "turn.started");
-  if (latestStarted?.type !== "turn.started") return undefined;
+  const turnId = latestStartedTurnId(events);
+  if (!turnId) return undefined;
   const settled = events.some((event) =>
     (event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled") &&
-    event.data.turnId === latestStarted.data.turnId
+    event.data.turnId === turnId
   );
-  return settled ? undefined : latestStarted.data.turnId;
+  return settled ? undefined : turnId;
+}
+
+function latestStartedTurnId(events: readonly MessageStreamEvent[]): string | undefined {
+  const latestStarted = events.findLast((event) => event.type === "turn.started");
+  return latestStarted?.type === "turn.started" ? latestStarted.data.turnId : undefined;
+}
+
+function isAgentTurnBusyError(error: unknown): boolean {
+  return error instanceof Error && /already processing a turn/i.test(error.message);
+}
+
+function messagesFromEvents(events: readonly MessageStreamEvent[]): readonly EveMessage[] {
+  const reducer = defaultMessageReducer();
+  let data = reducer.initial();
+  for (const event of events) data = reducer.reduce(data, event);
+  return data.messages;
+}
+
+function retargetInterruptedTurn(
+  turns: readonly AgentInterruptedTurn[],
+  fromTurnId: string,
+  toTurnId: string,
+): readonly AgentInterruptedTurn[] {
+  const turn = turns.find((candidate) => candidate.turnId === fromTurnId);
+  return turn
+    ? upsertInterruptedTurn(
+        turns.filter((candidate) => candidate.turnId !== fromTurnId),
+        { ...turn, turnId: toTurnId },
+      )
+    : turns;
+}
+
+function upsertInterruptedTurn(
+  turns: readonly AgentInterruptedTurn[],
+  turn: AgentInterruptedTurn,
+): readonly AgentInterruptedTurn[] {
+  return [
+    ...turns.filter((candidate) => candidate.turnId !== turn.turnId),
+    turn,
+  ].slice(-32);
 }
 
 function eveMessageText(message: EveMessage): string {

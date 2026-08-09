@@ -1,5 +1,6 @@
 import type { MessageStreamEvent, InputRequest } from "eve/client";
 import type { EveDynamicToolPart, EveMessage, EveMessagePart } from "eve/react";
+import type { AgentInterruptedTurn } from "./contracts.js";
 export type AgentTurnStatus = "cancelled" | "completed" | "failed" | "running" | "waiting";
 export type SubagentCallPresentation = {
     readonly childSessionId?: string;
@@ -41,6 +42,8 @@ export type AgentDisplayProjection = {
     readonly events: readonly MessageStreamEvent[];
     readonly messages: readonly EveMessage[];
 };
+export declare function shouldSuppressInterruptedTurnDisplayEvent(event: MessageStreamEvent, eventIndex: number, turns: readonly AgentInterruptedTurn[]): boolean;
+export declare function shouldSuppressInterruptedTurnStreamEvent(event: MessageStreamEvent, streamIndex: number, turns: readonly AgentInterruptedTurn[]): boolean;
 export declare function projectAgentDisplayTimeline(messages: readonly EveMessage[], events: readonly MessageStreamEvent[]): AgentDisplayProjection;
 export declare function presentAgentStep(events: readonly MessageStreamEvent[], turnId: string | undefined, stepIndex: number): AgentStepPresentation;
 export declare function presentAgentTurn(message: EveMessage, events: readonly MessageStreamEvent[], closedInputRequestIds?: ReadonlySet<string>): AgentTurnPresentation | undefined;

@@ -15,7 +15,7 @@ import { AgentThreadView } from "./agent-thread.js";
 import { AgentThreadStorageConflictError } from "./http-thread-storage.js";
 import { messagesFor, resolveBrowserLocale } from "./i18n.js";
 import { AGENT_THREAD_STORAGE_VERSION, browserThreadStorage, appendThreadEvent, compactThreadEvents, createAgentThread, } from "./thread-storage.js";
-import { hasUnresolvedInputRequests, presentSubagentSessions, } from "./turn-presentation.js";
+import { hasUnresolvedInputRequests, presentSubagentSessions, shouldSuppressInterruptedTurnStreamEvent, } from "./turn-presentation.js";
 const DEFAULT_STORAGE_KEY = "open-agent:threads:v1";
 const STORAGE_URGENT_SAVE_DELAY_MS = 50;
 const STORAGE_STREAM_CHECKPOINT_MS = 15_000;
@@ -440,6 +440,8 @@ export function AgentWorkspace({ client, commands = [], defaultPreferences, exte
         let reconnectAttempt = 0;
         let pendingTurn = thread.pendingTurn;
         let queuedTurns = thread.queuedTurns;
+        let interruptedTurns = thread.interruptedTurns ?? [];
+        let cancellationPending = thread.status === "cancelling";
         const committedCatchUpTurns = new Map(queuedTurns
             .filter((turn) => turn.delivery === "server" && turn.state === "committed" &&
             !mailboxMessageWasObserved(events, turn))
@@ -454,6 +456,9 @@ export function AgentWorkspace({ client, commands = [], defaultPreferences, exte
             const liveThread = threadsRef.current.find((candidate) => candidate.id === thread.id);
             if (!liveThread)
                 return;
+            if (!sameInterruptedTurns(interruptedTurns, liveThread.interruptedTurns ?? [])) {
+                interruptedTurns = liveThread.interruptedTurns ?? [];
+            }
             const liveQueuedTurnIds = new Set(liveThread.queuedTurns.map((turn) => turn.id));
             queuedTurns = queuedTurns.filter((turn) => !consumedQueuedTurnIds.has(turn.id) &&
                 (recoveryOwnedQueuedTurnIds.has(turn.id) || liveQueuedTurnIds.has(turn.id)));
@@ -539,7 +544,12 @@ export function AgentWorkspace({ client, commands = [], defaultPreferences, exte
                         ...(follow ? { streamReconnectPolicy: RECOVERY_STREAM_RECONNECT_POLICY } : {}),
                     })) {
                         mergeLiveAdmissions();
-                        events = [...appendThreadEvent(events, event)];
+                        if (cancellationPending && event.type === "turn.started") {
+                            interruptedTurns = retargetLatestInterruptedTurn(interruptedTurns, event.data.turnId);
+                        }
+                        const suppressEvent = shouldSuppressInterruptedTurnStreamEvent(event, cursor, interruptedTurns);
+                        if (!suppressEvent)
+                            events = [...appendThreadEvent(events, event)];
                         cursor += 1;
                         consumed += 1;
                         onEvent?.(event);
@@ -572,12 +582,18 @@ export function AgentWorkspace({ client, commands = [], defaultPreferences, exte
                                 }
                             }
                         }
+                        if (cancellationPending &&
+                            (event.type === "session.waiting" || event.type === "session.completed" || event.type === "session.failed"))
+                            cancellationPending = false;
                         updateThread(thread.id, {
                             events: [...events],
+                            interruptedTurns,
                             pendingTurn,
                             queuedTurns,
                             session: { ...session.state, streamIndex: cursor },
-                            status: statusFromEvents(events, currentClosedInputRequestIds()),
+                            status: cancellationPending
+                                ? "cancelling"
+                                : statusFromEvents(events, currentClosedInputRequestIds()),
                         });
                         if (isRecoveryBoundary(event)) {
                             await refreshMailboxQueue();
@@ -594,13 +610,19 @@ export function AgentWorkspace({ client, commands = [], defaultPreferences, exte
                         const missingBoundary = await readTailBoundary(session, controller.signal);
                         if (missingBoundary) {
                             events = [...appendThreadEvent(events, missingBoundary)];
+                            if (cancellationPending &&
+                                (missingBoundary.type === "session.waiting" || missingBoundary.type === "session.completed" || missingBoundary.type === "session.failed"))
+                                cancellationPending = false;
                             await refreshMailboxQueue();
                             updateThread(thread.id, {
                                 events: [...events],
+                                interruptedTurns,
                                 pendingTurn,
                                 queuedTurns,
                                 session: { ...session.state, streamIndex: cursor },
-                                status: statusFromEvents(events, currentClosedInputRequestIds()),
+                                status: cancellationPending
+                                    ? "cancelling"
+                                    : statusFromEvents(events, currentClosedInputRequestIds()),
                             });
                             settled = currentBoundarySettles();
                         }
@@ -631,10 +653,13 @@ export function AgentWorkspace({ client, commands = [], defaultPreferences, exte
             mergeLiveAdmissions();
             updateThread(thread.id, {
                 events: compactThreadEvents(events),
+                interruptedTurns,
                 pendingTurn,
                 queuedTurns,
                 session: { ...session.state, streamIndex: cursor },
-                status: statusFromEvents(events, currentClosedInputRequestIds()),
+                status: cancellationPending
+                    ? "cancelling"
+                    : statusFromEvents(events, currentClosedInputRequestIds()),
             });
         }
         catch (error) {
@@ -890,6 +915,23 @@ function sameQueuedTurns(left, right) {
             candidate.state === turn.state;
     });
 }
+function sameInterruptedTurns(left, right) {
+    return left.length === right.length && left.every((turn, index) => {
+        const candidate = right[index];
+        return candidate?.turnId === turn.turnId &&
+            candidate.eventCount === turn.eventCount &&
+            candidate.streamIndex === turn.streamIndex;
+    });
+}
+function retargetLatestInterruptedTurn(turns, turnId) {
+    const latest = turns.at(-1);
+    if (!latest || latest.turnId === turnId)
+        return turns;
+    return [
+        ...turns.slice(0, -1).filter((candidate) => candidate.turnId !== turnId),
+        { ...latest, turnId },
+    ];
+}
 function mailboxQueueState(status) {
     if (status === "failed")
         return "delivery-failed";
@@ -976,6 +1018,7 @@ function isUrgentPersistenceChange(previous, next) {
             prior.preferences.reasoning !== thread.preferences.reasoning ||
             !samePendingTurn(prior.pendingTurn, thread.pendingTurn) ||
             !sameQueuedTurns(prior.queuedTurns, thread.queuedTurns) ||
+            !sameInterruptedTurns(prior.interruptedTurns ?? [], thread.interruptedTurns ?? []) ||
             !sameStringList(prior.closedInputRequestIds, thread.closedInputRequestIds) ||
             !sameStringList(prior.retainedContext ?? [], thread.retainedContext ?? []))
             return true;

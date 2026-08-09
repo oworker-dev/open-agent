@@ -2191,6 +2191,98 @@ test("stop immediately returns the thread to an interactive state while server c
   expect(cancelledTurnId).toBe("turn_0");
 });
 
+test("a recovering cancellation never revives late output from the interrupted turn", async ({ page }) => {
+  const threadId = "recovering-cancellation-freeze-thread";
+  const sessionId = "mock-recovering-cancellation-freeze-session";
+  const turnId = "turn_cancel_freeze";
+  const at = new Date().toISOString();
+  const initialEvents = [
+    { data: { runtime: { agentId: "open-agent", agentName: "open-agent", eveVersion: "test", modelId: "mock/model" } }, meta: { at, id: "evt-freeze-session" }, type: "session.started" },
+    { data: { sequence: 0, turnId }, meta: { at, id: "evt-freeze-turn" }, type: "turn.started" },
+    { data: { message: "Stop this work", parts: [{ text: "Stop this work", type: "text" }], sequence: 0, turnId }, meta: { at, id: "evt-freeze-user" }, type: "message.received" },
+  ];
+  const lateEvent = {
+    data: { messageDelta: "LATE", messageSoFar: "LATE OUTPUT MUST STAY HIDDEN", sequence: 0, stepIndex: 0, turnId },
+    meta: { at, id: "evt-freeze-late" },
+    type: "message.appended",
+  } as const;
+  const cancelledEvent = {
+    data: { sequence: 0, turnId },
+    meta: { at, id: "evt-freeze-cancelled" },
+    type: "turn.cancelled",
+  } as const;
+  const waitingEvent = {
+    data: { wait: "next-user-message" },
+    meta: { at, id: "evt-freeze-waiting" },
+    type: "session.waiting",
+  } as const;
+  let lateCatchUpServed = false;
+  let releaseCancellation: (() => void) | undefined;
+  const cancellationReleased = new Promise<void>((resolve) => {
+    releaseCancellation = resolve;
+  });
+
+  setFakeThreadCollection(page, {
+    activeThreadId: threadId,
+    threads: [{
+      closedInputRequestIds: [],
+      createdAt: Date.now(),
+      events: initialEvents,
+      id: threadId,
+      interruptedTurns: [{ eventCount: initialEvents.length, streamIndex: initialEvents.length, turnId }],
+      preferences: { executionMode: "standard", modelId: "gpt-5.6-sol", reasoning: "medium" },
+      queuedTurns: [],
+      session: { sessionId, streamIndex: initialEvents.length },
+      status: "cancelling",
+      title: "Cancellation freeze",
+      updatedAt: Date.now(),
+    }],
+    version: 2,
+  });
+  await page.route(`**/eve/v1/session/${sessionId}/cancel`, async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({ ok: true, sessionId, status: "accepted" }),
+      contentType: "application/json",
+      status: 202,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
+    const url = new URL(route.request().url());
+    const startIndex = Number(url.searchParams.get("startIndex") ?? "0");
+    if (url.searchParams.has("includeTailIndex") && startIndex === initialEvents.length) {
+      lateCatchUpServed = true;
+      await route.fulfill({
+        body: ndjson([lateEvent]),
+        contentType: "application/x-ndjson",
+        headers: { "x-eve-stream-tail-index": String(initialEvents.length) },
+        status: 200,
+      });
+      return;
+    }
+    await cancellationReleased;
+    const tail = [lateEvent, cancelledEvent, waitingEvent];
+    await route.fulfill({
+      body: ndjson(tail.slice(Math.max(0, startIndex - initialEvents.length))),
+      contentType: "application/x-ndjson",
+      headers: { "x-eve-stream-tail-index": String(initialEvents.length + tail.length - 1) },
+      status: 200,
+    });
+  });
+
+  await page.goto(`/threads/${threadId}`);
+  await expect.poll(() => lateCatchUpServed).toBeTruthy();
+  await expect(page.getByText("LATE OUTPUT MUST STAY HIDDEN", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Send", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Stop", exact: true })).toHaveCount(0);
+  await expect.poll(() => firstStoredThread(page)?.status).toBe("cancelling");
+
+  releaseCancellation?.();
+  await expect.poll(() => firstStoredThread(page)?.status).toBe("ready");
+  await expect(page.getByText("LATE OUTPUT MUST STAY HIDDEN", { exact: true })).toHaveCount(0);
+  const storedEvents = firstStoredThread(page)?.events;
+  expect(JSON.stringify(storedEvents)).not.toContain("LATE OUTPUT MUST STAY HIDDEN");
+});
+
 test("a message sent while cancellation settles becomes the next normal turn instead of mailbox steering", async ({ page }) => {
   const sessionId = "mock-post-cancel-follow-up-session";
   const at = new Date().toISOString();

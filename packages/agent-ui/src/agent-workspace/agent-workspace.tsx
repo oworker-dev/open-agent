@@ -18,7 +18,7 @@ import { AgentSidebar } from "./agent-sidebar.js";
 import { AgentSubagentMenu } from "./agent-subagent-menu.js";
 import { AgentThreadView } from "./agent-thread.js";
 import { cn } from "../utils.js";
-import type { AgentModelOption, AgentQueuedTurn, AgentThread, AgentThreadPatch, AgentThreadPreferences, AgentWorkspaceClientConfig, AgentWorkspaceMailbox } from "./contracts.js";
+import type { AgentInterruptedTurn, AgentModelOption, AgentQueuedTurn, AgentThread, AgentThreadPatch, AgentThreadPreferences, AgentWorkspaceClientConfig, AgentWorkspaceMailbox } from "./contracts.js";
 import { AgentThreadStorageConflictError } from "./http-thread-storage.js";
 import { messagesFor, resolveBrowserLocale, type AgentLocale, type AgentMessages } from "./i18n.js";
 import {
@@ -33,6 +33,7 @@ import {
 import {
   hasUnresolvedInputRequests,
   presentSubagentSessions,
+  shouldSuppressInterruptedTurnStreamEvent,
 } from "./turn-presentation.js";
 
 const DEFAULT_STORAGE_KEY = "open-agent:threads:v1";
@@ -531,6 +532,8 @@ export function AgentWorkspace({
     let reconnectAttempt = 0;
     let pendingTurn = thread.pendingTurn;
     let queuedTurns = thread.queuedTurns;
+    let interruptedTurns = thread.interruptedTurns ?? [];
+    let cancellationPending = thread.status === "cancelling";
     const committedCatchUpTurns = new Map(
       queuedTurns
         .filter((turn) =>
@@ -551,6 +554,10 @@ export function AgentWorkspace({
     const mergeLiveAdmissions = () => {
       const liveThread = threadsRef.current.find((candidate) => candidate.id === thread.id);
       if (!liveThread) return;
+
+      if (!sameInterruptedTurns(interruptedTurns, liveThread.interruptedTurns ?? [])) {
+        interruptedTurns = liveThread.interruptedTurns ?? [];
+      }
 
       const liveQueuedTurnIds = new Set(liveThread.queuedTurns.map((turn) => turn.id));
       queuedTurns = queuedTurns.filter((turn) =>
@@ -643,7 +650,18 @@ export function AgentWorkspace({
             // recovery response. Merge them before every event so an older
             // recovery snapshot can never erase a newly staged turn.
             mergeLiveAdmissions();
-            events = [...appendThreadEvent(events, event)];
+            if (cancellationPending && event.type === "turn.started") {
+              interruptedTurns = retargetLatestInterruptedTurn(
+                interruptedTurns,
+                event.data.turnId,
+              );
+            }
+            const suppressEvent = shouldSuppressInterruptedTurnStreamEvent(
+              event,
+              cursor,
+              interruptedTurns,
+            );
+            if (!suppressEvent) events = [...appendThreadEvent(events, event)];
             cursor += 1;
             consumed += 1;
             onEvent?.(event);
@@ -677,12 +695,19 @@ export function AgentWorkspace({
                 }
               }
             }
+            if (
+              cancellationPending &&
+              (event.type === "session.waiting" || event.type === "session.completed" || event.type === "session.failed")
+            ) cancellationPending = false;
             updateThread(thread.id, {
               events: [...events],
+              interruptedTurns,
               pendingTurn,
               queuedTurns,
               session: { ...session.state, streamIndex: cursor },
-              status: statusFromEvents(events, currentClosedInputRequestIds()),
+              status: cancellationPending
+                ? "cancelling"
+                : statusFromEvents(events, currentClosedInputRequestIds()),
             });
             if (isRecoveryBoundary(event)) {
               await refreshMailboxQueue();
@@ -705,13 +730,20 @@ export function AgentWorkspace({
             const missingBoundary = await readTailBoundary(session, controller.signal);
             if (missingBoundary) {
               events = [...appendThreadEvent(events, missingBoundary)];
+              if (
+                cancellationPending &&
+                (missingBoundary.type === "session.waiting" || missingBoundary.type === "session.completed" || missingBoundary.type === "session.failed")
+              ) cancellationPending = false;
               await refreshMailboxQueue();
               updateThread(thread.id, {
                 events: [...events],
+                interruptedTurns,
                 pendingTurn,
                 queuedTurns,
                 session: { ...session.state, streamIndex: cursor },
-                status: statusFromEvents(events, currentClosedInputRequestIds()),
+                status: cancellationPending
+                  ? "cancelling"
+                  : statusFromEvents(events, currentClosedInputRequestIds()),
               });
               settled = currentBoundarySettles();
             }
@@ -736,10 +768,13 @@ export function AgentWorkspace({
       mergeLiveAdmissions();
       updateThread(thread.id, {
         events: compactThreadEvents(events),
+        interruptedTurns,
         pendingTurn,
         queuedTurns,
         session: { ...session.state, streamIndex: cursor },
-        status: statusFromEvents(events, currentClosedInputRequestIds()),
+        status: cancellationPending
+          ? "cancelling"
+          : statusFromEvents(events, currentClosedInputRequestIds()),
       });
     } catch (error) {
       if (controller.signal.aborted || isAbortError(error)) return;
@@ -1267,6 +1302,30 @@ function sameQueuedTurns(
   });
 }
 
+function sameInterruptedTurns(
+  left: readonly AgentInterruptedTurn[],
+  right: readonly AgentInterruptedTurn[],
+): boolean {
+  return left.length === right.length && left.every((turn, index) => {
+    const candidate = right[index];
+    return candidate?.turnId === turn.turnId &&
+      candidate.eventCount === turn.eventCount &&
+      candidate.streamIndex === turn.streamIndex;
+  });
+}
+
+function retargetLatestInterruptedTurn(
+  turns: readonly AgentInterruptedTurn[],
+  turnId: string,
+): readonly AgentInterruptedTurn[] {
+  const latest = turns.at(-1);
+  if (!latest || latest.turnId === turnId) return turns;
+  return [
+    ...turns.slice(0, -1).filter((candidate) => candidate.turnId !== turnId),
+    { ...latest, turnId },
+  ];
+}
+
 function mailboxQueueState(
   status: import("./contracts.js").AgentMailboxItemStatus,
 ): AgentQueuedTurn["state"] | "cancelled" {
@@ -1380,6 +1439,7 @@ function isUrgentPersistenceChange(
       prior.preferences.reasoning !== thread.preferences.reasoning ||
       !samePendingTurn(prior.pendingTurn, thread.pendingTurn) ||
       !sameQueuedTurns(prior.queuedTurns, thread.queuedTurns) ||
+      !sameInterruptedTurns(prior.interruptedTurns ?? [], thread.interruptedTurns ?? []) ||
       !sameStringList(prior.closedInputRequestIds, thread.closedInputRequestIds) ||
       !sameStringList(prior.retainedContext ?? [], thread.retainedContext ?? [])
     ) return true;

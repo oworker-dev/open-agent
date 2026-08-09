@@ -89,6 +89,7 @@ function parseThread(value) {
     const status = isThreadStatus(value.status) ? value.status : "ready";
     const pendingTurn = parsePendingTurn(value.pendingTurn);
     const draftRestore = parseDraftRestore(value.draftRestore);
+    const interruptedTurns = parseInterruptedTurns(value.interruptedTurns);
     const closedInputRequestIds = Array.isArray(value.closedInputRequestIds)
         ? [...new Set(value.closedInputRequestIds.filter((id) => typeof id === "string" && id.trim().length > 0))].slice(-128)
         : [];
@@ -112,6 +113,7 @@ function parseThread(value) {
         events: compactThreadEvents(rawEvents),
         ...(value.hydration === "summary" ? { hydration: "summary" } : {}),
         id: value.id,
+        ...(interruptedTurns.length > 0 ? { interruptedTurns } : {}),
         ...(pendingTurn ? { pendingTurn } : {}),
         preferences: {
             executionMode: isExecutionMode(preferences.executionMode)
@@ -140,6 +142,26 @@ function parseDraftRestore(value) {
         typeof value.text !== "string" || !value.text.trim())
         return undefined;
     return { id: value.id, text: value.text };
+}
+function parseInterruptedTurns(value) {
+    if (!Array.isArray(value))
+        return [];
+    const turns = new Map();
+    for (const candidate of value) {
+        if (!isRecord(candidate) ||
+            typeof candidate.turnId !== "string" || !candidate.turnId ||
+            typeof candidate.eventCount !== "number" ||
+            !Number.isSafeInteger(candidate.eventCount) || candidate.eventCount < 0 ||
+            typeof candidate.streamIndex !== "number" ||
+            !Number.isSafeInteger(candidate.streamIndex) || candidate.streamIndex < 0)
+            continue;
+        turns.set(candidate.turnId, {
+            eventCount: candidate.eventCount,
+            streamIndex: candidate.streamIndex,
+            turnId: candidate.turnId,
+        });
+    }
+    return [...turns.values()].slice(-32);
 }
 function parseQueuedTurn(value) {
     if (!isRecord(value))

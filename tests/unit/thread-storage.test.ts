@@ -114,6 +114,35 @@ test("hydrates only a valid one-shot composer draft restoration", () => {
   });
 });
 
+test("hydrates only bounded valid interrupted-turn markers", () => {
+  const collection = parseThreadCollection({
+    threads: [{
+      createdAt: 1,
+      events: [],
+      id: "thread-interrupted-turns",
+      interruptedTurns: [
+        { eventCount: 12, streamIndex: 120, turnId: "turn-valid" },
+        { eventCount: -1, streamIndex: 121, turnId: "turn-negative" },
+        { eventCount: 14.5, streamIndex: 122, turnId: "turn-fractional" },
+        { eventCount: 15, streamIndex: 123, turnId: "" },
+        { eventCount: 16, streamIndex: -1, turnId: "turn-stream-negative" },
+        { eventCount: 18, streamIndex: 128, turnId: "turn-valid" },
+      ],
+      preferences: { modelId: "model", reasoning: "medium" },
+      queuedTurns: [],
+      session: { streamIndex: 0 },
+      status: "cancelling",
+      title: "Interrupted",
+      updatedAt: 2,
+    }],
+    version: 2,
+  });
+
+  assert.deepEqual(collection.threads[0]?.interruptedTurns, [
+    { eventCount: 18, streamIndex: 128, turnId: "turn-valid" },
+  ]);
+});
+
 test("hydrates bounded retained context used after an edited turn", () => {
   const collection = parseThreadCollection({
     threads: [{

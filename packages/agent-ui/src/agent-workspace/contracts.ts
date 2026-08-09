@@ -31,6 +31,14 @@ export type AgentComposerDraftRestore = {
   readonly text: string;
 };
 
+export type AgentInterruptedTurn = {
+  /** Persisted presentation-event count observed at cancellation. */
+  readonly eventCount: number;
+  /** Absolute Eve stream cursor observed at cancellation. */
+  readonly streamIndex: number;
+  readonly turnId: string;
+};
+
 export type AgentQueuedTurn = {
   readonly delivery?: "browser" | "server";
   readonly id: string;
@@ -130,6 +138,7 @@ export type AgentThread = {
   /** Server-backed indexes omit the event transcript until the thread is opened. */
   readonly hydration?: "summary";
   readonly id: string;
+  readonly interruptedTurns?: readonly AgentInterruptedTurn[];
   readonly pendingTurn?: AgentPendingTurn;
   readonly preferences: AgentThreadPreferences;
   /** Token-bounded settled history retained across an Eve context rewrite. */

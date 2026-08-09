@@ -1,4 +1,21 @@
 const MAX_DURABLE_STEP_RETRIES = 3;
+export function shouldSuppressInterruptedTurnDisplayEvent(event, eventIndex, turns) {
+    return shouldSuppressInterruptedTurnEvent(event, turns, (turn) => eventIndex >= turn.eventCount);
+}
+export function shouldSuppressInterruptedTurnStreamEvent(event, streamIndex, turns) {
+    return shouldSuppressInterruptedTurnEvent(event, turns, (turn) => streamIndex >= turn.streamIndex);
+}
+function shouldSuppressInterruptedTurnEvent(event, turns, isAfterCancellation) {
+    if (event.type === "message.received" ||
+        event.type === "turn.cancelled" ||
+        event.type === "turn.started")
+        return false;
+    const turnId = eventTurnId(event);
+    if (!turnId)
+        return false;
+    const interrupted = turns.find((turn) => turn.turnId === turnId);
+    return Boolean(interrupted && isAfterCancellation(interrupted));
+}
 export function projectAgentDisplayTimeline(messages, events) {
     const turns = turnDisplayCoordinates(events);
     if (turns.size === 0)
