@@ -35,6 +35,7 @@ const deadlineMs = boundedInteger(
 const batchId = `load-${Date.now()}-${randomUUID()}`;
 const accessToken = signToken({
   actorType: "service",
+  scope: ["agent:runs"],
   sub: `load-runner-${randomUUID()}`,
   tenantId: `load-tenant-${randomUUID()}`,
 });

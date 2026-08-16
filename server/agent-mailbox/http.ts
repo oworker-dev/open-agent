@@ -104,6 +104,22 @@ function parseEnqueueRequest(
   if (value.clientContext !== undefined && !clientContext) {
     return { error: "The mailbox client context is invalid.", ok: false };
   }
+  const operationKind = value.operationKind;
+  if (value.operationId !== undefined && !validText(value.operationId)) {
+    return { error: "operationId must be a non-empty string.", ok: false };
+  }
+  if (value.expectedTurnId !== undefined && !validText(value.expectedTurnId)) {
+    return { error: "expectedTurnId must be a non-empty string.", ok: false };
+  }
+  if (operationKind !== undefined && operationKind !== "send" && operationKind !== "steer" && operationKind !== "edit") {
+    return { error: "operationKind must be send, steer, or edit.", ok: false };
+  }
+  if (value.operationId !== undefined && operationKind === undefined) {
+    return { error: "operationKind is required when operationId is provided.", ok: false };
+  }
+  if (operationKind === "steer" && !validText(value.expectedTurnId)) {
+    return { error: "expectedTurnId is required for a steering operation.", ok: false };
+  }
   const modelId = value.preferences.modelId;
   const reasoning = value.preferences.reasoning;
   const executionMode = value.preferences.executionMode;
@@ -121,6 +137,11 @@ function parseEnqueueRequest(
     value: {
       clientMessageId: value.clientMessageId,
       ...(clientContext ? { clientContext } : {}),
+      ...(validText(value.operationId) ? { operationId: value.operationId } : {}),
+      ...(validText(value.expectedTurnId) ? { expectedTurnId: value.expectedTurnId } : {}),
+      ...(operationKind
+        ? { operationKind }
+        : {}),
       message: value.message,
       preferences: { executionMode, modelId, reasoning },
       sessionId: value.sessionId,
@@ -144,6 +165,13 @@ function mailboxResponse(
       item: {
         clientMessageId: item.clientMessageId,
         itemId: item.itemId,
+        ...(item.payload.operation?.expectedTurnId
+          ? { expectedTurnId: item.payload.operation.expectedTurnId }
+          : {}),
+        ...(item.payload.operation?.kind ? { operationKind: item.payload.operation.kind } : {}),
+        ...(item.payload.operation?.operationId
+          ? { operationId: item.payload.operation.operationId }
+          : {}),
         status: item.status,
       },
       ok: true,

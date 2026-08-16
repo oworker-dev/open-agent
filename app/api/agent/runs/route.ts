@@ -13,7 +13,7 @@ import {
   startAgentRun,
   toAgentRunSnapshot,
 } from "@/server/agent-runs/service";
-import { authenticateHostRequest } from "@/server/http/host-request-auth";
+import { authenticateHostRequest, requireHostScope } from "@/server/http/host-request-auth";
 import { createPostgresAgentExtensionStoreFromEnvironment } from "@/server/data/agent-extension-store";
 import { AgentExtensionAccessError } from "@/lib/agent-extension-lifecycle";
 import { agentExtensionCatalogForConfig } from "@/lib/agent-extension-catalog";
@@ -25,7 +25,10 @@ const store = createPostgresAgentRunStoreFromEnvironment();
 const extensionStore = createPostgresAgentExtensionStoreFromEnvironment();
 
 export async function POST(request: Request): Promise<Response> {
-  const authenticated = await authenticateHostRequest(request);
+  const authenticated = requireHostScope(
+    await authenticateHostRequest(request),
+    "agent:runs",
+  );
   if (!authenticated.ok) return authenticated.response;
   if (!store) return databaseUnavailable();
   if (!isAgentRuntimeConfigured()) return runtimeUnavailable();

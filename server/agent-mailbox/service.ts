@@ -12,7 +12,7 @@ const DEFAULT_BUSY_RETRY_MS = 2_000;
 export type AgentMailboxBoundary =
   | { readonly state: "running"; readonly turnId?: string }
   | { readonly state: "waiting" }
-  | { readonly state: "terminal" };
+  | { readonly state: "terminal"; readonly terminalStatus?: "completed" | "failed" };
 
 export interface AgentMailboxRuntime {
   deliver(input: {
@@ -45,6 +45,9 @@ export class AgentMailboxAdmissionError extends Error {
 export async function enqueueAgentMailboxMessage(options: {
   readonly clientMessageId: string;
   readonly clientContext?: AgentMailboxPayload["clientContext"];
+  readonly expectedTurnId?: string;
+  readonly operationId?: string;
+  readonly operationKind?: "send" | "steer" | "edit";
   readonly message: string;
   readonly owner: AgentSessionOwner;
   readonly preferences?: AgentMailboxPayload["preferences"];
@@ -54,9 +57,15 @@ export async function enqueueAgentMailboxMessage(options: {
   const clientMessageId = parseClientMessageId(options.clientMessageId);
   const sessionId = parseSessionId(options.sessionId);
   const message = parseMessage(options.message);
+  const operation = parseOperation({
+    expectedTurnId: options.expectedTurnId,
+    operationId: options.operationId,
+    operationKind: options.operationKind,
+  });
   const payload = {
     ...(options.clientContext ? { clientContext: options.clientContext } : {}),
     message,
+    ...(operation ? { operation } : {}),
     ...(options.preferences ? { preferences: options.preferences } : {}),
   } as const;
   return await options.store.enqueue({
@@ -96,7 +105,7 @@ export async function dispatchNextAgentMailboxMessage(options: {
     return { item: deferred, status: "deferred" };
   }
 
-  if (boundary.state === "running") {
+  if (boundary.state === "running" && !canSteerBoundary(item, boundary)) {
     return await deferClaimedMessage({
       availableAt: nextAttemptAt(options.now, options.busyRetryMs),
       claimToken,
@@ -155,6 +164,16 @@ export async function dispatchNextAgentMailboxMessage(options: {
     );
     return { item: ambiguous, status: "submission-ambiguous" };
   }
+}
+
+function canSteerBoundary(
+  item: AgentMailboxItem,
+  boundary: Extract<AgentMailboxBoundary, { readonly state: "running" }>,
+): boolean {
+  const operation = item.payload.operation;
+  return operation?.kind === "steer" &&
+    typeof operation.expectedTurnId === "string" &&
+    operation.expectedTurnId === boundary.turnId;
 }
 
 async function deferClaimedMessage(options: {
@@ -228,6 +247,34 @@ function parseMessage(value: string): string {
     throw new Error("message must contain between 1 and 65536 characters.");
   }
   return normalized;
+}
+
+function parseOperation(input: {
+  readonly expectedTurnId?: string;
+  readonly operationId?: string;
+  readonly operationKind?: "send" | "steer" | "edit";
+}): NonNullable<AgentMailboxPayload["operation"]> | undefined {
+  if (input.operationId === undefined && input.operationKind === undefined && input.expectedTurnId === undefined) {
+    return undefined;
+  }
+  if (input.operationId === undefined || !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,199}$/.test(input.operationId)) {
+    throw new Error("operationId must contain 8 to 200 URL-safe identifier characters.");
+  }
+  if (input.operationKind === undefined) {
+    throw new Error("operationKind is required when operationId is provided.");
+  }
+  if (input.operationKind === "steer" && input.expectedTurnId === undefined) {
+    throw new Error("expectedTurnId is required for a steering operation.");
+  }
+  if (input.expectedTurnId !== undefined &&
+      !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,511}$/.test(input.expectedTurnId)) {
+    throw new Error("expectedTurnId must contain up to 512 URL-safe identifier characters.");
+  }
+  return {
+    ...(input.expectedTurnId ? { expectedTurnId: input.expectedTurnId } : {}),
+    kind: input.operationKind,
+    operationId: input.operationId,
+  };
 }
 
 function nextAttemptAt(now: (() => number) | undefined, delay: number | undefined): string {

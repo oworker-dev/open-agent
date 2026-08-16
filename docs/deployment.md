@@ -49,8 +49,31 @@ release pipeline; a healthy standalone page does not prove Host embedding works.
 `AGENT_PUBLIC_BASE_URL` and `AGENT_PREVIEW_SIGNING_SECRET` are mandatory in
 production. The former must be a public HTTPS origin without a path; the latter
 must be at least 32 bytes. They sign expiring website-preview and artifact links.
-The filesystem preview/artifact stores are local-development fallbacks and must
-not be used by a production deployment; `AGENT_DATABASE_URL` is required.
+The filesystem preview/artifact and asset stores are local-development
+fallbacks and must not be used by a production deployment; `AGENT_DATABASE_URL`
+is required. For the built-in asset path set
+`AGENT_ASSET_STORAGE_BACKEND=s3` and provide the S3-compatible endpoint,
+bucket, access key, and secret. Asset metadata and multipart state stay in the
+Agent PostgreSQL schema; object bytes stay in S3/MinIO/R2. A custom `host`
+adapter remains supported for deployments that use a different object store.
+Run one `npm run start:asset-cleanup` worker per deployment, or schedule
+`npm run reap:assets` with the deployment's job runner (using the same database
+and object-store credentials). It removes expired completed objects and aborts
+expired multipart uploads; set `AGENT_ASSET_CLEANUP_INTERVAL_MS` and
+`AGENT_ASSET_CLEANUP_LIMIT` to bound cadence and work per pass. Do not rely on
+request traffic to perform retention cleanup. `AGENT_ASSET_MAX_BYTES` limits a
+single object and `AGENT_ASSET_QUOTA_BYTES` is the aggregate authenticated
+tenant/principal reservation limit; the latter is mandatory for built-in S3
+production and is checked atomically under a PostgreSQL advisory lock. Host
+AssetStore adapters must provide equivalent atomic quota enforcement and
+malware/content scanning before marking an object ready.
+
+Asset scanning is a host capability, not a Muses-specific implementation.
+Register an `AssetScanner` with `configureAssetScanner()` before using the
+built-in S3 adapter. Production defaults to `AGENT_ASSET_SCAN_MODE=required`
+and fails closed when no scanner is registered; `AGENT_ASSET_SCAN_MODE=disabled`
+is accepted only outside production. `import_asset` and any host sandbox mount
+must admit only assets whose `scanStatus` is `clean` or explicitly `disabled`.
 `AGENT_SANDBOX_IMAGE` must also be an immutable OCI digest. Build the repository
 `sandbox/Dockerfile`, publish it to the deployment registry, and run
 `npm run verify:sandbox-runtime` against that exact digest. The gate verifies
@@ -83,6 +106,26 @@ AGENT_MAILBOX_WORKER_SECRET='replace-with-32-byte-secret' \
 AGENT_MAILBOX_DISPATCH_SECRET='replace-with-another-32-byte-secret' \
   npm run start:mailbox-worker
 ```
+
+For the Docker backend, also run the terminal sandbox cleanup worker. It only
+selects sessions whose latest AgentRun is terminal, whose retention window has
+elapsed, and which have no queued follow-up or active child. The worker first
+retires the exact Eve session, records the owner-scoped deletion authorization,
+then invokes the exact-session reaper with a bounded limit. It never performs a
+ broad container deletion and it leaves an authorization ledger for retries.
+
+```bash
+AGENT_SANDBOX_TERMINAL_RETENTION_HOURS=168 \
+AGENT_SANDBOX_CLEANUP_INTERVAL_MS=900000 \
+AGENT_SANDBOX_CLEANUP_MAX_SESSIONS=25 \
+  npm run start:sandbox-cleanup
+```
+
+The production wrapper starts both cleanup workers. Keep the terminal retention
+long enough for normal follow-up conversations; deleting a completed AgentRun
+does not immediately delete its sandbox because the durable session may still
+be reopened. Microsandbox and Vercel Sandbox deployments use their backend
+lifecycle controls instead of this Docker-specific worker.
 
 Inspection and busy-session failures are deferred with bounded backoff. A
 transport failure after admission begins is marked `submission-ambiguous` and
@@ -226,6 +269,24 @@ event count, and idempotency results without credentials or prompts. A local
 deterministic pass is only a regression baseline. Production capacity evidence
 must use the target Provider, database, queue, sandbox backend, autoscaling, and
 collector configuration, and must be repeated after material topology changes.
+
+Run `npm run verify:asset-load` against the staged Agent Web when validating the
+object-store path. The bounded gate defaults to two concurrent 100 MiB uploads
+(eight uploads are the maximum configured concurrency), uses the server-advertised
+multipart chunk size, retries a deliberately truncated first part, verifies the
+completion checksum and beginning/end range reads, and checks that another tenant
+cannot read the completed asset. It also checks that a different principal in the
+same tenant cannot read it, so a passing run covers both tenant and principal
+ownership boundaries. Set `AGENT_ASSET_LOAD_TOTAL_UPLOADS` above
+`AGENT_ASSET_LOAD_CONCURRENCY` for a fuller run, and use
+`AGENT_ASSET_LOAD_SIZE_BYTES` (for example `100MiB`) only within the 10 GiB asset
+limit. `AGENT_HOST_JWT_SECRET`, `AGENT_HOST_JWT_ISSUER`, and
+`AGENT_HOST_JWT_AUDIENCE` are required. Headless AgentRun tokens must also
+carry the `agent:runs` scope. Set
+`AGENT_ASSET_LOAD_EVIDENCE_PATH` to retain the redacted JSON report; it records
+part retry counts, throughput, upload latency, and isolation status, never file
+bytes or credentials. This is a bounded capacity/regression gate, not evidence
+that a deployment meets the full 1k/5k/10k stream or tenant SLO matrix.
 
 Keep Eve pinned to an exact version. Before any cross-minor upgrade, replay
 representative persistent sessions against an isolated copy of the Workflow

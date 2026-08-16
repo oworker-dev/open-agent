@@ -77,6 +77,25 @@ test("dispatcher does not hand a message to Eve while the addressed turn is runn
   assert.equal(runtime.deliveries.length, 0);
 });
 
+test("dispatcher admits a steer for the exact active Eve turn", async () => {
+  const store = new MemoryMailboxStore();
+  await enqueueAgentMailboxMessage({
+    clientMessageId: "message-steer-1",
+    expectedTurnId: "turn-active",
+    message: "Use the latest constraint.",
+    operationId: "operation-steer-1",
+    operationKind: "steer",
+    owner,
+    sessionId: "session-1",
+    store,
+  });
+  const runtime = new FakeMailboxRuntime({ state: "running", turnId: "turn-active" });
+  const result = await dispatchNextAgentMailboxMessage({ runtime, store });
+
+  assert.equal(result.status, "accepted");
+  assert.equal(runtime.deliveries.length, 1);
+});
+
 test("cancelling a leased message wins before admission begins", async () => {
   const store = await queuedStore();
   const runtime: AgentMailboxRuntime = {
@@ -423,4 +442,24 @@ test("payload fingerprints include the session id", () => {
     mailboxPayloadFingerprint("session-a", payload),
     mailboxPayloadFingerprint("session-b", payload),
   );
+});
+
+test("steering metadata remains part of the durable mailbox payload", async () => {
+  const store = new MemoryMailboxStore();
+  const result = await enqueueAgentMailboxMessage({
+    clientMessageId: "message-steer-1",
+    expectedTurnId: "turn-1",
+    message: "Also verify the mobile layout.",
+    operationId: "operation-steer-1",
+    operationKind: "steer",
+    owner,
+    sessionId: "session-1",
+    store,
+  });
+  assert.equal(result.status, "created");
+  assert.deepEqual(result.item.payload.operation, {
+    expectedTurnId: "turn-1",
+    kind: "steer",
+    operationId: "operation-steer-1",
+  });
 });

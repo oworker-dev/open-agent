@@ -44,6 +44,10 @@
       "types": "./dist/runtime-config.d.ts",
       "import": "./dist/runtime-config.js"
     },
+    "./asset": {
+      "types": "./dist/asset.d.ts",
+      "import": "./dist/asset.js"
+    },
     "./package.json": "./package.json"
   },
   "scripts": {

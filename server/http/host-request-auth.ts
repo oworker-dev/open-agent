@@ -22,6 +22,25 @@ export type HostRequestAuthentication =
     }
   | { readonly ok: false; readonly response: Response };
 
+/** Apply a least-privilege endpoint scope after the shared Host JWT check. */
+export function requireHostScope(
+  authenticated: HostRequestAuthentication,
+  scope: string,
+): HostRequestAuthentication {
+  if (!authenticated.ok || authenticated.scopes.has(scope)) return authenticated;
+  return {
+    ok: false,
+    response: Response.json(
+      {
+        code: "host_scope_required",
+        error: `The Host token requires the ${scope} scope.`,
+        ok: false,
+      },
+      { headers: { "cache-control": "no-store" }, status: 403 },
+    ),
+  };
+}
+
 export async function authenticateHostRequest(
   request: Request,
 ): Promise<HostRequestAuthentication> {
@@ -38,11 +57,27 @@ export async function authenticateHostRequest(
         }),
       };
     }
+    let runtimeConfig: AgentRuntimeConfigSnapshot;
+    try {
+      runtimeConfig = resolveAgentRuntimeConfig(auth.attributes);
+    } catch {
+      return {
+        ok: false,
+        response: Response.json(
+          {
+            code: "host_runtime_config_invalid",
+            error: "The Host token contains an invalid Agent Runtime Config snapshot.",
+            ok: false,
+          },
+          { headers: { "cache-control": "no-store" }, status: 403 },
+        ),
+      };
+    }
     return {
       accessToken,
       identity: sessionOwnerFromAuth(auth),
       ok: true,
-      runtimeConfig: resolveAgentRuntimeConfig(auth.attributes),
+      runtimeConfig,
       scopes: authScopes(auth.attributes.scope),
     };
   } catch (error) {

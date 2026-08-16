@@ -1,5 +1,9 @@
 # Architecture
 
+The implementation order and current completion status are tracked in
+[Production Roadmap](./production-roadmap.md). Large-file and visual-input
+contracts are defined in [Assets, Uploads, And Vision](./assets-and-vision.md).
+
 ## Product boundary
 
 `open-agent` is a general-purpose autonomous Agent product and integration
@@ -320,6 +324,14 @@ Production still requires evidence on the selected deployment backend. Remaining
 - a dynamic Preview Gateway with bounded process/port lifecycle before
   promising long-running server previews.
 
+Large user uploads and visual understanding are specified separately in
+[Assets, Uploads, And Vision](./assets-and-vision.md). In particular, the
+result-delivery `ArtifactStore` is not an upload store: it remains bounded and
+is only a compatibility projection for completed outputs. Production uploads
+use the host-replaceable `AssetStore`, object-store multipart transfers, and
+session-scoped sandbox mounts. Conversation events carry asset references, not
+file bytes.
+
 Skills add instructions; they do not add authority. MCP connections and tools
 must be scoped by the current principal, session, and approval policy.
 
@@ -399,8 +411,8 @@ The repository now builds `@oworker/open-agent-contracts@0.1.0-alpha.9`,
 `@oworker/open-agent-ui@0.1.0-alpha.9`, and
 `@oworker/open-agent-mcp-adapter@0.1.0-alpha.9` as real ESM/declaration packages
 with stable exports. A conformance command packs all five tarballs, installs them
-in an empty consumer, and imports their public entrypoints, an individual AI
-Element, and the stylesheet export. The compiled ESM, declarations, source
+in an empty consumer, and imports their public entrypoints, an assistant-ui
+surface, and the stylesheet export. The compiled ESM, declarations, source
 maps, and stylesheet are committed with each release so pnpm consumers can pin
 an exact Git commit plus package subdirectory without running a build or
 persisting an expiring release-asset URL. CI rejects any drift between those
@@ -475,6 +487,22 @@ ephemeral canvas context while reusing the same session and assistant-ui UI.
 
 No package may import Muses canvas state directly. Muses integration should be a
 separate adapter package and a set of permissioned canvas tools.
+
+### Verification snapshot (2026-08-16)
+
+The local production build currently passes type checking, 270 unit tests, the
+Provider failure/retry gate, and 47 browser E2E cases (2 intentionally skipped
+fixture-only cases). A MinIO-backed S3 run also passed two concurrent 100 MiB
+uploads with interrupted-part retry, Range reads, and tenant/principal
+isolation. The production doctor passes when supplied with the deployment's
+HTTPS origin and OTLP endpoint shape; Docker sandbox hardening remains an
+explicit operational warning.
+
+The remaining release evidence is external by design: a real Muses Host JWT,
+Provider broker, Workspace/Project/Canvas identifiers, target object store,
+telemetry collector, and deployed sandbox quotas are required for the Muses
+Host E2E. The repository does not invent those credentials or mark that gate
+green without them.
 
 ## Observability
 

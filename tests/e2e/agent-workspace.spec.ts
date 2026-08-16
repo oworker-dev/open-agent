@@ -858,6 +858,102 @@ test("file patch tools render with the assistant-ui diff viewer", async ({ page 
   await expect(diffViewer).toContainText("export const ready = true;");
 });
 
+test("secondary view lists session assets and previews markdown, images, and downloads", async ({ page }) => {
+  const sessionId = "asset-secondary-session";
+  const imageBytes = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    "base64",
+  );
+  const events = eventsFromNdjson(mockSuccessfulTurn("Review the session assets", "Assets are ready."));
+  setFakeThreadCollection(page, {
+    activeThreadId: "asset-secondary-thread",
+    threads: [{
+      closedInputRequestIds: [],
+      createdAt: Date.now(),
+      events,
+      id: "asset-secondary-thread",
+      preferences: { executionMode: "standard", modelId: "gpt-5.6-sol", reasoning: "medium" },
+      queuedTurns: [],
+      session: { sessionId, streamIndex: events.length },
+      status: "ready",
+      title: "Session assets",
+      updatedAt: Date.now(),
+      version: 2,
+    }],
+    version: 2,
+  });
+
+  await page.route(`**/api/assets?sessionId=${sessionId}`, async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({
+        assets: [
+          {
+            assetId: "asset-hero-image",
+            filename: "hero.png",
+            mediaType: "image/png",
+            sizeBytes: imageBytes.byteLength,
+          },
+          {
+            assetId: "asset-readme",
+            filename: "README.md",
+            mediaType: "text/markdown",
+            sizeBytes: 44,
+          },
+          {
+            assetId: "asset-bundle",
+            filename: "site.zip",
+            mediaType: "application/zip",
+            sizeBytes: 1_024,
+          },
+        ],
+        ok: true,
+      }),
+      contentType: "application/json",
+      status: 200,
+    });
+  });
+  await page.route("**/api/assets/asset-hero-image", async (route) => {
+    await route.fulfill({ body: imageBytes, contentType: "image/png", status: 200 });
+  });
+  await page.route("**/api/assets/asset-readme", async (route) => {
+    await route.fulfill({
+      body: "# Delivered site\n\nThe preview is ready.\n",
+      contentType: "text/markdown; charset=utf-8",
+      status: 200,
+    });
+  });
+  await page.route("**/api/assets/asset-bundle", async (route) => {
+    await route.fulfill({ body: Buffer.from("zip fixture"), contentType: "application/zip", status: 200 });
+  });
+
+  await page.goto("/threads/asset-secondary-thread");
+  await expect(page.getByText("Assets are ready.", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Open side view", exact: true }).click();
+  const secondary = page.locator("[data-agent-secondary-view]");
+  await expect(secondary).toBeVisible();
+  await secondary.getByRole("button", { name: /Assets\s*3/u }).click();
+  await expect(secondary.getByText("hero.png", { exact: true })).toBeVisible();
+  await expect(secondary.getByText("README.md", { exact: true })).toBeVisible();
+  await expect(secondary.getByText("site.zip", { exact: true })).toBeVisible();
+
+  await secondary.getByRole("button", { name: "Preview hero.png", exact: true }).click();
+  await expect(secondary.locator("h2")).toHaveText("hero.png");
+  await expect(secondary.locator('img[alt="hero.png"]')).toBeVisible();
+  await secondary.getByRole("button", { name: "Back to list", exact: true }).click();
+
+  await secondary.getByRole("button", { name: "Open README.md", exact: true }).click();
+  await expect(secondary.locator("h2")).toHaveText("README.md");
+  await expect(secondary.locator(".aui-md")).toContainText("Delivered site");
+  await expect(secondary.locator(".aui-md")).toContainText("The preview is ready.");
+  await secondary.getByRole("button", { name: "Back to list", exact: true }).click();
+
+  await secondary.getByRole("button", { name: "Open site.zip", exact: true }).click();
+  await expect(secondary.locator("h2")).toHaveText("site.zip");
+  const download = secondary.getByRole("link", { name: /下载文件|Download/u });
+  await expect(download).toBeVisible();
+  await expect(download).toHaveAttribute("download", "site.zip");
+});
+
 test("a live autonomous website task survives refresh and publishes a usable preview", async ({ page }) => {
   test.skip(process.env.RUN_AGENT_AUTONOMY_E2E !== "1", "Requires a healthy live model provider and sandbox.");
   test.setTimeout(20 * 60_000);
@@ -905,6 +1001,11 @@ test("a live autonomous website task survives refresh and publishes a usable pre
   expect(response?.ok()).toBeTruthy();
   expect((await previewPage.locator("body").innerText()).toLowerCase()).toContain("aperture systems");
   expect(previewResponses.some(({ url }) => new URL(url).pathname.endsWith(".css"))).toBeTruthy();
+  const stylesheets = await previewPage.locator('link[rel="stylesheet"]').evaluateAll((links) => links.map((link) => {
+    const stylesheet = (link as HTMLLinkElement).sheet;
+    return { loaded: Boolean(stylesheet), rules: stylesheet?.cssRules.length ?? 0 };
+  }));
+  expect(stylesheets.some(({ loaded, rules }) => loaded && rules > 0)).toBeTruthy();
   expect(previewResponses.some(({ url }) => new URL(url).pathname.endsWith(".js"))).toBeTruthy();
   expect(previewResponses.filter(({ status }) => status >= 400)).toEqual([]);
   await previewPage.close();

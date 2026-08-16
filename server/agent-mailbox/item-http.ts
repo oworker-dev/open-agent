@@ -47,6 +47,13 @@ function itemResponse(item: AgentMailboxItem, setCookie?: string): Response {
       item: {
         clientMessageId: item.clientMessageId,
         itemId: item.itemId,
+        ...(item.payload.operation?.expectedTurnId
+          ? { expectedTurnId: item.payload.operation.expectedTurnId }
+          : {}),
+        ...(item.payload.operation?.kind ? { operationKind: item.payload.operation.kind } : {}),
+        ...(item.payload.operation?.operationId
+          ? { operationId: item.payload.operation.operationId }
+          : {}),
         ...(item.lastError ? { lastError: item.lastError } : {}),
         status: item.status,
       },

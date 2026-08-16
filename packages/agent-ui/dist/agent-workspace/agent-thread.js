@@ -158,13 +158,23 @@ export function AgentThreadView({ client, commands, draftStorageKey, isRecoverin
     latestEventsRef.current = agent.events;
     const pendingTurnInFlight = isPendingTurnInFlight(thread.pendingTurn);
     const durableTurnSettled = !pendingTurnInFlight && hasSettledLatestTurn(agent.events);
+    const durableTurnOpen = !pendingTurnInFlight && !durableTurnSettled &&
+        agent.events.some((event) => event.type === "turn.started");
     const cancellationSettling = cancellationRef.current.requested || thread.status === "cancelling";
-    const agentIsBusy = runtimeIsBusy && !localInterruption && !cancellationSettling && !durableTurnSettled;
+    const agentIsBusy = (runtimeIsBusy || durableTurnOpen) && !localInterruption && !cancellationSettling && !durableTurnSettled;
     const isBusy = pendingTurnInFlight || agentIsBusy ||
         (isRecovering && !localInterruption && !cancellationSettling && !durableTurnSettled);
     const admissionBusy = pendingTurnInFlight || (!durableTurnSettled &&
         (runtimeIsBusy || isRecovering || cancellationSettling));
     const pendingInputRequests = unresolvedInputRequests(agent.events, closedInputRequestIdsRef.current);
+    const approvalRequest = pendingInputRequests.find((request) => request.kind === "tool-approval");
+    const approvalTakeover = approvalRequest
+        ? {
+            requestId: approvalRequest.requestId,
+            prompt: approvalRequest.prompt,
+            toolName: approvalRequest.action.toolName,
+        }
+        : undefined;
     const awaitingInput = pendingInputRequests.length > 0;
     const inputLocked = pendingInputRequests.some((request) => request.kind !== "question");
     const closeInputRequests = useCallback((requestIds) => {
@@ -600,6 +610,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, isRecoverin
     const visibleMessages = displayTimeline.messages;
     const displayEvents = displayTimeline.events;
     const assistantMessages = convertEveMessages({ ...agent.data, messages: visibleMessages }, {
+        assetUrl: client?.assetUrl,
         error: agent.error,
         isRunning: isBusy,
     });
@@ -668,7 +679,9 @@ export function AgentThreadView({ client, commands, draftStorageKey, isRecoverin
         });
     };
     const assistantRuntime = useExternalStoreRuntime({
-        adapters: { attachments: browserAttachmentAdapter },
+        adapters: {
+            attachments: createBrowserAttachmentAdapter(client, () => sessionRef.current?.state.sessionId ?? thread.session.sessionId),
+        },
         isDisabled: !providerReady,
         isSendDisabled: inputLocked,
         isRunning: isBusy,
@@ -881,7 +894,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, isRecoverin
     };
     const closeInputRequest = (requestId) => closeInputRequests([requestId]);
     const visibleQueuedTurns = thread.queuedTurns.filter((turn) => turn.intent !== "post-cancellation");
-    return (_jsx(AssistantRuntimeProvider, { runtime: assistantRuntime, children: _jsx("main", { className: "flex min-h-0 flex-1 flex-col overflow-hidden", children: _jsx(AssistantThreadSurface, { cancellationState: cancellationState, commands: commands, composerTop: visibleQueuedTurns.length > 0 || queueError ? (_jsx(FollowUpQueue, { error: queueError, messages: messages, onRemove: removeQueuedTurn, onRetry: markQueuedTurnForRetry, turns: visibleQueuedTurns })) : undefined, draftStorageKey: draftStorageKey, events: displayEvents, eveMessages: visibleMessages, fallbackStartedAt: thread.pendingTurn?.submittedAt, inputDisabled: inputLocked, isBusy: isBusy, locale: locale, mentions: mentions, messages: messages, models: models, onInputResponses: respond, onCloseInputRequest: closeInputRequest, onOpenSubagent: onOpenSubagent, onPreferencesChange: (preferences) => onChange({ preferences }), onDraftRestoreConsumed: (id) => {
+    return (_jsx(AssistantRuntimeProvider, { runtime: assistantRuntime, children: _jsx("main", { className: "flex min-h-0 flex-1 flex-col overflow-hidden", children: _jsx(AssistantThreadSurface, { assetUrl: client?.assetUrl, approvalTakeover: approvalTakeover, cancellationState: cancellationState, commands: commands, composerTop: visibleQueuedTurns.length > 0 || queueError ? (_jsx(FollowUpQueue, { error: queueError, messages: messages, onRemove: removeQueuedTurn, onRetry: markQueuedTurnForRetry, turns: visibleQueuedTurns })) : undefined, draftStorageKey: draftStorageKey, events: displayEvents, eveMessages: visibleMessages, fallbackStartedAt: thread.pendingTurn?.submittedAt, inputDisabled: inputLocked, isBusy: isBusy, locale: locale, mentions: mentions, messages: messages, models: models, onInputResponses: respond, onCloseInputRequest: closeInputRequest, onOpenSubagent: onOpenSubagent, onPreferencesChange: (preferences) => onChange({ preferences }), onDraftRestoreConsumed: (id) => {
                     if (thread.draftRestore?.id === id)
                         onChange({ draftRestore: undefined });
                 }, onRetryRuntimeError: recoveryError ? onRetryRecovery : undefined, closedInputRequestIds: closedInputRequestIdsRef.current, preferences: thread.preferences, reasoningLevels: reasoningLevels, draftRestore: thread.draftRestore, runtimeError: runtimeError, usage: usage }) }) }));
@@ -1063,21 +1076,37 @@ function promptFromAssistantMessage(content) {
     if (typeof content === "string")
         return { files: [], text: content };
     const text = content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
-    const files = content.filter((part) => part.type === "file").map((part) => ({ filename: part.filename, mediaType: part.mediaType, url: typeof part.data === "string" ? part.data : String(part.data) }));
+    const files = content.filter((part) => part.type === "file").map((part) => {
+        const url = typeof part.data === "string" ? part.data : String(part.data);
+        const assetId = url.startsWith("asset://")
+            ? url.slice("asset://".length)
+            : /^\/api\/assets\/([^/?#]+)/u.exec(url)?.[1];
+        return {
+            ...(assetId ? { assetId } : {}),
+            ...(part.filename ? { filename: part.filename } : {}),
+            mediaType: part.mediaType,
+            url,
+        };
+    });
     return { files, text };
 }
 function retainedContextOptions(context) {
     return context && context.length > 0 ? { clientContext: context } : {};
 }
 async function sendPrompt(send, prompt, context) {
-    if (prompt.files.length === 0) {
-        await send(prompt.text, retainedContextOptions(context));
+    const assetNotes = prompt.files
+        .filter((file) => file.assetId)
+        .map((file) => `[open-agent-asset ${JSON.stringify({ id: file.assetId, mediaType: file.mediaType, name: file.filename ?? "file", ...(file.sizeBytes ? { size: file.sizeBytes } : {}) })}] Attached asset ${file.filename ?? "file"}. Use import_asset before inspecting or processing it.`);
+    const text = [prompt.text, ...assetNotes].filter((value) => value.trim().length > 0).join("\n\n");
+    const inlineFiles = prompt.files.filter((file) => !file.assetId);
+    if (inlineFiles.length === 0) {
+        await send(text, retainedContextOptions(context));
         return;
     }
     const parts = [];
-    if (prompt.text)
-        parts.push({ text: prompt.text, type: "text" });
-    for (const file of prompt.files) {
+    if (text)
+        parts.push({ text, type: "text" });
+    for (const file of inlineFiles) {
         parts.push({
             data: file.url,
             ...(file.filename ? { filename: file.filename } : {}),
@@ -1087,47 +1116,119 @@ async function sendPrompt(send, prompt, context) {
     }
     await send(parts, retainedContextOptions(context));
 }
-const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
-const browserAttachmentAdapter = {
-    accept: "*",
-    async add({ file }) {
-        if (file.size > MAX_ATTACHMENT_BYTES) {
-            throw new Error("Attachments must be 20 MB or smaller.");
+const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024 * 1024;
+function createBrowserAttachmentAdapter(config, sessionId) {
+    return {
+        accept: "*",
+        async add({ file }) {
+            if (file.size > MAX_ATTACHMENT_BYTES) {
+                throw new Error("Attachments must be 10 GiB or smaller.");
+            }
+            return {
+                contentType: file.type || "application/octet-stream",
+                file,
+                id: typeof crypto !== "undefined" && "randomUUID" in crypto
+                    ? crypto.randomUUID()
+                    : `attachment-${Date.now()}`,
+                name: file.name,
+                status: { reason: "composer-send", type: "requires-action" },
+                type: file.type.startsWith("image/") ? "image" : "file",
+            };
+        },
+        async remove() {
+        },
+        async send(attachment) {
+            const asset = await uploadBrowserAsset(config, attachment.file, sessionId());
+            return {
+                ...attachment,
+                content: [{
+                        data: `asset://${asset.assetId}`,
+                        filename: asset.filename,
+                        mimeType: asset.mediaType,
+                        type: "file",
+                    }],
+                status: { type: "complete" },
+            };
+        },
+    };
+}
+async function uploadBrowserAsset(config, file, sessionId) {
+    const ownerSessionId = sessionId ?? `browser-${crypto.randomUUID()}`;
+    let uploadId;
+    try {
+        const init = await assetRequest(config, "/api/assets/uploads", {
+            body: JSON.stringify({ filename: file.name, mediaType: file.type || "application/octet-stream", sessionId: ownerSessionId, sizeBytes: file.size }),
+            headers: { "content-type": "application/json" },
+            method: "POST",
+        });
+        const upload = (await readJson(init)).upload;
+        uploadId = upload.uploadId;
+        for (let partNumber = 1, offset = 0; offset < file.size; partNumber += 1) {
+            const end = Math.min(file.size, offset + upload.chunkSizeBytes);
+            const bytes = new Uint8Array(await file.slice(offset, end).arrayBuffer());
+            await withUploadRetries(() => assetRequest(config, `/api/assets/uploads/${encodeURIComponent(upload.uploadId)}/parts/${partNumber}`, {
+                body: bytes,
+                headers: { "content-type": "application/octet-stream" },
+                method: "PUT",
+            }));
+            offset = end;
         }
-        return {
-            contentType: file.type || "application/octet-stream",
-            file,
-            id: typeof crypto !== "undefined" && "randomUUID" in crypto
-                ? crypto.randomUUID()
-                : `attachment-${Date.now()}`,
-            name: file.name,
-            status: { reason: "composer-send", type: "requires-action" },
-            type: file.type.startsWith("image/") ? "image" : "file",
-        };
-    },
-    async remove() {
-    },
-    async send(attachment) {
-        const data = await fileToDataUrl(attachment.file);
-        return {
-            ...attachment,
-            content: [{
-                    data,
-                    filename: attachment.name,
-                    mimeType: attachment.contentType || "application/octet-stream",
-                    type: "file",
-                }],
-            status: { type: "complete" },
-        };
-    },
-};
-function fileToDataUrl(file) {
-    return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(String(reader.result));
-        reader.onerror = () => reject(reader.error ?? new Error("Unable to read the attachment."));
-        reader.readAsDataURL(file);
-    });
+        const complete = await withUploadRetries(() => assetRequest(config, `/api/assets/uploads/${encodeURIComponent(upload.uploadId)}/complete`, {
+            body: "{}",
+            headers: { "content-type": "application/json" },
+            method: "POST",
+        }));
+        const asset = (await readJson(complete)).asset;
+        return asset;
+    }
+    catch (error) {
+        if (uploadId) {
+            await assetRequest(config, `/api/assets/uploads/${encodeURIComponent(uploadId)}`, { method: "DELETE" }).catch(() => undefined);
+        }
+        throw error;
+    }
+}
+async function withUploadRetries(request) {
+    let lastError;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+            return await request();
+        }
+        catch (error) {
+            lastError = error;
+            if (attempt < 2)
+                await new Promise((resolve) => window.setTimeout(resolve, 250 * (attempt + 1)));
+        }
+    }
+    throw lastError instanceof Error ? lastError : new Error("Asset upload failed after retries.");
+}
+async function assetRequest(config, path, init) {
+    const headers = {
+        ...(await resolveClientHeaders(config)),
+        ...(init.headers ?? {}),
+    };
+    const base = config?.host || (typeof window !== "undefined" ? window.location.origin : "http://localhost");
+    const response = await fetch(new URL(path, base).toString(), { ...init, credentials: "include", headers });
+    if (!response.ok)
+        throw new Error(`Asset request failed (${response.status}).`);
+    return response;
+}
+async function readJson(response) {
+    try {
+        return await response.json();
+    }
+    catch {
+        throw new Error("The asset service returned invalid JSON.");
+    }
+}
+async function resolveClientHeaders(config) {
+    const headers = config?.headers;
+    const resolved = typeof headers === "function" ? await headers() : headers;
+    if (config?.auth && "bearer" in config.auth) {
+        const token = typeof config.auth.bearer === "function" ? await config.auth.bearer() : config.auth.bearer;
+        return { ...(resolved ?? {}), authorization: `Bearer ${token}` };
+    }
+    return resolved ?? {};
 }
 function isSessionBoundary(event) {
     return event.type === "session.waiting" || event.type === "session.completed" || event.type === "session.failed";

@@ -1,8 +1,9 @@
 import { type MessageStreamEvent } from "eve/client";
-import type { AgentModelOption, AgentThread, AgentThreadPreferences, AgentWorkspaceClientConfig, AgentWorkspaceMailbox } from "./contracts.js";
+import type { AgentAssetEndpoint, AgentModelOption, AgentSessionAsset, AgentThread, AgentThreadPreferences, AgentWorkspaceClientConfig, AgentWorkspaceMailbox } from "./contracts.js";
 import { type AgentThreadStorage } from "./thread-storage.js";
-export declare function AgentWorkspace({ client, commands, defaultPreferences, extensions, hostSlots, initialSubagentSessionId, initialThreadId, mailbox, models, mentions, onEvent, onDeleteThread, onActiveSubagentChange, onActiveThreadChange, onStorageError, productName, reasoningLevels, runtimeStatus, storageKey, threadStorage, }: {
+export declare function AgentWorkspace({ assetEndpoint, client, commands, defaultPreferences, extensions, hostSlots, initialSubagentSessionId, initialThreadId, mailbox, models, mentions, onEvent, onOpenAsset, onDeleteThread, onActiveSubagentChange, onActiveThreadChange, onStorageError, productName, reasoningLevels, runtimeStatus, storageKey, threadStorage, }: {
     readonly agentName?: string;
+    readonly assetEndpoint?: AgentAssetEndpoint;
     readonly client?: AgentWorkspaceClientConfig;
     readonly commands?: readonly import("./contracts.js").AgentPromptMenuItem[];
     readonly defaultPreferences: AgentThreadPreferences;
@@ -17,6 +18,7 @@ export declare function AgentWorkspace({ client, commands, defaultPreferences, e
     readonly models: readonly AgentModelOption[];
     readonly mentions?: readonly import("./contracts.js").AgentPromptMenuItem[];
     readonly onEvent?: (event: MessageStreamEvent) => void;
+    readonly onOpenAsset?: (asset: AgentSessionAsset) => void;
     readonly onDeleteThread?: (thread: AgentThread) => void | Promise<void>;
     readonly onActiveSubagentChange?: (threadId: string, sessionId?: string) => void;
     readonly onActiveThreadChange?: (threadId?: string) => void;

@@ -4,9 +4,9 @@ const baseUrl = process.env.AGENT_RUN_TEST_BASE_URL?.trim() || "http://127.0.0.1
 const secret = required("AGENT_RUN_TEST_JWT_SECRET");
 const issuer = process.env.AGENT_RUN_TEST_JWT_ISSUER?.trim() || "https://muses.local.test";
 const audience = process.env.AGENT_RUN_TEST_JWT_AUDIENCE?.trim() || "open-agent";
-const userToken = signToken({ actorType: "user", sub: "run-test-user", tenantId: "run-test-tenant" });
-const otherUserToken = signToken({ actorType: "user", sub: "other-user", tenantId: "run-test-tenant" });
-const otherTenantToken = signToken({ actorType: "user", sub: "run-test-user", tenantId: "other-tenant" });
+const userToken = signToken({ actorType: "user", scope: ["agent:runs"], sub: "run-test-user", tenantId: "run-test-tenant" });
+const otherUserToken = signToken({ actorType: "user", scope: ["agent:runs"], sub: "other-user", tenantId: "run-test-tenant" });
+const otherTenantToken = signToken({ actorType: "user", scope: ["agent:runs"], sub: "run-test-user", tenantId: "other-tenant" });
 
 const unauthorized = await fetch(`${baseUrl}/api/agent/runs`, { method: "POST" });
 assert(unauthorized.status === 401, `Expected unauthenticated status 401, received ${unauthorized.status}.`);

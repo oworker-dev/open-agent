@@ -70,8 +70,10 @@ export type AgentPromptMenuItem = {
 };
 export type PromptInputMessage = {
     readonly files: readonly {
+        readonly assetId?: string;
         readonly filename?: string;
         readonly mediaType: string;
+        readonly sizeBytes?: number;
         readonly url: string;
     }[];
     readonly text: string;
@@ -115,14 +117,28 @@ export type AgentWorkspaceHostSlots = {
     readonly threadHeaderEnd?: ReactNode;
 };
 export type AgentWorkspaceClientConfig = {
+    readonly assetUrl?: (assetId: string) => string;
     readonly auth?: ClientAuth;
     readonly headers?: HeadersValue;
     readonly host?: string;
     readonly prepareSend?: PrepareSend;
     readonly redirect?: ClientRedirectPolicy;
 };
+export type AgentSessionAsset = {
+    readonly assetId: string;
+    readonly createdAt?: string;
+    readonly downloadUrl?: string;
+    readonly filename: string;
+    readonly mediaType: string;
+    readonly previewUrl?: string;
+    readonly sizeBytes: number;
+    readonly url?: string;
+};
+export type AgentAssetEndpoint = string | ((sessionId: string) => string);
 export type AgentWorkspaceConfig = {
     readonly agentName: string;
+    readonly assetEndpoint?: AgentAssetEndpoint;
+    readonly onOpenAsset?: (asset: AgentSessionAsset) => void;
     readonly client?: AgentWorkspaceClientConfig;
     readonly commands?: readonly AgentPromptMenuItem[];
     readonly defaultPreferences: AgentThreadPreferences;

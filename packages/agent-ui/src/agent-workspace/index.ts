@@ -1,4 +1,5 @@
 export { AgentWorkspace } from "./agent-workspace.js";
+export { AgentSecondaryView, type AgentSecondaryChild, type AgentSecondaryTab } from "./agent-secondary-view.js";
 export {
   AgentMailboxHttpError,
   createHttpAgentMailbox,
@@ -14,6 +15,8 @@ export { AgentMessage } from "./agent-message.js";
 export type { AgentInputResponse } from "./agent-message.js";
 export type {
   AgentExtensionInfo,
+  AgentAssetEndpoint,
+  AgentSessionAsset,
   AgentThread,
   AgentPendingTurn,
   AgentQueuedTurn,

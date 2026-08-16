@@ -201,7 +201,8 @@ const mailboxRoute = POST(MAILBOX_ROUTE, async (request, {
   if (input.action === "inspect") {
     return Response.json({ ...boundary, ok: true }, { headers: { "cache-control": "no-store" } });
   }
-  if (boundary.state === "terminal" || boundary.state === "running") {
+  if (boundary.state === "terminal" ||
+      boundary.state === "running" && !canSteerMailboxRequest(input, boundary)) {
     return mailboxProblem(
       boundary.state === "terminal" ? 410 : 409,
       boundary.state === "terminal" ? "mailbox_session_terminal" : "mailbox_turn_active",
@@ -211,13 +212,29 @@ const mailboxRoute = POST(MAILBOX_ROUTE, async (request, {
     );
   }
   try {
+    const steer = boundary.state === "running" && input.operationKind === "steer"
+      ? input.expectedTurnId
+        ? { clientMessageId: input.clientMessageId, expectedTurnId: input.expectedTurnId }
+        : undefined
+      : undefined;
+    if (boundary.state === "running" && input.operationKind === "steer" && !steer) {
+      return mailboxProblem(400, "mailbox_expected_turn_missing", "A steering message requires the active turn id.");
+    }
     const accepted = await attachSession(input.sessionId).send(
       input.message,
       {
         auth: mailboxSessionAuth(input),
         ...(input.clientContext ? { clientContext: input.clientContext } : {}),
+        ...(steer ? { steer } : {}),
       },
     );
+    if (accepted.status === "session_not_active") {
+      return mailboxProblem(
+        410,
+        "mailbox_session_terminal",
+        "The Agent session is no longer active.",
+      );
+    }
     if (accepted.status !== "accepted" || accepted.sessionId !== input.sessionId) {
       return mailboxProblem(
         409,
@@ -248,7 +265,7 @@ export default {
 type MailboxBoundary =
   | { readonly state: "running"; readonly turnId?: string }
   | { readonly state: "waiting" }
-  | { readonly state: "terminal" };
+  | { readonly state: "terminal"; readonly terminalStatus?: "completed" | "failed" };
 
 type MailboxInspectRequest = {
   readonly action: "inspect";
@@ -260,10 +277,13 @@ type MailboxDeliverRequest = {
   readonly clientMessageId: string;
   readonly clientContext?: readonly string[];
   readonly executionMode?: AgentRunPolicy["executionMode"];
+  readonly expectedTurnId?: string;
   readonly issuer?: string;
   readonly itemId: string;
   readonly message: string;
   readonly modelId?: string;
+  readonly operationId?: string;
+  readonly operationKind?: "send" | "steer" | "edit";
   readonly principalId: string;
   readonly principalType: string;
   readonly reasoning?: string;
@@ -295,6 +315,15 @@ function parseMailboxRequest(body: string): MailboxInspectRequest | MailboxDeliv
       value.executionMode !== "automation" &&
       value.executionMode !== "cautious" &&
       value.executionMode !== "standard" ||
+    value.operationId !== undefined && !validText(value.operationId, 200) ||
+    value.operationKind !== undefined &&
+      value.operationKind !== "send" &&
+      value.operationKind !== "steer" &&
+      value.operationKind !== "edit" ||
+    value.expectedTurnId !== undefined && !validText(value.expectedTurnId, 512) ||
+    value.operationKind === "steer" &&
+      (typeof value.operationId !== "string" || typeof value.expectedTurnId !== "string") ||
+    value.operationId !== undefined && typeof value.operationKind !== "string" ||
     value.clientContext !== undefined && !validClientContext(value.clientContext)
   ) return undefined;
   return {
@@ -302,16 +331,28 @@ function parseMailboxRequest(body: string): MailboxInspectRequest | MailboxDeliv
     clientMessageId: value.clientMessageId,
     ...(value.clientContext ? { clientContext: value.clientContext } : {}),
     ...(value.executionMode ? { executionMode: value.executionMode } : {}),
+    ...(value.expectedTurnId ? { expectedTurnId: value.expectedTurnId } : {}),
     ...(value.issuer ? { issuer: value.issuer } : {}),
     itemId: value.itemId,
     message: value.message,
     ...(value.modelId ? { modelId: value.modelId } : {}),
+    ...(value.operationId ? { operationId: value.operationId } : {}),
+    ...(value.operationKind ? { operationKind: value.operationKind } : {}),
     principalId: value.principalId,
     principalType: value.principalType,
     ...(value.reasoning ? { reasoning: value.reasoning } : {}),
     sessionId: value.sessionId,
     tenantId: value.tenantId,
   };
+}
+
+function canSteerMailboxRequest(
+  input: MailboxDeliverRequest,
+  boundary: Extract<MailboxBoundary, { readonly state: "running" }>,
+): boolean {
+  return input.operationKind === "steer" &&
+    typeof input.expectedTurnId === "string" &&
+    input.expectedTurnId === boundary.turnId;
 }
 
 function validClientContext(value: unknown): value is readonly string[] {
@@ -329,12 +370,16 @@ async function inspectMailboxBoundary(
     if (latest.value.type === "session.waiting") {
       return { state: "waiting" };
     }
-    if (latest.value.type === "session.completed" || latest.value.type === "session.failed") {
-      return { state: "terminal" };
+    if (latest.value.type === "session.completed") {
+      return { state: "terminal", terminalStatus: "completed" };
     }
-    const turnId = "turnId" in latest.value.data &&
-        validText(latest.value.data.turnId, 512)
-      ? latest.value.data.turnId
+    if (latest.value.type === "session.failed") {
+      return { state: "terminal", terminalStatus: "failed" };
+    }
+    const data: unknown = latest.value.data;
+    const record = isRecord(data) ? data : undefined;
+    const turnId = record && validText(record["turnId"], 512)
+      ? record["turnId"]
       : undefined;
     return { state: "running", ...(turnId ? { turnId } : {}) };
   } finally {

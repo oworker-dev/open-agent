@@ -50,6 +50,7 @@ import {
 } from "../assistant-ui/tool-group.js";
 import { DiffViewer } from "../assistant-ui/diff-viewer.js";
 import { Button } from "../ui/button.js";
+import { Attachment, AttachmentAction, AttachmentContent, AttachmentDescription, AttachmentMedia, AttachmentTitle } from "../ui/attachment.js";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "../ui/collapsible.js";
 import {
   Questionnaire,
@@ -102,6 +103,7 @@ type EveFilePart = Extract<EveMessagePart, { type: "file" }>;
 const EMPTY_CLOSED_INPUT_REQUEST_IDS: ReadonlySet<string> = new Set();
 
 export function AgentMessage({
+  assetUrl,
   canRespond,
   closedInputRequestIds = EMPTY_CLOSED_INPUT_REQUEST_IDS,
   events,
@@ -114,6 +116,7 @@ export function AgentMessage({
   onCloseInputRequest = () => undefined,
   showCopyAction = true,
 }: {
+  readonly assetUrl?: (assetId: string) => string;
   readonly canRespond: boolean;
   readonly closedInputRequestIds?: ReadonlySet<string>;
   readonly events: readonly MessageStreamEvent[];
@@ -126,10 +129,18 @@ export function AgentMessage({
   readonly onCloseInputRequest?: (requestId: string) => void;
   readonly showCopyAction?: boolean;
 }) {
-  const task = presentAgentTurn(message, events, closedInputRequestIds);
-  const responseText = task?.finalPart?.text ?? (task ? undefined : lastText(message.parts));
-  const failure = failureForTurn(events, message.metadata?.turnId);
-  const hasVisiblePart = message.parts.some((part) => part.type !== "step-start");
+  const displayMessage = assetUrl
+    ? {
+        ...message,
+        parts: message.parts.map((part) => part.type === "file" && part.url?.startsWith("asset://")
+          ? { ...part, url: assetUrl(part.url.slice("asset://".length)) }
+          : part),
+      }
+    : message;
+  const task = presentAgentTurn(displayMessage, events, closedInputRequestIds);
+  const responseText = task?.finalPart?.text ?? (task ? undefined : lastText(displayMessage.parts));
+  const failure = failureForTurn(events, displayMessage.metadata?.turnId);
+  const hasVisiblePart = displayMessage.parts.some((part) => part.type !== "step-start");
 
   return (
     <Message
@@ -201,7 +212,7 @@ export function AgentMessage({
               </div>
             ) : null}
           </>
-        ) : message.parts.map((part, index) => (
+        ) : displayMessage.parts.map((part, index) => (
           <AgentMessagePart
             canRespond={canRespond}
             events={events}
@@ -1326,29 +1337,33 @@ function AttachmentPart({ locale, part }: { readonly locale: AgentLocale; readon
   const detail = [part.mediaType, formatBytes(part.size)].filter(Boolean).join(" - ");
   const isImage = part.mediaType.startsWith("image/") && part.url !== undefined;
   const Icon = isImage ? ImageIcon : FileIcon;
-  const body = (
-    <span className="flex max-w-sm items-center gap-3 rounded-md border bg-background/60 p-2 text-sm">
-      {isImage ? (
-        <img alt={label} className="size-12 shrink-0 rounded-sm object-cover" src={part.url} />
-      ) : (
-        <span className="flex size-10 shrink-0 items-center justify-center rounded-sm bg-muted text-muted-foreground">
-          <Icon className="size-4" />
-        </span>
-      )}
-      <span className="min-w-0 flex-1">
-        <span className="block truncate font-medium">{label}</span>
-        {detail ? <span className="block truncate text-muted-foreground">{detail}</span> : null}
-      </span>
-      {part.url ? <ExternalLinkIcon className="size-4 shrink-0 text-muted-foreground" /> : null}
-    </span>
-  );
-
-  return part.url ? (
-    <a href={part.url} rel="noreferrer" target="_blank">
-      {body}
-    </a>
-  ) : (
-    body
+  const [previewOpen, setPreviewOpen] = useState(false);
+  return (
+    <>
+      <Attachment className="max-w-sm" size="default" state="done">
+        <AttachmentMedia variant={isImage ? "image" : "icon"}>
+          {isImage ? <img alt={label} src={part.url} /> : <Icon className="size-4" />}
+        </AttachmentMedia>
+        <AttachmentContent>
+          <AttachmentTitle>{label}</AttachmentTitle>
+          {detail ? <AttachmentDescription>{detail}</AttachmentDescription> : null}
+        </AttachmentContent>
+        {isImage && part.url ? (
+          <AttachmentAction aria-label={localize(locale, "Preview image", "预览图片")} onClick={() => setPreviewOpen(true)} title={localize(locale, "Preview image", "预览图片")}>
+            <ImageIcon className="size-3.5" />
+          </AttachmentAction>
+        ) : part.url ? (
+          <AttachmentAction asChild aria-label={localize(locale, "Open attachment", "打开附件")} title={localize(locale, "Open attachment", "打开附件")}>
+            <a href={part.url} rel="noreferrer" target="_blank"><ExternalLinkIcon className="size-3.5" /></a>
+          </AttachmentAction>
+        ) : null}
+      </Attachment>
+      {previewOpen && part.url ? (
+        <button className="fixed inset-0 z-50 flex cursor-zoom-out items-center justify-center bg-black/70 p-6" onClick={() => setPreviewOpen(false)} type="button">
+          <img alt={label} className="max-h-[90vh] max-w-[90vw] rounded-xl object-contain shadow-2xl" src={part.url} />
+        </button>
+      ) : null}
+    </>
   );
 }
 

@@ -6,7 +6,8 @@ export type AgentInputResponse = {
     readonly requestId: string;
     readonly text?: string;
 };
-export declare function AgentMessage({ canRespond, closedInputRequestIds, events, fallbackStartedAt, isStreaming, locale, message, onOpenSubagent, onInputResponses, onCloseInputRequest, showCopyAction, }: {
+export declare function AgentMessage({ assetUrl, canRespond, closedInputRequestIds, events, fallbackStartedAt, isStreaming, locale, message, onOpenSubagent, onInputResponses, onCloseInputRequest, showCopyAction, }: {
+    readonly assetUrl?: (assetId: string) => string;
     readonly canRespond: boolean;
     readonly closedInputRequestIds?: ReadonlySet<string>;
     readonly events: readonly MessageStreamEvent[];

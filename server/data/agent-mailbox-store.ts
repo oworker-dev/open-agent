@@ -21,6 +21,12 @@ export type AgentMailboxStatus =
 export type AgentMailboxPayload = {
   readonly clientContext?: readonly string[];
   readonly message: string;
+  /** Stable product operation metadata. Eve treats the message as opaque text. */
+  readonly operation?: {
+    readonly expectedTurnId?: string;
+    readonly kind: "send" | "steer" | "edit";
+    readonly operationId: string;
+  };
   readonly preferences?: {
     readonly executionMode: "automation" | "cautious" | "standard";
     readonly modelId: string;
@@ -496,6 +502,15 @@ function assertOwner(owner: AgentSessionOwner): void {
 
 function assertPayload(payload: AgentMailboxPayload): void {
   assertText(payload.message, "payload.message", 65_536);
+  if (payload.operation) {
+    assertText(payload.operation.operationId, "payload.operation.operationId", 200);
+    if (!["send", "steer", "edit"].includes(payload.operation.kind)) {
+      throw new Error("payload.operation.kind is invalid.");
+    }
+    if (payload.operation.expectedTurnId) {
+      assertText(payload.operation.expectedTurnId, "payload.operation.expectedTurnId", 512);
+    }
+  }
   if (payload.clientContext && !isBoundedAgentClientContext(payload.clientContext)) {
     throw new Error("payload.clientContext exceeds the 20k-token transport budget.");
   }

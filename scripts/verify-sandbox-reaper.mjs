@@ -164,7 +164,11 @@ async function migrate(targetSchema, pool) {
 }
 
 function existingSandboxImage() {
-  const configured = process.env.EVE_DOCKER_REAPER_TEST_IMAGE?.trim();
+  // Prefer the exact deployment image so the reaper gate exercises the same
+  // runtime that production will create. The dedicated test override remains
+  // useful for CI fixtures and local image names.
+  const configured = process.env.EVE_DOCKER_REAPER_TEST_IMAGE?.trim()
+    || process.env.AGENT_SANDBOX_IMAGE?.trim();
   if (configured) return configured;
   const image = execFileSync("docker", [
     "images", "ghcr.io/vercel/eve:latest", "--format", "{{.Repository}}:{{.Tag}}",

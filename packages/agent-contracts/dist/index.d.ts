@@ -5,4 +5,5 @@ export * from "./agent-session.js";
 export * from "./client-context.js";
 export * from "./host-capability.js";
 export * from "./runtime-config.js";
+export * from "./asset.js";
 //# sourceMappingURL=index.d.ts.map

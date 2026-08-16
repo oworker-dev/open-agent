@@ -83,7 +83,10 @@ function providerRetryable(
   }
   if (isTransientNetworkError(error)) return true;
   if (statusCode === undefined) return undefined;
-  return statusCode === 408 || statusCode === 429 || statusCode >= 500;
+  // Match the AI SDK's transient HTTP classification. 409 is commonly used
+  // by gateways for an overloaded/temporarily unavailable upstream and is
+  // safe for Eve to retry before any tool boundary has been crossed.
+  return statusCode === 408 || statusCode === 409 || statusCode === 429 || statusCode >= 500;
 }
 
 const TRANSIENT_NETWORK_CODES = new Set([

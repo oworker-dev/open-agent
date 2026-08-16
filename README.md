@@ -29,7 +29,8 @@ The project has a working Eve runtime and a reusable assistant-ui Web workspace:
 - PostgreSQL-backed session ownership and injectable account thread storage;
 - Host JWT enforcement across create, continue, stream, cancel, and reset routes.
 - buildable Contracts, Client, Host, and React UI alpha SDK packages;
-- optional iframe, native `AgentWorkspace`, and custom-host UI integration paths.
+- optional iframe, native `AgentWorkspace`, and custom-host UI integration paths;
+- authenticated, resumable 8 MiB-chunk asset uploads (including 100 MiB+ files), session asset listing, a PostgreSQL-metadata + S3-compatible production AssetStore, sandbox `import_asset`, and bounded `view_image` inspection.
 - assistant-ui primitives and shadcn/ui-compatible base components exported for reusable host composition.
 - authenticated static website previews and generic artifact delivery for Python, image, audio, video, and document outputs.
 
@@ -162,12 +163,20 @@ MUSES_E2E_WORKSPACE_ID=... \
 MUSES_E2E_PROJECT_ID=... \
 MUSES_E2E_CANVAS_ID=... \
 MUSES_E2E_DEPLOYMENT_ID=... \
-MUSES_E2E_RUNTIME_CONFIG_JSON='{"contractVersion":"0.1.0",...}' \
+MUSES_E2E_RUNTIME_CONFIG_JSON='{"contractVersion":"0.1.0",...full snapshot...}' \
 MUSES_AGENT_HOST_JWT_SECRET=... \
 MUSES_AGENT_HOST_JWT_ISSUER=... \
 MUSES_AGENT_HOST_JWT_AUDIENCE=... \
 npm run verify:muses-host-e2e
 ```
+
+`MUSES_E2E_RUNTIME_CONFIG_JSON` must be the complete versioned Runtime Config
+snapshot published by the Host; the abbreviated value above is only a shell
+placeholder and is rejected by the preflight. The verifier also requires a
+32-byte Host JWT secret and fails before making a network request when required
+configuration is missing or malformed. The `MUSES_AGENT_HOST_JWT_*` values are
+the Muses-side signing configuration; the Agent deployment verifies the same
+secret under its `AGENT_HOST_JWT_*` names.
 
 The script refreshes its short-lived Host JWT on every request, verifies
 idempotent replay, and asserts the semantic Host event chain and Workflow
@@ -336,8 +345,9 @@ GET    /api/agent/runs/:runId/events?after=cursor
 DELETE /api/agent/runs/:runId
 ```
 
-Every request requires a Host JWT and is scoped to its verified
-`tenantId + principalId`. Start requests require an idempotency key. Replaying
+Every request requires a Host JWT with the `agent:runs` scope and is scoped to
+its verified `tenantId + principalId`. Start requests require an idempotency
+key. Replaying
 the same semantic request returns the original run without submitting another
 model turn; reusing the key for a different request returns `409`.
 

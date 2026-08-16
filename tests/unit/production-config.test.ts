@@ -30,7 +30,13 @@ const validEnvironment = {
   AGENT_RUNTIME_URL: "https://agent-runtime.example.com",
   AGENT_SANDBOX_BACKEND: "microsandbox",
   AGENT_SANDBOX_IMAGE: "ghcr.io/oworker/open-agent-sandbox@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  AGENT_SANDBOX_TERMINAL_RETENTION_HOURS: "168",
+  AGENT_SANDBOX_CLEANUP_INTERVAL_MS: "900000",
+  AGENT_SANDBOX_CLEANUP_MAX_SESSIONS: "25",
   AGENT_BASH_APPROVAL_MODE: "risky",
+  AGENT_ASSET_STORAGE_BACKEND: "host",
+  AGENT_ASSET_CLEANUP_INTERVAL_MS: "3600000",
+  AGENT_ASSET_CLEANUP_LIMIT: "100",
   EVE_NEXT_PRODUCTION_PORT: "4275",
   NODE_ENV: "production",
   OPENAI_API_KEY: "provider-key",
@@ -44,6 +50,41 @@ const validEnvironment = {
 
 test("accepts the verified production topology", () => {
   assert.deepEqual(inspectProductionConfiguration(validEnvironment, "24.18.1"), []);
+});
+
+test("accepts the built-in S3 AssetStore production topology", () => {
+  const diagnostics = inspectProductionConfiguration({
+    ...validEnvironment,
+    AGENT_ASSET_STORAGE_BACKEND: "s3",
+    AGENT_ASSET_S3_BUCKET: "open-agent-assets",
+    AGENT_ASSET_S3_ACCESS_KEY_ID: "s3-access",
+    AGENT_ASSET_S3_SECRET_ACCESS_KEY: "s3-secret",
+    AGENT_ASSET_QUOTA_BYTES: "100GiB",
+  }, "24.18.1");
+  assert.deepEqual(diagnostics, []);
+});
+
+test("rejects an S3 AssetStore without object-store credentials", () => {
+  const diagnostics = inspectProductionConfiguration({
+    ...validEnvironment,
+    AGENT_ASSET_STORAGE_BACKEND: "s3",
+    AGENT_ASSET_S3_BUCKET: "open-agent-assets",
+  }, "24.18.1");
+  assert.ok(diagnostics.some((item) => item.code === "missing-required" && item.message.includes("AGENT_ASSET_S3_ACCESS_KEY_ID")));
+  assert.ok(diagnostics.some((item) => item.code === "missing-required" && item.message.includes("AGENT_ASSET_S3_SECRET_ACCESS_KEY")));
+});
+
+test("rejects disabled asset scanning for production S3", () => {
+  const diagnostics = inspectProductionConfiguration({
+    ...validEnvironment,
+    AGENT_ASSET_STORAGE_BACKEND: "s3",
+    AGENT_ASSET_S3_BUCKET: "open-agent-assets",
+    AGENT_ASSET_S3_ACCESS_KEY_ID: "s3-access",
+    AGENT_ASSET_S3_SECRET_ACCESS_KEY: "s3-secret",
+    AGENT_ASSET_QUOTA_BYTES: "100GiB",
+    AGENT_ASSET_SCAN_MODE: "disabled",
+  }, "24.18.1");
+  assert.ok(diagnostics.some((item) => item.code === "asset-scanner"));
 });
 
 test("rejects an implicit production sandbox and shared Workflow database", () => {

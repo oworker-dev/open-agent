@@ -10,6 +10,7 @@ import {
   useAui,
   useAuiState,
 } from "@assistant-ui/react";
+import type { Attachment as AssistantAttachment } from "@assistant-ui/react";
 import { LexicalComposerInput, type DirectiveChipProps } from "@assistant-ui/react-lexical";
 import type { MessageStreamEvent } from "eve/client";
 import type { EveMessage } from "eve/react";
@@ -21,6 +22,8 @@ import {
   CircleGaugeIcon,
   CircleXIcon,
   CopyIcon,
+  FileIcon,
+  ImageIcon,
   LockKeyholeIcon,
   LoaderCircleIcon,
   PlusIcon,
@@ -41,6 +44,7 @@ import { ModelSelector, type ModelOption } from "../assistant-ui/model-selector.
 import { ToolFallback } from "../assistant-ui/tool-fallback.js";
 import { TooltipIconButton } from "../assistant-ui/tooltip-icon-button.js";
 import { Button } from "../ui/button.js";
+import { Attachment, AttachmentContent, AttachmentDescription, AttachmentMedia, AttachmentTitle } from "../ui/attachment.js";
 import { cn } from "../utils.js";
 import {
   DropdownMenu,
@@ -57,7 +61,15 @@ import type { AgentUsageSummary } from "./usage.js";
 
 export type AgentCancellationState = "idle" | "requested" | "cancelling";
 
+export type AgentApprovalTakeover = {
+  readonly requestId: string;
+  readonly prompt: string;
+  readonly toolName: string;
+};
+
 export function AssistantThreadSurface({
+  assetUrl,
+  approvalTakeover,
   cancellationState,
   closedInputRequestIds,
   commands,
@@ -84,6 +96,8 @@ export function AssistantThreadSurface({
   runtimeError,
   usage,
 }: {
+  readonly assetUrl?: (assetId: string) => string;
+  readonly approvalTakeover?: AgentApprovalTakeover;
   readonly cancellationState: AgentCancellationState;
   readonly closedInputRequestIds: ReadonlySet<string>;
   readonly commands: readonly AgentPromptMenuItem[];
@@ -145,6 +159,7 @@ export function AssistantThreadSurface({
               <UserMessage messages={messages} />
             ) : (
               <AssistantMessage
+                assetUrl={assetUrl}
                 canRespond={!isBusy || canRespondToInputRequest}
                 events={events}
                 fallbackStartedAt={fallbackStartedAt}
@@ -184,6 +199,7 @@ export function AssistantThreadSurface({
             </TooltipIconButton>
           </ThreadPrimitive.ScrollToBottom>
           <AssistantComposer
+            approvalTakeover={approvalTakeover}
             cancellationState={cancellationState}
             commands={commands}
             composerTop={composerTop}
@@ -195,6 +211,7 @@ export function AssistantThreadSurface({
             messages={messages}
             models={models}
             onPreferencesChange={onPreferencesChange}
+            onInputResponses={onInputResponses}
             onDraftRestoreConsumed={onDraftRestoreConsumed}
             preferences={preferences}
             reasoningLevels={reasoningLevels}
@@ -276,6 +293,7 @@ function UserMessage({ messages }: { readonly messages: AgentMessages }) {
 }
 
 function AssistantMessage({
+  assetUrl,
   canRespond,
   closedInputRequestIds,
   events,
@@ -288,6 +306,7 @@ function AssistantMessage({
   onCloseInputRequest,
   onOpenSubagent,
 }: {
+  readonly assetUrl?: (assetId: string) => string;
   readonly canRespond: boolean;
   readonly closedInputRequestIds: ReadonlySet<string>;
   readonly events: readonly MessageStreamEvent[];
@@ -305,6 +324,7 @@ function AssistantMessage({
       <div className="min-w-0 px-1 text-[15px] leading-7 text-foreground">
         {message ? (
           <AgentMessage
+            assetUrl={assetUrl}
             canRespond={canRespond}
             closedInputRequestIds={closedInputRequestIds}
             events={events}
@@ -360,6 +380,7 @@ function EditMessage({ messages }: { readonly messages: AgentMessages }) {
 }
 
 export function AssistantComposer({
+  approvalTakeover,
   cancellationState,
   commands,
   composerTop,
@@ -371,11 +392,13 @@ export function AssistantComposer({
   messages,
   models,
   onPreferencesChange,
+  onInputResponses,
   onDraftRestoreConsumed,
   preferences,
   reasoningLevels,
   usage,
 }: {
+  readonly approvalTakeover?: AgentApprovalTakeover;
   readonly cancellationState: AgentCancellationState;
   readonly commands: readonly AgentPromptMenuItem[];
   readonly composerTop?: ReactNode;
@@ -387,6 +410,7 @@ export function AssistantComposer({
   readonly messages: AgentMessages;
   readonly models: readonly AgentModelOption[];
   readonly onPreferencesChange: (preferences: AgentThreadPreferences) => void;
+  readonly onInputResponses: (responses: readonly AgentInputResponse[]) => void | Promise<void>;
   readonly onDraftRestoreConsumed: (id: string) => void;
   readonly preferences: AgentThreadPreferences;
   readonly reasoningLevels: readonly string[];
@@ -503,15 +527,11 @@ export function AssistantComposer({
         }}
       >
         <div className="flex w-full flex-col gap-2 rounded-[1.5rem] border border-border/70 bg-background p-2.5 shadow-[0_8px_24px_-16px_rgba(0,0,0,0.24)]">
+          {approvalTakeover ? <ApprovalComposerTakeover locale={locale} onRespond={onInputResponses} request={approvalTakeover} /> : null}
           {composerTop}
           <ComposerPrimitive.Attachments>
             {({ attachment }) => (
-              <AttachmentPrimitive.Root className="group/attachment mr-1.5 inline-flex max-w-full items-center gap-2 rounded-lg bg-muted px-2.5 py-1.5 text-xs">
-                <span className="max-w-52 truncate">{attachment.name}</span>
-                <AttachmentPrimitive.Remove aria-label={messages.removeAttachment} className="rounded-sm text-muted-foreground hover:text-foreground">
-                  <span aria-hidden>×</span>
-                </AttachmentPrimitive.Remove>
-              </AttachmentPrimitive.Root>
+              <ComposerAttachment attachment={attachment} messages={messages} />
             )}
           </ComposerPrimitive.Attachments>
           <LexicalComposerInput
@@ -568,37 +588,46 @@ export function AssistantComposer({
                   usage={contextUsage}
                 />
               ) : null}
-              {stopping || (isRunning && composerIsEmpty) ? (
-                <ComposerPrimitive.Cancel asChild>
-                  <Button
-                    aria-label={cancellationState === "idle" ? messages.cancel : messages.stopping}
-                    className="size-9 shrink-0 rounded-full sm:size-8"
-                    disabled={cancellationState !== "idle"}
-                    size="icon-sm"
-                    type="button"
-                  >
-                    {cancellationState === "idle" ? (
-                      <SquareIcon className="size-3.5 fill-current" />
-                    ) : (
-                      <LoaderCircleIcon className="size-4 animate-spin" />
-                    )}
-                  </Button>
-                </ComposerPrimitive.Cancel>
-              ) : (
+              {/**
+               * Keep both controls mounted for the lifetime of the composer.
+               * Eve emits frequent stream checkpoints; swapping a Cancel
+               * primitive for a normal Button at each checkpoint makes the
+               * visible control detach while a user is clicking it. A stable
+               * DOM anchor preserves the assistant-ui cancellation contract
+               * without changing the visual one-button interaction.
+               */}
+              <ComposerPrimitive.Cancel asChild>
                 <Button
-                  aria-label={isRunning ? messages.queueFollowUp : messages.send}
-                  className="size-9 shrink-0 rounded-full sm:size-8"
-                  disabled={composerDisabled}
-                  onClick={() => {
-                    aui.composer.send();
-                    blurComposerOnTouch(composerInputRef);
-                  }}
+                  aria-hidden={!(stopping || (isRunning && composerIsEmpty))}
+                  aria-label={cancellationState === "idle" ? messages.cancel : messages.stopping}
+                  className={cn("size-9 shrink-0 rounded-full sm:size-8", !(stopping || (isRunning && composerIsEmpty)) && "hidden")}
+                  disabled={cancellationState !== "idle" || !(stopping || (isRunning && composerIsEmpty))}
                   size="icon-sm"
+                  tabIndex={stopping || (isRunning && composerIsEmpty) ? 0 : -1}
                   type="button"
                 >
-                  <ArrowUpIcon className="size-4" />
+                  {cancellationState === "idle" ? (
+                    <SquareIcon className="size-3.5 fill-current" />
+                  ) : (
+                    <LoaderCircleIcon className="size-4 animate-spin" />
+                  )}
                 </Button>
-              )}
+              </ComposerPrimitive.Cancel>
+              <Button
+                aria-hidden={stopping || (isRunning && composerIsEmpty)}
+                aria-label={isRunning ? messages.queueFollowUp : messages.send}
+                className={cn("size-9 shrink-0 rounded-full sm:size-8", (stopping || (isRunning && composerIsEmpty)) && "hidden")}
+                disabled={composerDisabled || stopping || (isRunning && composerIsEmpty)}
+                onClick={() => {
+                  aui.composer.send();
+                  blurComposerOnTouch(composerInputRef);
+                }}
+                size="icon-sm"
+                tabIndex={stopping || (isRunning && composerIsEmpty) ? -1 : 0}
+                type="button"
+              >
+                <ArrowUpIcon className="size-4" />
+              </Button>
             </span>
           </div>
         </div>
@@ -615,6 +644,69 @@ function blurComposerOnTouch(inputRef: React.RefObject<HTMLDivElement | null>) {
   window.requestAnimationFrame(() => {
     inputRef.current?.querySelector<HTMLElement>('[role="textbox"]')?.blur();
   });
+}
+
+function ComposerAttachment({ attachment, messages }: { readonly attachment: AssistantAttachment; readonly messages: AgentMessages }) {
+  const [previewUrl, setPreviewUrl] = useState<string>();
+  useEffect(() => {
+    if (!attachment.file || !attachment.contentType?.startsWith("image/")) {
+      setPreviewUrl(undefined);
+      return;
+    }
+    const url = URL.createObjectURL(attachment.file);
+    setPreviewUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [attachment.contentType, attachment.file]);
+  const isImage = attachment.contentType?.startsWith("image/") ?? attachment.type === "image";
+  return (
+    <Attachment className="mr-1.5 max-w-[min(22rem,calc(100vw-2rem))]" size="sm" state={attachment.status.type === "incomplete" ? "error" : attachment.status.type === "running" ? "uploading" : "done"}>
+      <AttachmentMedia variant={isImage ? "image" : "icon"}>
+        {isImage && previewUrl ? <img alt={attachment.name} src={previewUrl} /> : <FileIcon className="size-4" />}
+      </AttachmentMedia>
+      <AttachmentContent>
+        <AttachmentTitle>{attachment.name}</AttachmentTitle>
+        <AttachmentDescription>{attachment.status.type === "running" ? `${Math.round(attachment.status.progress)}%` : messages.attachment}</AttachmentDescription>
+      </AttachmentContent>
+      <AttachmentPrimitive.Remove aria-label={messages.removeAttachment} className="relative z-20 rounded-sm text-muted-foreground hover:text-foreground">
+        <span aria-hidden>×</span>
+      </AttachmentPrimitive.Remove>
+    </Attachment>
+  );
+}
+
+function ApprovalComposerTakeover({
+  locale,
+  onRespond,
+  request,
+}: {
+  readonly locale: AgentLocale;
+  readonly onRespond: (responses: readonly AgentInputResponse[]) => void | Promise<void>;
+  readonly request: AgentApprovalTakeover;
+}) {
+  const isZh = locale === "zh-CN";
+  const [submitting, setSubmitting] = useState(false);
+  const respond = async (optionId: string) => {
+    if (submitting) return;
+    setSubmitting(true);
+    try {
+      await onRespond([{ optionId, requestId: request.requestId }]);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+  return (
+    <section className="flex items-start gap-3 border-b border-border/60 px-1 pb-2" data-agent-approval-takeover>
+      <ShieldCheckIcon className="mt-0.5 size-4 shrink-0 text-amber-600" />
+      <div className="min-w-0 flex-1">
+        <p className="text-sm font-medium text-foreground">{isZh ? "需要批准后继续" : "Approval required to continue"}</p>
+        <p className="mt-0.5 truncate text-xs text-muted-foreground">{request.toolName}: {request.prompt}</p>
+        <div className="mt-2 flex gap-2">
+          <Button disabled={submitting} onClick={() => void respond("deny")} size="sm" variant="ghost">{isZh ? "拒绝" : "Deny"}</Button>
+          <Button disabled={submitting} onClick={() => void respond("approve")} size="sm">{isZh ? "批准" : "Approve"}</Button>
+        </div>
+      </div>
+    </section>
+  );
 }
 
 function DirectiveChip({ directiveId, directiveType, label }: DirectiveChipProps) {

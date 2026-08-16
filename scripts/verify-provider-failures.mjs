@@ -176,7 +176,10 @@ function spawnLogged(name, command, args, environment, cwd = projectRoot) {
 
 async function createIsolatedAppRoot(sourceRoot) {
   const target = await mkdtemp(join(tmpdir(), "open-agent-provider-failures-"));
-  for (const directory of ["agent", "contracts", "evals", "lib", "packages", "server"]) {
+  // The contracts package lives under packages/agent-contracts in the
+  // workspace. Keep this isolated fixture aligned with the repository layout
+  // instead of silently depending on a removed top-level contracts folder.
+  for (const directory of ["agent", "evals", "lib", "packages", "server"]) {
     await cp(resolve(sourceRoot, directory), join(target, directory), {
       dereference: true,
       recursive: true,

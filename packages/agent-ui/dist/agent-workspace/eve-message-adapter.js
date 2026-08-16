@@ -13,7 +13,7 @@ function convertEveMessage(message, index, messages, options) {
     };
     const like = message.role === "user"
         ? {
-            attachments: userAttachments(message.parts),
+            attachments: userAttachments(message.parts, options.assetUrl),
             content: userContent(message.parts),
             createdAt: new Date(),
             id: message.id,
@@ -22,7 +22,7 @@ function convertEveMessage(message, index, messages, options) {
         }
         : {
             content: message.parts.flatMap((part) => {
-                const converted = assistantPart(part);
+                const converted = assistantPart(part, options.assetUrl);
                 return converted ? [converted] : [];
             }),
             createdAt: new Date(),
@@ -58,7 +58,7 @@ function messageStatus(message, index, messages, options) {
     }
     return COMPLETE;
 }
-function assistantPart(part) {
+function assistantPart(part, assetUrl) {
     if (part.type === "text" || part.type === "reasoning") {
         return { text: part.text, type: part.type };
     }
@@ -67,7 +67,7 @@ function assistantPart(part) {
     if (part.type === "authorization")
         return authorizationPart(part);
     if (part.type === "file")
-        return filePart(part);
+        return filePart(part, assetUrl);
     return null;
 }
 function dynamicToolPart(part) {
@@ -135,26 +135,30 @@ function authorizationPart(part) {
         type: "data",
     };
 }
-function filePart(part) {
+function filePart(part, assetUrl) {
     if (!part.url)
         return null;
+    const assetId = part.url.startsWith("asset://") ? part.url.slice("asset://".length) : undefined;
+    const url = assetId ? assetUrl?.(assetId) ?? `/api/assets/${encodeURIComponent(assetId)}` : part.url;
     return {
-        data: part.url,
+        data: url,
         ...(part.filename ? { filename: part.filename } : {}),
         mimeType: part.mediaType || "application/octet-stream",
-        ...(/^https?:\/\//u.test(part.url) ? { sourceType: "url" } : {}),
+        ...(/^(?:https?:\/\/|\/api\/assets\/)/u.test(url) ? { sourceType: "url" } : {}),
         type: "file",
     };
 }
 function userContent(parts) {
-    const content = parts.flatMap((part) => part.type === "text" ? [{ text: part.text, type: "text" }] : []);
+    const content = parts.flatMap((part) => part.type === "text"
+        ? [{ text: stripAssetReferences(part.text), type: "text" }]
+        : []);
     return content.length > 0 ? content : [{ text: "", type: "text" }];
 }
-function userAttachments(parts) {
-    return parts.flatMap((part, index) => {
+function userAttachments(parts, assetUrl) {
+    const fileAttachments = parts.flatMap((part, index) => {
         if (part.type !== "file")
             return [];
-        const file = filePart(part);
+        const file = filePart(part, assetUrl);
         if (!file)
             return [];
         const image = file.mimeType.startsWith("image/");
@@ -167,6 +171,19 @@ function userAttachments(parts) {
                 type: image ? "image" : "file",
             }];
     });
+    const assetAttachments = parts.flatMap((part) => {
+        if (part.type !== "text")
+            return [];
+        return parseAssetReferences(part.text).map((asset, index) => ({
+            content: [{ data: assetUrl?.(asset.id) ?? `/api/assets/${encodeURIComponent(asset.id)}`, filename: asset.name, mimeType: asset.mediaType, type: "file" }],
+            contentType: asset.mediaType,
+            id: `asset-${asset.id}-${index}`,
+            name: asset.name,
+            status: { type: "complete" },
+            type: asset.mediaType.startsWith("image/") ? "image" : "file",
+        }));
+    });
+    return [...fileAttachments, ...assetAttachments];
 }
 export function getEveMessageContent(message) {
     const content = [
@@ -188,6 +205,23 @@ export function getEveMessageContent(message) {
         }
     }
     return parts.length === 1 && parts[0]?.type === "text" ? parts[0].text : parts;
+}
+function parseAssetReferences(text) {
+    const references = [];
+    for (const match of text.matchAll(/\[open-agent-asset (\{[^\n\]]+\})\]/gu)) {
+        try {
+            const value = JSON.parse(match[1]);
+            if (typeof value.id === "string" && typeof value.name === "string" && typeof value.mediaType === "string") {
+                references.push({ id: value.id, mediaType: value.mediaType, name: value.name, ...(typeof value.size === "number" ? { size: value.size } : {}) });
+            }
+        }
+        catch {
+        }
+    }
+    return references;
+}
+function stripAssetReferences(text) {
+    return text.replace(/\s*\[open-agent-asset \{[^\n\]]+\}\]/gu, "").trim();
 }
 function jsonObject(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value)

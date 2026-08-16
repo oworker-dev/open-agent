@@ -24,6 +24,10 @@
       "types": "./dist/eve-session-client.d.ts",
       "import": "./dist/eve-session-client.js"
     },
+    "./session-control": {
+      "types": "./dist/session-control-client.d.ts",
+      "import": "./dist/session-control-client.js"
+    },
     "./package.json": "./package.json"
   },
   "scripts": {

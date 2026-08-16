@@ -21,6 +21,11 @@ export function AgentPage() {
       agentName="general-agent"
       commands={[{ id: "software-task", label: "Software task", value: "/software-task" }]}
       defaultPreferences={{ modelId: "provider/model", reasoning: "high" }}
+      client={{
+        // Embedded hosts can return a short-lived signed URL. The standalone
+        // app omits this and uses its authenticated /api/assets route.
+        assetUrl: (assetId) => `/host/assets/${encodeURIComponent(assetId)}`,
+      }}
       extensions={[{ id: "software-task", kind: "skill", label: "Software task", status: "available" }]}
       mentions={[{ id: "workspace", label: "Workspace", value: "@workspace" }]}
       models={[{ id: "provider/model", label: "Model", contextWindowTokens: 272000 }]}

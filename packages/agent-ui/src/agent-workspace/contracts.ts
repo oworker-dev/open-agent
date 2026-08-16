@@ -105,8 +105,10 @@ export type AgentPromptMenuItem = {
 
 export type PromptInputMessage = {
   readonly files: readonly {
+    readonly assetId?: string;
     readonly filename?: string;
     readonly mediaType: string;
+    readonly sizeBytes?: number;
     readonly url: string;
   }[];
   readonly text: string;
@@ -159,6 +161,8 @@ export type AgentWorkspaceHostSlots = {
 };
 
 export type AgentWorkspaceClientConfig = {
+  /** Optional host-authorized URL resolver for persisted session assets. */
+  readonly assetUrl?: (assetId: string) => string;
   readonly auth?: ClientAuth;
   readonly headers?: HeadersValue;
   readonly host?: string;
@@ -166,8 +170,24 @@ export type AgentWorkspaceClientConfig = {
   readonly redirect?: ClientRedirectPolicy;
 };
 
+export type AgentSessionAsset = {
+  readonly assetId: string;
+  readonly createdAt?: string;
+  readonly downloadUrl?: string;
+  readonly filename: string;
+  readonly mediaType: string;
+  readonly previewUrl?: string;
+  readonly sizeBytes: number;
+  readonly url?: string;
+};
+
+export type AgentAssetEndpoint = string | ((sessionId: string) => string);
+
 export type AgentWorkspaceConfig = {
   readonly agentName: string;
+  /** Optional GET endpoint (or resolver) returning `{ assets: [...] }` metadata for the active session. */
+  readonly assetEndpoint?: AgentAssetEndpoint;
+  readonly onOpenAsset?: (asset: AgentSessionAsset) => void;
   readonly client?: AgentWorkspaceClientConfig;
   readonly commands?: readonly AgentPromptMenuItem[];
   readonly defaultPreferences: AgentThreadPreferences;

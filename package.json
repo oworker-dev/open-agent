@@ -32,6 +32,7 @@
     "verify:ci": "npm run typecheck && npm run test:unit && npm run verify:provider-failures && npm run verify:mcp-conformance && npm run build:eve && npm run build && npm run verify:sdk-source-distribution && npm run verify:sdk-packages && npm run verify:custom-host-example",
     "verify:embed-build": "node scripts/verify-embed-build.mjs",
     "verify:agent-run-api": "node scripts/verify-agent-run-api.mjs",
+    "verify:asset-load": "node scripts/verify-asset-upload-load.mjs",
     "verify:custom-host-example": "npm run build:examples",
     "verify:sdk-packages": "npm run build:sdk && node scripts/verify-sdk-packages.mjs",
     "verify:sdk-source-distribution": "node scripts/verify-sdk-source-distribution.mjs",
@@ -42,6 +43,9 @@
     "mock:otlp": "node scripts/mock-otlp-json.mjs",
     "postinstall": "patch-package",
     "reap:sandboxes": "node scripts/reap-docker-sandboxes.mjs",
+    "reap:assets": "node scripts/reap-assets.mjs",
+    "start:asset-cleanup": "node scripts/run-asset-cleanup-worker.mjs",
+    "start:sandbox-cleanup": "node scripts/run-sandbox-cleanup-worker.mjs",
     "verify:otel": "node scripts/verify-otel-export.mjs",
     "verify:extensions": "node scripts/verify-extension-lifecycle.mjs",
     "verify:live-autonomy": "node scripts/verify-live-autonomy.mjs",
@@ -51,13 +55,14 @@
     "verify:sandbox-reaper": "node scripts/verify-sandbox-reaper.mjs"
   },
   "dependencies": {
+    "@ai-sdk/openai": "^4.0.24",
     "@assistant-ui/core": "0.3.6",
+    "@aws-sdk/client-s3": "^3.1111.0",
+    "@opentelemetry/api": "1.9.1",
     "@oworker/open-agent-client": "0.1.0-alpha.9",
     "@oworker/open-agent-contracts": "0.1.0-alpha.9",
     "@oworker/open-agent-host": "0.1.0-alpha.9",
     "@oworker/open-agent-ui": "0.1.0-alpha.9",
-    "@ai-sdk/openai": "^4.0.24",
-    "@opentelemetry/api": "1.9.1",
     "@radix-ui/react-use-controllable-state": "1.2.2",
     "@shikijs/core": "4.1.0",
     "@shikijs/engine-javascript": "4.1.0",
@@ -92,12 +97,12 @@
     "zustand": "5.0.14"
   },
   "devDependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
     "@playwright/test": "^1.62.1",
     "@types/node": "24.x",
     "@types/pg": "^8.20.0",
     "@types/react": "19.2.15",
     "@types/react-dom": "19.2.3",
-    "@modelcontextprotocol/sdk": "1.30.0",
     "patch-package": "^8.0.0",
     "typescript": "6.0.3"
   },

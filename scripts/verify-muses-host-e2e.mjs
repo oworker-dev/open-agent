@@ -1,13 +1,15 @@
 import { createHmac, randomUUID } from "node:crypto";
+import { parseAgentRuntimeConfigSnapshot } from "@oworker/open-agent-contracts/runtime-config";
 
-const serviceUrl = required("MUSES_AGENT_SERVICE_URL").replace(/\/$/, "");
-const userId = required("MUSES_E2E_USER_ID");
-const workspaceId = required("MUSES_E2E_WORKSPACE_ID");
-const projectId = required("MUSES_E2E_PROJECT_ID");
+const configuration = readConfiguration();
+const serviceUrl = configuration.serviceUrl;
+const userId = configuration.userId;
+const workspaceId = configuration.workspaceId;
+const projectId = configuration.projectId;
 const canvasId = process.env.MUSES_E2E_CANVAS_ID?.trim();
-const deploymentId = required("MUSES_E2E_DEPLOYMENT_ID");
+const deploymentId = configuration.deploymentId;
 const agentNodeId = process.env.MUSES_E2E_AGENT_NODE_ID?.trim() || "agent-run-1";
-const runtimeConfig = parseRuntimeConfig(required("MUSES_E2E_RUNTIME_CONFIG_JSON"));
+const runtimeConfig = configuration.runtimeConfig;
 const runDurationMs = Math.min(
   runtimeConfig.limits?.maxDurationMs ?? 600_000,
   600_000,
@@ -118,7 +120,9 @@ async function poll(runId) {
     if (["completed", "failed", "cancelled"].includes(payload.run.status)) return payload.run;
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
-  throw new Error("AgentRun did not settle within 150 seconds.");
+  throw new Error(
+    `AgentRun did not settle within ${Math.ceil((runDurationMs + 60_000) / 1_000)} seconds.`,
+  );
 }
 
 async function api(method, path, body, expectedStatus) {
@@ -163,21 +167,58 @@ function createToken(actor) {
 }
 
 function parseRuntimeConfig(value) {
-  let parsed;
   try {
-    parsed = JSON.parse(value);
+    return parseAgentRuntimeConfigSnapshot(JSON.parse(value));
+  } catch (error) {
+    const detail = error instanceof Error ? ` ${error.message}` : "";
+    throw new Error(`MUSES_E2E_RUNTIME_CONFIG_JSON must contain a valid Agent Runtime Config snapshot.${detail}`);
+  }
+}
+
+function readConfiguration(environment = process.env) {
+  const requiredNames = [
+    "MUSES_AGENT_SERVICE_URL",
+    "MUSES_E2E_USER_ID",
+    "MUSES_E2E_WORKSPACE_ID",
+    "MUSES_E2E_PROJECT_ID",
+    "MUSES_E2E_DEPLOYMENT_ID",
+    "MUSES_E2E_RUNTIME_CONFIG_JSON",
+    "MUSES_AGENT_HOST_JWT_SECRET",
+    "MUSES_AGENT_HOST_JWT_ISSUER",
+    "MUSES_AGENT_HOST_JWT_AUDIENCE",
+  ];
+  const missing = requiredNames.filter((name) => !environment[name]?.trim());
+  if (missing.length > 0) {
+    throw new Error(`Muses Host E2E preflight failed. Missing required environment variables: ${missing.join(", ")}.`);
+  }
+  const serviceUrl = environment.MUSES_AGENT_SERVICE_URL.trim().replace(/\/+$/, "");
+  let parsedServiceUrl;
+  try {
+    parsedServiceUrl = new URL(serviceUrl);
   } catch {
-    throw new Error("MUSES_E2E_RUNTIME_CONFIG_JSON must contain valid JSON.");
+    throw new Error("MUSES_AGENT_SERVICE_URL must be an absolute HTTP(S) URL.");
   }
-  if (
-    !parsed ||
-    typeof parsed !== "object" ||
-    typeof parsed.profile?.id !== "string" ||
-    typeof parsed.profile?.version !== "string"
-  ) {
-    throw new Error("MUSES_E2E_RUNTIME_CONFIG_JSON must contain an Agent Runtime Config snapshot.");
+  if (parsedServiceUrl.protocol !== "http:" && parsedServiceUrl.protocol !== "https:") {
+    throw new Error("MUSES_AGENT_SERVICE_URL must use HTTP or HTTPS.");
   }
-  return parsed;
+  if (parsedServiceUrl.username || parsedServiceUrl.password) {
+    throw new Error("MUSES_AGENT_SERVICE_URL must not contain embedded credentials.");
+  }
+  if (parsedServiceUrl.search || parsedServiceUrl.hash) {
+    throw new Error("MUSES_AGENT_SERVICE_URL must not contain a query or fragment.");
+  }
+  const secret = environment.MUSES_AGENT_HOST_JWT_SECRET.trim();
+  if (Buffer.byteLength(secret) < 32) {
+    throw new Error("MUSES_AGENT_HOST_JWT_SECRET must contain at least 32 bytes.");
+  }
+  return {
+    deploymentId: environment.MUSES_E2E_DEPLOYMENT_ID.trim(),
+    projectId: environment.MUSES_E2E_PROJECT_ID.trim(),
+    runtimeConfig: parseRuntimeConfig(environment.MUSES_E2E_RUNTIME_CONFIG_JSON),
+    serviceUrl,
+    userId: environment.MUSES_E2E_USER_ID.trim(),
+    workspaceId: environment.MUSES_E2E_WORKSPACE_ID.trim(),
+  };
 }
 
 function encode(value) {

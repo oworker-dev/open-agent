@@ -123,6 +123,28 @@ export function inspectProductionConfiguration(
   requireValue(environment, "AGENT_EMBED_ALLOWED_ORIGINS", error);
   requireValue(environment, "AGENT_PUBLIC_BASE_URL", error);
   requireValue(environment, "AGENT_PREVIEW_SIGNING_SECRET", error);
+  const assetBackend = environment.AGENT_ASSET_STORAGE_BACKEND?.trim().toLowerCase();
+  if (assetBackend !== "host" && assetBackend !== "external" && assetBackend !== "s3" && assetBackend !== "object-store" && assetBackend !== "object_store") {
+    error(
+      "asset-storage-backend",
+      "Production assets require AGENT_ASSET_STORAGE_BACKEND=s3 with S3 credentials, or a configured host AssetStore adapter.",
+    );
+  }
+  if (assetBackend === "s3" || assetBackend === "object-store" || assetBackend === "object_store") {
+    requireConfiguredValue(environment.AGENT_ASSET_S3_BUCKET || environment.S3_BUCKET, "AGENT_ASSET_S3_BUCKET", error);
+    requireConfiguredValue(environment.AGENT_ASSET_S3_ACCESS_KEY_ID || environment.S3_ACCESS_KEY_ID, "AGENT_ASSET_S3_ACCESS_KEY_ID", error);
+    requireConfiguredValue(environment.AGENT_ASSET_S3_SECRET_ACCESS_KEY || environment.S3_SECRET_ACCESS_KEY, "AGENT_ASSET_S3_SECRET_ACCESS_KEY", error);
+    inspectAssetQuota(environment.AGENT_ASSET_QUOTA_BYTES, error);
+    const scanMode = environment.AGENT_ASSET_SCAN_MODE?.trim().toLowerCase();
+    if (scanMode === "disabled") {
+      error(
+        "asset-scanner",
+        "AGENT_ASSET_SCAN_MODE=disabled is not allowed for production S3 assets; register a host AssetScanner.",
+      );
+    } else if (scanMode && scanMode !== "required") {
+      error("asset-scanner", "AGENT_ASSET_SCAN_MODE must be required in production S3 deployments.");
+    }
+  }
   requireValue(environment, "WORKFLOW_POSTGRES_URL", error);
   requireValue(environment, "WORKFLOW_POSTGRES_JOB_PREFIX", error);
 
@@ -180,6 +202,20 @@ export function inspectProductionConfiguration(
     "AGENT_MAILBOX_WORKER_INTERVAL_MS",
     250,
     60_000,
+    error,
+  );
+  inspectInteger(
+    environment.AGENT_ASSET_CLEANUP_INTERVAL_MS,
+    "AGENT_ASSET_CLEANUP_INTERVAL_MS",
+    60_000,
+    86_400_000,
+    error,
+  );
+  inspectInteger(
+    environment.AGENT_ASSET_CLEANUP_LIMIT,
+    "AGENT_ASSET_CLEANUP_LIMIT",
+    1,
+    10_000,
     error,
   );
 
@@ -249,6 +285,27 @@ export function inspectProductionConfiguration(
       inspectInteger(
         environment.EVE_SANDBOX_REAPER_MAX_REMOVALS,
         "EVE_SANDBOX_REAPER_MAX_REMOVALS",
+        1,
+        10_000,
+        error,
+      );
+      inspectInteger(
+        environment.AGENT_SANDBOX_TERMINAL_RETENTION_HOURS,
+        "AGENT_SANDBOX_TERMINAL_RETENTION_HOURS",
+        1,
+        87_600,
+        error,
+      );
+      inspectInteger(
+        environment.AGENT_SANDBOX_CLEANUP_INTERVAL_MS,
+        "AGENT_SANDBOX_CLEANUP_INTERVAL_MS",
+        1_000,
+        86_400_000,
+        error,
+      );
+      inspectInteger(
+        environment.AGENT_SANDBOX_CLEANUP_MAX_SESSIONS,
+        "AGENT_SANDBOX_CLEANUP_MAX_SESSIONS",
         1,
         10_000,
         error,
@@ -365,6 +422,14 @@ function requireValue(
   }
 }
 
+function requireConfiguredValue(
+  value: string | undefined,
+  name: string,
+  error: (code: string, message: string) => void,
+): void {
+  if (!value?.trim()) error("missing-required", `${name} is required for production.`);
+}
+
 function postgresDatabaseIdentity(
   value: string | undefined,
   name: string,
@@ -441,5 +506,33 @@ function inspectInteger(
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed < minimum || parsed > maximum) {
     error("integer-range", `${name} must be an integer from ${minimum} to ${maximum}.`);
+  }
+}
+
+function inspectAssetQuota(
+  value: string | undefined,
+  error: (code: string, message: string) => void,
+): void {
+  if (!value?.trim()) {
+    error("asset-quota", "AGENT_ASSET_QUOTA_BYTES is required for production S3 assets.");
+    return;
+  }
+  const match = /^(\d+)(?:\s*(KiB|MiB|GiB|TiB))?$/iu.exec(value.trim());
+  if (!match) {
+    error("asset-quota", "AGENT_ASSET_QUOTA_BYTES must be a positive byte count with an optional KiB, MiB, GiB, or TiB suffix.");
+    return;
+  }
+  const multiplier = match[2]?.toLowerCase() === "kib"
+    ? 1024
+    : match[2]?.toLowerCase() === "mib"
+      ? 1024 ** 2
+      : match[2]?.toLowerCase() === "gib"
+        ? 1024 ** 3
+        : match[2]?.toLowerCase() === "tib"
+          ? 1024 ** 4
+          : 1;
+  const bytes = Number(match[1]) * multiplier;
+  if (!Number.isSafeInteger(bytes) || bytes <= 0 || bytes > 10 * 1024 ** 4) {
+    error("asset-quota", "AGENT_ASSET_QUOTA_BYTES must be between 1 byte and 10 TiB.");
   }
 }

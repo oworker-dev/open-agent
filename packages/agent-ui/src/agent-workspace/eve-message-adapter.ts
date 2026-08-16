@@ -24,6 +24,7 @@ import type {
 import type { ClientSession } from "eve/client";
 
 type ConvertOptions = {
+  readonly assetUrl?: (assetId: string) => string;
   readonly error?: unknown;
   readonly isRunning?: boolean;
 };
@@ -53,7 +54,7 @@ function convertEveMessage(
   };
   const like: ThreadMessageLike = message.role === "user"
     ? {
-        attachments: userAttachments(message.parts),
+        attachments: userAttachments(message.parts, options.assetUrl),
         content: userContent(message.parts),
         createdAt: new Date(),
         id: message.id,
@@ -62,7 +63,7 @@ function convertEveMessage(
       }
     : {
         content: message.parts.flatMap((part) => {
-          const converted = assistantPart(part);
+          const converted = assistantPart(part, options.assetUrl);
           return converted ? [converted] : [];
         }),
         createdAt: new Date(),
@@ -105,13 +106,13 @@ function messageStatus(
   return COMPLETE;
 }
 
-function assistantPart(part: EveMessagePart): ThreadAssistantMessagePart | DataMessagePart<AuthorizationData> | null {
+function assistantPart(part: EveMessagePart, assetUrl?: (assetId: string) => string): ThreadAssistantMessagePart | DataMessagePart<AuthorizationData> | null {
   if (part.type === "text" || part.type === "reasoning") {
     return { text: part.text, type: part.type };
   }
   if (part.type === "dynamic-tool") return dynamicToolPart(part);
   if (part.type === "authorization") return authorizationPart(part);
-  if (part.type === "file") return filePart(part);
+  if (part.type === "file") return filePart(part, assetUrl);
   return null;
 }
 
@@ -194,27 +195,31 @@ function authorizationPart(part: EveAuthorizationPart): DataMessagePart<Authoriz
   };
 }
 
-function filePart(part: Extract<EveMessagePart, { type: "file" }>): FileMessagePart | null {
+function filePart(part: Extract<EveMessagePart, { type: "file" }>, assetUrl?: (assetId: string) => string): FileMessagePart | null {
   if (!part.url) return null;
+  const assetId = part.url.startsWith("asset://") ? part.url.slice("asset://".length) : undefined;
+  const url = assetId ? assetUrl?.(assetId) ?? `/api/assets/${encodeURIComponent(assetId)}` : part.url;
   return {
-    data: part.url,
+    data: url,
     ...(part.filename ? { filename: part.filename } : {}),
     mimeType: part.mediaType || "application/octet-stream",
-    ...(/^https?:\/\//u.test(part.url) ? { sourceType: "url" as const } : {}),
+    ...(/^(?:https?:\/\/|\/api\/assets\/)/u.test(url) ? { sourceType: "url" as const } : {}),
     type: "file",
   };
 }
 
 function userContent(parts: readonly EveMessagePart[]): readonly ThreadUserMessagePart[] {
   const content = parts.flatMap((part) =>
-    part.type === "text" ? [{ text: part.text, type: "text" as const }] : []);
+    part.type === "text"
+      ? [{ text: stripAssetReferences(part.text), type: "text" as const }]
+      : []);
   return content.length > 0 ? content : [{ text: "", type: "text" }];
 }
 
-function userAttachments(parts: readonly EveMessagePart[]): CompleteAttachment[] {
-  return parts.flatMap((part, index) => {
+function userAttachments(parts: readonly EveMessagePart[], assetUrl?: (assetId: string) => string): CompleteAttachment[] {
+  const fileAttachments = parts.flatMap((part, index) => {
     if (part.type !== "file") return [];
-    const file = filePart(part);
+    const file = filePart(part, assetUrl);
     if (!file) return [];
     const image = file.mimeType.startsWith("image/");
     return [{
@@ -226,6 +231,18 @@ function userAttachments(parts: readonly EveMessagePart[]): CompleteAttachment[]
       type: image ? "image" as const : "file" as const,
     }];
   });
+  const assetAttachments = parts.flatMap((part) => {
+    if (part.type !== "text") return [];
+    return parseAssetReferences(part.text).map((asset, index) => ({
+      content: [{ data: assetUrl?.(asset.id) ?? `/api/assets/${encodeURIComponent(asset.id)}`, filename: asset.name, mimeType: asset.mediaType, type: "file" as const }],
+      contentType: asset.mediaType,
+      id: `asset-${asset.id}-${index}`,
+      name: asset.name,
+      status: { type: "complete" as const },
+      type: asset.mediaType.startsWith("image/") ? "image" as const : "file" as const,
+    }));
+  });
+  return [...fileAttachments, ...assetAttachments];
 }
 
 export function getEveMessageContent(message: AppendMessage): Parameters<ClientSession["send"]>[0] {
@@ -248,6 +265,27 @@ export function getEveMessageContent(message: AppendMessage): Parameters<ClientS
     }
   }
   return parts.length === 1 && parts[0]?.type === "text" ? parts[0].text : parts;
+}
+
+type AssetReference = { readonly id: string; readonly mediaType: string; readonly name: string; readonly size?: number };
+
+function parseAssetReferences(text: string): AssetReference[] {
+  const references: AssetReference[] = [];
+  for (const match of text.matchAll(/\[open-agent-asset (\{[^\n\]]+\})\]/gu)) {
+    try {
+      const value = JSON.parse(match[1]) as Partial<AssetReference>;
+      if (typeof value.id === "string" && typeof value.name === "string" && typeof value.mediaType === "string") {
+        references.push({ id: value.id, mediaType: value.mediaType, name: value.name, ...(typeof value.size === "number" ? { size: value.size } : {}) });
+      }
+    } catch {
+      // Ignore malformed display markers; the raw text remains available to the Agent.
+    }
+  }
+  return references;
+}
+
+function stripAssetReferences(text: string): string {
+  return text.replace(/\s*\[open-agent-asset \{[^\n\]]+\}\]/gu, "").trim();
 }
 
 function jsonObject(value: unknown): ToolCallMessagePart["args"] {

@@ -11,7 +11,7 @@ import { cn } from "../utils.js";
 import { attachAgentSession, createAgentSession } from "./agent-client.js";
 import { convertEveMessages, getEveMessageContent } from "./eve-message-adapter.js";
 import type { AgentInputResponse } from "./agent-message.js";
-import { AssistantThreadSurface } from "./assistant-thread-surface.js";
+import { AssistantThreadSurface, type AgentApprovalTakeover } from "./assistant-thread-surface.js";
 import type { AgentInterruptedTurn, AgentModelOption, AgentPromptMenuItem, AgentQueuedTurn, AgentThread, AgentThreadPatch, AgentWorkspaceClientConfig, AgentWorkspaceMailbox, PromptInputMessage } from "./contracts.js";
 import { sanitizeAgentError } from "./error-presentation.js";
 import { AgentMailboxHttpError } from "./http-agent-mailbox.js";
@@ -262,13 +262,28 @@ export function AgentThreadView({
   // stale after a reconnect even though Eve has already parked the session.
   const pendingTurnInFlight = isPendingTurnInFlight(thread.pendingTurn);
   const durableTurnSettled = !pendingTurnInFlight && hasSettledLatestTurn(agent.events);
+  // A bounded Eve stream can close at its current durable tail while the
+  // session is still executing. In that window `agent.status` may already be
+  // idle even though the latest persisted turn has no terminal boundary. Keep
+  // the Composer's stable stop control available until Eve reports completion,
+  // cancellation, failure, or waiting.
+  const durableTurnOpen = !pendingTurnInFlight && !durableTurnSettled &&
+    agent.events.some((event) => event.type === "turn.started");
   const cancellationSettling = cancellationRef.current.requested || thread.status === "cancelling";
-  const agentIsBusy = runtimeIsBusy && !localInterruption && !cancellationSettling && !durableTurnSettled;
+  const agentIsBusy = (runtimeIsBusy || durableTurnOpen) && !localInterruption && !cancellationSettling && !durableTurnSettled;
   const isBusy = pendingTurnInFlight || agentIsBusy ||
     (isRecovering && !localInterruption && !cancellationSettling && !durableTurnSettled);
   const admissionBusy = pendingTurnInFlight || (!durableTurnSettled &&
     (runtimeIsBusy || isRecovering || cancellationSettling));
   const pendingInputRequests = unresolvedInputRequests(agent.events, closedInputRequestIdsRef.current);
+  const approvalRequest = pendingInputRequests.find((request) => request.kind === "tool-approval");
+  const approvalTakeover: AgentApprovalTakeover | undefined = approvalRequest
+    ? {
+        requestId: approvalRequest.requestId,
+        prompt: approvalRequest.prompt,
+        toolName: approvalRequest.action.toolName,
+      }
+    : undefined;
   const awaitingInput = pendingInputRequests.length > 0;
   // Questions are non-blocking from the composer: a new message is a normal
   // follow-up and Eve clears the pending question. Approvals remain locked so
@@ -786,6 +801,7 @@ export function AgentThreadView({
   const visibleMessages = displayTimeline.messages;
   const displayEvents = displayTimeline.events;
   const assistantMessages = convertEveMessages({ ...agent.data, messages: visibleMessages }, {
+    assetUrl: client?.assetUrl,
     error: agent.error,
     isRunning: isBusy,
   });
@@ -860,7 +876,12 @@ export function AgentThreadView({
   };
 
   const assistantRuntime = useExternalStoreRuntime({
-    adapters: { attachments: browserAttachmentAdapter },
+    adapters: {
+      attachments: createBrowserAttachmentAdapter(
+        client,
+        () => sessionRef.current?.state.sessionId ?? thread.session.sessionId,
+      ),
+    },
     // Lock regular sends while an approval is pending, but keep the runtime
     // available to the edit composer. assistant-ui intentionally allows edits
     // while `isSendDisabled` is true; `isDisabled` would disable both paths.
@@ -1095,7 +1116,9 @@ export function AgentThreadView({
   return (
     <AssistantRuntimeProvider runtime={assistantRuntime}>
       <main className="flex min-h-0 flex-1 flex-col overflow-hidden">
-        <AssistantThreadSurface
+      <AssistantThreadSurface
+        assetUrl={client?.assetUrl}
+          approvalTakeover={approvalTakeover}
           cancellationState={cancellationState}
           commands={commands}
           composerTop={visibleQueuedTurns.length > 0 || queueError ? (
@@ -1393,7 +1416,18 @@ function sameContextEntries(
 function promptFromAssistantMessage(content: Parameters<ClientSession["send"]>[0]): PromptInputMessage {
   if (typeof content === "string") return { files: [], text: content };
   const text = content.filter((part): part is Extract<typeof part, { type: "text" }> => part.type === "text").map((part) => part.text).join("\n");
-  const files = content.filter((part): part is Extract<typeof part, { type: "file" }> => part.type === "file").map((part) => ({ filename: part.filename, mediaType: part.mediaType, url: typeof part.data === "string" ? part.data : String(part.data) }));
+  const files = content.filter((part): part is Extract<typeof part, { type: "file" }> => part.type === "file").map((part) => {
+    const url = typeof part.data === "string" ? part.data : String(part.data);
+    const assetId = url.startsWith("asset://")
+      ? url.slice("asset://".length)
+      : /^\/api\/assets\/([^/?#]+)/u.exec(url)?.[1];
+    return {
+      ...(assetId ? { assetId } : {}),
+      ...(part.filename ? { filename: part.filename } : {}),
+      mediaType: part.mediaType,
+      url,
+    };
+  });
   return { files, text };
 }
 
@@ -1408,14 +1442,19 @@ async function sendPrompt(
   prompt: PromptInputMessage,
   context: readonly string[] | undefined,
 ): Promise<void> {
-  if (prompt.files.length === 0) {
-    await send(prompt.text, retainedContextOptions(context));
+  const assetNotes = prompt.files
+    .filter((file) => file.assetId)
+    .map((file) => `[open-agent-asset ${JSON.stringify({ id: file.assetId, mediaType: file.mediaType, name: file.filename ?? "file", ...(file.sizeBytes ? { size: file.sizeBytes } : {}) })}] Attached asset ${file.filename ?? "file"}. Use import_asset before inspecting or processing it.`);
+  const text = [prompt.text, ...assetNotes].filter((value) => value.trim().length > 0).join("\n\n");
+  const inlineFiles = prompt.files.filter((file) => !file.assetId);
+  if (inlineFiles.length === 0) {
+    await send(text, retainedContextOptions(context));
     return;
   }
 
   const parts: UserContent = [];
-  if (prompt.text) parts.push({ text: prompt.text, type: "text" });
-  for (const file of prompt.files) {
+  if (text) parts.push({ text, type: "text" });
+  for (const file of inlineFiles) {
     parts.push({
       data: file.url,
       ...(file.filename ? { filename: file.filename } : {}),
@@ -1426,50 +1465,137 @@ async function sendPrompt(
   await send(parts, retainedContextOptions(context));
 }
 
-const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024 * 1024;
 
-const browserAttachmentAdapter: AttachmentAdapter = {
-  accept: "*",
-  async add({ file }): Promise<PendingAttachment> {
-    if (file.size > MAX_ATTACHMENT_BYTES) {
-      throw new Error("Attachments must be 20 MB or smaller.");
+function createBrowserAttachmentAdapter(
+  config: AgentWorkspaceClientConfig | undefined,
+  sessionId: () => string | undefined,
+): AttachmentAdapter {
+  return {
+    accept: "*",
+    async add({ file }): Promise<PendingAttachment> {
+      if (file.size > MAX_ATTACHMENT_BYTES) {
+        throw new Error("Attachments must be 10 GiB or smaller.");
+      }
+      return {
+        contentType: file.type || "application/octet-stream",
+        file,
+        id: typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : `attachment-${Date.now()}`,
+        name: file.name,
+        status: { reason: "composer-send", type: "requires-action" },
+        type: file.type.startsWith("image/") ? "image" : "file",
+      };
+    },
+    async remove() {
+      // Uploads are short-lived and reclaimed by the store when removed before send.
+    },
+    async send(attachment): Promise<CompleteAttachment> {
+      const asset = await uploadBrowserAsset(config, attachment.file, sessionId());
+      return {
+        ...attachment,
+        content: [{
+          data: `asset://${asset.assetId}`,
+          filename: asset.filename,
+          mimeType: asset.mediaType,
+          type: "file",
+        }],
+        status: { type: "complete" },
+      };
+    },
+  };
+}
+
+type UploadedAsset = { readonly assetId: string; readonly filename: string; readonly mediaType: string; readonly sizeBytes: number };
+
+async function uploadBrowserAsset(
+  config: AgentWorkspaceClientConfig | undefined,
+  file: File,
+  sessionId: string | undefined,
+): Promise<UploadedAsset> {
+  const ownerSessionId = sessionId ?? `browser-${crypto.randomUUID()}`;
+  let uploadId: string | undefined;
+  try {
+    const init = await assetRequest(config, "/api/assets/uploads", {
+      body: JSON.stringify({ filename: file.name, mediaType: file.type || "application/octet-stream", sessionId: ownerSessionId, sizeBytes: file.size }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    });
+    const upload = (await readJson(init)).upload as { readonly assetId: string; readonly chunkSizeBytes: number; readonly uploadId: string };
+    uploadId = upload.uploadId;
+    for (let partNumber = 1, offset = 0; offset < file.size; partNumber += 1) {
+      const end = Math.min(file.size, offset + upload.chunkSizeBytes);
+      const bytes = new Uint8Array(await file.slice(offset, end).arrayBuffer());
+      await withUploadRetries(() => assetRequest(config, `/api/assets/uploads/${encodeURIComponent(upload.uploadId)}/parts/${partNumber}`, {
+        body: bytes,
+        headers: { "content-type": "application/octet-stream" },
+        method: "PUT",
+      }));
+      offset = end;
     }
-    return {
-      contentType: file.type || "application/octet-stream",
-      file,
-      id: typeof crypto !== "undefined" && "randomUUID" in crypto
-        ? crypto.randomUUID()
-        : `attachment-${Date.now()}`,
-      name: file.name,
-      status: { reason: "composer-send", type: "requires-action" },
-      type: file.type.startsWith("image/") ? "image" : "file",
-    };
-  },
-  async remove() {
-    // Browser data URLs do not allocate a remote resource.
-  },
-  async send(attachment): Promise<CompleteAttachment> {
-    const data = await fileToDataUrl(attachment.file);
-    return {
-      ...attachment,
-      content: [{
-        data,
-        filename: attachment.name,
-        mimeType: attachment.contentType || "application/octet-stream",
-        type: "file",
-      }],
-      status: { type: "complete" },
-    };
-  },
-};
+    const complete = await withUploadRetries(() => assetRequest(config, `/api/assets/uploads/${encodeURIComponent(upload.uploadId)}/complete`, {
+      body: "{}",
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    }));
+    const asset = (await readJson(complete)).asset as UploadedAsset;
+    return asset;
+  } catch (error) {
+    // A failed browser tab should not leave a large, billable partial upload
+    // behind. Abort is best-effort because the original failure is the useful
+    // error to show in the composer.
+    if (uploadId) {
+      await assetRequest(config, `/api/assets/uploads/${encodeURIComponent(uploadId)}`, { method: "DELETE" }).catch(() => undefined);
+    }
+    throw error;
+  }
+}
 
-function fileToDataUrl(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result));
-    reader.onerror = () => reject(reader.error ?? new Error("Unable to read the attachment."));
-    reader.readAsDataURL(file);
-  });
+async function withUploadRetries(request: () => Promise<Response>): Promise<Response> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return await request();
+    } catch (error) {
+      lastError = error;
+      if (attempt < 2) await new Promise((resolve) => window.setTimeout(resolve, 250 * (attempt + 1)));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("Asset upload failed after retries.");
+}
+
+async function assetRequest(
+  config: AgentWorkspaceClientConfig | undefined,
+  path: string,
+  init: RequestInit,
+): Promise<Response> {
+  const headers = {
+    ...(await resolveClientHeaders(config)),
+    ...(init.headers ?? {}),
+  };
+  const base = config?.host || (typeof window !== "undefined" ? window.location.origin : "http://localhost");
+  const response = await fetch(new URL(path, base).toString(), { ...init, credentials: "include", headers });
+  if (!response.ok) throw new Error(`Asset request failed (${response.status}).`);
+  return response;
+}
+
+async function readJson(response: Response): Promise<{ readonly asset?: UploadedAsset; readonly upload?: Record<string, unknown> }> {
+  try {
+    return await response.json() as { readonly asset?: UploadedAsset; readonly upload?: Record<string, unknown> };
+  } catch {
+    throw new Error("The asset service returned invalid JSON.");
+  }
+}
+
+async function resolveClientHeaders(config: AgentWorkspaceClientConfig | undefined): Promise<Readonly<Record<string, string>>> {
+  const headers = config?.headers;
+  const resolved = typeof headers === "function" ? await headers() : headers;
+  if (config?.auth && "bearer" in config.auth) {
+    const token = typeof config.auth.bearer === "function" ? await config.auth.bearer() : config.auth.bearer;
+    return { ...(resolved ?? {}), authorization: `Bearer ${token}` };
+  }
+  return resolved ?? {};
 }
 
 function isSessionBoundary(event: MessageStreamEvent): boolean {

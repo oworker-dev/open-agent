@@ -10,7 +10,7 @@ import {
   readAgentRunEvents,
   toAgentRunSnapshot,
 } from "@/server/agent-runs/service";
-import { authenticateHostRequest } from "@/server/http/host-request-auth";
+import { authenticateHostRequest, requireHostScope } from "@/server/http/host-request-auth";
 
 export const runtime = "nodejs";
 
@@ -18,7 +18,10 @@ const store = createPostgresAgentRunStoreFromEnvironment();
 type RouteContext = { readonly params: Promise<{ readonly runId: string }> };
 
 export async function GET(request: Request, context: RouteContext): Promise<Response> {
-  const authenticated = await authenticateHostRequest(request);
+  const authenticated = requireHostScope(
+    await authenticateHostRequest(request),
+    "agent:runs",
+  );
   if (!authenticated.ok) return authenticated.response;
   if (!store) return databaseUnavailable();
   const { runId } = await context.params;

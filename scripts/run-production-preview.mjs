@@ -12,6 +12,10 @@ import { resolveProductionPreviewSigningSecret } from "./production-preview-secr
 const WEB_PORT = PRODUCTION_PREVIEW_PORTS.web;
 const EVE_PORT = configureEveNextProductionPort();
 const SANDBOX_IMAGE = "ghcr.io/oworker-dev/open-agent-sandbox@sha256:44e675839b0e4e16a97e5aceb86ef001fd379ae2642efe4d3bbead9d333f14d9";
+const previewNodeEnv = process.env.OPEN_AGENT_PREVIEW_NODE_ENV?.trim() || "production";
+if (previewNodeEnv !== "production" && previewNodeEnv !== "development") {
+  throw new Error("OPEN_AGENT_PREVIEW_NODE_ENV must be production or development.");
+}
 
 await Promise.all([
   access(new URL("../.next/BUILD_ID", import.meta.url)),
@@ -34,6 +38,8 @@ const runtimeEnvironment = {
   ...process.env,
   AGENT_BASH_APPROVAL_MODE: "risky",
   AGENT_DATABASE_SCHEMA: "open_agent",
+  AGENT_ASSET_CLEANUP_INTERVAL_MS: "3600000",
+  AGENT_ASSET_CLEANUP_LIMIT: "100",
   AGENT_DATABASE_URL: postgresUrl("open-agent-prod-data", 55432),
   AGENT_DEPLOYMENT_TENANCY: "single-tenant",
   AGENT_EMBED_ALLOWED_ORIGINS: process.env.AGENT_EMBED_ALLOWED_ORIGINS || "http://localhost:4730,http://127.0.0.1:4730",
@@ -47,8 +53,11 @@ const runtimeEnvironment = {
   AGENT_RUNTIME_URL: `http://127.0.0.1:${EVE_PORT}`,
   AGENT_SANDBOX_BACKEND: "docker",
   AGENT_SANDBOX_IMAGE: SANDBOX_IMAGE,
+  AGENT_SANDBOX_TERMINAL_RETENTION_HOURS: process.env.AGENT_SANDBOX_TERMINAL_RETENTION_HOURS || "168",
+  AGENT_SANDBOX_CLEANUP_INTERVAL_MS: process.env.AGENT_SANDBOX_CLEANUP_INTERVAL_MS || "900000",
+  AGENT_SANDBOX_CLEANUP_MAX_SESSIONS: process.env.AGENT_SANDBOX_CLEANUP_MAX_SESSIONS || "25",
   EVE_NEXT_PRODUCTION_PORT: String(EVE_PORT),
-  NODE_ENV: "production",
+  NODE_ENV: previewNodeEnv,
   WORKFLOW_POSTGRES_JOB_PREFIX: "open_agent_",
   WORKFLOW_POSTGRES_MAX_POOL_SIZE: "22",
   WORKFLOW_POSTGRES_URL: postgresUrl("open-agent-prod-world", 55433),
@@ -89,6 +98,16 @@ const mailboxWorker = spawn(process.execPath, ["scripts/run-agent-mailbox-worker
   stdio: "inherit",
 });
 
+const assetCleanupWorker = spawn(process.execPath, ["scripts/run-asset-cleanup-worker.mjs"], {
+  env: runtimeEnvironment,
+  stdio: "inherit",
+});
+
+const sandboxCleanupWorker = spawn(process.execPath, ["scripts/run-sandbox-cleanup-worker.mjs"], {
+  env: runtimeEnvironment,
+  stdio: "inherit",
+});
+
 console.log(`OPEN_AGENT_PUBLIC_URL=${publicOrigin}`);
 
 let stopping = false;
@@ -99,6 +118,8 @@ const stop = (signal = "SIGTERM") => {
   web.kill(signal);
   eve.kill(signal);
   mailboxWorker.kill(signal);
+  assetCleanupWorker.kill(signal);
+  sandboxCleanupWorker.kill(signal);
 };
 for (const signal of ["SIGINT", "SIGTERM"]) {
   process.on(signal, () => {
@@ -111,12 +132,16 @@ const outcome = await Promise.race([
   childExit("eve", eve),
   childExit("web", web),
   childExit("mailbox-worker", mailboxWorker),
+  childExit("asset-cleanup-worker", assetCleanupWorker),
+  childExit("sandbox-cleanup-worker", sandboxCleanupWorker),
 ]);
 stop();
 await Promise.allSettled([
   childExit("eve", eve),
   childExit("web", web),
   childExit("mailbox-worker", mailboxWorker),
+  childExit("asset-cleanup-worker", assetCleanupWorker),
+  childExit("sandbox-cleanup-worker", sandboxCleanupWorker),
 ]);
 if (!stopping || outcome.code !== 0) {
   console.error(`${outcome.name} exited`, { code: outcome.code, signal: outcome.signal });

@@ -1,7 +1,7 @@
 "use client";
 
 import { ClientError, type Client, type ClientSession, type MessageStreamEvent } from "eve/client";
-import { AlertCircleIcon, ArrowLeftIcon, MenuIcon, PanelLeftCloseIcon, PanelLeftIcon, ServerOffIcon } from "lucide-react";
+import { AlertCircleIcon, ArrowLeftIcon, MenuIcon, PanelLeftCloseIcon, PanelLeftIcon, PanelRightIcon, ServerOffIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "../ui/button.js";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "../ui/resizable.js";
@@ -16,9 +16,10 @@ import { AgentChildSessionView } from "./agent-child-session.js";
 import { AgentSettingsDialog } from "./agent-settings-dialog.js";
 import { AgentSidebar } from "./agent-sidebar.js";
 import { AgentSubagentMenu } from "./agent-subagent-menu.js";
+import { AgentSecondaryView, type AgentSecondaryChild, type AgentSecondaryTab } from "./agent-secondary-view.js";
 import { AgentThreadView } from "./agent-thread.js";
 import { cn } from "../utils.js";
-import type { AgentInterruptedTurn, AgentModelOption, AgentQueuedTurn, AgentThread, AgentThreadPatch, AgentThreadPreferences, AgentWorkspaceClientConfig, AgentWorkspaceMailbox } from "./contracts.js";
+import type { AgentAssetEndpoint, AgentInterruptedTurn, AgentModelOption, AgentQueuedTurn, AgentSessionAsset, AgentThread, AgentThreadPatch, AgentThreadPreferences, AgentWorkspaceClientConfig, AgentWorkspaceMailbox } from "./contracts.js";
 import { AgentThreadStorageConflictError } from "./http-thread-storage.js";
 import { messagesFor, resolveBrowserLocale, type AgentLocale, type AgentMessages } from "./i18n.js";
 import {
@@ -49,6 +50,7 @@ const FLOATING_SIDEBAR_DEFAULT_WIDTH = 288;
 type WorkbenchLayoutMode = "split" | "collapsing" | "fullscreen" | "expanding";
 
 export function AgentWorkspace({
+  assetEndpoint,
   client,
   commands = [],
   defaultPreferences,
@@ -60,6 +62,7 @@ export function AgentWorkspace({
   models,
   mentions = [],
   onEvent,
+  onOpenAsset,
   onDeleteThread,
   onActiveSubagentChange,
   onActiveThreadChange,
@@ -71,6 +74,7 @@ export function AgentWorkspace({
   threadStorage = browserThreadStorage,
 }: {
   readonly agentName?: string;
+  readonly assetEndpoint?: AgentAssetEndpoint;
   readonly client?: AgentWorkspaceClientConfig;
   readonly commands?: readonly import("./contracts.js").AgentPromptMenuItem[];
   readonly defaultPreferences: AgentThreadPreferences;
@@ -82,6 +86,7 @@ export function AgentWorkspace({
   readonly models: readonly AgentModelOption[];
   readonly mentions?: readonly import("./contracts.js").AgentPromptMenuItem[];
   readonly onEvent?: (event: MessageStreamEvent) => void;
+  readonly onOpenAsset?: (asset: AgentSessionAsset) => void;
   readonly onDeleteThread?: (thread: AgentThread) => void | Promise<void>;
   readonly onActiveSubagentChange?: (threadId: string, sessionId?: string) => void;
   readonly onActiveThreadChange?: (threadId?: string) => void;
@@ -118,6 +123,12 @@ export function AgentWorkspace({
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [deletionIssue, setDeletionIssue] = useState(false);
   const [deletingThreadIds, setDeletingThreadIds] = useState<Set<string>>(new Set());
+  const [secondaryOpen, setSecondaryOpen] = useState(false);
+  const [secondaryTab, setSecondaryTab] = useState<AgentSecondaryTab>("home");
+  const [secondaryChildSessionId, setSecondaryChildSessionId] = useState<string>();
+  const [sessionAssets, setSessionAssets] = useState<readonly AgentSessionAsset[]>([]);
+  const [assetsLoading, setAssetsLoading] = useState(false);
+  const [assetsError, setAssetsError] = useState<string>();
   const [ephemeralThreadIds, setEphemeralThreadIds] = useState<Set<string>>(new Set());
   const [locale, setLocale] = useState<AgentLocale>("en");
   const recoveryStarted = useRef(new Set<string>());
@@ -455,6 +466,55 @@ export function AgentWorkspace({
   }, []);
 
   const activeThread = threads.find((thread) => thread.id === activeThreadId) ?? threads[0];
+  const refreshAssets = useCallback(() => {
+    const sessionId = activeThread?.session.sessionId;
+    if (!sessionId) {
+      setSessionAssets([]);
+      setAssetsError(undefined);
+      return;
+    }
+    const controller = new AbortController();
+    setAssetsLoading(true);
+    setAssetsError(undefined);
+    void (async () => {
+      try {
+        const configuredHeaders = typeof client?.headers === "function" ? await client.headers() : client?.headers;
+        const headers = client?.auth && "bearer" in client.auth
+          ? {
+            ...(configuredHeaders ?? {}),
+            authorization: `Bearer ${typeof client.auth.bearer === "function" ? await client.auth.bearer() : client.auth.bearer}`,
+          }
+          : configuredHeaders;
+        const base = client?.host || (typeof window !== "undefined" ? window.location.origin : "http://localhost");
+        const endpoint = resolveSessionAssetEndpoint(assetEndpoint ?? "/api/assets", sessionId);
+        const endpointUrl = new URL(endpoint, base);
+        if (endpointUrl.protocol !== "http:" && endpointUrl.protocol !== "https:") throw new Error("The asset endpoint must use HTTP(S).");
+        const response = await fetch(endpointUrl, {
+          credentials: "include",
+          headers,
+          signal: controller.signal,
+        });
+        if (!response.ok) throw new Error(`Asset list failed (${response.status}).`);
+        const body: unknown = await response.json();
+        setSessionAssets(parseSessionAssets(body));
+      } catch (error) {
+        if (!controller.signal.aborted) setAssetsError(error instanceof Error ? error.message : "The session assets could not be loaded.");
+      } finally {
+        if (!controller.signal.aborted) setAssetsLoading(false);
+      }
+    })();
+    return () => controller.abort();
+  }, [activeThread?.session.sessionId, assetEndpoint, client]);
+
+  useEffect(() => {
+    if (!secondaryOpen || activeSubagentSessionId) return;
+    const cleanup = refreshAssets();
+    return typeof cleanup === "function" ? cleanup : undefined;
+  }, [activeSubagentSessionId, refreshAssets, secondaryOpen]);
+
+  useEffect(() => {
+    if (!activeThread?.session.sessionId) setSecondaryOpen(false);
+  }, [activeThread?.session.sessionId]);
   const hydrateThread = useCallback((thread: AgentThread) => {
     if (thread.hydration !== "summary" || !threadStorage.loadThread) return;
     setThreadHydrationErrors((current) => withoutMapKey(current, thread.id));
@@ -873,6 +933,8 @@ export function AgentWorkspace({
           if (workbenchMode === "split") setPanelResizing(true);
         }} /> : null}
         <ResizablePanel className="min-w-0 p-0" data-workbench-panel defaultSize="100%" id="agent-workbench" minSize="0px">
+          <ResizablePanelGroup className="h-full" orientation="horizontal">
+            <ResizablePanel className="min-w-0" defaultSize={secondaryOpen && !desktopLayout ? "0%" : secondaryOpen ? "70%" : "100%"} id="agent-primary" minSize="0px">
       <section className="flex h-full min-w-0 flex-col overflow-hidden bg-card" data-slot="agent-workbench">
         <header className="flex h-12 shrink-0 items-center justify-between border-b border-border/70 px-3 lg:h-13 lg:px-4">
           <div className="flex min-w-0 items-center gap-2">
@@ -888,6 +950,9 @@ export function AgentWorkspace({
             </h2>
           </div>
           <div className="flex items-center gap-1">
+            <Button aria-label={secondaryOpen ? messages.closeSecondaryView : messages.openSecondaryView} onClick={() => setSecondaryOpen((open) => !open)} size="icon-sm" variant="ghost">
+              <PanelRightIcon className="size-4" />
+            </Button>
             <AgentSubagentMenu
               activeSessionId={activeSubagentSessionId}
               events={activeThread.events}
@@ -930,8 +995,15 @@ export function AgentWorkspace({
           activeSubagent ? (
             <AgentChildSessionView
               client={client}
+              commands={commands}
               locale={locale}
+              mailbox={mailbox}
+              mentions={mentions}
+              models={models}
+              onEvent={onEvent}
+              onOpenSubagent={openSubagent}
               preferences={activeThread.preferences}
+              reasoningLevels={reasoningLevels}
               sessionId={activeSubagentSessionId}
             />
           ) : (
@@ -965,6 +1037,48 @@ export function AgentWorkspace({
           </div>
         )}
       </section>
+            </ResizablePanel>
+            {secondaryOpen ? (
+              <>
+                <ResizableHandle className="flex bg-transparent after:w-2" data-secondary-resize-handle />
+                <ResizablePanel className="min-w-0 border-l border-border/70" defaultSize={desktopLayout ? "30%" : "100%"} id="agent-secondary" maxSize={desktopLayout ? "50%" : "100%"} minSize={desktopLayout ? "260px" : "0px"}>
+                  <AgentSecondaryView
+                    assetUrl={client?.assetUrl}
+                    assets={sessionAssets}
+                    assetsError={assetsError}
+                    assetsLoading={assetsLoading}
+                    children={activeThread ? subagentsForThread(activeThread.events) : []}
+                    childContent={secondaryChildSessionId && activeThread ? (
+                      <AgentChildSessionView
+                        client={client}
+                        commands={commands}
+                        locale={locale}
+                        mailbox={mailbox}
+                        mentions={mentions}
+                        models={models}
+                        onEvent={onEvent}
+                        onOpenSubagent={openSubagent}
+                        preferences={activeThread.preferences}
+                        reasoningLevels={reasoningLevels}
+                        sessionId={secondaryChildSessionId}
+                      />
+                    ) : undefined}
+                    locale={locale}
+                    onClose={() => setSecondaryOpen(false)}
+                    onOpenAsset={onOpenAsset ? (asset) => onOpenAsset(asset) : undefined}
+                    onOpenChild={(sessionId) => {
+                      setSecondaryTab("children");
+                      setSecondaryChildSessionId(sessionId);
+                      setSecondaryTab("child");
+                    }}
+                    onRefreshAssets={refreshAssets}
+                    onSelectTab={setSecondaryTab}
+                    tab={secondaryTab}
+                  />
+                </ResizablePanel>
+              </>
+            ) : null}
+          </ResizablePanelGroup>
         </ResizablePanel>
       </ResizablePanelGroup>
       {workbenchFullscreen ? (
@@ -1131,6 +1245,17 @@ function findSubagentSession(
       : locale === "zh-CN" ? `子代理 ${index + 1}` : `Sub-agent ${index + 1}`,
     ...(session.task ? { task: session.task } : {}),
   };
+}
+
+function subagentsForThread(events: readonly MessageStreamEvent[]): readonly AgentSecondaryChild[] {
+  return presentSubagentSessions(events)
+    .filter((session): session is typeof session & { readonly childSessionId: string } => Boolean(session.childSessionId))
+    .map((session, index) => ({
+      childSessionId: session.childSessionId,
+      nickname: session.name && session.name !== "agent" ? session.name : `Sub-agent ${index + 1}`,
+      status: session.status,
+      ...(session.task ? { task: session.task } : {}),
+    }));
 }
 
 function UnavailableSubagentView({
@@ -1643,6 +1768,61 @@ function isUrgentPersistenceEvent(event: MessageStreamEvent): boolean {
     event.type === "turn.cancelled" ||
     event.type === "turn.completed" ||
     event.type === "turn.failed";
+}
+
+function resolveSessionAssetEndpoint(endpoint: AgentAssetEndpoint, sessionId: string): string {
+  if (typeof endpoint === "function") return endpoint(sessionId);
+  const encoded = encodeURIComponent(sessionId);
+  if (endpoint.includes("{sessionId}")) return endpoint.replaceAll("{sessionId}", encoded);
+  if (endpoint.includes(":sessionId")) return endpoint.replaceAll(":sessionId", encoded);
+  return `${endpoint}${endpoint.includes("?") ? "&" : "?"}sessionId=${encoded}`;
+}
+
+function parseSessionAssets(payload: unknown): readonly AgentSessionAsset[] {
+  const values = Array.isArray(payload)
+    ? payload
+    : isRecord(payload) && Array.isArray(payload.assets)
+      ? payload.assets
+      : [];
+  const assets: AgentSessionAsset[] = [];
+  for (const value of values.slice(0, 200)) {
+    if (!isRecord(value)) continue;
+    const assetId = boundedText(value.assetId, 512);
+    const filename = boundedText(value.filename, 255);
+    const mediaType = boundedText(value.mediaType, 128);
+    const sizeBytes = typeof value.sizeBytes === "number" && Number.isSafeInteger(value.sizeBytes) && value.sizeBytes >= 0 ? value.sizeBytes : undefined;
+    if (!assetId || !filename || !mediaType || sizeBytes === undefined) continue;
+    assets.push({
+      assetId,
+      ...(boundedText(value.createdAt, 64) ? { createdAt: boundedText(value.createdAt, 64) } : {}),
+      ...(safeAssetUrl(value.downloadUrl) ? { downloadUrl: safeAssetUrl(value.downloadUrl) } : {}),
+      filename,
+      mediaType,
+      ...(safeAssetUrl(value.previewUrl) ? { previewUrl: safeAssetUrl(value.previewUrl) } : {}),
+      sizeBytes,
+      ...(safeAssetUrl(value.url) ? { url: safeAssetUrl(value.url) } : {}),
+    });
+  }
+  return assets;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function boundedText(value: unknown, maxLength: number): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 && value.length <= maxLength ? value.trim() : undefined;
+}
+
+function safeAssetUrl(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length === 0 || value.length > 2_048) return undefined;
+  if (value.startsWith("/")) return value;
+  try {
+    const parsed = new URL(value, typeof window !== "undefined" ? window.location.origin : "http://localhost");
+    return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed.toString() : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function loadLocale(storageKey: string): AgentLocale {

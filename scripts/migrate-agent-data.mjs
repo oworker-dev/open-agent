@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 
@@ -10,16 +10,20 @@ if (!/^[a-z_][a-z0-9_]*$/i.test(schema)) {
   throw new Error("AGENT_DATABASE_SCHEMA must be a valid PostgreSQL identifier.");
 }
 
-const migrationUrl = new URL(
-  "../server/data/migrations/0001_agent_service.sql",
-  import.meta.url,
-);
-const source = await readFile(fileURLToPath(migrationUrl), "utf8");
-const sql = source.replaceAll("__AGENT_SCHEMA__", schema);
 const pool = new pg.Pool({ application_name: "open-agent-migrate", connectionString, max: 1 });
 
 try {
-  await pool.query(sql);
+  const migrationsUrl = new URL("../server/data/migrations/", import.meta.url);
+  const migrationsDirectory = fileURLToPath(migrationsUrl);
+  const migrations = (await readdir(migrationsDirectory))
+    .filter((file) => /^\d+_.+\.sql$/u.test(file))
+    .sort();
+  if (migrations.length === 0) throw new Error("No Agent data migrations were found.");
+  for (const migration of migrations) {
+    const source = await readFile(new URL(migration, migrationsUrl), "utf8");
+    await pool.query(source.replaceAll("__AGENT_SCHEMA__", schema));
+    console.log(`Applied ${migration}.`);
+  }
   console.log(`Agent data schema ${schema} is ready.`);
 } finally {
   await pool.end();

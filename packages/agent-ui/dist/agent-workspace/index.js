@@ -1,4 +1,5 @@
 export { AgentWorkspace } from "./agent-workspace.js";
+export { AgentSecondaryView } from "./agent-secondary-view.js";
 export { AgentMailboxHttpError, createHttpAgentMailbox, } from "./http-agent-mailbox.js";
 export { AgentThreadStorageConflictError, AgentThreadStorageHttpError, createHttpAgentThreadStorage, } from "./http-thread-storage.js";
 export { AgentMessage } from "./agent-message.js";

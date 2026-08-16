@@ -5,6 +5,7 @@ import {
   normalizeAgentRuntimeHost,
   readEveAgentEvents,
   resetEveAgentRun,
+  resetEveSession,
 } from "../../server/agent-runs/eve-adapter.ts";
 
 test("keeps an Eve runtime origin for the client route prefix", () => {
@@ -75,6 +76,26 @@ test("uses the stable session ID as the reset handle", async (t) => {
   assert.equal(
     await resetEveAgentRun("run-1", "correlation-1", "session-1", "token"),
     "reset",
+  );
+});
+
+test("uses a valid AgentRun-shaped control id for sandbox session reset", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const originalRuntimeUrl = process.env.AGENT_RUNTIME_URL;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalRuntimeUrl === undefined) delete process.env.AGENT_RUNTIME_URL;
+    else process.env.AGENT_RUNTIME_URL = originalRuntimeUrl;
+  });
+  process.env.AGENT_RUNTIME_URL = "https://agent.example";
+  globalThis.fetch = async (_input, init) => {
+    const headers = new Headers(init?.headers);
+    assert.match(headers.get("x-agent-run-id") ?? "", /^arun_[a-f0-9]{32}$/u);
+    return Response.json({ ok: true, status: "no_active_session" });
+  };
+  assert.equal(
+    await resetEveSession("session-1", "token", "sandbox-cleanup-1"),
+    "no_active_session",
   );
 });
 
@@ -176,4 +197,52 @@ test("reconnects a bounded event page until it reaches the declared durable tail
   const events = await readEveAgentEvents("run-1", "correlation-1", "session-1", "token");
   assert.deepEqual(events.map((event) => event.type), ["session.started", "session.waiting"]);
   assert.equal(requestCount, 2);
+});
+
+test("returns immediately when an exhausted cursor is at the durable tail", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const originalRuntimeUrl = process.env.AGENT_RUNTIME_URL;
+  let cancelled = false;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalRuntimeUrl === undefined) delete process.env.AGENT_RUNTIME_URL;
+    else process.env.AGENT_RUNTIME_URL = originalRuntimeUrl;
+  });
+  process.env.AGENT_RUNTIME_URL = "https://agent.example";
+  globalThis.fetch = async () => new Response(new ReadableStream({
+    cancel() {
+      cancelled = true;
+    },
+  }), { headers: { "x-eve-stream-tail-index": "0" } });
+
+  const events = await readEveAgentEvents("run-1", "correlation-1", "session-1", "token", 1);
+
+  assert.deepEqual(events, []);
+  assert.equal(cancelled, true);
+});
+
+test("retries transient Eve stream transport failures from the same cursor", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const originalRuntimeUrl = process.env.AGENT_RUNTIME_URL;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalRuntimeUrl === undefined) delete process.env.AGENT_RUNTIME_URL;
+    else process.env.AGENT_RUNTIME_URL = originalRuntimeUrl;
+  });
+  process.env.AGENT_RUNTIME_URL = "https://agent.example";
+  let calls = 0;
+  globalThis.fetch = async (input) => {
+    calls += 1;
+    if (calls === 1) throw new TypeError("socket closed");
+    assert.equal(new URL(String(input)).searchParams.get("startIndex"), "0");
+    return new Response(JSON.stringify({
+      data: {},
+      meta: { at: "2026-08-03T00:00:00.000Z", id: "evt_retry" },
+      type: "session.started",
+    }) + "\n", { headers: { "x-eve-stream-tail-index": "0" } });
+  };
+
+  const events = await readEveAgentEvents("run-1", "correlation-1", "session-1", "token");
+  assert.equal(events.length, 1);
+  assert.equal(calls, 2);
 });

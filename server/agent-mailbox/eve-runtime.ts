@@ -55,7 +55,12 @@ export function createEveAgentMailboxRuntime(
         };
       }
       if (parsed.state === "terminal") {
-        return { state: "terminal" };
+        return {
+          state: "terminal",
+          ...(parsed.terminalStatus === "failed" || parsed.terminalStatus === "completed"
+            ? { terminalStatus: parsed.terminalStatus }
+            : {}),
+        };
       }
       if (parsed.state === "waiting") {
         return { state: "waiting" };
@@ -70,6 +75,13 @@ export function createEveAgentMailboxRuntime(
           clientMessageId: input.clientMessageId,
           ...(input.payload.clientContext ? { clientContext: input.payload.clientContext } : {}),
           itemId: input.itemId,
+          ...(input.payload.operation?.expectedTurnId
+            ? { expectedTurnId: input.payload.operation.expectedTurnId }
+            : {}),
+          ...(input.payload.operation?.kind ? { operationKind: input.payload.operation.kind } : {}),
+          ...(input.payload.operation?.operationId
+            ? { operationId: input.payload.operation.operationId }
+            : {}),
           ...(input.payload.preferences ?? {}),
           ...(input.owner.issuer ? { issuer: input.owner.issuer } : {}),
           message: input.payload.message,

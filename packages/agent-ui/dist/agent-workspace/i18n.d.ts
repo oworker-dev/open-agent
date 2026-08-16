@@ -10,6 +10,7 @@ declare const translations: {
         readonly cacheWriteTokens: "Cache write";
         readonly catchingUpDurableRun: "Catching up with the durable run";
         readonly closeNavigation: "Close navigation";
+        readonly closeSecondaryView: "Close side view";
         readonly closeSettings: "Close settings";
         readonly context: "Context";
         readonly contextUsage: "Context usage";
@@ -49,6 +50,7 @@ declare const translations: {
         readonly removeQueuedMessage: "Remove queued message";
         readonly retryQueuedMessage: "Retry queued message";
         readonly openNavigation: "Open navigation";
+        readonly openSecondaryView: "Open side view";
         readonly outputTokens: "Output";
         readonly tokenUsageOf: "of";
         readonly reasoning: "Reasoning";
@@ -126,6 +128,7 @@ declare const translations: {
         readonly cacheWriteTokens: "缓存写入";
         readonly catchingUpDurableRun: "正在同步持久化任务进度";
         readonly closeNavigation: "关闭导航栏";
+        readonly closeSecondaryView: "关闭副视图";
         readonly closeSettings: "关闭设置";
         readonly context: "上下文";
         readonly contextUsage: "上下文用量";
@@ -165,6 +168,7 @@ declare const translations: {
         readonly removeQueuedMessage: "移除待发送消息";
         readonly retryQueuedMessage: "重试待发送消息";
         readonly openNavigation: "打开导航栏";
+        readonly openSecondaryView: "打开副视图";
         readonly outputTokens: "输出";
         readonly tokenUsageOf: "/";
         readonly reasoning: "思考强度";

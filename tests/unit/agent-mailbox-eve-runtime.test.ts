@@ -25,11 +25,32 @@ test("Eve mailbox runtime reads waiting boundaries and admits messages", async (
     clientMessageId: "message-1",
     itemId: "mail-1",
     owner: owner(),
-    payload: { message: "Continue" },
+    payload: {
+      message: "Continue",
+      operation: {
+        expectedTurnId: "turn-1",
+        kind: "steer",
+        operationId: "operation-1",
+      },
+    },
     sessionId: "session-1",
   }), { sessionId: "session-1" });
   assert.equal(requests.length, 2);
+  assert.deepEqual(requests[1], {
+    action: "deliver",
+    clientMessageId: "message-1",
+    expectedTurnId: "turn-1",
+    itemId: "mail-1",
+    message: "Continue",
+    operationId: "operation-1",
+    operationKind: "steer",
+    principalId: "user-1",
+    principalType: "user",
+    sessionId: "session-1",
+    tenantId: "tenant-1",
+  });
 });
+
 
 test("Eve mailbox runtime retains the active turn identity", async () => {
   const runtime = createEveAgentMailboxRuntime(environment, async () =>
@@ -39,6 +60,17 @@ test("Eve mailbox runtime retains the active turn identity", async () => {
   assert.deepEqual(await runtime.inspect({ owner: owner(), sessionId: "session-1" }), {
     state: "running",
     turnId: "turn-active",
+  });
+});
+
+test("Eve mailbox runtime preserves a failed terminal boundary", async () => {
+  const runtime = createEveAgentMailboxRuntime(environment, async () =>
+    Response.json({ ok: true, state: "terminal", terminalStatus: "failed" }),
+  );
+
+  assert.deepEqual(await runtime.inspect({ owner: owner(), sessionId: "session-1" }), {
+    state: "terminal",
+    terminalStatus: "failed",
   });
 });
 
