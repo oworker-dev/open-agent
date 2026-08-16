@@ -49,15 +49,20 @@ function postgresSessionOwnershipStore(
     owner: AgentSessionOwner,
   ): Promise<AgentSessionOwnershipResult> => {
     const result = await pool.query<{
+      issuer: string | null;
       principal_id: string;
+      principal_type: string;
       tenant_id: string;
     }>(
-      `select tenant_id, principal_id from ${table} where session_id = $1`,
+      `select tenant_id, principal_id, principal_type, issuer from ${table} where session_id = $1`,
       [sessionId],
     );
     const current = result.rows[0];
     if (!current) return "missing";
-    return current.tenant_id === owner.tenantId && current.principal_id === owner.principalId
+    return current.tenant_id === owner.tenantId
+      && current.principal_id === owner.principalId
+      && current.principal_type === owner.principalType
+      && (current.issuer ?? "") === (owner.issuer ?? "")
       ? "owned"
       : "forbidden";
   };

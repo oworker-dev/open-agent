@@ -1,18 +1,19 @@
 import type { MessageStreamEvent, InputRequest } from "eve/client";
 import type { EveDynamicToolPart, EveMessage, EveMessagePart } from "eve/react";
-import type { AgentInterruptedTurn } from "./contracts.js";
+import type { AgentInterruptedTurn, AgentSubagentSummary } from "./contracts.js";
 export type AgentTurnStatus = "cancelled" | "completed" | "failed" | "running" | "waiting";
 export type SubagentCallPresentation = {
     readonly childSessionId?: string;
     readonly endedAt?: number;
     readonly name?: string;
     readonly startedAt?: number;
-    readonly status: "cancelled" | "completed" | "failed" | "running" | "starting";
+    readonly status: "cancelled" | "completed" | "failed" | "running" | "starting" | "waiting";
 };
 export type SubagentSessionPresentation = SubagentCallPresentation & {
     readonly callId: string;
     readonly task?: string;
 };
+export declare function mergeSubagentSessions(events: readonly MessageStreamEvent[], durable?: readonly AgentSubagentSummary[]): readonly SubagentSessionPresentation[];
 export type AgentTurnPresentation = {
     readonly endedAt?: number;
     readonly finalPart?: Extract<EveMessagePart, {

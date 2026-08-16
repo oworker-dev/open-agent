@@ -34,9 +34,9 @@ export type UpdateAgentSubagentInput = {
   readonly task?: string;
   readonly status?: AgentSubagentStatus;
   readonly waitPolicy?: AgentSubagentWaitPolicy;
-  readonly lastError?: string;
+  readonly lastError?: string | null;
   readonly startedAt?: string;
-  readonly finishedAt?: string;
+  readonly finishedAt?: string | null;
 };
 
 export interface AgentSubagentStore {
@@ -95,9 +95,22 @@ export function createMemoryAgentSubagentStore(): AgentSubagentStore {
       const current = item.record;
       const now = new Date().toISOString();
       const status = patch.status ?? current.status;
-      const terminal = status === "completed" || status === "failed" || status === "interrupted" || status === "closed";
+      const idle = status === "waiting" || status === "completed" || status === "failed" || status === "interrupted" || status === "closed";
+      const startedAt = patch.startedAt ?? current.startedAt ?? (status === "running" ? now : undefined);
+      const finishedAt = patch.finishedAt === null || status === "running" || status === "starting"
+        ? undefined
+        : patch.finishedAt ?? current.finishedAt ?? (idle ? now : undefined);
+      const lastError = patch.lastError === null || status === "running"
+        ? undefined
+        : patch.lastError ?? current.lastError;
+      const {
+        finishedAt: _finishedAt,
+        lastError: _lastError,
+        startedAt: _startedAt,
+        ...base
+      } = current;
       const record: AgentSubagentRecord = {
-        ...current,
+        ...base,
         ...(patch.agentId ? { agentId: patch.agentId } : {}),
         ...(patch.name ? { name: patch.name } : {}),
         ...(patch.nickname ? { nickname: patch.nickname } : {}),
@@ -105,9 +118,9 @@ export function createMemoryAgentSubagentStore(): AgentSubagentStore {
         status,
         ...(patch.waitPolicy ? { waitPolicy: patch.waitPolicy } : {}),
         updatedAt: now,
-        ...(patch.lastError ? { lastError: patch.lastError } : {}),
-        ...(patch.startedAt ? { startedAt: patch.startedAt } : status === "running" && !current.startedAt ? { startedAt: now } : {}),
-        ...(patch.finishedAt ? { finishedAt: patch.finishedAt } : terminal && !current.finishedAt ? { finishedAt: now } : {}),
+        ...(lastError ? { lastError } : {}),
+        ...(startedAt ? { startedAt } : {}),
+        ...(finishedAt ? { finishedAt } : {}),
       };
       records.set(childSessionId, { owner: item.owner, record });
       return record;
@@ -146,6 +159,10 @@ function postgresStore(pool: Pool, table: string): AgentSubagentStore {
            task = coalesce(excluded.task, ${table}.task),
            status = case when ${table}.status in ('starting','waiting') and excluded.status = 'running' then excluded.status else ${table}.status end,
            updated_at = now()
+         where ${table}.tenant_id = excluded.tenant_id
+           and ${table}.principal_id = excluded.principal_id
+           and ${table}.principal_type = excluded.principal_type
+           and coalesce(${table}.issuer, '') = coalesce(excluded.issuer, '')
          returning ${columns()}`,
         [
           input.childSessionId, input.agentId ?? null, input.parentSessionId, input.callId ?? null,
@@ -160,8 +177,10 @@ function postgresStore(pool: Pool, table: string): AgentSubagentStore {
     async findOwned(owner, childSessionId) {
       assertOwner(owner);
       const result = await pool.query<Row>(
-        `select ${columns()} from ${table} where child_session_id = $1 and tenant_id = $2 and principal_id = $3`,
-        [childSessionId, owner.tenantId, owner.principalId],
+        `select ${columns()} from ${table}
+         where child_session_id = $1 and tenant_id = $2 and principal_id = $3
+           and principal_type = $4 and coalesce(issuer, '') = $5`,
+        [childSessionId, owner.tenantId, owner.principalId, owner.principalType, owner.issuer ?? ""],
       );
       return result.rows[0] ? toRecord(result.rows[0]) : undefined;
     },
@@ -170,15 +189,16 @@ function postgresStore(pool: Pool, table: string): AgentSubagentStore {
       const result = await pool.query<Row>(
         `select ${columns()} from ${table}
           where parent_session_id = $1 and tenant_id = $2 and principal_id = $3
+            and principal_type = $4 and coalesce(issuer, '') = $5
           order by created_at asc`,
-        [parentSessionId, owner.tenantId, owner.principalId],
+        [parentSessionId, owner.tenantId, owner.principalId, owner.principalType, owner.issuer ?? ""],
       );
       return result.rows.map(toRecord);
     },
     async updateOwned(owner, childSessionId, patch) {
       assertOwner(owner);
       const fields: string[] = [];
-      const values: unknown[] = [childSessionId, owner.tenantId, owner.principalId];
+      const values: unknown[] = [childSessionId, owner.tenantId, owner.principalId, owner.principalType, owner.issuer ?? ""];
       const add = (column: string, value: unknown) => { fields.push(`${column} = $${values.length + 1}`); values.push(value); };
       if (patch.agentId) add("agent_id", patch.agentId);
       if (patch.name) add("name", patch.name);
@@ -189,11 +209,22 @@ function postgresStore(pool: Pool, table: string): AgentSubagentStore {
       if (patch.lastError !== undefined) add("last_error", patch.lastError);
       if (patch.startedAt !== undefined) add("started_at", patch.startedAt);
       if (patch.finishedAt !== undefined) add("finished_at", patch.finishedAt);
+      if (patch.status === "running") {
+        if (patch.startedAt === undefined) fields.push("started_at = coalesce(started_at, now())");
+        if (patch.finishedAt === undefined) fields.push("finished_at = null");
+        if (patch.lastError === undefined) fields.push("last_error = null");
+      } else if (
+        patch.finishedAt === undefined &&
+        (patch.status === "waiting" || patch.status === "completed" || patch.status === "failed" || patch.status === "interrupted" || patch.status === "closed")
+      ) {
+        fields.push("finished_at = coalesce(finished_at, now())");
+      }
       if (fields.length === 0) return await this.findOwned(owner, childSessionId);
       fields.push("updated_at = now()");
       const result = await pool.query<Row>(
         `update ${table} set ${fields.join(", ")}
           where child_session_id = $1 and tenant_id = $2 and principal_id = $3
+            and principal_type = $4 and coalesce(issuer, '') = $5
           returning ${columns()}`,
         values,
       );

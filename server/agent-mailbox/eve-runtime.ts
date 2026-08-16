@@ -40,6 +40,21 @@ export function createEveAgentMailboxRuntime(
   };
 
   return {
+    async cancel(input) {
+      const { parsed, response } = await request({
+        action: "cancel",
+        sessionId: input.sessionId,
+        ...(input.turnId ? { turnId: input.turnId } : {}),
+      });
+      if (
+        !response.ok ||
+        !isRecord(parsed) ||
+        parsed.status !== "accepted" && parsed.status !== "no_active_turn"
+      ) {
+        throw new Error(problemMessage(parsed, `Mailbox cancellation failed with HTTP ${response.status}.`));
+      }
+      return parsed.status;
+    },
     async inspect(input) {
       const { parsed, response } = await request({
         action: "inspect",
@@ -66,6 +81,21 @@ export function createEveAgentMailboxRuntime(
         return { state: "waiting" };
       }
       throw new Error("The Agent runtime returned an invalid mailbox boundary.");
+    },
+    async reset(input) {
+      const { parsed, response } = await request({
+        action: "reset",
+        sessionId: input.sessionId,
+        ...(input.reason ? { reason: input.reason } : {}),
+      });
+      if (
+        !response.ok ||
+        !isRecord(parsed) ||
+        parsed.status !== "reset" && parsed.status !== "no_active_session"
+      ) {
+        throw new Error(problemMessage(parsed, `Mailbox reset failed with HTTP ${response.status}.`));
+      }
+      return parsed.status;
     },
     async deliver(input) {
       let result: Awaited<ReturnType<typeof request>>;

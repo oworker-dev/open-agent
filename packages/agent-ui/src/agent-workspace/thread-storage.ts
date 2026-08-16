@@ -220,6 +220,9 @@ function parseQueuedTurn(value: unknown): AgentQueuedTurn | undefined {
   const mailboxItemId = typeof value.mailboxItemId === "string" && value.mailboxItemId
     ? value.mailboxItemId
     : undefined;
+  const expectedTurnId = typeof value.expectedTurnId === "string" && value.expectedTurnId
+    ? value.expectedTurnId
+    : undefined;
   const durableDeliveryPhase = value.state === "delivering" ||
     value.state === "accepted" || value.state === "committed";
   if (durableDeliveryPhase && (value.delivery !== "server" || !mailboxItemId)) {
@@ -235,6 +238,7 @@ function parseQueuedTurn(value: unknown): AgentQueuedTurn | undefined {
     ...(value.delivery === "server" || value.delivery === "browser"
       ? { delivery: value.delivery }
       : {}),
+    ...(expectedTurnId ? { expectedTurnId } : {}),
     id: value.id,
     ...(value.intent === "active-turn" || value.intent === "post-cancellation"
       ? { intent: value.intent }

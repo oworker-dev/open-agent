@@ -22,6 +22,17 @@ export type HostRequestAuthentication =
     }
   | { readonly ok: false; readonly response: Response };
 
+export const HOST_AGENT_SCOPE = {
+  approvalRead: "agent:approvals:read",
+  mailboxRead: "agent:mailbox:read",
+  mailboxWrite: "agent:mailbox:write",
+  sessionDelete: "agent:sessions:delete",
+  sessionRead: "agent:sessions:read",
+  sessionWrite: "agent:sessions:write",
+  subagentRead: "agent:subagents:read",
+  subagentWrite: "agent:subagents:write",
+} as const;
+
 /** Apply a least-privilege endpoint scope after the shared Host JWT check. */
 export function requireHostScope(
   authenticated: HostRequestAuthentication,

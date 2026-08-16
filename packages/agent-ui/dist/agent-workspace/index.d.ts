@@ -4,7 +4,8 @@ export { AgentMailboxHttpError, createHttpAgentMailbox, type HttpAgentMailboxOpt
 export { AgentThreadStorageConflictError, AgentThreadStorageHttpError, createHttpAgentThreadStorage, type HttpAgentThreadStorageOptions, } from "./http-thread-storage.js";
 export { AgentMessage } from "./agent-message.js";
 export type { AgentInputResponse } from "./agent-message.js";
-export type { AgentExtensionInfo, AgentAssetEndpoint, AgentSessionAsset, AgentThread, AgentPendingTurn, AgentQueuedTurn, AgentThreadPatch, AgentThreadPreferences, AgentModelOption, AgentPromptMenuItem, PromptInputMessage, AgentRuntimeStatus, AgentWorkspaceClientConfig, AgentWorkspaceConfig, AgentWorkspaceHostSlots, AgentWorkspaceMailbox, AgentMailboxItemStatus, AgentMailboxReceipt, } from "./contracts.js";
+export { createHttpAgentAssetUploadAdapter } from "./browser-asset-upload.js";
+export type { AgentAssetUpload, AgentAssetUploadAdapter, AgentExtensionInfo, AgentAssetEndpoint, AgentSessionAsset, AgentThread, AgentPendingTurn, AgentQueuedTurn, AgentThreadPatch, AgentThreadPreferences, AgentModelOption, AgentPromptMenuItem, PromptInputMessage, AgentRuntimeStatus, AgentWorkspaceClientConfig, AgentWorkspaceConfig, AgentWorkspaceHostSlots, AgentWorkspaceMailbox, AgentMailboxItemStatus, AgentMailboxReceipt, AgentSubagentLoader, AgentSubagentSummary, } from "./contracts.js";
 export { filterPromptMenuItems, findPromptTrigger, replacePromptTrigger, type PromptTrigger, } from "./prompt-menu.js";
 export { AGENT_THREAD_STORAGE_VERSION, appendThreadEvent, browserThreadStorage, compactThreadEvents, createAgentThread, parseThreadCollection, } from "./thread-storage.js";
 export type { AgentThreadCollection, AgentThreadStorage, } from "./thread-storage.js";

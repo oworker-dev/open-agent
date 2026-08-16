@@ -10,7 +10,7 @@ import {
   useAui,
   useAuiState,
 } from "@assistant-ui/react";
-import type { Attachment as AssistantAttachment } from "@assistant-ui/react";
+import type { Attachment as AssistantAttachment, CompleteAttachment } from "@assistant-ui/react";
 import { LexicalComposerInput, type DirectiveChipProps } from "@assistant-ui/react-lexical";
 import type { MessageStreamEvent } from "eve/client";
 import type { EveMessage } from "eve/react";
@@ -33,18 +33,19 @@ import {
   SlashIcon,
   SquareIcon,
   WrenchIcon,
+  XIcon,
 } from "lucide-react";
 import { type FormEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { ComposerTriggerPopover } from "../assistant-ui/composer-trigger-popover.js";
-import { ContextDisplay } from "../assistant-ui/context-display.js";
 import { copyText } from "../assistant-ui/copy-text.js";
+import { ContextDisplay } from "../assistant-ui/context-display.js";
 import { DirectiveText } from "../assistant-ui/directive-text.js";
 import { MarkdownText } from "../assistant-ui/markdown-text.js";
 import { ModelSelector, type ModelOption } from "../assistant-ui/model-selector.js";
 import { ToolFallback } from "../assistant-ui/tool-fallback.js";
 import { TooltipIconButton } from "../assistant-ui/tooltip-icon-button.js";
 import { Button } from "../ui/button.js";
-import { Attachment, AttachmentContent, AttachmentDescription, AttachmentMedia, AttachmentTitle } from "../ui/attachment.js";
+import { Attachment, AttachmentContent, AttachmentDescription, AttachmentGroup, AttachmentMedia, AttachmentTitle, AttachmentTrigger } from "../ui/attachment.js";
 import { cn } from "../utils.js";
 import {
   DropdownMenu,
@@ -262,13 +263,13 @@ function UserMessage({ messages }: { readonly messages: AgentMessages }) {
     const lastUser = [...state.thread.messages].reverse().find((message) => message.role === "user");
     return lastUser?.id === state.message.id;
   });
-  const userText = useAuiState((state) => state.message.parts
-    .filter((part) => part.type === "text")
-    .map((part) => part.type === "text" ? part.text : "")
-    .join("\n"));
-
   return (
     <MessagePrimitive.Root className="group mx-auto flex w-full max-w-(--thread-max-width) flex-col items-end">
+      <AttachmentGroup className="mb-2 max-w-[88%] justify-end py-0 empty:hidden">
+        <MessagePrimitive.Attachments>
+          {({ attachment }) => <UserAttachment attachment={attachment} messages={messages} />}
+        </MessagePrimitive.Attachments>
+      </AttachmentGroup>
       <div
         className="max-w-[min(44rem,88%)] rounded-2xl bg-muted/75 px-4 py-3 text-[15px] leading-6 text-foreground"
         onClick={() => {
@@ -278,18 +279,65 @@ function UserMessage({ messages }: { readonly messages: AgentMessages }) {
         <MessagePrimitive.Parts components={{ Text: DirectiveText }} />
       </div>
       <div className={cn("mt-0.5 flex min-h-7 items-center transition-opacity", actionsVisible ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100")}>
-        <CopyTextAction label={messages.copyResponse} text={userText} />
-        <ActionBarPrimitive.Root className="flex min-h-7 items-center">
-          <ActionBarPrimitive.Edit
-            aria-label={messages.editMessage}
-            className={`inline-flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground ${isLastUserMessage ? "" : "invisible pointer-events-none"}`}
-          >
-            <PencilIcon className="size-3.5" />
-          </ActionBarPrimitive.Edit>
+        <ActionBarPrimitive.Root className="flex min-h-7 items-center gap-0.5">
+          <ActionBarPrimitive.Copy aria-label={messages.copyResponse} className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground">
+            <CopyIcon className="size-3.5" />
+          </ActionBarPrimitive.Copy>
+          {isLastUserMessage ? (
+            <ActionBarPrimitive.Edit
+              aria-label={messages.editMessage}
+              className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
+            >
+              <PencilIcon className="size-3.5" />
+            </ActionBarPrimitive.Edit>
+          ) : null}
         </ActionBarPrimitive.Root>
       </div>
     </MessagePrimitive.Root>
   );
+}
+
+function UserAttachment({ attachment, messages }: { readonly attachment: CompleteAttachment; readonly messages: AgentMessages }) {
+  const isImage = attachment.contentType?.startsWith("image/") ?? attachment.type === "image";
+  const previewUrl = isImage ? attachmentContentUrl(attachment) : undefined;
+  const [previewOpen, setPreviewOpen] = useState(false);
+  return (
+    <>
+      {isImage ? (
+        <Attachment className="size-24 min-w-0 overflow-hidden p-0 sm:size-28" orientation="vertical" size="sm" state="done">
+          <AttachmentMedia className="size-full rounded-xl" variant={previewUrl ? "image" : "icon"}>
+            {previewUrl ? <img alt={attachment.name} src={previewUrl} /> : <ImageIcon className="size-5" />}
+          </AttachmentMedia>
+          {previewUrl ? (
+            <AttachmentTrigger aria-label={`${messages.attachment}: ${attachment.name}`} onClick={() => setPreviewOpen(true)} />
+          ) : null}
+        </Attachment>
+      ) : (
+        <Attachment className="max-w-72" size="sm" state="done">
+          <AttachmentMedia variant="icon"><FileIcon className="size-4" /></AttachmentMedia>
+          <AttachmentContent>
+            <AttachmentTitle>{attachment.name}</AttachmentTitle>
+            <AttachmentDescription>{attachment.contentType ?? messages.attachment}</AttachmentDescription>
+          </AttachmentContent>
+        </Attachment>
+      )}
+      {previewOpen && previewUrl ? (
+        <button aria-label={messages.dismiss} className="fixed inset-0 z-50 flex cursor-zoom-out items-center justify-center bg-black/70 p-4" onClick={() => setPreviewOpen(false)} type="button">
+          <img alt={attachment.name} className="max-h-[90vh] max-w-[90vw] rounded-xl object-contain" src={previewUrl} />
+        </button>
+      ) : null}
+    </>
+  );
+}
+
+function attachmentContentUrl(attachment: CompleteAttachment): string | undefined {
+  for (const part of attachment.content) {
+    const value = part.type === "file" ? part.data : part.type === "image" ? part.image : undefined;
+    if (typeof value === "string") return value;
+    const candidate: unknown = value;
+    if (candidate instanceof URL) return candidate.toString();
+  }
+  return undefined;
 }
 
 function AssistantMessage({
@@ -319,6 +367,7 @@ function AssistantMessage({
   readonly onCloseInputRequest: (requestId: string) => void;
   readonly onOpenSubagent?: (sessionId: string) => void;
 }) {
+  const hasCopyableText = message?.parts.some((part) => part.type === "text" && part.text.trim().length > 0) ?? false;
   return (
     <MessagePrimitive.Root className="group mx-auto flex w-full max-w-(--thread-max-width) flex-col">
       <div className="min-w-0 px-1 text-[15px] leading-7 text-foreground">
@@ -335,13 +384,19 @@ function AssistantMessage({
             onInputResponses={onInputResponses}
             onCloseInputRequest={onCloseInputRequest}
             onOpenSubagent={onOpenSubagent}
-            showCopyAction
+            showCopyAction={false}
           />
         ) : (
           <MessagePrimitive.Parts components={{ Text: MarkdownText, tools: { Fallback: ToolFallback } }} />
         )}
       </div>
-      <div className="min-h-7" />
+      {!isStreaming && hasCopyableText ? (
+        <ActionBarPrimitive.Root className="mt-1 flex min-h-7 items-center opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
+          <ActionBarPrimitive.Copy aria-label={messages.copyResponse} className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground">
+            <CopyIcon className="size-3.5" />
+          </ActionBarPrimitive.Copy>
+        </ActionBarPrimitive.Root>
+      ) : <div className="min-h-7" />}
     </MessagePrimitive.Root>
   );
 }
@@ -665,7 +720,13 @@ function ComposerAttachment({ attachment, messages }: { readonly attachment: Ass
       </AttachmentMedia>
       <AttachmentContent>
         <AttachmentTitle>{attachment.name}</AttachmentTitle>
-        <AttachmentDescription>{attachment.status.type === "running" ? `${Math.round(attachment.status.progress)}%` : messages.attachment}</AttachmentDescription>
+        <AttachmentDescription>
+          {attachment.status.type === "running"
+            ? `${Math.round(attachment.status.progress)}%`
+            : attachment.status.type === "incomplete"
+              ? attachment.status.message ?? messages.attachment
+              : messages.attachment}
+        </AttachmentDescription>
       </AttachmentContent>
       <AttachmentPrimitive.Remove aria-label={messages.removeAttachment} className="relative z-20 rounded-sm text-muted-foreground hover:text-foreground">
         <span aria-hidden>×</span>

@@ -56,6 +56,10 @@ is required. For the built-in asset path set
 bucket, access key, and secret. Asset metadata and multipart state stay in the
 Agent PostgreSQL schema; object bytes stay in S3/MinIO/R2. A custom `host`
 adapter remains supported for deployments that use a different object store.
+Configure bucket CORS to allow browser-origin `PUT` from every intended Web
+origin and expose the `ETag` response header. Production S3 uploads are direct:
+Next.js signs and acknowledges parts but must not proxy their bytes. Keep
+`AGENT_ASSET_UPLOAD_URL_TTL_SECONDS` between 60 and 3600 seconds.
 Run one `npm run start:asset-cleanup` worker per deployment, or schedule
 `npm run reap:assets` with the deployment's job runner (using the same database
 and object-store credentials). It removes expired completed objects and aborts
@@ -74,6 +78,13 @@ built-in S3 adapter. Production defaults to `AGENT_ASSET_SCAN_MODE=required`
 and fails closed when no scanner is registered; `AGENT_ASSET_SCAN_MODE=disabled`
 is accepted only outside production. `import_asset` and any host sandbox mount
 must admit only assets whose `scanStatus` is `clean` or explicitly `disabled`.
+The standalone reference server can register its bundled constant-memory clamd
+INSTREAM adapter by setting `AGENT_ASSET_CLAMAV_HOST`, optional
+`AGENT_ASSET_CLAMAV_PORT`, and `AGENT_ASSET_CLAMAV_TIMEOUT_MS`. Configure
+clamd's `StreamMaxLength` at or above `AGENT_ASSET_MAX_BYTES`, keep the clamd
+port on a private network, and include scanner saturation and outage behavior
+in the staged load gate. Muses and other hosts may replace this adapter through
+the same `AssetScanner` contract.
 `AGENT_SANDBOX_IMAGE` must also be an immutable OCI digest. Build the repository
 `sandbox/Dockerfile`, publish it to the deployment registry, and run
 `npm run verify:sandbox-runtime` against that exact digest. The gate verifies
@@ -277,7 +288,9 @@ multipart chunk size, retries a deliberately truncated first part, verifies the
 completion checksum and beginning/end range reads, and checks that another tenant
 cannot read the completed asset. It also checks that a different principal in the
 same tenant cannot read it, so a passing run covers both tenant and principal
-ownership boundaries. Set `AGENT_ASSET_LOAD_TOTAL_UPLOADS` above
+ownership boundaries. The gate fails unless the server advertises direct
+object-store transfer, so a filesystem/proxied pass cannot be mistaken for
+production evidence. Set `AGENT_ASSET_LOAD_TOTAL_UPLOADS` above
 `AGENT_ASSET_LOAD_CONCURRENCY` for a fuller run, and use
 `AGENT_ASSET_LOAD_SIZE_BYTES` (for example `100MiB`) only within the 10 GiB asset
 limit. `AGENT_HOST_JWT_SECRET`, `AGENT_HOST_JWT_ISSUER`, and
@@ -287,6 +300,22 @@ carry the `agent:runs` scope. Set
 part retry counts, throughput, upload latency, and isolation status, never file
 bytes or credentials. This is a bounded capacity/regression gate, not evidence
 that a deployment meets the full 1k/5k/10k stream or tenant SLO matrix.
+
+Host JWTs for the interactive control plane use separate least-privilege
+scopes. Grant only the operations that the embedding surface exposes:
+
+| Surface | Read scope | Mutation scope |
+| --- | --- | --- |
+| Session history and state | `agent:sessions:read` | `agent:sessions:write` |
+| Session deletion | - | `agent:sessions:delete` |
+| Child-agent supervisor | `agent:subagents:read` | `agent:subagents:write` |
+| Durable approvals | `agent:approvals:read` | Resolution continues through the authenticated Eve input request |
+| Mailbox item status | `agent:mailbox:read` | `agent:mailbox:write` |
+
+`agent:runs`, `asset:read`, and `asset:write` remain independent. A token with
+one scope does not inherit another. The standalone Web surface does not mint a
+Host JWT; it uses its opaque HttpOnly owner cookie through `/api/standalone/*`
+and can access only records claimed by that owner.
 
 Keep Eve pinned to an exact version. Before any cross-minor upgrade, replay
 representative persistent sessions against an isolated copy of the Workflow

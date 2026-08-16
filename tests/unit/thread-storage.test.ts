@@ -73,7 +73,7 @@ test("hydrates queued follow-ups from the v2 collection without accepting malfor
       queuedTurns: [
         { id: "queued-1", state: "queued", submittedAt: 2, text: "Continue" },
         { id: "invalid", state: "delivering", submittedAt: 3, text: "Do not send" },
-        { delivery: "server", id: "committed-1", intent: "active-turn", mailboxItemId: "mail-1", state: "committed", submittedAt: 4, text: "Durably admitted" },
+        { delivery: "server", expectedTurnId: "turn-1", id: "committed-1", intent: "active-turn", mailboxItemId: "mail-1", state: "committed", submittedAt: 4, text: "Durably admitted" },
         { delivery: "browser", id: "post-cancel-1", intent: "post-cancellation", state: "queued", submittedAt: 5, text: "Continue after stop" },
       ],
       session: { streamIndex: 0 },
@@ -86,7 +86,7 @@ test("hydrates queued follow-ups from the v2 collection without accepting malfor
 
   assert.deepEqual(collection.threads[0]?.queuedTurns, [
     { id: "queued-1", state: "queued", submittedAt: 2, text: "Continue" },
-    { delivery: "server", id: "committed-1", intent: "active-turn", mailboxItemId: "mail-1", state: "committed", submittedAt: 4, text: "Durably admitted" },
+    { delivery: "server", expectedTurnId: "turn-1", id: "committed-1", intent: "active-turn", mailboxItemId: "mail-1", state: "committed", submittedAt: 4, text: "Durably admitted" },
     { delivery: "browser", id: "post-cancel-1", intent: "post-cancellation", state: "queued", submittedAt: 5, text: "Continue after stop" },
   ]);
 });

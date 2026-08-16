@@ -50,7 +50,7 @@ import {
 } from "../assistant-ui/tool-group.js";
 import { DiffViewer } from "../assistant-ui/diff-viewer.js";
 import { Button } from "../ui/button.js";
-import { Attachment, AttachmentAction, AttachmentContent, AttachmentDescription, AttachmentMedia, AttachmentTitle } from "../ui/attachment.js";
+import { Attachment, AttachmentAction, AttachmentContent, AttachmentDescription, AttachmentMedia, AttachmentTitle, AttachmentTrigger } from "../ui/attachment.js";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "../ui/collapsible.js";
 import {
   Questionnaire,
@@ -165,6 +165,7 @@ export function AgentMessage({
               task={task}
             >
               <ProcessParts
+                assetUrl={assetUrl}
                 canRespond={canRespond}
                 closedInputRequestIds={closedInputRequestIds}
                 events={events}
@@ -182,6 +183,7 @@ export function AgentMessage({
                     {localize(locale, "A delegated task needs your approval", "子代理任务需要你的批准")}
                   </p>
                   <AgentMessagePart
+                    assetUrl={assetUrl}
                     canRespond={canRespond}
                     closedInputRequestIds={closedInputRequestIds}
                     events={events}
@@ -199,6 +201,7 @@ export function AgentMessage({
             {task.finalPart ? (
               <div className="pt-3">
                 <AgentMessagePart
+                  assetUrl={assetUrl}
                   canRespond={canRespond}
                   events={events}
                   inActiveExecution={false}
@@ -214,6 +217,7 @@ export function AgentMessage({
           </>
         ) : displayMessage.parts.map((part, index) => (
           <AgentMessagePart
+            assetUrl={assetUrl}
             canRespond={canRespond}
             events={events}
             inActiveExecution={false}
@@ -236,6 +240,7 @@ export function AgentMessage({
 }
 
 function AgentMessagePart({
+  assetUrl,
   canRespond,
   closedInputRequestIds = EMPTY_CLOSED_INPUT_REQUEST_IDS,
   events,
@@ -247,6 +252,7 @@ function AgentMessagePart({
   part,
   turnId,
 }: {
+  readonly assetUrl?: (assetId: string) => string;
   readonly canRespond: boolean;
   readonly closedInputRequestIds?: ReadonlySet<string>;
   readonly events: readonly MessageStreamEvent[];
@@ -276,12 +282,13 @@ function AgentMessagePart({
     case "authorization":
       return <AuthorizationPrompt locale={locale} part={part} />;
     case "dynamic-tool": {
-      return <ToolPart canRespond={canRespond} closedInputRequestIds={closedInputRequestIds} events={events} inActiveExecution={inActiveExecution} locale={locale} onCloseInputRequest={onCloseInputRequest} onInputResponses={onInputResponses} onOpenSubagent={onOpenSubagent} part={part} />;
+      return <ToolPart assetUrl={assetUrl} canRespond={canRespond} closedInputRequestIds={closedInputRequestIds} events={events} inActiveExecution={inActiveExecution} locale={locale} onCloseInputRequest={onCloseInputRequest} onInputResponses={onInputResponses} onOpenSubagent={onOpenSubagent} part={part} />;
     }
   }
 }
 
 function ProcessParts({
+  assetUrl,
   canRespond,
   closedInputRequestIds = EMPTY_CLOSED_INPUT_REQUEST_IDS,
   events,
@@ -293,6 +300,7 @@ function ProcessParts({
   parts,
   turnId,
 }: {
+  readonly assetUrl?: (assetId: string) => string;
   readonly canRespond: boolean;
   readonly closedInputRequestIds?: ReadonlySet<string>;
   readonly events: readonly MessageStreamEvent[];
@@ -335,6 +343,7 @@ function ProcessParts({
     if (part.type !== "dynamic-tool") {
       rendered.push(
         <AgentMessagePart
+          assetUrl={assetUrl}
           canRespond={canRespond}
           events={events}
           inActiveExecution={inActiveExecution}
@@ -363,6 +372,7 @@ function ProcessParts({
         <div className="space-y-2" key={`inputs:${toolParts[0]?.toolCallId}`}>
           {toolParts.map((toolPart) => (
             <AgentMessagePart
+              assetUrl={assetUrl}
               canRespond={canRespond}
               events={events}
               inActiveExecution={inActiveExecution}
@@ -386,21 +396,41 @@ function ProcessParts({
       toolPart.state === "approval-requested" ||
       Boolean(toolPart.toolMetadata?.eve?.inputRequest && !toolPart.toolMetadata.eve.inputResponse)
     );
-    rendered.push(<ProcessToolGroup
-      active={active}
-      canRespond={canRespond}
-      closedInputRequestIds={closedInputRequestIds}
-      events={events}
-      inActiveExecution={inActiveExecution}
-      key={`tools:${toolParts[0]?.toolCallId}`}
-      locale={locale}
-      needsInput={needsInput}
-      onCloseInputRequest={onCloseInputRequest}
-      onInputResponses={onInputResponses}
-      onOpenSubagent={onOpenSubagent}
-      toolParts={toolParts}
-      turnId={turnId}
-    />);
+    if (toolParts.length === 1) {
+      rendered.push(
+        <AgentMessagePart
+          assetUrl={assetUrl}
+          canRespond={canRespond}
+          closedInputRequestIds={closedInputRequestIds}
+          events={events}
+          inActiveExecution={inActiveExecution}
+          key={toolParts[0]!.toolCallId}
+          locale={locale}
+          onCloseInputRequest={onCloseInputRequest}
+          onInputResponses={onInputResponses}
+          onOpenSubagent={onOpenSubagent}
+          part={toolParts[0]!}
+          turnId={turnId}
+        />,
+      );
+    } else {
+      rendered.push(<ProcessToolGroup
+        active={active}
+        assetUrl={assetUrl}
+        canRespond={canRespond}
+        closedInputRequestIds={closedInputRequestIds}
+        events={events}
+        inActiveExecution={inActiveExecution}
+        key={`tools:${toolParts[0]?.toolCallId}`}
+        locale={locale}
+        needsInput={needsInput}
+        onCloseInputRequest={onCloseInputRequest}
+        onInputResponses={onInputResponses}
+        onOpenSubagent={onOpenSubagent}
+        toolParts={toolParts}
+        turnId={turnId}
+      />);
+    }
     index = cursor;
   }
 
@@ -409,6 +439,7 @@ function ProcessParts({
 
 function ProcessToolGroup({
   active,
+  assetUrl,
   canRespond,
   closedInputRequestIds,
   events,
@@ -422,6 +453,7 @@ function ProcessToolGroup({
   turnId,
 }: {
   readonly active: boolean;
+  readonly assetUrl?: (assetId: string) => string;
   readonly canRespond: boolean;
   readonly closedInputRequestIds: ReadonlySet<string>;
   readonly events: readonly MessageStreamEvent[];
@@ -454,6 +486,7 @@ function ProcessToolGroup({
       <ToolGroupContent>
         {toolParts.map((toolPart) => (
           <AgentMessagePart
+            assetUrl={assetUrl}
             canRespond={canRespond}
             closedInputRequestIds={closedInputRequestIds}
             events={events}
@@ -473,6 +506,7 @@ function ProcessToolGroup({
 }
 
 function ToolPart({
+  assetUrl,
   canRespond,
   closedInputRequestIds = EMPTY_CLOSED_INPUT_REQUEST_IDS,
   events,
@@ -482,6 +516,7 @@ function ToolPart({
   onOpenSubagent,
   part,
 }: {
+  readonly assetUrl?: (assetId: string) => string;
   readonly canRespond: boolean;
   readonly closedInputRequestIds?: ReadonlySet<string>;
   readonly events: readonly MessageStreamEvent[];
@@ -522,7 +557,7 @@ function ToolPart({
         <ChevronDownIcon className="size-3.5 shrink-0 -rotate-90 transition-transform group-data-[state=open]/trigger:rotate-0" />
       </CollapsibleTrigger>
       <ToolFallbackContent>
-        <KnownToolContent events={events} locale={locale} onOpenSubagent={onOpenSubagent} part={part} />
+        <KnownToolContent assetUrl={assetUrl} events={events} locale={locale} onOpenSubagent={onOpenSubagent} part={part} />
         {part.errorText ? <p className="whitespace-pre-wrap text-xs text-destructive">{part.errorText}</p> : null}
       </ToolFallbackContent>
     </ToolFallbackRoot>
@@ -530,11 +565,13 @@ function ToolPart({
 }
 
 function KnownToolContent({
+  assetUrl,
   events,
   locale,
   onOpenSubagent,
   part,
 }: {
+  readonly assetUrl?: (assetId: string) => string;
   readonly events: readonly MessageStreamEvent[];
   readonly locale: AgentLocale;
   readonly onOpenSubagent?: (sessionId: string) => void;
@@ -586,6 +623,10 @@ function KnownToolContent({
         {result ? <pre className="max-h-72 overflow-auto whitespace-pre px-3 py-2.5 font-mono text-foreground">{result}</pre> : null}
       </div>
     );
+  }
+
+  if (isViewImageTool(normalized)) {
+    return <ViewImageToolContent assetUrl={assetUrl} input={input} locale={locale} output={output} running={!isToolTerminal(part)} />;
   }
 
   if (["todo", "todo_write", "update_plan"].includes(normalized)) {
@@ -645,6 +686,20 @@ function KnownToolContent({
     ) : result ? <p className="whitespace-pre-wrap text-xs text-muted-foreground">{result}</p> : null;
   }
 
+  if (["import_remote_asset", "remote_asset_import"].includes(normalized)) {
+    const record = asRecord(output);
+    const filename = firstString(record, ["filename"]) ?? firstString(input, ["filename"]) ?? localize(locale, "Remote asset", "远程资产");
+    const mediaType = firstString(record, ["mediaType", "contentType"]);
+    const bytes = firstNumber(record, ["bytes", "sizeBytes"]);
+    return (
+      <div className="flex items-center gap-2 text-sm" data-tool-view="asset-import">
+        <AttachmentMedia variant="icon"><FileIcon className="size-4" /></AttachmentMedia>
+        <span className="min-w-0 truncate">{filename}</span>
+        <span className="shrink-0 text-xs text-muted-foreground">{[mediaType, bytes !== undefined ? formatBytes(bytes) : undefined].filter(Boolean).join(" · ")}</span>
+      </div>
+    );
+  }
+
   if (["publish_artifact", "artifact_publish"].includes(normalized)) {
     const record = asRecord(output);
     const url = firstUrl(output);
@@ -689,8 +744,106 @@ function KnownToolContent({
   );
 }
 
+const VIEW_IMAGE_MEDIA_TYPES = new Set([
+  "image/gif",
+  "image/jpeg",
+  "image/png",
+  "image/svg+xml",
+  "image/webp",
+]);
+function ViewImageToolContent({
+  assetUrl,
+  input,
+  locale,
+  output,
+  running,
+}: {
+  readonly assetUrl?: (assetId: string) => string;
+  readonly input: Record<string, unknown> | undefined;
+  readonly locale: AgentLocale;
+  readonly output: unknown;
+  readonly running: boolean;
+}) {
+  const record = asRecord(output);
+  const path = firstString(record, ["path"]) ?? firstString(input, ["path"])
+    ?? localize(locale, "Workspace image", "工作区图片");
+  const mediaType = firstString(record, ["mediaType"]);
+  const bytes = nonnegativeInteger(record?.bytes);
+  const originalBytes = positiveInteger(record?.originalBytes);
+  const dimensions = imageDimensions(record?.dimensions);
+  const resized = record?.resized === true;
+  const assetId = firstString(record, ["assetId"]);
+  const previewUrl = assetId
+    ? assetUrl?.(assetId) ?? `/api/assets/${encodeURIComponent(assetId)}`
+    : undefined;
+  const details = [
+    mediaType && VIEW_IMAGE_MEDIA_TYPES.has(mediaType) ? mediaType : undefined,
+    dimensions ? `${dimensions.width}\u00d7${dimensions.height}` : undefined,
+    formatBytes(bytes),
+    resized
+      ? originalBytes !== undefined
+        ? localize(locale, `resized from ${formatBytes(originalBytes)}`, `已从 ${formatBytes(originalBytes)} 缩放`)
+        : localize(locale, "resized preview", "已缩放预览图")
+      : undefined,
+  ].filter((value): value is string => Boolean(value));
+  const [previewOpen, setPreviewOpen] = useState(false);
+
+  return (
+    <div data-tool-view="view-image">
+      <Attachment className="max-w-[min(100%,28rem)]" size="default" state={running ? "processing" : "done"}>
+        <AttachmentMedia className="size-12" variant={previewUrl ? "image" : "icon"}>
+          {previewUrl ? <img alt={path} src={previewUrl} /> : <ImageIcon className="size-5" />}
+        </AttachmentMedia>
+        <AttachmentContent>
+          <AttachmentTitle title={path}>{path}</AttachmentTitle>
+          <AttachmentDescription>
+            {details.length > 0
+              ? details.join(" \u00b7 ")
+              : running
+                ? localize(locale, "Preparing image preview...", "正在准备图片预览…")
+                : localize(locale, "Image metadata unavailable", "图片元数据不可用")}
+          </AttachmentDescription>
+        </AttachmentContent>
+        {previewUrl ? (
+          <AttachmentTrigger
+            aria-label={localize(locale, `Preview ${path}`, `预览 ${path}`)}
+            onClick={() => setPreviewOpen(true)}
+            title={localize(locale, "Preview image", "预览图片")}
+          />
+        ) : null}
+      </Attachment>
+      {previewOpen && previewUrl ? (
+        <button
+          aria-label={localize(locale, "Close image preview", "关闭图片预览")}
+          className="fixed inset-0 z-50 flex cursor-zoom-out items-center justify-center bg-black/70 p-6"
+          onClick={() => setPreviewOpen(false)}
+          type="button"
+        >
+          <img alt={path} className="max-h-[90vh] max-w-[90vw] rounded-xl object-contain shadow-2xl" src={previewUrl} />
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+function imageDimensions(value: unknown): { readonly height: number; readonly width: number } | undefined {
+  const record = asRecord(value);
+  const height = positiveInteger(record?.height);
+  const width = positiveInteger(record?.width);
+  return height !== undefined && width !== undefined ? { height, width } : undefined;
+}
+
+function nonnegativeInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function positiveInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
 function toolIcon(part: EveDynamicToolPart): React.ComponentType<{ className?: string }> {
   const normalized = normalizeToolName(part.toolName);
+  if (isViewImageTool(normalized)) return ImageIcon;
   if (["bash", "shell", "terminal", "exec_command"].includes(normalized)) return TerminalIcon;
   if (["read_file", "read", "view_file", "glob", "find_files"].includes(normalized)) return FileSearchIcon;
   if (["grep", "search_files", "web_search", "search_web", "search"].includes(normalized)) return SearchIcon;
@@ -708,6 +861,10 @@ function isToolTerminal(part: EveDynamicToolPart): boolean {
 
 function normalizeToolName(toolName: string): string {
   return toolName.toLocaleLowerCase().replaceAll("-", "_");
+}
+
+function isViewImageTool(normalizedToolName: string): boolean {
+  return normalizedToolName === "view_image" || normalizedToolName.endsWith("__view_image");
 }
 
 function isFileMutationTool(part: EveDynamicToolPart): boolean {
@@ -979,6 +1136,18 @@ function firstString(
   for (const key of keys) {
     const value = record[key];
     if (typeof value === "string" && value.length > 0) return value;
+  }
+  return undefined;
+}
+
+function firstNumber(
+  record: Record<string, unknown> | undefined,
+  keys: readonly string[],
+): number | undefined {
+  if (!record) return undefined;
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "number" && Number.isFinite(value)) return value;
   }
   return undefined;
 }
@@ -1822,11 +1991,19 @@ function toolTitle(
     return [localize(locale, "Terminal command", "终端命令"), command].filter(Boolean).join(" ");
   }
   if (["publish_preview", "website_preview"].includes(normalized)) return localize(locale, "Published preview", "发布网站预览");
+  if (["import_remote_asset", "remote_asset_import"].includes(normalized)) {
+    const filename = firstString(asRecord(part.input), ["filename", "url"]);
+    return [localize(locale, "Imported remote asset", "导入远程资产"), filename].filter(Boolean).join(" ");
+  }
   if (["publish_artifact", "artifact_publish"].includes(normalized)) return localize(locale, "Published artifact", "发布产物");
   if (["record_checkpoint", "checkpoint"].includes(normalized)) return localize(locale, "Saved checkpoint", "保存检查点");
   if (["read_file", "read", "view_file"].includes(normalized)) {
     const path = firstString(asRecord(part.input), ["path", "file", "filename"]);
     return [localize(locale, "Read file", "读取文件"), path].filter(Boolean).join(" ");
+  }
+  if (isViewImageTool(normalized)) {
+    const path = firstString(asRecord(part.input), ["path"]);
+    return [localize(locale, "Viewed image", "查看图片"), path].filter(Boolean).join(" ");
   }
   if (["glob", "find_files"].includes(normalized)) {
     const query = firstString(asRecord(part.input), ["query", "pattern", "glob", "path"]);

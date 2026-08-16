@@ -4,7 +4,7 @@ import {
   retryAgentMailboxItemHttp,
 } from "@/server/agent-mailbox/item-http";
 import { createPostgresAgentMailboxStoreFromEnvironment } from "@/server/data/agent-mailbox-store";
-import { authenticateHostRequest } from "@/server/http/host-request-auth";
+import { authenticateHostRequest, HOST_AGENT_SCOPE, requireHostScope } from "@/server/http/host-request-auth";
 
 export const runtime = "nodejs";
 
@@ -28,7 +28,13 @@ async function handle(
   context: RouteContext,
   operation: typeof inspectAgentMailboxItemHttp,
 ): Promise<Response> {
-  const authenticated = await authenticateHostRequest(request);
+  const requiredScope = request.method === "GET"
+    ? HOST_AGENT_SCOPE.mailboxRead
+    : HOST_AGENT_SCOPE.mailboxWrite;
+  const authenticated = requireHostScope(
+    await authenticateHostRequest(request),
+    requiredScope,
+  );
   if (!authenticated.ok) return authenticated.response;
   if (!store) {
     return Response.json(

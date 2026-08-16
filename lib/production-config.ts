@@ -7,6 +7,44 @@ export type ProductionDiagnostic = {
 export type AgentSandboxBackendName = "auto" | "docker" | "microsandbox" | "vercel";
 export type AgentDeploymentTenancy = "single-tenant" | "multi-tenant";
 
+/**
+ * Logical per-session reservation limit for assets materialized into
+ * `/workspace` by the import_asset tool. The sandbox backend should still
+ * apply a physical disk limit; this guard protects the durable import path
+ * before a host-specific disk quota is available.
+ */
+export const DEFAULT_AGENT_SANDBOX_WORKSPACE_QUOTA_BYTES = 10 * 1024 ** 3;
+export const MAX_AGENT_SANDBOX_WORKSPACE_QUOTA_BYTES = 10 * 1024 ** 4;
+
+export function readAgentSandboxWorkspaceQuota(
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+): number {
+  const value = environment.AGENT_SANDBOX_WORKSPACE_QUOTA_BYTES?.trim();
+  if (!value) return DEFAULT_AGENT_SANDBOX_WORKSPACE_QUOTA_BYTES;
+  const match = /^(\d+)(?:\s*(KiB|MiB|GiB|TiB))?$/iu.exec(value);
+  if (!match) {
+    throw new Error(
+      "AGENT_SANDBOX_WORKSPACE_QUOTA_BYTES must be a positive byte count with an optional KiB, MiB, GiB, or TiB suffix.",
+    );
+  }
+  const multiplier = match[2]?.toLowerCase() === "kib"
+    ? 1024
+    : match[2]?.toLowerCase() === "mib"
+      ? 1024 ** 2
+      : match[2]?.toLowerCase() === "gib"
+        ? 1024 ** 3
+        : match[2]?.toLowerCase() === "tib"
+          ? 1024 ** 4
+          : 1;
+  const bytes = Number(match[1]) * multiplier;
+  if (!Number.isSafeInteger(bytes) || bytes <= 0 || bytes > MAX_AGENT_SANDBOX_WORKSPACE_QUOTA_BYTES) {
+    throw new Error(
+      `AGENT_SANDBOX_WORKSPACE_QUOTA_BYTES must be between 1 byte and ${MAX_AGENT_SANDBOX_WORKSPACE_QUOTA_BYTES} bytes.`,
+    );
+  }
+  return bytes;
+}
+
 const SANDBOX_BACKENDS = new Set<AgentSandboxBackendName>([
   "auto",
   "docker",
@@ -268,6 +306,11 @@ export function inspectProductionConfiguration(
   try {
     const backend = readAgentSandboxBackend({ ...environment, NODE_ENV: "production" });
     const image = readAgentSandboxImage(environment);
+    try {
+      readAgentSandboxWorkspaceQuota(environment);
+    } catch (cause) {
+      error("sandbox-workspace-quota", cause instanceof Error ? cause.message : "Invalid sandbox workspace quota.");
+    }
     if (image && !/@sha256:[a-f0-9]{64}$/u.test(image)) {
       error(
         "sandbox-image",

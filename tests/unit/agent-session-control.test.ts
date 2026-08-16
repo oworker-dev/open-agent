@@ -50,6 +50,48 @@ test("session hydration projects a bounded absolute cursor and latest runtime st
   assert.equal(result?.hasMore, true);
 });
 
+test("session hydration uses the authoritative runtime boundary for an empty middle page", async () => {
+  let inspected = 0;
+  const runtime: AgentSessionRuntime = {
+    async readEvents() { return []; },
+    async inspect(input) {
+      inspected += 1;
+      assert.deepEqual(input, { owner, sessionId: "session-1" });
+      return { state: "running", turnId: "turn-authoritative" };
+    },
+    async cancel() { return "no_active_turn"; },
+  };
+  const result = await readAgentSession({
+    accessToken: "token",
+    after: 99,
+    identity: owner,
+    limit: 2,
+    ownershipStore: ownershipStore("owned"),
+    runtime,
+    sessionId: "session-1",
+  });
+  assert.equal(inspected, 1);
+  assert.equal(result?.session.status, "running");
+  assert.equal(result?.session.activeTurnId, "turn-authoritative");
+});
+
+test("session hydration keeps the durable page when authority is temporarily unavailable", async () => {
+  const runtime: AgentSessionRuntime = {
+    async readEvents() { return [event("message.appended", { text: "still here" })]; },
+    async inspect() { throw new Error("runtime restarting"); },
+    async cancel() { return "no_active_turn"; },
+  };
+  const result = await readAgentSession({
+    accessToken: "token",
+    identity: owner,
+    ownershipStore: ownershipStore("owned"),
+    runtime,
+    sessionId: "session-1",
+  });
+  assert.equal(result?.events.length, 1);
+  assert.equal(result?.session.status, "running");
+});
+
 test("session cancellation is ownership checked and delegated to the runtime", async () => {
   let calls = 0;
   const result = await cancelAgentSession({

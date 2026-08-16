@@ -63,6 +63,38 @@ test("Eve mailbox runtime retains the active turn identity", async () => {
   });
 });
 
+test("Eve mailbox runtime sends signed cancellation and terminal reset controls", async () => {
+  const requests: unknown[] = [];
+  const runtime = createEveAgentMailboxRuntime(environment, async (_input, init) => {
+    const body = JSON.parse(String(init?.body));
+    requests.push(body);
+    return body.action === "cancel"
+      ? Response.json({ ok: true, sessionId: "session-1", status: "accepted" }, { status: 202 })
+      : Response.json({ ok: true, previousSessionId: "session-1", status: "reset" });
+  });
+
+  assert.equal(await runtime.cancel!({ owner: owner(), sessionId: "session-1", turnId: "turn-1" }), "accepted");
+  assert.equal(await runtime.reset!({ owner: owner(), reason: "closed", sessionId: "session-1" }), "reset");
+  assert.deepEqual(requests, [
+    { action: "cancel", sessionId: "session-1", turnId: "turn-1" },
+    { action: "reset", reason: "closed", sessionId: "session-1" },
+  ]);
+});
+
+test("Eve mailbox runtime rejects malformed lifecycle responses", async () => {
+  const runtime = createEveAgentMailboxRuntime(environment, async () =>
+    Response.json({ ok: true, status: "maybe" }),
+  );
+  await assert.rejects(
+    runtime.cancel!({ owner: owner(), sessionId: "session-1" }),
+    /cancellation failed/i,
+  );
+  await assert.rejects(
+    runtime.reset!({ owner: owner(), sessionId: "session-1" }),
+    /reset failed/i,
+  );
+});
+
 test("Eve mailbox runtime preserves a failed terminal boundary", async () => {
   const runtime = createEveAgentMailboxRuntime(environment, async () =>
     Response.json({ ok: true, state: "terminal", terminalStatus: "failed" }),

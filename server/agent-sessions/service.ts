@@ -7,20 +7,35 @@ import {
   type AgentSessionSnapshot,
 } from "@oworker/open-agent-contracts/agent-session";
 import type { EveResetStatus } from "../agent-runs/eve-adapter.ts";
-import {
-  cancelEveAgentRun,
-  readEveAgentEvents,
-  resetEveSession,
-} from "../agent-runs/eve-adapter.ts";
+import { readEveAgentEvents } from "../agent-runs/eve-adapter.ts";
 import type { AgentSessionOwner, AgentSessionOwnershipStore } from "../data/session-ownership-store.ts";
 import type { SandboxDeletionRecord, SandboxDeletionStore } from "../data/sandbox-deletion-store.ts";
+import { createEveAgentMailboxRuntime } from "../agent-mailbox/eve-runtime.ts";
 
 export type AgentSessionDeletionRuntime = {
-  readonly reset: typeof resetEveSession;
+  readonly reset: (
+    sessionId: string,
+    accessToken: string,
+    correlationId: string,
+  ) => Promise<EveResetStatus>;
 };
 
 export const eveAgentSessionDeletionRuntime: AgentSessionDeletionRuntime = {
-  reset: resetEveSession,
+  async reset(sessionId, _accessToken, correlationId) {
+    const runtime = createEveAgentMailboxRuntime();
+    if (!runtime.reset) throw new Error("The Agent runtime does not expose session retirement.");
+    return await runtime.reset({
+      owner: INTERNAL_CONTROL_OWNER,
+      reason: correlationId,
+      sessionId,
+    });
+  },
+};
+
+const INTERNAL_CONTROL_OWNER: AgentSessionOwner = {
+  principalId: "open-agent-control-plane",
+  principalType: "service",
+  tenantId: "open-agent-runtime",
 };
 
 export type AgentSessionRuntime = {
@@ -34,6 +49,15 @@ export type AgentSessionRuntime = {
     readonly accessToken: string;
     readonly sessionId: string;
   }) => Promise<"accepted" | "no_active_turn">;
+  /** Read the current Eve lifecycle boundary when a bounded event page has no terminal marker. */
+  readonly inspect?: (input: {
+    readonly owner: AgentSessionOwner;
+    readonly sessionId: string;
+  }) => Promise<{
+    readonly state: "running" | "waiting" | "terminal";
+    readonly turnId?: string;
+    readonly terminalStatus?: "completed" | "failed";
+  }>;
 };
 
 export const eveAgentSessionRuntime: AgentSessionRuntime = {
@@ -51,12 +75,15 @@ export const eveAgentSessionRuntime: AgentSessionRuntime = {
     );
   },
   async cancel(input) {
-    return await cancelEveAgentRun(
-      sessionRuntimeRunId(input.sessionId),
-      `session-${input.sessionId}`,
-      input.sessionId,
-      input.accessToken,
-    );
+    const runtime = createEveAgentMailboxRuntime();
+    if (!runtime.cancel) throw new Error("The Agent runtime does not expose session cancellation.");
+    return await runtime.cancel({
+      owner: INTERNAL_CONTROL_OWNER,
+      sessionId: input.sessionId,
+    });
+  },
+  async inspect(input) {
+    return await createEveAgentMailboxRuntime().inspect(input);
   },
 };
 
@@ -86,13 +113,67 @@ export async function readAgentSession(options: {
     sessionId: options.sessionId,
   });
   const projected = events.map((event, index) => projectSessionEvent(event, after + index + 1));
-  const session = projectSessionSnapshot(options.sessionId, after + events.length, events);
+  let session = projectSessionSnapshot(options.sessionId, after + events.length, events);
+  const runtime = options.runtime ?? eveAgentSessionRuntime;
+  // A page read from the middle of a long stream can contain only tool and
+  // message events. The browser must not infer "unknown" or keep showing a
+  // stale running child in that case. Eve's mailbox boundary is the source of
+  // truth for the current turn and is intentionally best-effort here so a
+  // transient runtime outage does not hide the durable event history.
+  if (runtime.inspect && !hasLifecycleBoundary(events)) {
+    try {
+      session = applyRuntimeBoundary(session, await runtime.inspect({
+        owner: options.identity,
+        sessionId: options.sessionId,
+      }));
+    } catch {
+      // Keep the event projection when the runtime is temporarily unavailable.
+    }
+  }
   return {
     events: projected,
     hasMore: events.length >= limit,
     nextCursor: after + events.length,
     owner: options.identity,
     session,
+  };
+}
+
+function hasLifecycleBoundary(events: readonly MessageStreamEvent[]): boolean {
+  return events.some((event) => [
+    "turn.started",
+    "turn.completed",
+    "turn.cancelled",
+    "turn.failed",
+    "session.waiting",
+    "session.completed",
+    "session.failed",
+  ].includes(event.type));
+}
+
+function applyRuntimeBoundary(
+  session: AgentSessionSnapshot,
+  boundary: {
+    readonly state: "running" | "waiting" | "terminal";
+    readonly turnId?: string;
+    readonly terminalStatus?: "completed" | "failed";
+  },
+): AgentSessionSnapshot {
+  if (boundary.state === "running") {
+    return {
+      ...session,
+      activeTurnId: boundary.turnId,
+      status: "running",
+    };
+  }
+  if (boundary.state === "waiting") {
+    const { activeTurnId: _activeTurnId, ...withoutTurn } = session;
+    return { ...withoutTurn, status: "waiting" };
+  }
+  const { activeTurnId: _activeTurnId, ...withoutTurn } = session;
+  return {
+    ...withoutTurn,
+    status: boundary.terminalStatus === "failed" ? "failed" : "completed",
   };
 }
 

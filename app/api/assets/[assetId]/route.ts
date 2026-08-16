@@ -1,11 +1,12 @@
 import { AssetStoreError, createAssetStoreFromEnvironment } from "@/server/data/asset-store";
-import { authResponseHeaders, authenticateAssetRequest } from "@/server/http/asset-request-auth";
+import { authResponseHeaders, authenticateAssetRequest, requireAssetScope } from "@/server/http/asset-request-auth";
+import { assetContentDisposition, safeAssetContentType } from "@/server/http/asset-content";
 
 export const runtime = "nodejs";
 type RouteContext = { readonly params: Promise<{ readonly assetId: string }> };
 
 export async function GET(request: Request, context: RouteContext): Promise<Response> {
-  const authenticated = await authenticateAssetRequest(request);
+  const authenticated = requireAssetScope(await authenticateAssetRequest(request), "asset:read");
   if (!authenticated.ok) return authenticated.response;
   const { assetId } = await context.params;
   const rangeHeader = request.headers.get("range");
@@ -20,9 +21,9 @@ export async function GET(request: Request, context: RouteContext): Promise<Resp
     const status = range ? 206 : 200;
     const headers = new Headers({
       "cache-control": "private, max-age=60",
-      "content-disposition": `inline; filename="${safeHeaderFilename(download.filename)}"`,
+      "content-disposition": assetContentDisposition(download.contentType, download.filename),
       "content-length": String(download.contentLength),
-      "content-type": download.contentType,
+      "content-type": safeAssetContentType(download.contentType),
       "cross-origin-resource-policy": "same-site",
       "x-content-type-options": "nosniff",
     });
@@ -38,7 +39,7 @@ export async function GET(request: Request, context: RouteContext): Promise<Resp
 
 /** Delete one test/user asset after an explicit owner check. */
 export async function DELETE(request: Request, context: RouteContext): Promise<Response> {
-  const authenticated = await authenticateAssetRequest(request);
+  const authenticated = requireAssetScope(await authenticateAssetRequest(request), "asset:write");
   if (!authenticated.ok) return authenticated.response;
   const { assetId } = await context.params;
   try {
@@ -66,8 +67,4 @@ function parseRange(value: string | null): { end?: number; start: number } | nul
 
 function response(status: number, message: string): Response {
   return new Response(message, { headers: { "cache-control": "no-store", "content-type": "text/plain; charset=utf-8" }, status });
-}
-
-function safeHeaderFilename(value: string): string {
-  return value.replace(/["\\\r\n]/gu, "_");
 }

@@ -26,6 +26,7 @@ export type AgentInterruptedTurn = {
 };
 export type AgentQueuedTurn = {
     readonly delivery?: "browser" | "server";
+    readonly expectedTurnId?: string;
     readonly id: string;
     readonly intent?: "active-turn" | "post-cancellation";
     readonly mailboxItemId?: string;
@@ -45,7 +46,10 @@ export interface AgentWorkspaceMailbox {
     enqueue(input: {
         readonly clientMessageId: string;
         readonly clientContext?: readonly string[];
+        readonly expectedTurnId?: string;
         readonly message: string;
+        readonly operationId: string;
+        readonly operationKind: "send" | "steer";
         readonly preferences: AgentThreadPreferences;
         readonly sessionId: string;
     }): Promise<AgentMailboxReceipt>;
@@ -86,6 +90,15 @@ export type AgentExtensionInfo = {
     readonly status: "available" | "disabled" | "unconfigured";
     readonly version?: string;
 };
+export type AgentSubagentSummary = {
+    readonly callId?: string;
+    readonly childSessionId: string;
+    readonly name?: string;
+    readonly nickname?: string;
+    readonly status: "starting" | "running" | "waiting" | "completed" | "failed" | "cancelled" | "interrupted" | "closed";
+    readonly task?: string;
+};
+export type AgentSubagentLoader = (parentSessionId: string) => Promise<readonly AgentSubagentSummary[]>;
 export type AgentRuntimeStatus = {
     readonly provider: "mock" | "ready" | "unconfigured";
 };
@@ -117,12 +130,32 @@ export type AgentWorkspaceHostSlots = {
     readonly threadHeaderEnd?: ReactNode;
 };
 export type AgentWorkspaceClientConfig = {
+    readonly assetUpload?: AgentAssetUploadAdapter;
     readonly assetUrl?: (assetId: string) => string;
     readonly auth?: ClientAuth;
     readonly headers?: HeadersValue;
     readonly host?: string;
     readonly prepareSend?: PrepareSend;
     readonly redirect?: ClientRedirectPolicy;
+};
+export type AgentAssetUpload = {
+    readonly assetId: string;
+    readonly filename: string;
+    readonly mediaType: string;
+    readonly sizeBytes: number;
+};
+export type AgentAssetUploadAdapter = {
+    upload(input: {
+        readonly attachmentId: string;
+        readonly file: File;
+        readonly onProgress: (progress: {
+            readonly totalBytes: number;
+            readonly uploadedBytes: number;
+        }) => void;
+        readonly sessionId?: string;
+        readonly signal: AbortSignal;
+    }): Promise<AgentAssetUpload>;
+    remove?(asset: AgentAssetUpload): Promise<void>;
 };
 export type AgentSessionAsset = {
     readonly assetId: string;
@@ -159,5 +192,6 @@ export type AgentWorkspaceConfig = {
     readonly runtimeStatus?: AgentRuntimeStatus;
     readonly storageKey?: string;
     readonly threadStorage?: AgentThreadStorage;
+    readonly loadSubagents?: AgentSubagentLoader;
 };
 //# sourceMappingURL=contracts.d.ts.map

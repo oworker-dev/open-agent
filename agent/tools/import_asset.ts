@@ -2,6 +2,7 @@ import { defineTool } from "eve/tools";
 import { z } from "zod";
 import { publicationOwnerFromAuth } from "../lib/session-ownership-auth.ts";
 import { AssetStoreError, createAssetStoreFromEnvironment } from "../../server/data/asset-store.ts";
+import { writeSandboxImport } from "../lib/import-asset-quota.ts";
 
 const outputSchema = z.object({
   assetId: z.string(),
@@ -46,11 +47,16 @@ export default defineTool({
         throw new Error("The requested asset is not available until its content scan completes.");
       }
     }
-    const download = await store.openReadStream(input.assetId, owner);
+    const download = await store.openReadStream(asset.assetId, owner);
     if (!download) throw new Error("The requested asset could not be read.");
     const destination = normalizeWorkspacePath(input.destination, asset.filename);
     const sandbox = await ctx.getSandbox();
-    await sandbox.writeFile({ content: download.stream, path: destination });
+    await writeSandboxImport(sandbox, {
+      assetId: asset.assetId,
+      bytes: asset.sizeBytes,
+      content: download.stream,
+      destination,
+    });
     // Imported bytes are a source snapshot. Keep the source immutable inside
     // the workspace while allowing the Agent to copy it elsewhere for edits.
     try {

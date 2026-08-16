@@ -1,3 +1,37 @@
+export function mergeSubagentSessions(events, durable = []) {
+    const projected = presentSubagentSessions(events);
+    const bySession = new Map(durable.map((child) => [child.childSessionId, child]));
+    const merged = projected.map((session) => {
+        const durableSession = session.childSessionId ? bySession.get(session.childSessionId) : undefined;
+        if (!durableSession)
+            return session;
+        return {
+            ...session,
+            ...(durableSession.callId ? { callId: durableSession.callId } : {}),
+            ...(durableSession.name || durableSession.nickname ? { name: durableSession.nickname ?? durableSession.name } : {}),
+            ...(durableSession.task ? { task: durableSession.task } : {}),
+            status: durableStatus(durableSession.status),
+        };
+    });
+    const known = new Set(projected.map((session) => session.childSessionId).filter(Boolean));
+    for (const child of durable) {
+        if (known.has(child.childSessionId))
+            continue;
+        merged.push({
+            callId: child.callId ?? child.childSessionId,
+            childSessionId: child.childSessionId,
+            ...(child.name || child.nickname ? { name: child.nickname ?? child.name } : {}),
+            ...(child.task ? { task: child.task } : {}),
+            status: durableStatus(child.status),
+        });
+    }
+    return merged;
+}
+function durableStatus(status) {
+    if (status === "interrupted" || status === "closed")
+        return "cancelled";
+    return status;
+}
 const MAX_DURABLE_STEP_RETRIES = 3;
 export function shouldSuppressInterruptedTurnDisplayEvent(event, eventIndex, turns) {
     return shouldSuppressInterruptedTurnEvent(event, turns, (turn) => eventIndex >= turn.eventCount);

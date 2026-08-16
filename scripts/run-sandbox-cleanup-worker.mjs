@@ -1,8 +1,9 @@
 import { execFileSync } from "node:child_process";
 import { createHmac, randomUUID } from "node:crypto";
 import { resetEveSession } from "../server/agent-runs/eve-adapter.ts";
-import { closeAgentDatabasePools, getAgentDatabasePool, quoteIdentifier, readAgentDatabaseConfig } from "../server/data/agent-database.ts";
+import { closeAgentDatabasePools, getAgentDatabasePool, readAgentDatabaseConfig } from "../server/data/agent-database.ts";
 import { createPostgresSandboxDeletionStoreFromEnvironment } from "../server/data/sandbox-deletion-store.ts";
+import { buildTerminalSandboxSessionQuery } from "../lib/sandbox-cleanup-query.ts";
 
 const config = readConfig(process.env);
 const database = getAgentDatabasePool(config.database);
@@ -101,39 +102,10 @@ async function cleanupPass({ config, database, deletionStore }) {
 }
 
 async function findTerminalSessions(pool, config) {
-  const schema = quoteIdentifier(config.database.schema);
-  const result = await pool.query(`
-    select distinct on (r.eve_session_id)
-      r.eve_session_id as "sessionId",
-      o.tenant_id as "tenantId",
-      o.principal_id as "principalId",
-      o.principal_type as "principalType",
-      o.issuer,
-      r.updated_at as "updatedAt"
-    from ${schema}."agent_runs" r
-    join ${schema}."agent_session_owners" o on o.session_id = r.eve_session_id
-    where r.eve_session_id is not null
-      and r.status in ('completed', 'failed', 'cancelled', 'submission-ambiguous')
-      and r.updated_at < now() - ($1::bigint * interval '1 millisecond')
-      and not exists (
-        select 1 from ${schema}."agent_runs" active
-        where active.eve_session_id = r.eve_session_id
-          and active.status in ('submitting', 'running', 'waiting-input', 'waiting-authorization')
-      )
-      and not exists (
-        select 1 from ${schema}."agent_mailbox_items" mailbox
-        where mailbox.session_id = r.eve_session_id
-          and mailbox.status in ('queued', 'delivering', 'accepted')
-      )
-      and not exists (
-        select 1 from ${schema}."agent_subagent_sessions" child
-        where child.child_session_id = r.eve_session_id
-          and child.status in ('starting', 'running', 'waiting')
-      )
-      and o.issuer = $3
-    order by r.eve_session_id, r.updated_at desc
-    limit $2
-  `, [config.retentionHours * 60 * 60 * 1_000, config.maxSessions, config.hostIssuer]);
+  const result = await pool.query(
+    buildTerminalSandboxSessionQuery(config.database.schema),
+    [config.retentionHours * 60 * 60 * 1_000, config.maxSessions, config.hostIssuer],
+  );
 
   return result.rows.map((row) => ({
     owner: {

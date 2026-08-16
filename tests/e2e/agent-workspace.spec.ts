@@ -510,10 +510,11 @@ test("tool work collapses into one timed execution cycle and keeps the final del
 
   await execution.click();
   await expect(page.getByText("Inspecting the workspace.", { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: /(?:Ran|Running) 1 tool/u }).click();
   await expect(page.getByRole("button", { name: /Terminal command/u })).toBeVisible();
+  await page.getByRole("button", { name: /Terminal command/u }).click();
   await expect(page.getByText(/exitCode/u)).toHaveCount(0);
-  await expect(page.locator('[data-slot="tool-group-root"][data-variant="ghost"]')).toBeVisible();
+  await expect(page.locator('[data-slot="tool-group-root"][data-variant="ghost"]')).toHaveCount(0);
+  await expect(page.locator('[data-slot="tool-fallback-root"]')).toBeVisible();
 });
 
 test("ask_question renders a localized question card instead of raw tool JSON", async ({ page }) => {
@@ -850,12 +851,74 @@ test("file patch tools render with the assistant-ui diff viewer", async ({ page 
   await composer.fill("Update the application");
   await composer.press("Enter");
   await page.getByRole("button", { name: /Worked for/u }).click();
-  await page.getByRole("button", { name: /(?:Ran|Running) 1 tool/u }).click();
   await page.getByRole("button", { name: /Edited src\/app\.ts \+1 -1/u }).click();
 
   const diffViewer = page.locator('[data-tool-view="diff"] [data-slot="diff-viewer"]');
   await expect(diffViewer).toBeVisible();
   await expect(diffViewer).toContainText("export const ready = true;");
+});
+
+test("view_image renders a native preview card without exposing base64 as text", async ({ page }) => {
+  const sessionId = "mock-view-image-session";
+  const assetId = "asset-view-image-preview";
+  const dataBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+  const bytes = Buffer.from(dataBase64, "base64").byteLength;
+  await page.route(`**/api/assets/${assetId}`, async (route) => {
+    await route.fulfill({
+      body: Buffer.from(dataBase64, "base64"),
+      contentType: "image/png",
+      status: 200,
+    });
+  });
+  await page.route("**/eve/v1/session", async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({ sessionId }),
+      contentType: "application/json",
+      headers: { "x-eve-session-id": sessionId },
+      status: 200,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
+    await route.fulfill({
+      body: mockToolTurn("Inspect the image", "The image is visible.", {
+        input: { path: "/workspace/reference.png" },
+        output: {
+          assetId,
+          assetRef: "workspace:/workspace/reference.png",
+          bytes,
+          dimensions: { height: 1, width: 1 },
+          mediaType: "image/png",
+          originalBytes: 2_048,
+          path: "/workspace/reference.png",
+          resized: true,
+        },
+        toolName: "view_image",
+      }),
+      contentType: "application/x-ndjson",
+      status: 200,
+    });
+  });
+
+  await page.goto("/");
+  const composer = page.getByRole("textbox", { name: "Do anything" });
+  await composer.fill("Inspect the image");
+  await composer.press("Enter");
+  await page.getByRole("button", { name: /Worked for/u }).click();
+  await page.getByRole("button", { name: /Viewed image \/workspace\/reference\.png/u }).click();
+
+  const view = page.locator('[data-tool-view="view-image"]');
+  await expect(view).toBeVisible();
+  await expect(view.locator('[data-slot="attachment"]')).toBeVisible();
+  await expect(view).toContainText("/workspace/reference.png");
+  await expect(view).toContainText("image/png");
+  await expect(view).toContainText("1\u00d71");
+  await expect(view).toContainText("resized from 2.0 KB");
+  await expect(view.locator("img").first()).toHaveAttribute("src", `/api/assets/${assetId}`);
+  await expect(page.locator('[data-tool-view="fallback"]')).toHaveCount(0);
+  expect(await page.locator("body").evaluate((body, marker) => (body.textContent ?? "").includes(marker), dataBase64)).toBe(false);
+
+  await view.getByRole("button", { name: "Preview /workspace/reference.png" }).click();
+  await expect(page.getByRole("button", { name: "Close image preview" })).toBeVisible();
 });
 
 test("secondary view lists session assets and previews markdown, images, and downloads", async ({ page }) => {
@@ -1101,6 +1164,26 @@ test("a queued follow-up does not replace a healthy stream during prolonged Prov
       const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
       const body = new ReadableStream({
         start(controller) {
+          const at = new Date().toISOString();
+          controller.enqueue(new TextEncoder().encode(`${[
+            {
+              data: {
+                runtime: {
+                  agentId: "open-agent",
+                  agentName: "open-agent",
+                  eveVersion: "test",
+                  modelId: "mock/model",
+                },
+              },
+              meta: { at, id: "evt-slow-session" },
+              type: "session.started",
+            },
+            {
+              data: { sequence: 0, turnId: "turn-slow-provider" },
+              meta: { at, id: "evt-slow-turn" },
+              type: "turn.started",
+            },
+          ].map((event) => JSON.stringify(event)).join("\n")}\n`));
           signal?.addEventListener(
             "abort",
             () => controller.error(new DOMException("Aborted", "AbortError")),
@@ -1275,9 +1358,12 @@ test("a follow-up is admitted into the active turn at the next model boundary", 
   expect(continuationRequests).toBe(0);
   expect(mailboxRequests).toBe(1);
   expect(mailboxBody).toMatchObject({
+    expectedTurnId: "turn_tool",
     message: "Add the requested footer",
+    operationKind: "steer",
     sessionId,
   });
+  expect(mailboxBody?.operationId).toBe(mailboxBody?.clientMessageId);
 });
 
 test("cancelling a queued follow-up prevents browser delivery before admission", async ({ page }) => {
@@ -1994,7 +2080,6 @@ test("a proxied child approval stays attached to the parent task and resumes it"
   await expect(page.getByText("The delegated task resumed and completed.", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: /Worked for/u })).toHaveCount(1);
   await page.getByRole("button", { name: /Worked for/ }).click();
-  await page.getByRole("button", { name: /(?:Ran|Running) 1 tool/u }).click();
   await page.getByRole("button", { name: /Sub-agent/u }).click();
   await expect(page.getByText("Sub-agent finished and returned its result to the parent Agent", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Open sub-agents" }).click();

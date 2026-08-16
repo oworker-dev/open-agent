@@ -1,17 +1,24 @@
 import { defineTool, toolOutput, toolOutputPart } from "eve/tools";
 import type { SandboxSession } from "eve/sandbox";
+import type { SessionAuthContext } from "eve/context";
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
+import { publicationOwnerFromAuth } from "../lib/session-ownership-auth.ts";
+import { createAssetStoreFromEnvironment } from "../../server/data/asset-store.ts";
 
 /** Maximum inline image payload sent through the durable model transcript. */
 export const MAX_VIEW_IMAGE_BYTES = 3 * 1024 * 1024;
+const MAX_PENDING_MODEL_OBSERVATIONS = 16;
+const MAX_PENDING_MODEL_OBSERVATION_BYTES = 32 * 1024 * 1024;
 const MAX_IMAGE_PROBE_BYTES = 64 * 1024;
 const SUPPORTED_MEDIA_TYPES = ["image/jpeg", "image/png", "image/gif", "image/webp", "image/svg+xml"] as const;
 export type ViewImageMediaType = (typeof SUPPORTED_MEDIA_TYPES)[number];
 
 const outputSchema = z.object({
+  assetId: z.string().optional(),
+  assetRef: z.string(),
   bytes: z.number().int().nonnegative(),
-  dataBase64: z.string(),
+  dimensions: z.object({ height: z.number().int().positive(), width: z.number().int().positive() }).optional(),
   mediaType: z.enum(SUPPORTED_MEDIA_TYPES),
   originalBytes: z.number().int().positive(),
   path: z.string(),
@@ -19,6 +26,20 @@ const outputSchema = z.object({
 });
 
 export type ViewImageOutput = z.infer<typeof outputSchema>;
+
+type ModelImageObservation = {
+  readonly bytes: Uint8Array;
+  readonly filename: string;
+  readonly mediaType: ViewImageMediaType;
+};
+
+const pendingModelObservations = new WeakMap<object, ModelImageObservation>();
+let pendingModelObservationBytes = 0;
+let pendingModelObservationCount = 0;
+const observationFinalizer = new FinalizationRegistry<number>((bytes) => {
+  pendingModelObservationBytes = Math.max(0, pendingModelObservationBytes - bytes);
+  pendingModelObservationCount = Math.max(0, pendingModelObservationCount - 1);
+});
 
 export default defineTool({
   description: [
@@ -43,7 +64,9 @@ export default defineTool({
     let bytes = preview.bytes;
     let outputMediaType = mediaType;
     let resized = false;
+    let originalBytes = preview.totalBytes;
     if (preview.oversized) {
+      originalBytes = await readImageFileSize(sandbox, path, ctx.abortSignal) ?? originalBytes;
       const converted = await resizeImageInSandbox(sandbox, path, ctx.abortSignal);
       bytes = converted.bytes;
       outputMediaType = converted.mediaType;
@@ -52,22 +75,107 @@ export default defineTool({
     if (bytes.byteLength === 0 || bytes.byteLength > MAX_VIEW_IMAGE_BYTES) {
       throw new Error(`The image preview exceeds the ${MAX_VIEW_IMAGE_BYTES}-byte inline limit after resizing.`);
     }
-    return {
+    const dimensions = readImageDimensions(bytes, outputMediaType);
+    const output: ViewImageOutput = {
+      assetRef: `workspace:${path}`,
       bytes: bytes.byteLength,
-      dataBase64: Buffer.from(bytes).toString("base64"),
+      ...(dimensions ? { dimensions } : {}),
       mediaType: outputMediaType,
-      originalBytes: preview.totalBytes,
+      originalBytes,
       path,
       resized,
     };
+    rememberModelObservation(output, {
+      bytes,
+      filename: basename(path),
+      mediaType: outputMediaType,
+    });
+    try {
+      const assetId = await persistPreviewAsset({
+        bytes,
+        ctx,
+        filename: basename(path),
+        mediaType: outputMediaType,
+      });
+      if (assetId) output.assetId = assetId;
+      return output;
+    } catch (error) {
+      consumeModelObservation(output);
+      throw error;
+    }
   },
   toModelOutput(output) {
+    const observation = consumeModelObservation(output);
     return toolOutput.content([
-      toolOutputPart.text(`${output.resized ? "Resized image" : "Image"} ${output.path} (${output.bytes} bytes${output.resized ? `, original ${output.originalBytes} bytes` : ""}).`),
-      toolOutputPart.file(output.dataBase64, { mediaType: output.mediaType, filename: basename(output.path) }),
+      toolOutputPart.text(`${output.resized ? "Resized image" : "Image"} ${output.path} (${output.bytes} bytes${output.resized ? `, original ${output.originalBytes} bytes` : ""}${output.dimensions ? `, ${output.dimensions.width}x${output.dimensions.height}` : ""}).`),
+      toolOutputPart.file(Buffer.from(observation.bytes).toString("base64"), {
+        filename: observation.filename,
+        mediaType: observation.mediaType,
+      }),
     ]);
   },
 });
+
+function rememberModelObservation(output: ViewImageOutput, observation: ModelImageObservation): void {
+  if (
+    pendingModelObservationCount >= MAX_PENDING_MODEL_OBSERVATIONS ||
+    pendingModelObservationBytes + observation.bytes.byteLength > MAX_PENDING_MODEL_OBSERVATION_BYTES
+  ) {
+    throw new Error("The image observation buffer is busy. Retry after the active vision calls settle.");
+  }
+  pendingModelObservations.set(output, observation);
+  pendingModelObservationBytes += observation.bytes.byteLength;
+  pendingModelObservationCount += 1;
+  observationFinalizer.register(output, observation.bytes.byteLength, output);
+}
+
+function consumeModelObservation(output: ViewImageOutput): ModelImageObservation {
+  const observation = pendingModelObservations.get(output);
+  if (!observation) {
+    throw new Error("The private image observation is no longer available. Run view_image again.");
+  }
+  pendingModelObservations.delete(output);
+  observationFinalizer.unregister(output);
+  pendingModelObservationBytes = Math.max(0, pendingModelObservationBytes - observation.bytes.byteLength);
+  pendingModelObservationCount = Math.max(0, pendingModelObservationCount - 1);
+  return observation;
+}
+
+async function persistPreviewAsset(input: {
+  readonly bytes: Uint8Array;
+  readonly ctx: ViewImageContext;
+  readonly filename: string;
+  readonly mediaType: ViewImageMediaType;
+}): Promise<string | undefined> {
+  const auth = input.ctx.session.auth.current;
+  if (!auth) return undefined;
+  const owner = publicationOwnerFromAuth(auth);
+  const store = createAssetStoreFromEnvironment();
+  const upload = await store.createUpload({
+    filename: input.filename,
+    mediaType: input.mediaType,
+    owner,
+    sessionId: input.ctx.session.id,
+    sizeBytes: input.bytes.byteLength,
+  });
+  try {
+    await store.writePart({ content: input.bytes, owner, partNumber: 1, uploadId: upload.uploadId });
+    const asset = await store.completeUpload({ owner, uploadId: upload.uploadId });
+    return asset.assetId;
+  } catch (error) {
+    await store.abortUpload({ owner, uploadId: upload.uploadId }).catch(() => undefined);
+    throw error;
+  }
+}
+
+type ViewImageContext = {
+  readonly session: {
+    readonly auth: {
+      readonly current?: SessionAuthContext | null;
+    };
+    readonly id: string;
+  };
+};
 
 type VisionCapabilityContext = {
   readonly session: {
@@ -122,6 +230,41 @@ export function detectMediaType(bytes: Uint8Array, path: string): ViewImageMedia
 
 function ascii(bytes: Uint8Array, start: number, end: number): string {
   return String.fromCharCode(...bytes.slice(start, end));
+}
+
+function readImageDimensions(bytes: Uint8Array, mediaType: ViewImageMediaType): { width: number; height: number } | undefined {
+  if (mediaType === "image/png" && bytes.length >= 24) {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    return { width: view.getUint32(16), height: view.getUint32(20) };
+  }
+  if (mediaType === "image/gif" && bytes.length >= 10) {
+    return { width: bytes[6]! | (bytes[7]! << 8), height: bytes[8]! | (bytes[9]! << 8) };
+  }
+  if (mediaType === "image/webp" && bytes.length >= 30 && ascii(bytes, 12, 16) === "VP8X") {
+    const width = 1 + bytes[24]! + (bytes[25]! << 8) + (bytes[26]! << 16);
+    const height = 1 + bytes[27]! + (bytes[28]! << 8) + (bytes[29]! << 16);
+    return { width, height };
+  }
+  if (mediaType === "image/svg+xml") {
+    const head = new TextDecoder().decode(bytes.slice(0, 16_384));
+    const viewBox = /viewBox\s*=\s*["']\s*[-+\d.e]+\s+[-+\d.e]+\s+([-+\d.e]+)\s+([-+\d.e]+)\s*["']/iu.exec(head);
+    if (viewBox) return { width: Math.max(1, Math.round(Number(viewBox[1]))), height: Math.max(1, Math.round(Number(viewBox[2]))) };
+  }
+  return undefined;
+}
+
+async function readImageFileSize(
+  sandbox: SandboxSession,
+  path: string,
+  abortSignal?: AbortSignal,
+): Promise<number | undefined> {
+  try {
+    const result = await sandbox.run({ command: `stat -c %s -- ${shellQuote(path)}`, ...(abortSignal ? { abortSignal } : {}) });
+    const value = Number(result.stdout.trim());
+    return Number.isSafeInteger(value) && value > 0 ? value : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export function basename(path: string): string {

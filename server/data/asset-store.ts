@@ -38,7 +38,7 @@ export {
   MAX_ASSET_PART_BYTES,
 } from "./asset-store-core.ts";
 
-type UploadRecord = AssetUpload & {
+type UploadRecord = Omit<AssetUpload, "parts"> & {
   readonly expiresAt?: string;
   readonly messageId?: string;
   readonly sessionId: string;
@@ -105,6 +105,7 @@ export function createFilesystemAssetStore(options: FilesystemAssetStoreOptions)
           sizeBytes: input.sizeBytes,
           status: "uploading",
           scanStatus: scanMode === "disabled" ? "disabled" : "pending",
+          transferStrategy: "proxy",
           uploadId,
           sessionId: input.sessionId,
           parts: {},
@@ -190,14 +191,16 @@ export function createFilesystemAssetStore(options: FilesystemAssetStoreOptions)
         await rm(temporaryPath, { force: true });
         throw new AssetStoreError("invalid", "The completed asset checksum does not match.");
       }
-      const metadata: AssetMetadata = {
-        assetId: record.assetId,
+        const metadata: AssetMetadata = {
+          assetId: record.assetId,
         checksumSha256,
         createdAt: record.createdAt,
         expiresAt: record.expiresAt,
         filename: record.filename,
         ...(record.messageId ? { messageId: record.messageId } : {}),
-        mediaType: record.mediaType,
+          mediaType: record.mediaType,
+          ...(record.owner.principalType ? { principalType: record.owner.principalType } : {}),
+          ...(record.owner.issuer ? { issuer: record.owner.issuer } : {}),
         principalId: record.owner.principalId,
         sessionId: record.sessionId,
         sizeBytes: record.sizeBytes,
@@ -251,11 +254,11 @@ export function createFilesystemAssetStore(options: FilesystemAssetStoreOptions)
       const uploadsDirectory = join(root, "uploads");
       for (const assetId of await childDirectories(assetsDirectory)) {
         const metadata = await readAssetMetadata(root, assetId);
-        if (metadata && metadata.tenantId === owner.tenantId && metadata.principalId === owner.principalId && metadata.status === "ready") usedBytes += metadata.sizeBytes;
+        if (metadata && sameOwner(metadata, owner) && metadata.status === "ready") usedBytes += metadata.sizeBytes;
       }
       for (const uploadId of await childDirectories(uploadsDirectory)) {
         const upload = await readUpload(root, uploadId).catch(() => undefined);
-        if (upload && upload.owner.tenantId === owner.tenantId && upload.owner.principalId === owner.principalId && upload.status === "uploading") activeUploadBytes += upload.sizeBytes;
+        if (upload && sameOwner(upload.owner, owner) && upload.status === "uploading") activeUploadBytes += upload.sizeBytes;
       }
       return { activeUploadBytes, limitBytes: quotaBytes ?? maxBytes, usedBytes };
     },
@@ -302,7 +305,7 @@ export function createFilesystemAssetStore(options: FilesystemAssetStoreOptions)
         const metadata = await readAssetMetadata(root, assetId);
         if (!metadata || metadata.sessionId !== sessionId || metadata.status !== "ready") continue;
         if (metadata.expiresAt && Date.parse(metadata.expiresAt) <= Date.now()) continue;
-        if (metadata.tenantId !== owner.tenantId || metadata.principalId !== owner.principalId) continue;
+        if (!sameOwner(metadata, owner)) continue;
         result.push(metadata);
       }
       return result.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
@@ -397,6 +400,10 @@ export function createAssetStoreFromEnvironment(
         endpoint: environment.AGENT_ASSET_S3_ENDPOINT?.trim() || environment.S3_ENDPOINT?.trim(),
         forcePathStyle: parseBoolean(environment.AGENT_ASSET_S3_FORCE_PATH_STYLE, true),
         region: environment.AGENT_ASSET_S3_REGION?.trim() || environment.S3_REGION?.trim() || "us-east-1",
+        // Presigned UploadPart commands have no body at signing time. Disable
+        // optional SDK checksum synthesis or it signs the empty-body CRC32 and
+        // every non-empty browser upload is rejected by S3.
+        requestChecksumCalculation: "WHEN_REQUIRED",
       }),
       database,
       maxBytes: parseAssetMaxBytes(environment.AGENT_ASSET_MAX_BYTES, MAX_ASSET_BYTES),
@@ -404,6 +411,7 @@ export function createAssetStoreFromEnvironment(
       prefix: environment.AGENT_ASSET_S3_PREFIX,
       scanner: configuredHostAssetScanner,
       scanMode: readAssetScanMode(environment),
+      uploadUrlExpiresSeconds: parseUploadUrlExpiry(environment.AGENT_ASSET_UPLOAD_URL_TTL_SECONDS),
     });
   }
   if (environment.NODE_ENV === "production" && backend !== "host" && backend !== "external") {
@@ -470,6 +478,15 @@ function parseAssetMaxBytes(value: string | undefined, fallback: number, maximum
 function parseOptionalAssetQuota(value: string | undefined): number | undefined {
   const normalized = value?.trim();
   return normalized ? parseAssetMaxBytes(normalized, MAX_ASSET_BYTES * 1_000, MAX_ASSET_BYTES * 1_000) : undefined;
+}
+
+function parseUploadUrlExpiry(value: string | undefined): number | undefined {
+  if (!value?.trim()) return undefined;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 60 || parsed > 3600) {
+    throw new Error("AGENT_ASSET_UPLOAD_URL_TTL_SECONDS must be between 60 and 3600.");
+  }
+  return parsed;
 }
 
 function normalizeCleanupLimit(value: number | undefined): number {
@@ -542,8 +559,11 @@ async function withOwnerMutex<T>(
 }
 
 function publicUpload(record: UploadRecord): AssetUpload {
-  const { parts: _parts, ...upload } = record;
-  return upload;
+  const { parts, ...upload } = record;
+  return {
+    ...upload,
+    parts: Object.values(parts).sort((left, right) => left.partNumber - right.partNumber),
+  };
 }
 
 async function readUpload(root: string, uploadId: string): Promise<UploadRecord> {
@@ -613,13 +633,24 @@ function assertCreateUploadInput(input: {
 function assertOwnerInput(owner: AssetOwner): void {
   assertAssetIdentifier(owner.tenantId, "tenantId");
   assertAssetPrincipalIdentifier(owner.principalId, "principalId");
+  if (owner.principalType !== undefined) assertAssetPrincipalIdentifier(owner.principalType, "principalType");
+  if (owner.issuer !== undefined) assertAssetPrincipalIdentifier(owner.issuer, "issuer");
 }
 
 function assertOwner(expected: AssetOwner, actual: AssetOwner): void {
   assertOwnerInput(actual);
-  if (expected.tenantId !== actual.tenantId || expected.principalId !== actual.principalId) {
+  if (expected.tenantId !== actual.tenantId || expected.principalId !== actual.principalId
+    || (expected.principalType !== undefined && expected.principalType !== actual.principalType)
+    || (expected.issuer ?? "") !== (actual.issuer ?? "")) {
     throw new AssetStoreError("forbidden", "The authenticated principal cannot access this asset.");
   }
+}
+
+function sameOwner(expected: { readonly tenantId: string; readonly principalId: string; readonly principalType?: string; readonly issuer?: string }, actual: AssetOwner): boolean {
+  return expected.tenantId === actual.tenantId
+    && expected.principalId === actual.principalId
+    && (expected.principalType === undefined || expected.principalType === actual.principalType)
+    && (expected.issuer ?? "") === (actual.issuer ?? "");
 }
 
 function assertIdentifier(value: string, name: string): void {

@@ -58,7 +58,7 @@
     "lucide-react": "1.16.0",
     "media-chrome": "^4.19.2",
     "motion": "12.40.0",
-    "nanoid": "5.1.11",
+    "nanoid": "5.1.16",
     "next-themes": "^0.4.6",
     "parse-diff": "0.12.0",
     "radix-ui": "1.4.3",

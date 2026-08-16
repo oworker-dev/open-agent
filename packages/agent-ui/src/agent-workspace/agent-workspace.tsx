@@ -19,7 +19,7 @@ import { AgentSubagentMenu } from "./agent-subagent-menu.js";
 import { AgentSecondaryView, type AgentSecondaryChild, type AgentSecondaryTab } from "./agent-secondary-view.js";
 import { AgentThreadView } from "./agent-thread.js";
 import { cn } from "../utils.js";
-import type { AgentAssetEndpoint, AgentInterruptedTurn, AgentModelOption, AgentQueuedTurn, AgentSessionAsset, AgentThread, AgentThreadPatch, AgentThreadPreferences, AgentWorkspaceClientConfig, AgentWorkspaceMailbox } from "./contracts.js";
+import type { AgentAssetEndpoint, AgentInterruptedTurn, AgentModelOption, AgentQueuedTurn, AgentSessionAsset, AgentSubagentLoader, AgentSubagentSummary, AgentThread, AgentThreadPatch, AgentThreadPreferences, AgentWorkspaceClientConfig, AgentWorkspaceMailbox } from "./contracts.js";
 import { AgentThreadStorageConflictError } from "./http-thread-storage.js";
 import { messagesFor, resolveBrowserLocale, type AgentLocale, type AgentMessages } from "./i18n.js";
 import {
@@ -33,7 +33,7 @@ import {
 } from "./thread-storage.js";
 import {
   hasUnresolvedInputRequests,
-  presentSubagentSessions,
+  mergeSubagentSessions,
   shouldSuppressInterruptedTurnStreamEvent,
 } from "./turn-presentation.js";
 
@@ -58,6 +58,7 @@ export function AgentWorkspace({
   hostSlots,
   initialSubagentSessionId,
   initialThreadId,
+  loadSubagents,
   mailbox,
   models,
   mentions = [],
@@ -83,6 +84,7 @@ export function AgentWorkspace({
   readonly initialSubagentSessionId?: string;
   readonly initialThreadId?: string;
   readonly mailbox?: AgentWorkspaceMailbox;
+  readonly loadSubagents?: AgentSubagentLoader;
   readonly models: readonly AgentModelOption[];
   readonly mentions?: readonly import("./contracts.js").AgentPromptMenuItem[];
   readonly onEvent?: (event: MessageStreamEvent) => void;
@@ -127,6 +129,7 @@ export function AgentWorkspace({
   const [secondaryTab, setSecondaryTab] = useState<AgentSecondaryTab>("home");
   const [secondaryChildSessionId, setSecondaryChildSessionId] = useState<string>();
   const [sessionAssets, setSessionAssets] = useState<readonly AgentSessionAsset[]>([]);
+  const [durableSubagents, setDurableSubagents] = useState<readonly AgentSubagentSummary[]>([]);
   const [assetsLoading, setAssetsLoading] = useState(false);
   const [assetsError, setAssetsError] = useState<string>();
   const [ephemeralThreadIds, setEphemeralThreadIds] = useState<Set<string>>(new Set());
@@ -466,6 +469,31 @@ export function AgentWorkspace({
   }, []);
 
   const activeThread = threads.find((thread) => thread.id === activeThreadId) ?? threads[0];
+
+  useEffect(() => {
+    let cancelled = false;
+    const sessionId = activeThread?.session.sessionId;
+    if (!loadSubagents || !sessionId) {
+      setDurableSubagents([]);
+      return;
+    }
+    const refresh = async () => {
+      try {
+        const next = await loadSubagents(sessionId);
+        if (!cancelled) setDurableSubagents(next);
+      } catch {
+        // Parent events remain useful while the control-plane endpoint is
+        // unavailable; the next interval or navigation retries the read.
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 5_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [activeThread?.session.sessionId, loadSubagents]);
+
   const refreshAssets = useCallback(() => {
     const sessionId = activeThread?.session.sessionId;
     if (!sessionId) {
@@ -552,10 +580,10 @@ export function AgentWorkspace({
   }, [activeThread, hydrateThread, hydratingThreadIds, threadHydrationErrors]);
 
   const activeSubagent = activeThread && activeSubagentSessionId
-    ? findSubagentSession(activeThread.events, activeSubagentSessionId, locale)
+    ? findSubagentSession(activeThread.events, activeSubagentSessionId, locale, durableSubagents)
     : undefined;
   const openSubagent = useCallback((sessionId: string) => {
-    if (!activeThread || !findSubagentSession(activeThread.events, sessionId, locale)) return;
+    if (!activeThread || !findSubagentSession(activeThread.events, sessionId, locale, durableSubagents)) return;
     setActiveSubagentSessionId(sessionId);
   }, [activeThread, locale]);
   const closeSubagent = useCallback(() => setActiveSubagentSessionId(undefined), []);
@@ -955,6 +983,7 @@ export function AgentWorkspace({
             </Button>
             <AgentSubagentMenu
               activeSessionId={activeSubagentSessionId}
+              durableSessions={durableSubagents}
               events={activeThread.events}
               locale={locale}
               onOpen={openSubagent}
@@ -1047,7 +1076,7 @@ export function AgentWorkspace({
                     assets={sessionAssets}
                     assetsError={assetsError}
                     assetsLoading={assetsLoading}
-                    children={activeThread ? subagentsForThread(activeThread.events) : []}
+                    children={activeThread ? subagentsForThread(activeThread.events, durableSubagents) : []}
                     childContent={secondaryChildSessionId && activeThread ? (
                       <AgentChildSessionView
                         client={client}
@@ -1234,8 +1263,9 @@ function findSubagentSession(
   events: readonly MessageStreamEvent[],
   sessionId: string,
   locale: AgentLocale,
+  durable: readonly AgentSubagentSummary[] = [],
 ): { readonly label: string; readonly task?: string } | undefined {
-  const sessions = presentSubagentSessions(events);
+  const sessions = mergeSubagentSessions(events, durable);
   const index = sessions.findIndex((candidate) => candidate.childSessionId === sessionId);
   const session = sessions[index];
   if (!session) return undefined;
@@ -1247,8 +1277,8 @@ function findSubagentSession(
   };
 }
 
-function subagentsForThread(events: readonly MessageStreamEvent[]): readonly AgentSecondaryChild[] {
-  return presentSubagentSessions(events)
+function subagentsForThread(events: readonly MessageStreamEvent[], durable: readonly AgentSubagentSummary[] = []): readonly AgentSecondaryChild[] {
+  return mergeSubagentSessions(events, durable)
     .filter((session): session is typeof session & { readonly childSessionId: string } => Boolean(session.childSessionId))
     .map((session, index) => ({
       childSessionId: session.childSessionId,

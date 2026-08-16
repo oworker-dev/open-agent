@@ -192,9 +192,31 @@ const mailboxRoute = POST(MAILBOX_ROUTE, async (request, {
   if (!input) {
     return mailboxProblem(400, "mailbox_request_invalid", "The mailbox request is invalid.");
   }
+  const session = attachSession(input.sessionId);
+  if (input.action === "cancel") {
+    const result = await session.cancel(
+      input.turnId ? { turnId: input.turnId } : undefined,
+    );
+    return Response.json(
+      { ...result, ok: true },
+      {
+        headers: { "cache-control": "no-store" },
+        status: result.status === "accepted" ? 202 : 200,
+      },
+    );
+  }
+  if (input.action === "reset") {
+    const result = await session.reset(
+      input.reason ? { reason: input.reason } : undefined,
+    );
+    return Response.json(
+      { ...result, ok: true },
+      { headers: { "cache-control": "no-store" } },
+    );
+  }
   let boundary: MailboxBoundary;
   try {
-    boundary = await inspectMailboxBoundary(attachSession(input.sessionId));
+    boundary = await inspectMailboxBoundary(session);
   } catch {
     return mailboxProblem(404, "mailbox_session_not_found", "The Agent session was not found.");
   }
@@ -220,7 +242,7 @@ const mailboxRoute = POST(MAILBOX_ROUTE, async (request, {
     if (boundary.state === "running" && input.operationKind === "steer" && !steer) {
       return mailboxProblem(400, "mailbox_expected_turn_missing", "A steering message requires the active turn id.");
     }
-    const accepted = await attachSession(input.sessionId).send(
+    const accepted = await session.send(
       input.message,
       {
         auth: mailboxSessionAuth(input),
@@ -272,6 +294,18 @@ type MailboxInspectRequest = {
   readonly sessionId: string;
 };
 
+type MailboxControlRequest =
+  | {
+      readonly action: "cancel";
+      readonly sessionId: string;
+      readonly turnId?: string;
+    }
+  | {
+      readonly action: "reset";
+      readonly reason?: string;
+      readonly sessionId: string;
+    };
+
 type MailboxDeliverRequest = {
   readonly action: "deliver";
   readonly clientMessageId: string;
@@ -291,7 +325,7 @@ type MailboxDeliverRequest = {
   readonly tenantId: string;
 };
 
-function parseMailboxRequest(body: string): MailboxInspectRequest | MailboxDeliverRequest | undefined {
+function parseMailboxRequest(body: string): MailboxInspectRequest | MailboxControlRequest | MailboxDeliverRequest | undefined {
   let value: unknown;
   try {
     value = JSON.parse(body);
@@ -300,6 +334,22 @@ function parseMailboxRequest(body: string): MailboxInspectRequest | MailboxDeliv
   }
   if (!isRecord(value) || !validText(value.sessionId, 512)) return undefined;
   if (value.action === "inspect") return { action: "inspect", sessionId: value.sessionId };
+  if (value.action === "cancel") {
+    if (value.turnId !== undefined && !validText(value.turnId, 512)) return undefined;
+    return {
+      action: "cancel",
+      sessionId: value.sessionId,
+      ...(typeof value.turnId === "string" ? { turnId: value.turnId } : {}),
+    };
+  }
+  if (value.action === "reset") {
+    if (value.reason !== undefined && !validText(value.reason, 2_000)) return undefined;
+    return {
+      action: "reset",
+      sessionId: value.sessionId,
+      ...(typeof value.reason === "string" ? { reason: value.reason } : {}),
+    };
+  }
   if (
     value.action !== "deliver" ||
     !validText(value.clientMessageId, 200) ||

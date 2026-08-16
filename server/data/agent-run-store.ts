@@ -153,7 +153,9 @@ function postgresAgentRunStore(pool: Pool, table: string): AgentRunStore {
             set cancellation_requested_at = now(),
                 revision = revision + 1,
                 updated_at = now()
-          where run_id = $1 and cancellation_requested_at is null
+          where run_id = $1
+            and cancellation_requested_at is null
+            and status not in ('completed', 'failed', 'cancelled', 'submission-ambiguous')
           returning ${selectColumns()}`,
         [runId],
       );

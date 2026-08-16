@@ -1,6 +1,6 @@
 import { registerOTel } from "@vercel/otel";
 
-export function register(): void {
+export async function register(): Promise<void> {
   registerOTel({
     serviceName: "open-agent-web",
     instrumentationConfig: {
@@ -12,6 +12,10 @@ export function register(): void {
       },
     },
   });
+  if (process.env.NEXT_RUNTIME === "nodejs") {
+    const { registerNodeRuntime } = await import("./instrumentation-node");
+    registerNodeRuntime();
+  }
 }
 
 function configuredOrigins(values: readonly (string | undefined)[]): string[] {

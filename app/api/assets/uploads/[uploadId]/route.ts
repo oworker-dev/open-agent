@@ -1,12 +1,12 @@
 import { AssetStoreError, createAssetStoreFromEnvironment } from "@/server/data/asset-store";
-import { authResponseHeaders, authenticateAssetRequest } from "@/server/http/asset-request-auth";
+import { authResponseHeaders, authenticateAssetRequest, requireAssetScope } from "@/server/http/asset-request-auth";
 import { problem, storeProblem } from "../route";
 
 export const runtime = "nodejs";
 type RouteContext = { readonly params: Promise<{ readonly uploadId: string }> };
 
 export async function GET(_request: Request, context: RouteContext): Promise<Response> {
-  const authenticated = await authenticateAssetRequest(_request);
+  const authenticated = requireAssetScope(await authenticateAssetRequest(_request), "asset:read");
   if (!authenticated.ok) return authenticated.response;
   const { uploadId } = await context.params;
   try {
@@ -22,7 +22,7 @@ export async function GET(_request: Request, context: RouteContext): Promise<Res
 }
 
 export async function DELETE(request: Request, context: RouteContext): Promise<Response> {
-  const authenticated = await authenticateAssetRequest(request);
+  const authenticated = requireAssetScope(await authenticateAssetRequest(request), "asset:write");
   if (!authenticated.ok) return authenticated.response;
   const { uploadId } = await context.params;
   try {

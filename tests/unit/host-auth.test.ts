@@ -7,6 +7,7 @@ import { ForbiddenError } from "eve/channels/auth";
 import { hostJwtAuth, hostJwtAuthFromEnvironment } from "../../agent/lib/host-auth.ts";
 import {
   authenticateHostRequest,
+  HOST_AGENT_SCOPE,
   requireHostScope,
 } from "../../server/http/host-request-auth.ts";
 
@@ -92,6 +93,19 @@ test("requires the declared endpoint scope after Host JWT authentication", async
     "agent:runs",
   );
   assert.equal(allowed.ok, true);
+});
+
+test("publishes separate least-privilege scopes for session control surfaces", () => {
+  assert.deepEqual(new Set(Object.values(HOST_AGENT_SCOPE)), new Set([
+    "agent:approvals:read",
+    "agent:mailbox:read",
+    "agent:mailbox:write",
+    "agent:sessions:delete",
+    "agent:sessions:read",
+    "agent:sessions:write",
+    "agent:subagents:read",
+    "agent:subagents:write",
+  ]));
 });
 
 test("returns a clear forbidden response for an invalid Host Runtime Config claim", async () => {

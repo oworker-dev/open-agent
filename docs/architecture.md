@@ -490,13 +490,12 @@ separate adapter package and a set of permissioned canvas tools.
 
 ### Verification snapshot (2026-08-16)
 
-The local production build currently passes type checking, 270 unit tests, the
-Provider failure/retry gate, and 47 browser E2E cases (2 intentionally skipped
-fixture-only cases). A MinIO-backed S3 run also passed two concurrent 100 MiB
-uploads with interrupted-part retry, Range reads, and tenant/principal
-isolation. The production doctor passes when supplied with the deployment's
-HTTPS origin and OTLP endpoint shape; Docker sandbox hardening remains an
-explicit operational warning.
+The current local evidence is 310 deterministic unit tests, successful SDK
+type-checking, a successful Next production build, and a passing `/embed` CSP
+manifest check when `AGENT_EMBED_ALLOWED_ORIGINS` is supplied. Asset, sandbox,
+browser, Provider, OTel, and load verifiers are present, but their production
+claims require the corresponding external services and credentials; a missing
+gate configuration is not treated as a pass.
 
 The remaining release evidence is external by design: a real Muses Host JWT,
 Provider broker, Workspace/Project/Canvas identifiers, target object store,
@@ -575,23 +574,9 @@ model loop.
 
 ## Release gates
 
-The current implementation has passed type checking, deterministic browser
-tests, Eve production build under Node 24, Next production build, HMAC Host
-bridge tests, and a two-process local production smoke test. The Headless
-AgentRun protocol has also passed a local Eve/PostgreSQL conformance run. A
-real-Provider autonomy gate has completed a sandbox website task, published a
-signed preview, read the requested marker back from the delivered HTML, and
-verified idempotent admission plus token/cache projection. The same run's local
-OTLP evidence joined Agent Web to the durable Eve turn without exporting the
-prompt probe. This is local production-topology evidence, not deployed SLO or
-capacity evidence.
-The Eve-native fixed suite additionally passes 58/58 gates against real Docker
-sandboxes for file/Shell/checkpoint autonomy, tool failure recovery, durable
-approval, cancellation, cross-turn continuity, static website preview delivery,
-Python artifact delivery, and ImageMagick/FFmpeg media rendering. PostgreSQL extension
-lifecycle conformance proves default enablement, tenant revocation, re-enable,
-and credential-minimized append-only audit records.
-Cancellation prefers Eve's cooperative boundary
+The implementation has deterministic coverage for the AgentRun, mailbox,
+approval, subagent, asset, SSRF, recovery, and production-config contracts.
+Eve/Next production builds are reproducible under Node 24. Cancellation prefers Eve's cooperative boundary
 and uses an exclusive-session reset when the installed preview runtime accepts
 the signal without settling the provider turn.
 

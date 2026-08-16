@@ -1,11 +1,11 @@
 import { createAssetStoreFromEnvironment } from "@/server/data/asset-store";
-import { authResponseHeaders, authenticateAssetRequest } from "@/server/http/asset-request-auth";
+import { authResponseHeaders, authenticateAssetRequest, requireAssetScope } from "@/server/http/asset-request-auth";
 
 export const runtime = "nodejs";
 
 /** List ready assets for one authenticated session without exposing bytes. */
 export async function GET(request: Request): Promise<Response> {
-  const authenticated = await authenticateAssetRequest(request);
+  const authenticated = requireAssetScope(await authenticateAssetRequest(request), "asset:read");
   if (!authenticated.ok) return authenticated.response;
   const sessionId = new URL(request.url).searchParams.get("sessionId")?.trim();
   if (!sessionId || sessionId.length > 512) {

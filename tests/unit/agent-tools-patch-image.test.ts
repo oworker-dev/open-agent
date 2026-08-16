@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import applyPatchTool, {
   applyUpdateText,
   countLines,
@@ -14,6 +17,10 @@ import viewImageTool, {
   readBoundedImage,
 } from "../../agent/tools/view_image.ts";
 import { assertAssetSession } from "../../agent/tools/import_asset.ts";
+import {
+  configureAssetStore,
+  createFilesystemAssetStore,
+} from "../../server/data/asset-store.ts";
 
 test("apply_patch parses and applies multiple hunks without collapsing contexts", () => {
   const patch = `*** Begin Patch
@@ -162,6 +169,7 @@ test("view_image resizes oversized images and emits a typed file output", async 
       return new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(source); controller.close(); } });
     },
     async run({ command }: { command: string }) {
+      if (command.startsWith("stat -c %s")) return { exitCode: 0, stdout: String(source.byteLength), stderr: "" };
       assert.match(command, /set -eu; if command -v magick/);
       return { exitCode: 0, stdout: "", stderr: "" };
     },
@@ -176,7 +184,65 @@ test("view_image resizes oversized images and emits a typed file output", async 
   assert.equal(output.resized, true);
   assert.equal(output.mediaType, "image/jpeg");
   assert.equal(output.bytes, resized.byteLength);
+  assert.equal("dataBase64" in output, false);
+  assert.equal(JSON.stringify(output).includes(Buffer.from(resized).toString("base64")), false);
   const projected = (viewImageTool as unknown as { toModelOutput(value: typeof output): { type: string; value?: readonly { type: string; [key: string]: unknown }[] } }).toModelOutput(output);
   assert.equal(projected.type, "content");
   assert.equal(projected.value?.some((part) => part.type === "file"), true);
+  assert.throws(
+    () => (viewImageTool as unknown as { toModelOutput(value: typeof output): unknown }).toModelOutput(output),
+    /no longer available/,
+  );
+});
+
+test("view_image persists an authenticated UI preview while keeping bytes private", async () => {
+  const root = await mkdtemp(join(tmpdir(), "open-agent-view-image-"));
+  try {
+    const store = createFilesystemAssetStore({ root });
+    configureAssetStore(store);
+    const bytes = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+      "base64",
+    );
+    const sandbox = {
+      async readFile() {
+        return new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(bytes);
+            controller.close();
+          },
+        });
+      },
+    };
+    const owner = {
+      principalId: "view-image-user",
+      principalType: "user",
+      tenantId: "view-image-tenant",
+    };
+    const context = {
+      getSandbox: async () => sandbox,
+      session: {
+        auth: {
+          current: {
+            attributes: { tenantId: owner.tenantId },
+            principalId: owner.principalId,
+            principalType: owner.principalType,
+          },
+        },
+        id: "view-image-session",
+      },
+    };
+    const output = await (viewImageTool as unknown as {
+      execute(input: { path: string }, context: unknown): Promise<{ assetId?: string; bytes: number }>;
+    }).execute({ path: "reference.png" }, context);
+    assert.ok(output.assetId);
+    assert.equal("dataBase64" in output, false);
+    const asset = await store.findAsset(output.assetId, owner);
+    assert.equal(asset?.sessionId, "view-image-session");
+    assert.equal(asset?.mediaType, "image/png");
+    assert.equal(asset?.sizeBytes, bytes.byteLength);
+    (viewImageTool as unknown as { toModelOutput(value: typeof output): unknown }).toModelOutput(output);
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
 });

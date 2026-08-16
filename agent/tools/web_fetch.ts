@@ -1,5 +1,6 @@
 import { defineTool } from "eve/tools";
 import { z } from "zod";
+import { readRemoteBytes, safeRemoteFetch } from "../lib/safe-remote-fetch.ts";
 
 const MAX_RESPONSE_SIZE = 5 * 1024 * 1024;
 const MAX_TEXT_OUTPUT = 50 * 1024;
@@ -34,13 +35,10 @@ export default defineTool({
   inputSchema,
   outputSchema,
   async execute(input, ctx) {
-    if (!input.url.startsWith("http://") && !input.url.startsWith("https://")) {
-      throw new Error("URL must start with http:// or https://");
-    }
     const timeoutMs = Math.min(Math.max((input.timeout ?? 30) * 1000, 1_000), 120_000);
     const timeoutSignal = AbortSignal.timeout(timeoutMs);
     const signal = ctx.abortSignal ? AbortSignal.any([ctx.abortSignal, timeoutSignal]) : timeoutSignal;
-    const response = await fetch(input.url, {
+    const { response, url } = await safeRemoteFetch(input.url, {
       headers: {
         Accept: input.format === "html"
           ? "text/html, application/xhtml+xml, text/plain;q=0.8, */*;q=0.1"
@@ -50,12 +48,12 @@ export default defineTool({
       },
       signal,
     });
+    const finalUrl = url;
     if (!response.ok) throw new Error(`Request failed with status code: ${response.status}`);
     const contentType = response.headers.get("content-type") ?? "application/octet-stream";
     const declaredLength = Number(response.headers.get("content-length") ?? "0");
     if (declaredLength > MAX_RESPONSE_SIZE) throw new Error("Response exceeds the 5 MB limit.");
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    if (bytes.byteLength > MAX_RESPONSE_SIZE) throw new Error("Response exceeds the 5 MB limit.");
+    const bytes = await readRemoteBytes(response, MAX_RESPONSE_SIZE);
     const binary = !TEXT_CONTENT_TYPES.test(contentType) && !contentType.toLowerCase().includes("text/html");
     if (binary) {
       return {
@@ -64,7 +62,7 @@ export default defineTool({
         content: "",
         contentType,
         truncated: false,
-        url: input.url,
+        url: finalUrl,
       };
     }
     const decoded = new TextDecoder().decode(bytes);
@@ -75,7 +73,7 @@ export default defineTool({
       content: truncated ? decoded.slice(0, MAX_TEXT_OUTPUT) : decoded,
       contentType,
       truncated,
-      url: input.url,
+      url: finalUrl,
     };
   },
   toModelOutput(output) {

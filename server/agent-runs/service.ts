@@ -262,6 +262,13 @@ export async function cancelAgentRun(options: {
   // Persist the caller's intent before crossing the Eve transport boundary.
   // A hung request or process restart can then be reconciled by inspection.
   const requested = await options.store.markCancellationRequested(record.runId);
+  // The run may have crossed a terminal boundary after the initial lookup but
+  // before the cancellation CAS. Stores return the authoritative row when
+  // that race loses; never stamp a completed/failed run with a cancellation
+  // request or send a late cancel to Eve.
+  if (isTerminal(requested.status)) {
+    return { cancellation: "terminal", record: requested };
+  }
   const cancellation = await runtime.cancel(
     record.runId,
     record.correlationId,

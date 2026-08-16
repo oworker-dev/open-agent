@@ -1,4 +1,4 @@
-import { authenticateHostRequest } from "@/server/http/host-request-auth";
+import { authenticateHostRequest, HOST_AGENT_SCOPE, requireHostScope } from "@/server/http/host-request-auth";
 import { createPostgresSessionOwnershipStoreFromEnvironment } from "@/server/data/session-ownership-store";
 import { createPostgresAgentSubagentStoreFromEnvironment } from "@/server/data/agent-subagent-store";
 import { createPostgresAgentMailboxStoreFromEnvironment } from "@/server/data/agent-mailbox-store";
@@ -11,7 +11,10 @@ const mailboxStore = createPostgresAgentMailboxStoreFromEnvironment();
 type RouteContext = { readonly params: Promise<{ readonly sessionId: string }> };
 
 export async function GET(request: Request, context: RouteContext): Promise<Response> {
-  const authenticated = await authenticateHostRequest(request);
+  const authenticated = requireHostScope(
+    await authenticateHostRequest(request),
+    HOST_AGENT_SCOPE.subagentRead,
+  );
   if (!authenticated.ok) return authenticated.response;
   if (!ownershipStore || !subagentStore) return unavailable();
   const { sessionId } = await context.params;
@@ -27,7 +30,10 @@ export async function GET(request: Request, context: RouteContext): Promise<Resp
 
 /** Explicit spawning is available to hosts that provide an Eve spawn adapter. */
 export async function POST(request: Request, context: RouteContext): Promise<Response> {
-  const authenticated = await authenticateHostRequest(request);
+  const authenticated = requireHostScope(
+    await authenticateHostRequest(request),
+    HOST_AGENT_SCOPE.subagentWrite,
+  );
   if (!authenticated.ok) return authenticated.response;
   if (!ownershipStore || !subagentStore) return unavailable();
   const { sessionId } = await context.params;

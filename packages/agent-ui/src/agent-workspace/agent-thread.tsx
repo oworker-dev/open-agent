@@ -3,12 +3,13 @@
 import type { UserContent } from "ai";
 import { defaultMessageReducer, isCurrentTurnBoundaryEvent, type ClientSession, type MessageStreamEvent } from "eve/client";
 import { useEveAgent, type EveMessage } from "eve/react";
-import { AssistantRuntimeProvider, unstable_defaultDirectiveFormatter, useExternalStoreRuntime, type AppendMessage, type AttachmentAdapter, type CompleteAttachment, type ExternalThreadQueueAdapter, type PendingAttachment } from "@assistant-ui/react";
+import { AssistantRuntimeProvider, unstable_defaultDirectiveFormatter, useExternalStoreRuntime, type AppendMessage, type ExternalThreadQueueAdapter } from "@assistant-ui/react";
 import { AlertCircleIcon, Clock3Icon, HammerIcon, RotateCcwIcon, SearchIcon, ShieldCheckIcon, SparklesIcon, XIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "../ui/button.js";
 import { cn } from "../utils.js";
 import { attachAgentSession, createAgentSession } from "./agent-client.js";
+import { createBrowserAttachmentAdapter, createHttpAgentAssetUploadAdapter } from "./browser-asset-upload.js";
 import { convertEveMessages, getEveMessageContent } from "./eve-message-adapter.js";
 import type { AgentInputResponse } from "./agent-message.js";
 import { AssistantThreadSurface, type AgentApprovalTakeover } from "./assistant-thread-surface.js";
@@ -720,11 +721,13 @@ export function AgentThreadView({
         return;
       }
       if (text.length > 0) {
+        const expectedTurnId = latestActiveTurnId(latestEventsRef.current);
         setQueueError(undefined);
         updateQueuedTurns([
           ...queuedTurnsRef.current,
           {
             ...(mailbox ? { delivery: "server" as const } : {}),
+            ...(mailbox && expectedTurnId ? { expectedTurnId } : {}),
             id: createPendingTurnId(),
             intent: "active-turn",
             state: "queued",
@@ -875,12 +878,20 @@ export function AgentThreadView({
     });
   };
 
+  const assetUploadAdapter = useMemo(
+    () => client?.assetUpload ?? createHttpAgentAssetUploadAdapter(client),
+    [client],
+  );
+  const attachmentAdapter = useMemo(
+    () => createBrowserAttachmentAdapter(
+      assetUploadAdapter,
+      () => sessionRef.current?.state.sessionId ?? thread.session.sessionId,
+    ),
+    [assetUploadAdapter, thread.session.sessionId],
+  );
   const assistantRuntime = useExternalStoreRuntime({
     adapters: {
-      attachments: createBrowserAttachmentAdapter(
-        client,
-        () => sessionRef.current?.state.sessionId ?? thread.session.sessionId,
-      ),
+      attachments: attachmentAdapter,
     },
     // Lock regular sends while an approval is pending, but keep the runtime
     // available to the edit composer. assistant-ui intentionally allows edits
@@ -982,11 +993,33 @@ export function AgentThreadView({
       !mailboxEnqueueIdsRef.current.has(turn.id)
     );
     if (!next) return;
+
+    if (next.intent === "active-turn" && !next.expectedTurnId) {
+      const expectedTurnId = latestActiveTurnId(agent.events);
+      if (expectedTurnId) {
+        // Persist the authoritative Eve turn before admission. A browser may
+        // accept a follow-up while session creation is still streaming its
+        // first turn.started event; classifying it as a normal send in that
+        // window would miss the current turn's next model boundary.
+        updateQueuedTurns(queuedTurnsRef.current.map((turn) =>
+          turn.id === next.id ? { ...turn, expectedTurnId } : turn,
+        ));
+        return;
+      }
+      // Keep the durable browser queue until Eve either identifies the active
+      // turn or the original admission settles. Once settled, the same item is
+      // intentionally delivered as the next normal turn.
+      if (admissionBusy) return;
+    }
+
     mailboxEnqueueIdsRef.current.add(next.id);
     void mailbox.enqueue({
       clientMessageId: next.id,
       ...(thread.retainedContext ? { clientContext: thread.retainedContext } : {}),
+      ...(next.expectedTurnId ? { expectedTurnId: next.expectedTurnId } : {}),
       message: next.text,
+      operationId: next.id,
+      operationKind: next.expectedTurnId ? "steer" : "send",
       preferences: preferencesRef.current,
       sessionId: agent.session.sessionId,
     }).then((receipt) => {
@@ -1008,7 +1041,7 @@ export function AgentThreadView({
     }).finally(() => {
       mailboxEnqueueIdsRef.current.delete(next.id);
     });
-  }, [agent.session?.sessionId, mailbox, messages.queueDeliveryFailed, thread.queuedTurns]);
+  }, [admissionBusy, agent.events, agent.session?.sessionId, mailbox, messages.queueDeliveryFailed, thread.queuedTurns]);
 
   useEffect(() => {
     if (!mailbox || isRecovering) return;
@@ -1465,139 +1498,6 @@ async function sendPrompt(
   await send(parts, retainedContextOptions(context));
 }
 
-const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024 * 1024;
-
-function createBrowserAttachmentAdapter(
-  config: AgentWorkspaceClientConfig | undefined,
-  sessionId: () => string | undefined,
-): AttachmentAdapter {
-  return {
-    accept: "*",
-    async add({ file }): Promise<PendingAttachment> {
-      if (file.size > MAX_ATTACHMENT_BYTES) {
-        throw new Error("Attachments must be 10 GiB or smaller.");
-      }
-      return {
-        contentType: file.type || "application/octet-stream",
-        file,
-        id: typeof crypto !== "undefined" && "randomUUID" in crypto
-          ? crypto.randomUUID()
-          : `attachment-${Date.now()}`,
-        name: file.name,
-        status: { reason: "composer-send", type: "requires-action" },
-        type: file.type.startsWith("image/") ? "image" : "file",
-      };
-    },
-    async remove() {
-      // Uploads are short-lived and reclaimed by the store when removed before send.
-    },
-    async send(attachment): Promise<CompleteAttachment> {
-      const asset = await uploadBrowserAsset(config, attachment.file, sessionId());
-      return {
-        ...attachment,
-        content: [{
-          data: `asset://${asset.assetId}`,
-          filename: asset.filename,
-          mimeType: asset.mediaType,
-          type: "file",
-        }],
-        status: { type: "complete" },
-      };
-    },
-  };
-}
-
-type UploadedAsset = { readonly assetId: string; readonly filename: string; readonly mediaType: string; readonly sizeBytes: number };
-
-async function uploadBrowserAsset(
-  config: AgentWorkspaceClientConfig | undefined,
-  file: File,
-  sessionId: string | undefined,
-): Promise<UploadedAsset> {
-  const ownerSessionId = sessionId ?? `browser-${crypto.randomUUID()}`;
-  let uploadId: string | undefined;
-  try {
-    const init = await assetRequest(config, "/api/assets/uploads", {
-      body: JSON.stringify({ filename: file.name, mediaType: file.type || "application/octet-stream", sessionId: ownerSessionId, sizeBytes: file.size }),
-      headers: { "content-type": "application/json" },
-      method: "POST",
-    });
-    const upload = (await readJson(init)).upload as { readonly assetId: string; readonly chunkSizeBytes: number; readonly uploadId: string };
-    uploadId = upload.uploadId;
-    for (let partNumber = 1, offset = 0; offset < file.size; partNumber += 1) {
-      const end = Math.min(file.size, offset + upload.chunkSizeBytes);
-      const bytes = new Uint8Array(await file.slice(offset, end).arrayBuffer());
-      await withUploadRetries(() => assetRequest(config, `/api/assets/uploads/${encodeURIComponent(upload.uploadId)}/parts/${partNumber}`, {
-        body: bytes,
-        headers: { "content-type": "application/octet-stream" },
-        method: "PUT",
-      }));
-      offset = end;
-    }
-    const complete = await withUploadRetries(() => assetRequest(config, `/api/assets/uploads/${encodeURIComponent(upload.uploadId)}/complete`, {
-      body: "{}",
-      headers: { "content-type": "application/json" },
-      method: "POST",
-    }));
-    const asset = (await readJson(complete)).asset as UploadedAsset;
-    return asset;
-  } catch (error) {
-    // A failed browser tab should not leave a large, billable partial upload
-    // behind. Abort is best-effort because the original failure is the useful
-    // error to show in the composer.
-    if (uploadId) {
-      await assetRequest(config, `/api/assets/uploads/${encodeURIComponent(uploadId)}`, { method: "DELETE" }).catch(() => undefined);
-    }
-    throw error;
-  }
-}
-
-async function withUploadRetries(request: () => Promise<Response>): Promise<Response> {
-  let lastError: unknown;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    try {
-      return await request();
-    } catch (error) {
-      lastError = error;
-      if (attempt < 2) await new Promise((resolve) => window.setTimeout(resolve, 250 * (attempt + 1)));
-    }
-  }
-  throw lastError instanceof Error ? lastError : new Error("Asset upload failed after retries.");
-}
-
-async function assetRequest(
-  config: AgentWorkspaceClientConfig | undefined,
-  path: string,
-  init: RequestInit,
-): Promise<Response> {
-  const headers = {
-    ...(await resolveClientHeaders(config)),
-    ...(init.headers ?? {}),
-  };
-  const base = config?.host || (typeof window !== "undefined" ? window.location.origin : "http://localhost");
-  const response = await fetch(new URL(path, base).toString(), { ...init, credentials: "include", headers });
-  if (!response.ok) throw new Error(`Asset request failed (${response.status}).`);
-  return response;
-}
-
-async function readJson(response: Response): Promise<{ readonly asset?: UploadedAsset; readonly upload?: Record<string, unknown> }> {
-  try {
-    return await response.json() as { readonly asset?: UploadedAsset; readonly upload?: Record<string, unknown> };
-  } catch {
-    throw new Error("The asset service returned invalid JSON.");
-  }
-}
-
-async function resolveClientHeaders(config: AgentWorkspaceClientConfig | undefined): Promise<Readonly<Record<string, string>>> {
-  const headers = config?.headers;
-  const resolved = typeof headers === "function" ? await headers() : headers;
-  if (config?.auth && "bearer" in config.auth) {
-    const token = typeof config.auth.bearer === "function" ? await config.auth.bearer() : config.auth.bearer;
-    return { ...(resolved ?? {}), authorization: `Bearer ${token}` };
-  }
-  return resolved ?? {};
-}
-
 function isSessionBoundary(event: MessageStreamEvent): boolean {
   return event.type === "session.waiting" || event.type === "session.completed" || event.type === "session.failed";
 }
@@ -1630,6 +1530,7 @@ function sameQueuedTurnSnapshots(
     const candidate = right[index];
     return candidate?.id === turn.id &&
       candidate.delivery === turn.delivery &&
+      candidate.expectedTurnId === turn.expectedTurnId &&
       candidate.intent === turn.intent &&
       candidate.mailboxItemId === turn.mailboxItemId &&
       candidate.state === turn.state &&

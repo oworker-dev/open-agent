@@ -11,6 +11,7 @@ import {
   type AgentModelOption,
   type AgentPromptMenuItem,
   type AgentRuntimeStatus,
+  type AgentSubagentSummary,
   type AgentThreadPreferences,
 } from "@oworker/open-agent-ui";
 
@@ -54,6 +55,17 @@ export function StandaloneAgentWorkspace({
     [storageMode],
   );
   const threadStorage = storageMode === "server" ? httpThreadStorage : browserThreadStorage;
+  const loadSubagents = useCallback(async (sessionId: string): Promise<readonly AgentSubagentSummary[]> => {
+    if (storageMode !== "server") return [];
+    const response = await fetch(`/api/standalone/sessions/${encodeURIComponent(sessionId)}/subagents`, {
+      credentials: "same-origin",
+      headers: { accept: "application/json" },
+      cache: "no-store",
+    });
+    if (!response.ok) throw new Error(`Subagent status request failed (${response.status}).`);
+    const body = await response.json() as { children?: unknown };
+    return Array.isArray(body.children) ? body.children.filter(isSubagentSummary) : [];
+  }, [storageMode]);
   const handleActiveThreadChange = useCallback((threadId?: string) => {
     const target = threadId ? `/threads/${encodeURIComponent(threadId)}` : "/";
     if (window.location.pathname !== target) window.history.replaceState(null, "", target);
@@ -76,6 +88,7 @@ export function StandaloneAgentWorkspace({
       mentions={mentions}
       models={models}
       mailbox={mailbox}
+      loadSubagents={loadSubagents}
       onActiveSubagentChange={handleActiveSubagentChange}
       onActiveThreadChange={handleActiveThreadChange}
       productName="Open Agent"
@@ -84,4 +97,10 @@ export function StandaloneAgentWorkspace({
       threadStorage={threadStorage}
     />
   );
+}
+
+function isSubagentSummary(value: unknown): value is AgentSubagentSummary {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const item = value as Record<string, unknown>;
+  return typeof item.childSessionId === "string" && ["starting", "running", "waiting", "completed", "failed", "interrupted", "closed"].includes(String(item.status));
 }

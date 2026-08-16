@@ -26,6 +26,17 @@ export interface AgentMailboxRuntime {
     readonly owner: AgentSessionOwner;
     readonly sessionId: string;
   }): Promise<AgentMailboxBoundary>;
+  /** Server-authorized lifecycle controls use the same signed runtime bridge. */
+  cancel?(input: {
+    readonly owner: AgentSessionOwner;
+    readonly sessionId: string;
+    readonly turnId?: string;
+  }): Promise<"accepted" | "no_active_turn">;
+  reset?(input: {
+    readonly owner: AgentSessionOwner;
+    readonly reason?: string;
+    readonly sessionId: string;
+  }): Promise<"no_active_session" | "reset">;
 }
 
 export type DispatchAgentMailboxResult =

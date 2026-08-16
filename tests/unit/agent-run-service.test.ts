@@ -299,6 +299,33 @@ test("cancellation is idempotent and reaches Eve only once", async () => {
   assert.equal(runtime.calls.reset, 1);
 });
 
+test("does not cancel or mark a run that completed during cancellation admission", async () => {
+  const store = new TerminalDuringCancellationStore();
+  const runtime = fakeRuntime({ events: runningEvents() });
+  const started = await startAgentRun({
+    accessToken: "token",
+    identity: user,
+    request: parseRequest({ idempotencyKey: "request-cancel-race", message: "Keep working" }),
+    runtime,
+    store,
+  });
+
+  const outcome = await cancelAgentRun({
+    accessToken: "token",
+    identity: user,
+    runId: started.record.runId,
+    cancellationPolicy: immediateCancellation,
+    runtime,
+    store,
+  });
+
+  assert.equal(outcome?.cancellation, "terminal");
+  assert.equal(outcome?.record.status, "completed");
+  assert.equal(outcome?.record.cancellationRequestedAt, undefined);
+  assert.equal(runtime.calls.cancel, 0);
+  assert.equal(runtime.calls.reset, 0);
+});
+
 test("uses Eve's cooperative cancellation boundary without resetting the session", async () => {
   const store = new MemoryAgentRunStore();
   const runtime = fakeRuntime({ events: cancelledEvents() });
@@ -780,6 +807,21 @@ class MemoryAgentRunStore implements AgentRunStore {
     };
     this.records.set(runId, record);
     return record;
+  }
+}
+
+/** Simulates the row lock losing a cancellation race to a terminal update. */
+class TerminalDuringCancellationStore extends MemoryAgentRunStore {
+  override async markCancellationRequested(runId: string): Promise<AgentRunRecord> {
+    const current = this.records.get(runId);
+    if (!current) throw new Error("missing test AgentRun");
+    return {
+      ...current,
+      failure: undefined,
+      result: { kind: "text", value: "Already complete" },
+      status: "completed",
+      updatedAt: new Date().toISOString(),
+    };
   }
 }
 

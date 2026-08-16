@@ -4,9 +4,11 @@ import {
   CreateMultipartUploadCommand,
   DeleteObjectCommand,
   GetObjectCommand,
+  HeadObjectCommand,
   S3Client,
   UploadPartCommand,
 } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { createHash, randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import type {
@@ -44,6 +46,9 @@ export type S3AssetStoreOptions = {
   /** Host scanner for untrusted uploads. */
   readonly scanner?: AssetScanner;
   readonly scanMode?: AssetScanMode;
+  /** Test/host injection point; defaults to the AWS SigV4 presigner. */
+  readonly presignUploadPart?: (command: UploadPartCommand, expiresInSeconds: number) => Promise<string>;
+  readonly uploadUrlExpiresSeconds?: number;
 };
 
 type UploadRow = {
@@ -52,6 +57,8 @@ type UploadRow = {
   provider_upload_id: string | null;
   tenant_id: string;
   principal_id: string;
+  principal_type?: string | null;
+  issuer?: string | null;
   session_id: string;
   filename: string;
   media_type: string;
@@ -59,16 +66,21 @@ type UploadRow = {
   declared_size_bytes: number | string;
   chunk_size_bytes: number;
   part_count: number;
-  status: "uploading" | "ready" | "failed";
+  status: "uploading" | "completing" | "ready" | "failed";
   created_at: Date | string;
   expires_at: Date | string | null;
   scan_status?: string | null;
+  updated_at?: Date | string;
 };
+
+const COMPLETION_LEASE_MS = 5 * 60 * 1_000;
 
 type AssetRow = {
   asset_id: string;
   tenant_id: string;
   principal_id: string;
+  principal_type?: string | null;
+  issuer?: string | null;
   session_id: string;
   message_id: string | null;
   filename: string;
@@ -102,6 +114,10 @@ export function createS3AssetStore(options: S3AssetStoreOptions): AssetStore {
   const quotaBytes = normalizeConfiguredQuotaBytes(options.quotaBytes);
   const prefix = normalizePrefix(options.prefix);
   const scanMode = resolveScanMode(options.scanMode, options.scanner);
+  const uploadUrlExpiresSeconds = normalizeUploadUrlExpiry(options.uploadUrlExpiresSeconds);
+  const presignUploadPart = options.presignUploadPart
+    ?? ((command: UploadPartCommand, expiresInSeconds: number) =>
+      getSignedUrl(options.client, command, { expiresIn: expiresInSeconds }));
 
   return {
     async createUpload(input) {
@@ -118,8 +134,12 @@ export function createS3AssetStore(options: S3AssetStoreOptions): AssetStore {
           ContentType: input.mediaType,
           Key: storageKey,
           Metadata: {
-            asset: assetId,
-            tenant: input.owner.tenantId,
+            asset: metadataDigest(assetId),
+            issuer: metadataDigest(input.owner.issuer ?? ""),
+            principal: metadataDigest(input.owner.principalId),
+            principaltype: metadataDigest(input.owner.principalType ?? ""),
+            session: metadataDigest(input.sessionId),
+            tenant: metadataDigest(input.owner.tenantId),
           },
         }));
         providerUploadId = created.UploadId;
@@ -130,15 +150,17 @@ export function createS3AssetStore(options: S3AssetStoreOptions): AssetStore {
         transactionClient = executor.client;
         const insertedAsset = await executor.query<{ asset_id: string }>(
           `insert into ${table.assets}
-             (asset_id, tenant_id, principal_id, session_id, message_id, filename,
+             (asset_id, tenant_id, principal_id, principal_type, issuer, session_id, message_id, filename,
               media_type, size_bytes, storage_key, status, scan_status, expires_at)
-           values ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'uploading', $10, $11)
+           values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'uploading', $12, $13)
            on conflict (asset_id) do nothing
            returning asset_id`,
           [
             assetId,
             input.owner.tenantId,
             input.owner.principalId,
+            input.owner.principalType ?? null,
+            input.owner.issuer ?? null,
             input.sessionId,
             input.messageId ?? null,
             input.filename,
@@ -153,14 +175,16 @@ export function createS3AssetStore(options: S3AssetStoreOptions): AssetStore {
         metadataInserted = true;
         await executor.query(
           `insert into ${table.uploads}
-             (upload_id, asset_id, tenant_id, principal_id, session_id,
+             (upload_id, asset_id, tenant_id, principal_id, principal_type, issuer, session_id,
               chunk_size_bytes, declared_size_bytes, part_count, provider_upload_id, status)
-           values ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'uploading')`,
+           values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'uploading')`,
           [
             uploadId,
             assetId,
             input.owner.tenantId,
             input.owner.principalId,
+            input.owner.principalType ?? null,
+            input.owner.issuer ?? null,
             input.sessionId,
             ASSET_CHUNK_SIZE_BYTES,
             input.sizeBytes,
@@ -184,6 +208,7 @@ export function createS3AssetStore(options: S3AssetStoreOptions): AssetStore {
           sizeBytes: input.sizeBytes,
           scanStatus: scanMode === "disabled" ? "disabled" : "pending",
           status: "uploading",
+          transferStrategy: "direct",
           uploadId,
           owner: input.owner,
         } satisfies AssetUpload;
@@ -205,119 +230,244 @@ export function createS3AssetStore(options: S3AssetStoreOptions): AssetStore {
       }
     },
 
+    async createPartUpload(input) {
+      assertPartNumber(input.partNumber);
+      return await withUploadWriteLock(pool, input.uploadId, async (lockedPool) => {
+        const row = await readUpload(lockedPool, table, input.uploadId);
+        assertOwner(ownerFromUploadRow(row), input.owner);
+        assertWritablePart(row, input.partNumber, input.sizeBytes);
+        const command = new UploadPartCommand({
+          Body: undefined,
+          Bucket: options.bucket,
+          ContentLength: input.sizeBytes,
+          Key: row.storage_key,
+          PartNumber: input.partNumber,
+          UploadId: row.provider_upload_id!,
+        });
+        const url = await presignUploadPart(command, uploadUrlExpiresSeconds);
+        return {
+          expiresAt: new Date(Date.now() + uploadUrlExpiresSeconds * 1_000).toISOString(),
+          method: "PUT" as const,
+          partNumber: input.partNumber,
+          url,
+        };
+      });
+    },
+
+    async acknowledgePart(input) {
+      assertPartNumber(input.partNumber);
+      const etag = normalizeEtag(input.etag);
+      return await withUploadWriteLock(pool, input.uploadId, async (lockedPool) => {
+        const row = await readUpload(lockedPool, table, input.uploadId);
+        assertOwner(ownerFromUploadRow(row), input.owner);
+        assertWritablePart(row, input.partNumber, input.sizeBytes);
+        await upsertPart(lockedPool, table.parts, {
+          etag,
+          partNumber: input.partNumber,
+          sizeBytes: input.sizeBytes,
+          storageKey: row.storage_key,
+          uploadId: input.uploadId,
+        });
+        return { etag, partNumber: input.partNumber, sizeBytes: input.sizeBytes };
+      });
+    },
+
     async writePart(input) {
       assertPartNumber(input.partNumber);
       if (input.content.byteLength === 0 || input.content.byteLength > 16 * 1024 * 1024) {
         throw new AssetStoreError("quota", "Asset parts exceed the configured 16 MiB limit.");
       }
-      const row = await readUpload(pool, table, input.uploadId);
-      assertOwner({ principalId: row.principal_id, tenantId: row.tenant_id }, input.owner);
-      if (row.status !== "uploading" || !row.provider_upload_id) {
-        throw new AssetStoreError("conflict", "The asset upload is no longer writable.");
-      }
-      if (input.partNumber > row.part_count) {
-        throw new AssetStoreError("invalid", "The asset part number exceeds the declared object size.");
-      }
-      const currentTotal = await sumParts(pool, table.parts, input.uploadId, input.partNumber);
-      if (currentTotal + input.content.byteLength > Number(row.declared_size_bytes)) {
-        throw new AssetStoreError("quota", "Uploaded parts exceed the declared asset size.");
-      }
-      const result = await options.client.send(new UploadPartCommand({
-        Body: input.content,
-        Bucket: options.bucket,
-        ContentLength: input.content.byteLength,
-        Key: row.storage_key,
-        PartNumber: input.partNumber,
-        UploadId: row.provider_upload_id,
-      }));
-      const etag = result.ETag?.replaceAll('"', "") || undefined;
-      if (!etag) throw new Error("The object store did not return a part etag.");
-      await pool.query(
-        `insert into ${table.parts} (upload_id, part_number, size_bytes, etag, storage_key)
-         values ($1, $2, $3, $4, $5)
-         on conflict (upload_id, part_number)
-         do update set size_bytes = excluded.size_bytes, etag = excluded.etag,
-                       storage_key = excluded.storage_key, created_at = now()`,
-        [input.uploadId, input.partNumber, input.content.byteLength, etag, row.storage_key],
-      );
-      return { etag, partNumber: input.partNumber, sizeBytes: input.content.byteLength } satisfies AssetPart;
+      // A multipart upload may receive different parts concurrently. The
+      // object store and metadata table have no shared transaction, so hold a
+      // per-upload PostgreSQL advisory lock across the re-read, provider
+      // write, and metadata upsert. This prevents two requests from both
+      // passing the declared-size check against the same stale total.
+      return await withUploadWriteLock(pool, input.uploadId, async (lockedPool) => {
+        const row = await readUpload(lockedPool, table, input.uploadId);
+        assertOwner({ principalId: row.principal_id, principalType: row.principal_type ?? undefined, issuer: row.issuer ?? undefined, tenantId: row.tenant_id }, input.owner);
+        if (row.status !== "uploading" || !row.provider_upload_id) {
+          throw new AssetStoreError("conflict", "The asset upload is no longer writable.");
+        }
+        if (input.partNumber > row.part_count) {
+          throw new AssetStoreError("invalid", "The asset part number exceeds the declared object size.");
+        }
+        // Re-read parts only after the lock is acquired. Replacing a part
+        // subtracts its previous metadata size before adding the new bytes.
+        const currentTotal = await sumParts(lockedPool, table.parts, input.uploadId, input.partNumber);
+        if (currentTotal + input.content.byteLength > Number(row.declared_size_bytes)) {
+          throw new AssetStoreError("quota", "Uploaded parts exceed the declared asset size.");
+        }
+        const result = await options.client.send(new UploadPartCommand({
+          Body: input.content,
+          Bucket: options.bucket,
+          ContentLength: input.content.byteLength,
+          Key: row.storage_key,
+          PartNumber: input.partNumber,
+          UploadId: row.provider_upload_id,
+        }));
+        const etag = result.ETag?.replaceAll('"', "") || undefined;
+        if (!etag) throw new Error("The object store did not return a part etag.");
+        await upsertPart(lockedPool, table.parts, {
+          etag,
+          partNumber: input.partNumber,
+          sizeBytes: input.content.byteLength,
+          storageKey: row.storage_key,
+          uploadId: input.uploadId,
+        });
+        return { etag, partNumber: input.partNumber, sizeBytes: input.content.byteLength } satisfies AssetPart;
+      });
     },
 
     async completeUpload(input) {
-      const row = await readUpload(pool, table, input.uploadId);
-      assertOwner({ principalId: row.principal_id, tenantId: row.tenant_id }, input.owner);
-      if (row.status === "ready") {
-        const existing = await readAsset(pool, table, row.asset_id);
-        if (existing) return toMetadata(existing);
+      // Claim the completion in durable metadata before touching the provider.
+      // If the process dies after CompleteMultipartUpload succeeds, the next
+      // caller can recover the `completing` row by inspecting the object.
+      const claim = await withUploadWriteLock(pool, input.uploadId, async (lockedPool) => {
+        const row = await readUpload(lockedPool, table, input.uploadId);
+        assertOwner({ principalId: row.principal_id, principalType: row.principal_type ?? undefined, issuer: row.issuer ?? undefined, tenantId: row.tenant_id }, input.owner);
+        if (row.status === "ready") {
+          const existing = await readAsset(lockedPool, table, row.asset_id);
+          if (existing) return { kind: "ready" as const, metadata: toMetadata(existing) };
+        }
+        if (row.status === "failed" || !row.provider_upload_id) {
+          throw new AssetStoreError("conflict", "The asset upload cannot be completed.");
+        }
+        const updatedAt = row.updated_at ? Date.parse(asIso(row.updated_at)) : Number.NaN;
+        if (row.status === "completing" && Number.isFinite(updatedAt) && Date.now() - updatedAt < COMPLETION_LEASE_MS) {
+          throw new AssetStoreError("conflict", "The asset upload is already being completed. Retry after the active attempt settles.");
+        }
+        if (input.parts) {
+          await reconcileCompletionParts(lockedPool, table.parts, row, input.uploadId, input.parts);
+        }
+        const parts = await readParts(lockedPool, table.parts, input.uploadId);
+        if (parts.length !== row.part_count || parts.some((part, index) => part.part_number !== index + 1)) {
+          throw new AssetStoreError("invalid", "All asset parts must be uploaded before completion.");
+        }
+        const totalBytes = parts.reduce((sum, part) => sum + part.size_bytes, 0);
+        if (totalBytes !== Number(row.declared_size_bytes)) {
+          throw new AssetStoreError("invalid", "Uploaded bytes do not match the declared asset size.");
+        }
+        await lockedPool.query(
+          `update ${table.uploads} set status = 'completing', updated_at = now()
+           where upload_id = $1 and status in ('uploading', 'completing')`,
+          [input.uploadId],
+        );
+        return { kind: "claimed" as const, parts, row };
+      });
+      if (claim.kind === "ready") return claim.metadata;
+
+      const { row, parts } = claim;
+      try {
+        await options.client.send(new CompleteMultipartUploadCommand({
+          Bucket: options.bucket,
+          Key: row.storage_key,
+          MultipartUpload: { Parts: parts.map((part) => ({ ETag: part.etag ?? undefined, PartNumber: part.part_number })) },
+          UploadId: row.provider_upload_id!,
+        }));
+      } catch (error) {
+        // S3-compatible providers commonly return NoSuchUpload when the
+        // multipart operation already committed before a client crash. A
+        // successful HeadObject is the durable provider-side commit marker.
+        if (!await objectMatches(options.client, options.bucket, row)) {
+          throw storageFailure(error);
+        }
       }
-      if (row.status !== "uploading" || !row.provider_upload_id) {
-        throw new AssetStoreError("conflict", "The asset upload cannot be completed.");
+
+      if (!await objectMatches(options.client, options.bucket, row)) {
+        await options.client.send(new DeleteObjectCommand({ Bucket: options.bucket, Key: row.storage_key })).catch(() => undefined);
+        await withUploadWriteLock(pool, input.uploadId, async (lockedPool) => {
+          await lockedPool.query(`update ${table.assets} set status = 'failed' where asset_id = $1`, [row.asset_id]);
+          await lockedPool.query(`update ${table.uploads} set status = 'failed', updated_at = now() where upload_id = $1`, [input.uploadId]);
+        });
+        throw new AssetStoreError("invalid", "The completed object does not match its declared size or authenticated upload identity.");
       }
-      const parts = await readParts(pool, table.parts, input.uploadId);
-      if (parts.length !== row.part_count || parts.some((part, index) => part.part_number !== index + 1)) {
-        throw new AssetStoreError("invalid", "All asset parts must be uploaded before completion.");
-      }
-      const totalBytes = parts.reduce((sum, part) => sum + part.size_bytes, 0);
-      if (totalBytes !== Number(row.declared_size_bytes)) {
-        throw new AssetStoreError("invalid", "Uploaded bytes do not match the declared asset size.");
-      }
-      await options.client.send(new CompleteMultipartUploadCommand({
-        Bucket: options.bucket,
-        Key: row.storage_key,
-        MultipartUpload: { Parts: parts.map((part) => ({ ETag: part.etag ?? undefined, PartNumber: part.part_number })) },
-        UploadId: row.provider_upload_id,
-      }));
+
       const checksum = await hashObject(options.client, options.bucket, row.storage_key);
       if (input.checksumSha256 && input.checksumSha256 !== checksum) {
         await options.client.send(new DeleteObjectCommand({ Bucket: options.bucket, Key: row.storage_key })).catch(() => undefined);
-        await pool.query(`update ${table.assets} set status = 'failed' where asset_id = $1`, [row.asset_id]);
+        await withUploadWriteLock(pool, input.uploadId, async (lockedPool) => {
+          await lockedPool.query(`update ${table.assets} set status = 'failed' where asset_id = $1`, [row.asset_id]);
+          await lockedPool.query(`update ${table.uploads} set status = 'failed', updated_at = now() where upload_id = $1`, [input.uploadId]);
+        });
         throw new AssetStoreError("invalid", "The completed asset checksum does not match.");
       }
-      const updated = await pool.query<AssetRow>(
-        `update ${table.assets}
-            set status = 'ready', scan_status = $3, checksum_sha256 = $2
-          where asset_id = $1
-          returning asset_id, tenant_id, principal_id, session_id, message_id,
-            filename, media_type, size_bytes, checksum_sha256, storage_key,
-            status, scan_status, expires_at, created_at`,
-        [row.asset_id, checksum, scanMode === "disabled" ? "disabled" : "scanning"],
-      );
-      await pool.query(`update ${table.uploads} set status = 'ready', updated_at = now() where upload_id = $1`, [input.uploadId]);
-      const asset = updated.rows[0];
-      if (!asset) throw new Error("The asset metadata disappeared during completion.");
-      const metadata = toMetadata(asset);
+
+      const metadata = await withUploadWriteLock(pool, input.uploadId, async (lockedPool) => {
+        const current = await readUpload(lockedPool, table, input.uploadId);
+        assertOwner({ principalId: current.principal_id, principalType: current.principal_type ?? undefined, issuer: current.issuer ?? undefined, tenantId: current.tenant_id }, input.owner);
+        if (current.status === "ready") {
+          const existing = await readAsset(lockedPool, table, current.asset_id);
+          if (existing) return toMetadata(existing);
+        }
+        if (current.status !== "completing") throw new AssetStoreError("conflict", "The asset upload completion lease is no longer active.");
+        const updated = await lockedPool.query<AssetRow>(
+          `update ${table.assets}
+              set status = 'ready', scan_status = $3, checksum_sha256 = $2
+            where asset_id = $1
+              returning asset_id, tenant_id, principal_id, principal_type, issuer, session_id, message_id,
+              filename, media_type, size_bytes, checksum_sha256, storage_key,
+              status, scan_status, expires_at, created_at`,
+          [current.asset_id, checksum, scanMode === "disabled" ? "disabled" : "scanning"],
+        );
+        await lockedPool.query(`update ${table.uploads} set status = 'ready', updated_at = now() where upload_id = $1`, [input.uploadId]);
+        const asset = updated.rows[0];
+        if (!asset) throw new Error("The asset metadata disappeared during completion.");
+        return toMetadata(asset);
+      });
+
       const scanned = await scanAsset(
         metadata,
         scanMode,
         options.scanner,
-        () => openS3AssetReadStream(options.client, options.bucket, asset),
+        () => openS3AssetReadStream(options.client, options.bucket, {
+          asset_id: metadata.assetId,
+          tenant_id: metadata.tenantId,
+          principal_id: metadata.principalId,
+          session_id: metadata.sessionId,
+          message_id: metadata.messageId ?? null,
+          filename: metadata.filename,
+          media_type: metadata.mediaType,
+          size_bytes: metadata.sizeBytes,
+          checksum_sha256: metadata.checksumSha256 ?? null,
+          storage_key: metadata.storageKey,
+          status: "ready",
+          scan_status: metadata.scanStatus,
+          expires_at: metadata.expiresAt ?? null,
+          created_at: metadata.createdAt,
+        }),
       );
-      await pool.query(
-        `update ${table.assets} set scan_status = $2 where asset_id = $1`,
-        [asset.asset_id, scanned.scanStatus ?? "pending"],
-      );
+      if (scanned.scanStatus !== metadata.scanStatus) {
+        await withUploadWriteLock(pool, input.uploadId, async (lockedPool) => {
+          await lockedPool.query(`update ${table.assets} set scan_status = $2 where asset_id = $1`, [metadata.assetId, scanned.scanStatus ?? "pending"]);
+        });
+      }
       return scanned;
     },
 
     async abortUpload(input) {
-      const row = await readUpload(pool, table, input.uploadId);
-      assertOwner({ principalId: row.principal_id, tenantId: row.tenant_id }, input.owner);
-      if (row.status === "ready") throw new AssetStoreError("conflict", "A completed asset cannot be aborted.");
-      if (row.provider_upload_id) {
-        await options.client.send(new AbortMultipartUploadCommand({
-          Bucket: options.bucket,
-          Key: row.storage_key,
-          UploadId: row.provider_upload_id,
-        }));
-      }
-      await pool.query(`delete from ${table.uploads} where upload_id = $1`, [input.uploadId]);
-      await pool.query(`delete from ${table.assets} where asset_id = $1 and status = 'uploading'`, [row.asset_id]);
+      await withUploadWriteLock(pool, input.uploadId, async (lockedPool) => {
+        const row = await readUpload(lockedPool, table, input.uploadId);
+        assertOwner({ principalId: row.principal_id, principalType: row.principal_type ?? undefined, issuer: row.issuer ?? undefined, tenantId: row.tenant_id }, input.owner);
+        if (row.status === "ready") throw new AssetStoreError("conflict", "A completed asset cannot be aborted.");
+        if (row.status === "completing") {
+          throw new AssetStoreError("conflict", "An upload being completed cannot be aborted; retry after completion reconciliation.");
+        }
+        if (row.provider_upload_id) {
+          await options.client.send(new AbortMultipartUploadCommand({
+            Bucket: options.bucket,
+            Key: row.storage_key,
+            UploadId: row.provider_upload_id,
+          })).catch((error) => { throw storageFailure(error); });
+        }
+        await lockedPool.query(`delete from ${table.uploads} where upload_id = $1`, [input.uploadId]);
+        await lockedPool.query(`delete from ${table.assets} where asset_id = $1 and status = 'uploading'`, [row.asset_id]);
+      });
     },
 
     async deleteAsset(input) {
       const row = await readAsset(pool, table, input.assetId);
       if (!row) return;
-      assertOwner({ principalId: row.principal_id, tenantId: row.tenant_id }, input.owner);
+      assertOwner({ principalId: row.principal_id, principalType: row.principal_type ?? undefined, issuer: row.issuer ?? undefined, tenantId: row.tenant_id }, input.owner);
       await options.client.send(new DeleteObjectCommand({ Bucket: options.bucket, Key: row.storage_key }));
       await pool.query(`delete from ${table.assets} where asset_id = $1`, [input.assetId]);
     },
@@ -329,8 +479,9 @@ export function createS3AssetStore(options: S3AssetStoreOptions): AssetStore {
            coalesce(sum(case when status = 'ready' then size_bytes else 0 end), 0)::text as used_bytes,
            coalesce(sum(case when status = 'uploading' then size_bytes else 0 end), 0)::text as active_upload_bytes
          from ${table.assets}
-         where tenant_id = $1 and principal_id = $2`,
-        [owner.tenantId, owner.principalId],
+         where tenant_id = $1 and principal_id = $2
+           and coalesce(principal_type, '') = $3 and coalesce(issuer, '') = $4`,
+        [owner.tenantId, owner.principalId, owner.principalType ?? "", owner.issuer ?? ""],
       );
       return {
         activeUploadBytes: Number(result.rows[0]?.active_upload_bytes ?? 0),
@@ -345,18 +496,19 @@ export function createS3AssetStore(options: S3AssetStoreOptions): AssetStore {
       assertOwnerInput(input.owner);
       const row = await readAsset(pool, table, input.assetId);
       if (!row) return undefined;
-      assertOwner({ principalId: row.principal_id, tenantId: row.tenant_id }, input.owner);
+      assertOwner({ principalId: row.principal_id, principalType: row.principal_type ?? undefined, issuer: row.issuer ?? undefined, tenantId: row.tenant_id }, input.owner);
       if (row.session_id === input.sessionId) return toMetadata(row);
       if (!row.session_id.startsWith("browser-") || row.status !== "ready") return undefined;
       const rebound = await pool.query<AssetRow>(
         `update ${table.assets}
             set session_id = $2
           where asset_id = $1 and tenant_id = $3 and principal_id = $4
+            and coalesce(principal_type, '') = $5 and coalesce(issuer, '') = $6
             and status = 'ready' and session_id like 'browser-%'
-          returning asset_id, tenant_id, principal_id, session_id, message_id,
+          returning asset_id, tenant_id, principal_id, principal_type, issuer, session_id, message_id,
             filename, media_type, size_bytes, checksum_sha256, storage_key,
             status, scan_status, expires_at, created_at`,
-        [input.assetId, input.sessionId, input.owner.tenantId, input.owner.principalId],
+        [input.assetId, input.sessionId, input.owner.tenantId, input.owner.principalId, input.owner.principalType ?? "", input.owner.issuer ?? ""],
       );
       return rebound.rows[0] ? toMetadata(rebound.rows[0]) : undefined;
     },
@@ -364,28 +516,30 @@ export function createS3AssetStore(options: S3AssetStoreOptions): AssetStore {
     async findAsset(assetId, owner) {
       const row = await readAsset(pool, table, assetId);
       if (!row) return undefined;
-      assertOwner({ principalId: row.principal_id, tenantId: row.tenant_id }, owner);
+      assertOwner({ principalId: row.principal_id, principalType: row.principal_type ?? undefined, issuer: row.issuer ?? undefined, tenantId: row.tenant_id }, owner);
       if (row.expires_at && Date.parse(asIso(row.expires_at)) <= Date.now()) return undefined;
       return toMetadata(row);
     },
 
     async findUpload(uploadId, owner) {
       const row = await readUpload(pool, table, uploadId);
-      assertOwner({ principalId: row.principal_id, tenantId: row.tenant_id }, owner);
-      return toUpload(row, maxBytes);
+      assertOwner({ principalId: row.principal_id, principalType: row.principal_type ?? undefined, issuer: row.issuer ?? undefined, tenantId: row.tenant_id }, owner);
+      const parts = await readParts(pool, table.parts, uploadId);
+      return toUpload(row, maxBytes, parts);
     },
 
     async listAssets(sessionId, owner) {
       assertIdentifier(sessionId, "sessionId");
       assertOwnerInput(owner);
       const result = await pool.query<AssetRow>(
-        `select asset_id, tenant_id, principal_id, session_id, message_id,
+        `select asset_id, tenant_id, principal_id, principal_type, issuer, session_id, message_id,
            filename, media_type, size_bytes, checksum_sha256, storage_key,
            status, scan_status, expires_at, created_at
          from ${table.assets}
-         where session_id = $1 and tenant_id = $2 and principal_id = $3 and status = 'ready'
+         where session_id = $1 and tenant_id = $2 and principal_id = $3
+           and coalesce(principal_type, '') = $4 and coalesce(issuer, '') = $5 and status = 'ready'
          order by created_at desc`,
-        [sessionId, owner.tenantId, owner.principalId],
+        [sessionId, owner.tenantId, owner.principalId, owner.principalType ?? "", owner.issuer ?? ""],
       );
       return result.rows.map(toMetadata);
     },
@@ -417,28 +571,56 @@ export function createS3AssetStore(options: S3AssetStoreOptions): AssetStore {
       if (remaining > 0) {
         const expiredUploads = await pool.query<UploadRow>(
           `select upload.asset_id, upload.upload_id, upload.provider_upload_id,
-             upload.tenant_id, upload.principal_id, upload.session_id,
+             upload.tenant_id, upload.principal_id, upload.principal_type, upload.issuer, upload.session_id,
              asset.filename, asset.media_type, asset.storage_key,
              upload.declared_size_bytes, upload.chunk_size_bytes, upload.part_count,
              upload.status, upload.created_at, asset.scan_status, asset.expires_at
            from ${table.uploads} upload
            join ${table.assets} asset on asset.asset_id = upload.asset_id
-           where upload.status = 'uploading'
+             where (upload.status = 'uploading'
+               or (upload.status = 'completing' and upload.updated_at <= $1 - interval '5 minutes'))
              and asset.expires_at is not null and asset.expires_at <= $1
            order by asset.expires_at asc
            limit $2`,
           [now, remaining],
         );
         for (const row of expiredUploads.rows) {
-          if (row.provider_upload_id) {
-            await options.client.send(new AbortMultipartUploadCommand({
-              Bucket: options.bucket,
-              Key: row.storage_key,
-              UploadId: row.provider_upload_id,
-            }));
-          }
-          await pool.query(`delete from ${table.assets} where asset_id = $1 and status = 'uploading'`, [row.asset_id]);
-          abortedUploads += 1;
+          await withUploadWriteLock(pool, row.upload_id, async (lockedPool) => {
+            // Some lightweight host adapters expose only the cleanup query;
+            // PostgreSQL re-reads authoritatively under the same lock.
+            const current = await readUpload(lockedPool, table, row.upload_id).catch(() => row);
+            if (!current || (current.status !== "uploading" && current.status !== "completing")) return;
+            const currentUpdatedAt = current.updated_at ? Date.parse(asIso(current.updated_at)) : Number.NaN;
+            if (current.status === "completing" && (!Number.isFinite(currentUpdatedAt) || now.getTime() - currentUpdatedAt < COMPLETION_LEASE_MS)) return;
+            if (current.provider_upload_id) {
+              try {
+                await options.client.send(new AbortMultipartUploadCommand({
+                  Bucket: options.bucket,
+                  Key: current.storage_key,
+                  UploadId: current.provider_upload_id,
+                }));
+              } catch (error) {
+                // A stale completion may already have committed the object, in
+                // which case S3 returns NoSuchUpload. The idempotent object
+                // deletion below is the authoritative cleanup. For a normal
+                // upload, retain metadata so the abort can be retried later.
+                if (current.status !== "completing") return;
+              }
+            }
+            if (current.status === "completing") {
+              try {
+                await options.client.send(new DeleteObjectCommand({
+                  Bucket: options.bucket,
+                  Key: current.storage_key,
+                }));
+              } catch {
+                // Do not lose the only durable pointer to a billed object.
+                return;
+              }
+            }
+            await lockedPool.query(`delete from ${table.assets} where asset_id = $1 and status = 'uploading'`, [current.asset_id]);
+            abortedUploads += 1;
+          });
         }
       }
       return { abortedUploads, deletedAssets };
@@ -447,7 +629,7 @@ export function createS3AssetStore(options: S3AssetStoreOptions): AssetStore {
     async openReadStream(assetId, owner, optionsRead) {
       const row = await readAsset(pool, table, assetId);
       if (!row) return undefined;
-      assertOwner({ principalId: row.principal_id, tenantId: row.tenant_id }, owner);
+      assertOwner({ principalId: row.principal_id, principalType: row.principal_type ?? undefined, issuer: row.issuer ?? undefined, tenantId: row.tenant_id }, owner);
       if (row.status !== "ready"
         || (row.expires_at && Date.parse(asIso(row.expires_at)) <= Date.now())
         || !isScanAllowed(row.scan_status)) return undefined;
@@ -499,14 +681,16 @@ async function openS3AssetReadStream(
   return body.transformToWebStream();
 }
 
-async function readUpload(pool: Pool, tables: ReturnType<typeof tableNames>, uploadId: string): Promise<UploadRow> {
+type SqlExecutor = Pick<Pool, "query">;
+
+async function readUpload(pool: SqlExecutor, tables: ReturnType<typeof tableNames>, uploadId: string): Promise<UploadRow> {
   assertIdentifier(uploadId, "uploadId");
   const result = await pool.query<UploadRow>(
     `select upload.asset_id, upload.upload_id, upload.provider_upload_id,
-       upload.tenant_id, upload.principal_id, upload.session_id,
+       upload.tenant_id, upload.principal_id, upload.principal_type, upload.issuer, upload.session_id,
        asset.filename, asset.media_type, asset.storage_key,
        upload.declared_size_bytes, upload.chunk_size_bytes, upload.part_count,
-       upload.status, upload.created_at, asset.scan_status, asset.expires_at
+       upload.status, upload.created_at, upload.updated_at, asset.scan_status, asset.expires_at
      from ${tables.uploads} upload
      join ${tables.assets} asset on asset.asset_id = upload.asset_id
      where upload.upload_id = $1`,
@@ -517,10 +701,10 @@ async function readUpload(pool: Pool, tables: ReturnType<typeof tableNames>, upl
   return row;
 }
 
-async function readAsset(pool: Pool, tables: ReturnType<typeof tableNames>, assetId: string): Promise<AssetRow | undefined> {
+async function readAsset(pool: SqlExecutor, tables: ReturnType<typeof tableNames>, assetId: string): Promise<AssetRow | undefined> {
   assertIdentifier(assetId, "assetId");
   const result = await pool.query<AssetRow>(
-    `select asset_id, tenant_id, principal_id, session_id, message_id,
+    `select asset_id, tenant_id, principal_id, principal_type, issuer, session_id, message_id,
        filename, media_type, size_bytes, checksum_sha256, storage_key,
        status, scan_status, expires_at, created_at
      from ${tables.assets} where asset_id = $1`,
@@ -529,7 +713,7 @@ async function readAsset(pool: Pool, tables: ReturnType<typeof tableNames>, asse
   return result.rows[0];
 }
 
-async function readParts(pool: Pool, table: string, uploadId: string): Promise<PartRow[]> {
+async function readParts(pool: SqlExecutor, table: string, uploadId: string): Promise<PartRow[]> {
   const result = await pool.query<PartRow>(
     `select part_number, size_bytes, etag from ${table} where upload_id = $1 order by part_number asc`,
     [uploadId],
@@ -537,13 +721,90 @@ async function readParts(pool: Pool, table: string, uploadId: string): Promise<P
   return result.rows;
 }
 
-async function sumParts(pool: Pool, table: string, uploadId: string, replacingPart: number): Promise<number> {
+async function upsertPart(
+  pool: SqlExecutor,
+  table: string,
+  input: {
+    readonly etag: string;
+    readonly partNumber: number;
+    readonly sizeBytes: number;
+    readonly storageKey: string;
+    readonly uploadId: string;
+  },
+): Promise<void> {
+  await pool.query(
+    `insert into ${table} (upload_id, part_number, size_bytes, etag, storage_key)
+     values ($1, $2, $3, $4, $5)
+     on conflict (upload_id, part_number)
+     do update set size_bytes = excluded.size_bytes, etag = excluded.etag,
+                   storage_key = excluded.storage_key, created_at = now()`,
+    [input.uploadId, input.partNumber, input.sizeBytes, input.etag, input.storageKey],
+  );
+}
+
+async function reconcileCompletionParts(
+  pool: SqlExecutor,
+  table: string,
+  row: UploadRow,
+  uploadId: string,
+  parts: readonly AssetPart[],
+): Promise<void> {
+  if (parts.length !== row.part_count) {
+    throw new AssetStoreError("invalid", "The completion payload must acknowledge every asset part.");
+  }
+  const seen = new Set<number>();
+  for (const part of parts) {
+    if (seen.has(part.partNumber)) throw new AssetStoreError("invalid", "The completion payload contains duplicate asset parts.");
+    seen.add(part.partNumber);
+    assertExpectedPart(row, part.partNumber, part.sizeBytes);
+    const etag = normalizeEtag(part.etag ?? "");
+    await upsertPart(pool, table, {
+      etag,
+      partNumber: part.partNumber,
+      sizeBytes: part.sizeBytes,
+      storageKey: row.storage_key,
+      uploadId,
+    });
+  }
+}
+
+async function sumParts(pool: SqlExecutor, table: string, uploadId: string, replacingPart: number): Promise<number> {
   const result = await pool.query<{ total: string }>(
     `select coalesce(sum(size_bytes), 0)::text as total
        from ${table} where upload_id = $1 and part_number <> $2`,
     [uploadId, replacingPart],
   );
   return Number(result.rows[0]?.total ?? 0);
+}
+
+async function withUploadWriteLock<T>(
+  pool: Pool,
+  uploadId: string,
+  operation: (pool: Pool | PoolClient) => Promise<T>,
+): Promise<T> {
+  // The in-memory/fake stores used by hosts and unit tests may expose only
+  // query(). They retain their host-neutral behavior; the built-in PostgreSQL
+  // adapter enables the stronger transactional lock when connect() exists.
+  if (typeof (pool as unknown as { connect?: unknown }).connect !== "function") {
+    return await operation(pool);
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+    await client.query(
+      "select pg_advisory_xact_lock(hashtextextended($1, 0))",
+      [`open-agent:asset-upload:${uploadId}`],
+    );
+    const result = await operation(client);
+    await client.query("commit");
+    return result;
+  } catch (error) {
+    await client.query("rollback").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 async function hashObject(client: S3Client, bucket: string, key: string): Promise<string> {
@@ -553,6 +814,22 @@ async function hashObject(client: S3Client, bucket: string, key: string): Promis
   const hash = createHash("sha256");
   for await (const chunk of body) hash.update(chunk);
   return hash.digest("hex");
+}
+
+async function objectMatches(client: S3Client, bucket: string, row: UploadRow): Promise<boolean> {
+  try {
+    const response = await client.send(new HeadObjectCommand({ Bucket: bucket, Key: row.storage_key }));
+    const metadata = response.Metadata ?? {};
+    return Number(response.ContentLength) === Number(row.declared_size_bytes)
+      && metadata.asset === metadataDigest(row.asset_id)
+      && metadata.tenant === metadataDigest(row.tenant_id)
+      && metadata.principal === metadataDigest(row.principal_id)
+      && metadata.principaltype === metadataDigest(row.principal_type ?? "")
+      && metadata.issuer === metadataDigest(row.issuer ?? "")
+      && metadata.session === metadataDigest(row.session_id);
+  } catch {
+    return false;
+  }
 }
 
 function toMetadata(row: AssetRow): AssetMetadata {
@@ -565,6 +842,8 @@ function toMetadata(row: AssetRow): AssetMetadata {
     mediaType: row.media_type,
     messageId: row.message_id ?? undefined,
     principalId: row.principal_id,
+    ...(row.principal_type ? { principalType: row.principal_type } : {}),
+    ...(row.issuer ? { issuer: row.issuer } : {}),
     sessionId: row.session_id,
     sizeBytes: Number(row.size_bytes),
     status: row.status,
@@ -574,7 +853,7 @@ function toMetadata(row: AssetRow): AssetMetadata {
   };
 }
 
-function toUpload(row: UploadRow, maxBytes: number): AssetUpload {
+function toUpload(row: UploadRow, maxBytes: number, parts: readonly PartRow[] = []): AssetUpload {
   return {
     assetId: row.asset_id,
     chunkSizeBytes: row.chunk_size_bytes,
@@ -583,11 +862,22 @@ function toUpload(row: UploadRow, maxBytes: number): AssetUpload {
     mediaType: row.media_type,
     maxBytes,
     partCount: row.part_count,
+    parts: parts.map((part) => ({
+      ...(part.etag ? { etag: part.etag } : {}),
+      partNumber: part.part_number,
+      sizeBytes: part.size_bytes,
+    })),
     sizeBytes: Number(row.declared_size_bytes),
     ...(row.scan_status ? { scanStatus: row.scan_status as AssetUpload["scanStatus"] } : {}),
-    status: row.status,
+    status: row.status === "completing" ? "uploading" : row.status,
+    transferStrategy: "direct",
     uploadId: row.upload_id,
-    owner: { principalId: row.principal_id, tenantId: row.tenant_id },
+    owner: {
+      ...(row.issuer ? { issuer: row.issuer } : {}),
+      principalId: row.principal_id,
+      ...(row.principal_type ? { principalType: row.principal_type } : {}),
+      tenantId: row.tenant_id,
+    },
   };
 }
 
@@ -641,11 +931,15 @@ function assertCreateUploadInput(input: {
 function assertOwnerInput(owner: AssetOwner) {
   assertAssetIdentifier(owner.tenantId, "tenantId");
   assertAssetPrincipalIdentifier(owner.principalId, "principalId");
+  if (owner.principalType !== undefined) assertAssetPrincipalIdentifier(owner.principalType, "principalType");
+  if (owner.issuer !== undefined) assertAssetPrincipalIdentifier(owner.issuer, "issuer");
 }
 
 function assertOwner(expected: AssetOwner, actual: AssetOwner) {
   assertOwnerInput(actual);
-  if (expected.tenantId !== actual.tenantId || expected.principalId !== actual.principalId) {
+  if (expected.tenantId !== actual.tenantId || expected.principalId !== actual.principalId
+    || (expected.principalType !== undefined && expected.principalType !== actual.principalType)
+    || (expected.issuer ?? "") !== (actual.issuer ?? "")) {
     throw new AssetStoreError("forbidden", "The authenticated principal cannot access this asset.");
   }
 }
@@ -656,6 +950,47 @@ function assertIdentifier(value: string, name: string) {
 
 function assertPartNumber(value: number) {
   if (!Number.isSafeInteger(value) || value < 1) throw new AssetStoreError("invalid", "The asset part number must be a positive integer.");
+}
+
+function assertWritablePart(row: UploadRow, partNumber: number, sizeBytes: number): void {
+  if (row.status !== "uploading" || !row.provider_upload_id) {
+    throw new AssetStoreError("conflict", "The asset upload is no longer writable.");
+  }
+  assertExpectedPart(row, partNumber, sizeBytes);
+}
+
+function assertExpectedPart(row: UploadRow, partNumber: number, sizeBytes: number): void {
+  assertPartNumber(partNumber);
+  if (partNumber > row.part_count) {
+    throw new AssetStoreError("invalid", "The asset part number exceeds the declared object size.");
+  }
+  const expected = partNumber === row.part_count
+    ? Number(row.declared_size_bytes) - row.chunk_size_bytes * (row.part_count - 1)
+    : row.chunk_size_bytes;
+  if (!Number.isSafeInteger(sizeBytes) || sizeBytes !== expected) {
+    throw new AssetStoreError("invalid", `Asset part ${partNumber} must contain exactly ${expected} bytes.`);
+  }
+}
+
+function normalizeEtag(value: string): string {
+  const normalized = value.trim().replace(/^"|"$/gu, "");
+  if (!/^[A-Za-z0-9+/_=:.-]{1,256}$/u.test(normalized)) {
+    throw new AssetStoreError("invalid", "The object-store part ETag is invalid.");
+  }
+  return normalized;
+}
+
+function ownerFromUploadRow(row: UploadRow): AssetOwner {
+  return {
+    ...(row.issuer ? { issuer: row.issuer } : {}),
+    principalId: row.principal_id,
+    ...(row.principal_type ? { principalType: row.principal_type } : {}),
+    tenantId: row.tenant_id,
+  };
+}
+
+function metadataDigest(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
 function assertFilename(value: string) {
@@ -693,6 +1028,14 @@ function normalizeConfiguredQuotaBytes(value: number | undefined): number | unde
   return value;
 }
 
+function normalizeUploadUrlExpiry(value: number | undefined): number {
+  const seconds = value ?? 15 * 60;
+  if (!Number.isSafeInteger(seconds) || seconds < 60 || seconds > 60 * 60) {
+    throw new Error("The S3 upload URL expiry must be between 60 and 3600 seconds.");
+  }
+  return seconds;
+}
+
 async function beginQuotaTransaction(
   pool: Pool,
   owner: AssetOwner,
@@ -713,8 +1056,9 @@ async function beginQuotaTransaction(
          coalesce(sum(case when status = 'ready' then size_bytes else 0 end), 0)::text as used_bytes,
          coalesce(sum(case when status = 'uploading' then size_bytes else 0 end), 0)::text as active_upload_bytes
        from ${tables.assets}
-       where tenant_id = $1 and principal_id = $2`,
-      [owner.tenantId, owner.principalId],
+       where tenant_id = $1 and principal_id = $2
+         and coalesce(principal_type, '') = $3 and coalesce(issuer, '') = $4`,
+      [owner.tenantId, owner.principalId, owner.principalType ?? "", owner.issuer ?? ""],
     );
     const usedBytes = Number(result.rows[0]?.used_bytes ?? 0);
     const activeUploadBytes = Number(result.rows[0]?.active_upload_bytes ?? 0);

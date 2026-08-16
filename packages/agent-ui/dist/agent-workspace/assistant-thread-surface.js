@@ -1,19 +1,19 @@
 "use client";
-import { jsx as _jsx, jsxs as _jsxs } from "react/jsx-runtime";
+import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-runtime";
 import { ActionBarPrimitive, AttachmentPrimitive, ComposerPrimitive, MessagePrimitive, ThreadPrimitive, unstable_useMentionAdapter, useAui, useAuiState, } from "@assistant-ui/react";
 import { LexicalComposerInput } from "@assistant-ui/react-lexical";
-import { ArrowDownIcon, ArrowUpIcon, AtSignIcon, CheckIcon, CircleGaugeIcon, CircleXIcon, CopyIcon, FileIcon, LockKeyholeIcon, LoaderCircleIcon, PlusIcon, PencilIcon, RotateCcwIcon, ShieldCheckIcon, SlashIcon, SquareIcon, WrenchIcon, } from "lucide-react";
+import { ArrowDownIcon, ArrowUpIcon, AtSignIcon, CheckIcon, CircleGaugeIcon, CircleXIcon, CopyIcon, FileIcon, ImageIcon, LockKeyholeIcon, LoaderCircleIcon, PlusIcon, PencilIcon, RotateCcwIcon, ShieldCheckIcon, SlashIcon, SquareIcon, WrenchIcon, } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ComposerTriggerPopover } from "../assistant-ui/composer-trigger-popover.js";
-import { ContextDisplay } from "../assistant-ui/context-display.js";
 import { copyText } from "../assistant-ui/copy-text.js";
+import { ContextDisplay } from "../assistant-ui/context-display.js";
 import { DirectiveText } from "../assistant-ui/directive-text.js";
 import { MarkdownText } from "../assistant-ui/markdown-text.js";
 import { ModelSelector } from "../assistant-ui/model-selector.js";
 import { ToolFallback } from "../assistant-ui/tool-fallback.js";
 import { TooltipIconButton } from "../assistant-ui/tooltip-icon-button.js";
 import { Button } from "../ui/button.js";
-import { Attachment, AttachmentContent, AttachmentDescription, AttachmentMedia, AttachmentTitle } from "../ui/attachment.js";
+import { Attachment, AttachmentContent, AttachmentDescription, AttachmentGroup, AttachmentMedia, AttachmentTitle, AttachmentTrigger } from "../ui/attachment.js";
 import { cn } from "../utils.js";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuLabel, DropdownMenuRadioGroup, DropdownMenuRadioItem, DropdownMenuTrigger, } from "../ui/dropdown-menu.js";
 import { AgentMessage } from "./agent-message.js";
@@ -34,17 +34,31 @@ function UserMessage({ messages }) {
         const lastUser = [...state.thread.messages].reverse().find((message) => message.role === "user");
         return lastUser?.id === state.message.id;
     });
-    const userText = useAuiState((state) => state.message.parts
-        .filter((part) => part.type === "text")
-        .map((part) => part.type === "text" ? part.text : "")
-        .join("\n"));
-    return (_jsxs(MessagePrimitive.Root, { className: "group mx-auto flex w-full max-w-(--thread-max-width) flex-col items-end", children: [_jsx("div", { className: "max-w-[min(44rem,88%)] rounded-2xl bg-muted/75 px-4 py-3 text-[15px] leading-6 text-foreground", onClick: () => {
+    return (_jsxs(MessagePrimitive.Root, { className: "group mx-auto flex w-full max-w-(--thread-max-width) flex-col items-end", children: [_jsx(AttachmentGroup, { className: "mb-2 max-w-[88%] justify-end py-0 empty:hidden", children: _jsx(MessagePrimitive.Attachments, { children: ({ attachment }) => _jsx(UserAttachment, { attachment: attachment, messages: messages }) }) }), _jsx("div", { className: "max-w-[min(44rem,88%)] rounded-2xl bg-muted/75 px-4 py-3 text-[15px] leading-6 text-foreground", onClick: () => {
                     if (window.matchMedia("(pointer: coarse)").matches)
                         setActionsVisible((visible) => !visible);
-                }, children: _jsx(MessagePrimitive.Parts, { components: { Text: DirectiveText } }) }), _jsxs("div", { className: cn("mt-0.5 flex min-h-7 items-center transition-opacity", actionsVisible ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"), children: [_jsx(CopyTextAction, { label: messages.copyResponse, text: userText }), _jsx(ActionBarPrimitive.Root, { className: "flex min-h-7 items-center", children: _jsx(ActionBarPrimitive.Edit, { "aria-label": messages.editMessage, className: `inline-flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground ${isLastUserMessage ? "" : "invisible pointer-events-none"}`, children: _jsx(PencilIcon, { className: "size-3.5" }) }) })] })] }));
+                }, children: _jsx(MessagePrimitive.Parts, { components: { Text: DirectiveText } }) }), _jsx("div", { className: cn("mt-0.5 flex min-h-7 items-center transition-opacity", actionsVisible ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"), children: _jsxs(ActionBarPrimitive.Root, { className: "flex min-h-7 items-center gap-0.5", children: [_jsx(ActionBarPrimitive.Copy, { "aria-label": messages.copyResponse, className: "inline-flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground", children: _jsx(CopyIcon, { className: "size-3.5" }) }), isLastUserMessage ? (_jsx(ActionBarPrimitive.Edit, { "aria-label": messages.editMessage, className: "inline-flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground", children: _jsx(PencilIcon, { className: "size-3.5" }) })) : null] }) })] }));
+}
+function UserAttachment({ attachment, messages }) {
+    const isImage = attachment.contentType?.startsWith("image/") ?? attachment.type === "image";
+    const previewUrl = isImage ? attachmentContentUrl(attachment) : undefined;
+    const [previewOpen, setPreviewOpen] = useState(false);
+    return (_jsxs(_Fragment, { children: [isImage ? (_jsxs(Attachment, { className: "size-24 min-w-0 overflow-hidden p-0 sm:size-28", orientation: "vertical", size: "sm", state: "done", children: [_jsx(AttachmentMedia, { className: "size-full rounded-xl", variant: previewUrl ? "image" : "icon", children: previewUrl ? _jsx("img", { alt: attachment.name, src: previewUrl }) : _jsx(ImageIcon, { className: "size-5" }) }), previewUrl ? (_jsx(AttachmentTrigger, { "aria-label": `${messages.attachment}: ${attachment.name}`, onClick: () => setPreviewOpen(true) })) : null] })) : (_jsxs(Attachment, { className: "max-w-72", size: "sm", state: "done", children: [_jsx(AttachmentMedia, { variant: "icon", children: _jsx(FileIcon, { className: "size-4" }) }), _jsxs(AttachmentContent, { children: [_jsx(AttachmentTitle, { children: attachment.name }), _jsx(AttachmentDescription, { children: attachment.contentType ?? messages.attachment })] })] })), previewOpen && previewUrl ? (_jsx("button", { "aria-label": messages.dismiss, className: "fixed inset-0 z-50 flex cursor-zoom-out items-center justify-center bg-black/70 p-4", onClick: () => setPreviewOpen(false), type: "button", children: _jsx("img", { alt: attachment.name, className: "max-h-[90vh] max-w-[90vw] rounded-xl object-contain", src: previewUrl }) })) : null] }));
+}
+function attachmentContentUrl(attachment) {
+    for (const part of attachment.content) {
+        const value = part.type === "file" ? part.data : part.type === "image" ? part.image : undefined;
+        if (typeof value === "string")
+            return value;
+        const candidate = value;
+        if (candidate instanceof URL)
+            return candidate.toString();
+    }
+    return undefined;
 }
 function AssistantMessage({ assetUrl, canRespond, closedInputRequestIds, events, fallbackStartedAt, isStreaming, locale, message, messages, onInputResponses, onCloseInputRequest, onOpenSubagent, }) {
-    return (_jsxs(MessagePrimitive.Root, { className: "group mx-auto flex w-full max-w-(--thread-max-width) flex-col", children: [_jsx("div", { className: "min-w-0 px-1 text-[15px] leading-7 text-foreground", children: message ? (_jsx(AgentMessage, { assetUrl: assetUrl, canRespond: canRespond, closedInputRequestIds: closedInputRequestIds, events: events, fallbackStartedAt: fallbackStartedAt, isStreaming: isStreaming, locale: locale, message: message, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, showCopyAction: true })) : (_jsx(MessagePrimitive.Parts, { components: { Text: MarkdownText, tools: { Fallback: ToolFallback } } })) }), _jsx("div", { className: "min-h-7" })] }));
+    const hasCopyableText = message?.parts.some((part) => part.type === "text" && part.text.trim().length > 0) ?? false;
+    return (_jsxs(MessagePrimitive.Root, { className: "group mx-auto flex w-full max-w-(--thread-max-width) flex-col", children: [_jsx("div", { className: "min-w-0 px-1 text-[15px] leading-7 text-foreground", children: message ? (_jsx(AgentMessage, { assetUrl: assetUrl, canRespond: canRespond, closedInputRequestIds: closedInputRequestIds, events: events, fallbackStartedAt: fallbackStartedAt, isStreaming: isStreaming, locale: locale, message: message, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, showCopyAction: false })) : (_jsx(MessagePrimitive.Parts, { components: { Text: MarkdownText, tools: { Fallback: ToolFallback } } })) }), !isStreaming && hasCopyableText ? (_jsx(ActionBarPrimitive.Root, { className: "mt-1 flex min-h-7 items-center opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100", children: _jsx(ActionBarPrimitive.Copy, { "aria-label": messages.copyResponse, className: "inline-flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground", children: _jsx(CopyIcon, { className: "size-3.5" }) }) })) : _jsx("div", { className: "min-h-7" })] }));
 }
 function EditMessage({ messages }) {
     const aui = useAui();
@@ -204,7 +218,11 @@ function ComposerAttachment({ attachment, messages }) {
         return () => URL.revokeObjectURL(url);
     }, [attachment.contentType, attachment.file]);
     const isImage = attachment.contentType?.startsWith("image/") ?? attachment.type === "image";
-    return (_jsxs(Attachment, { className: "mr-1.5 max-w-[min(22rem,calc(100vw-2rem))]", size: "sm", state: attachment.status.type === "incomplete" ? "error" : attachment.status.type === "running" ? "uploading" : "done", children: [_jsx(AttachmentMedia, { variant: isImage ? "image" : "icon", children: isImage && previewUrl ? _jsx("img", { alt: attachment.name, src: previewUrl }) : _jsx(FileIcon, { className: "size-4" }) }), _jsxs(AttachmentContent, { children: [_jsx(AttachmentTitle, { children: attachment.name }), _jsx(AttachmentDescription, { children: attachment.status.type === "running" ? `${Math.round(attachment.status.progress)}%` : messages.attachment })] }), _jsx(AttachmentPrimitive.Remove, { "aria-label": messages.removeAttachment, className: "relative z-20 rounded-sm text-muted-foreground hover:text-foreground", children: _jsx("span", { "aria-hidden": true, children: "\u00D7" }) })] }));
+    return (_jsxs(Attachment, { className: "mr-1.5 max-w-[min(22rem,calc(100vw-2rem))]", size: "sm", state: attachment.status.type === "incomplete" ? "error" : attachment.status.type === "running" ? "uploading" : "done", children: [_jsx(AttachmentMedia, { variant: isImage ? "image" : "icon", children: isImage && previewUrl ? _jsx("img", { alt: attachment.name, src: previewUrl }) : _jsx(FileIcon, { className: "size-4" }) }), _jsxs(AttachmentContent, { children: [_jsx(AttachmentTitle, { children: attachment.name }), _jsx(AttachmentDescription, { children: attachment.status.type === "running"
+                            ? `${Math.round(attachment.status.progress)}%`
+                            : attachment.status.type === "incomplete"
+                                ? attachment.status.message ?? messages.attachment
+                                : messages.attachment })] }), _jsx(AttachmentPrimitive.Remove, { "aria-label": messages.removeAttachment, className: "relative z-20 rounded-sm text-muted-foreground hover:text-foreground", children: _jsx("span", { "aria-hidden": true, children: "\u00D7" }) })] }));
 }
 function ApprovalComposerTakeover({ locale, onRespond, request, }) {
     const isZh = locale === "zh-CN";

@@ -8,7 +8,7 @@ import {
 } from "@/server/agent-sessions/service";
 import { createPostgresSessionOwnershipStoreFromEnvironment } from "@/server/data/session-ownership-store";
 import { createPostgresSandboxDeletionStoreFromEnvironment } from "@/server/data/sandbox-deletion-store";
-import { authenticateHostRequest } from "@/server/http/host-request-auth";
+import { authenticateHostRequest, HOST_AGENT_SCOPE, requireHostScope } from "@/server/http/host-request-auth";
 import { createPostgresAgentSubagentStoreFromEnvironment } from "@/server/data/agent-subagent-store";
 import { syncAgentSubagentsFromEvents } from "@/server/agent-sessions/subagents";
 import {
@@ -26,7 +26,10 @@ const approvalStore = createPostgresAgentSessionApprovalStoreFromEnvironment();
 type RouteContext = { readonly params: Promise<{ readonly sessionId: string }> };
 
 export async function GET(request: Request, context: RouteContext): Promise<Response> {
-  const authenticated = await authenticateHostRequest(request);
+  const authenticated = requireHostScope(
+    await authenticateHostRequest(request),
+    HOST_AGENT_SCOPE.sessionRead,
+  );
   if (!authenticated.ok) return authenticated.response;
   if (!ownershipStore) return databaseUnavailable();
   const { sessionId } = await context.params;
@@ -93,7 +96,10 @@ export async function GET(request: Request, context: RouteContext): Promise<Resp
  * unrelated queued message.
  */
 export async function POST(request: Request, context: RouteContext): Promise<Response> {
-  const authenticated = await authenticateHostRequest(request);
+  const authenticated = requireHostScope(
+    await authenticateHostRequest(request),
+    HOST_AGENT_SCOPE.sessionWrite,
+  );
   if (!authenticated.ok) return authenticated.response;
   const { sessionId } = await context.params;
   let body: unknown;
@@ -115,7 +121,13 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
         sessionId,
       });
       return result
-        ? Response.json({ ...result, ok: true }, { headers: { "cache-control": "no-store" }, status: 202 })
+        ? Response.json(
+            { ...result, ok: true },
+            {
+              headers: { "cache-control": "no-store" },
+              status: result.status === "accepted" ? 202 : 200,
+            },
+          )
         : problem(404, "agent_session_not_found", "The Agent session was not found for this principal.");
     } catch (error) {
       return error instanceof AgentSessionDeletionError
@@ -145,7 +157,10 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
 }
 
 export async function DELETE(request: Request, context: RouteContext): Promise<Response> {
-  const authenticated = await authenticateHostRequest(request);
+  const authenticated = requireHostScope(
+    await authenticateHostRequest(request),
+    HOST_AGENT_SCOPE.sessionDelete,
+  );
   if (!authenticated.ok) return authenticated.response;
   if (!ownershipStore || !deletionStore) return databaseUnavailable();
   const contentLength = Number(request.headers.get("content-length") ?? "0");

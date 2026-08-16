@@ -110,6 +110,7 @@ async function uploadOne(uploadIndex) {
     );
     assert(upload.upload?.status === "uploading", "The upload was not admitted.");
     const uploadRecord = upload.upload;
+    assert(uploadRecord.transferStrategy === "direct", "The production asset gate requires browser-to-object-store direct multipart upload.");
     const chunkSize = uploadRecord.chunkSizeBytes;
     assert(Number.isSafeInteger(chunkSize) && chunkSize > 0 && chunkSize <= ASSET_LOAD_MAX_PART_BYTES, "The server returned an unsafe multipart chunk size.");
     const partCount = uploadRecord.partCount;
@@ -125,16 +126,19 @@ async function uploadOne(uploadIndex) {
         // request. Hosts may reject it or persist it; the full retry below
         // must work in either case.
         const partial = bytes.subarray(0, Math.max(1, Math.floor(bytes.byteLength / 2)));
-        const partialResult = await partialPart(uploadRecord.uploadId, partNumber, partial);
+        const partialTarget = await signPart(uploadRecord.uploadId, partNumber, bytes.byteLength);
+        const partialResult = await partialDirectPart(partialTarget, partial);
         assert(partialResult.status !== 401 && partialResult.status !== 403, "The partial part request was rejected by authentication.");
         interruptedParts += 1;
         retries += 1;
       }
-      const part = await binaryRequest(
-        "PUT",
+      const target = await signPart(uploadRecord.uploadId, partNumber, bytes.byteLength);
+      const etag = await directPart(target, bytes);
+      const part = await jsonRequest(
+        "POST",
         `/api/assets/uploads/${encodeURIComponent(uploadRecord.uploadId)}/parts/${partNumber}`,
         accessToken,
-        bytes,
+        { action: "acknowledge", etag, sizeBytes: bytes.byteLength },
         200,
       );
       assert(part.part?.partNumber === partNumber, `Part ${partNumber} was not acknowledged.`);
@@ -229,41 +233,43 @@ async function verifyIsolation(assetId, token) {
   return { ok: response.status === 403, status: response.status };
 }
 
-async function partialPart(uploadId, partNumber, bytes) {
+async function signPart(uploadId, partNumber, sizeBytes) {
+  const response = await jsonRequest(
+    "POST",
+    `/api/assets/uploads/${encodeURIComponent(uploadId)}/parts/${partNumber}`,
+    accessToken,
+    { action: "sign", sizeBytes },
+    200,
+  );
+  assert(response.target?.method === "PUT" && typeof response.target?.url === "string", "The server returned an invalid direct upload target.");
+  return response.target;
+}
+
+async function partialDirectPart(target, bytes) {
   try {
-    const response = await fetch(
-      `${config.baseUrl}/api/assets/uploads/${encodeURIComponent(uploadId)}/parts/${partNumber}`,
-      {
-        body: bytes,
-        headers: {
-          authorization: `Bearer ${accessToken}`,
-          "content-length": String(bytes.byteLength),
-          "content-type": "application/octet-stream",
-        },
-        method: "PUT",
-        signal: AbortSignal.timeout(config.deadlineMs),
-      },
-    );
+    const response = await fetch(target.url, {
+      body: bytes,
+      headers: target.headers,
+      method: target.method,
+      signal: AbortSignal.timeout(config.deadlineMs),
+    });
     return { status: response.status };
   } catch {
     return { status: 499 };
   }
 }
 
-async function binaryRequest(method, path, token, bytes, expectedStatus) {
-  const response = await fetch(`${config.baseUrl}${path}`, {
+async function directPart(target, bytes) {
+  const response = await fetch(target.url, {
     body: bytes,
-    headers: {
-      authorization: `Bearer ${token}`,
-      "content-length": String(bytes.byteLength),
-      "content-type": "application/octet-stream",
-    },
-    method,
+    headers: target.headers,
+    method: target.method,
     signal: AbortSignal.timeout(config.deadlineMs),
   });
-  const payload = await response.json().catch(() => undefined);
-  if (response.status !== expectedStatus) throw new Error(`${method} ${path} returned ${response.status}, expected ${expectedStatus}: ${payload?.error || "unknown error"}`);
-  return payload;
+  assert(response.ok, `Direct object-store part returned ${response.status}.`);
+  const etag = response.headers.get("etag");
+  assert(etag, "The object store did not expose the ETag response header.");
+  return etag;
 }
 
 async function jsonRequest(method, path, token, body, expectedStatus) {

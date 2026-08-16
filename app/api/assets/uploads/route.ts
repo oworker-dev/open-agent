@@ -1,5 +1,5 @@
 import { AssetStoreError, createAssetStoreFromEnvironment } from "@/server/data/asset-store";
-import { authResponseHeaders, authenticateAssetRequest } from "@/server/http/asset-request-auth";
+import { authResponseHeaders, authenticateAssetRequest, requireAssetScope } from "@/server/http/asset-request-auth";
 import { z } from "zod";
 
 export const runtime = "nodejs";
@@ -12,11 +12,10 @@ const createUploadSchema = z.object({
   messageId: z.string().min(1).max(512).optional(),
   sessionId: z.string().min(1).max(512),
   sizeBytes: z.number().int().positive(),
-  expiresAt: z.string().datetime().optional(),
 }).strict();
 
 export async function POST(request: Request): Promise<Response> {
-  const authenticated = await authenticateAssetRequest(request);
+  const authenticated = requireAssetScope(await authenticateAssetRequest(request), "asset:write");
   if (!authenticated.ok) return authenticated.response;
   if (tooLarge(request, MAX_REQUEST_BYTES)) return problem(413, "asset_upload_request_too_large", "The upload initialization request is too large.");
   let input: unknown;
@@ -38,7 +37,6 @@ export async function POST(request: Request): Promise<Response> {
       owner: authenticated.identity,
       sessionId: parsed.data.sessionId,
       sizeBytes: parsed.data.sizeBytes,
-      ...(parsed.data.expiresAt ? { expiresAt: new Date(parsed.data.expiresAt) } : {}),
     });
     return Response.json({ ok: true, upload }, { headers: { "cache-control": "no-store", ...authResponseHeaders(authenticated) }, status: 201 });
   } catch (error) {

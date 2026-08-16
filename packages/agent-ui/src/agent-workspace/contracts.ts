@@ -41,6 +41,8 @@ export type AgentInterruptedTurn = {
 
 export type AgentQueuedTurn = {
   readonly delivery?: "browser" | "server";
+  /** Exact Eve turn that may accept this message at its next model boundary. */
+  readonly expectedTurnId?: string;
   readonly id: string;
   /** A post-cancellation message is a normal next turn staged until Eve parks. */
   readonly intent?: "active-turn" | "post-cancellation";
@@ -77,7 +79,10 @@ export interface AgentWorkspaceMailbox {
   enqueue(input: {
     readonly clientMessageId: string;
     readonly clientContext?: readonly string[];
+    readonly expectedTurnId?: string;
     readonly message: string;
+    readonly operationId: string;
+    readonly operationKind: "send" | "steer";
     readonly preferences: AgentThreadPreferences;
     readonly sessionId: string;
   }): Promise<AgentMailboxReceipt>;
@@ -123,6 +128,18 @@ export type AgentExtensionInfo = {
   readonly version?: string;
 };
 
+export type AgentSubagentSummary = {
+  readonly callId?: string;
+  readonly childSessionId: string;
+  readonly name?: string;
+  readonly nickname?: string;
+  readonly status: "starting" | "running" | "waiting" | "completed" | "failed" | "cancelled" | "interrupted" | "closed";
+  readonly task?: string;
+};
+
+/** Host-provided durable loader. Event streams remain the optimistic fast path. */
+export type AgentSubagentLoader = (parentSessionId: string) => Promise<readonly AgentSubagentSummary[]>;
+
 export type AgentRuntimeStatus = {
   readonly provider: "mock" | "ready" | "unconfigured";
 };
@@ -161,6 +178,8 @@ export type AgentWorkspaceHostSlots = {
 };
 
 export type AgentWorkspaceClientConfig = {
+  /** Host-replaceable browser upload transport. */
+  readonly assetUpload?: AgentAssetUploadAdapter;
   /** Optional host-authorized URL resolver for persisted session assets. */
   readonly assetUrl?: (assetId: string) => string;
   readonly auth?: ClientAuth;
@@ -168,6 +187,26 @@ export type AgentWorkspaceClientConfig = {
   readonly host?: string;
   readonly prepareSend?: PrepareSend;
   readonly redirect?: ClientRedirectPolicy;
+};
+
+export type AgentAssetUpload = {
+  readonly assetId: string;
+  readonly filename: string;
+  readonly mediaType: string;
+  readonly sizeBytes: number;
+};
+
+export type AgentAssetUploadAdapter = {
+  /** Upload bytes without placing them in an Agent message or durable event. */
+  upload(input: {
+    readonly attachmentId: string;
+    readonly file: File;
+    readonly onProgress: (progress: { readonly totalBytes: number; readonly uploadedBytes: number }) => void;
+    readonly sessionId?: string;
+    readonly signal: AbortSignal;
+  }): Promise<AgentAssetUpload>;
+  /** Optional cleanup for a completed upload removed before message send. */
+  remove?(asset: AgentAssetUpload): Promise<void>;
 };
 
 export type AgentSessionAsset = {
@@ -208,4 +247,5 @@ export type AgentWorkspaceConfig = {
   readonly runtimeStatus?: AgentRuntimeStatus;
   readonly storageKey?: string;
   readonly threadStorage?: AgentThreadStorage;
+  readonly loadSubagents?: AgentSubagentLoader;
 };

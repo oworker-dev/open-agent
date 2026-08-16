@@ -1,6 +1,6 @@
 import type { MessageStreamEvent, InputRequest } from "eve/client";
 import type { EveDynamicToolPart, EveMessage, EveMessagePart } from "eve/react";
-import type { AgentInterruptedTurn } from "./contracts.js";
+import type { AgentInterruptedTurn, AgentSubagentSummary } from "./contracts.js";
 
 export type AgentTurnStatus = "cancelled" | "completed" | "failed" | "running" | "waiting";
 
@@ -9,13 +9,50 @@ export type SubagentCallPresentation = {
   readonly endedAt?: number;
   readonly name?: string;
   readonly startedAt?: number;
-  readonly status: "cancelled" | "completed" | "failed" | "running" | "starting";
+  readonly status: "cancelled" | "completed" | "failed" | "running" | "starting" | "waiting";
 };
 
 export type SubagentSessionPresentation = SubagentCallPresentation & {
   readonly callId: string;
   readonly task?: string;
 };
+
+/** Merge durable server records over the optimistic parent event projection. */
+export function mergeSubagentSessions(
+  events: readonly MessageStreamEvent[],
+  durable: readonly AgentSubagentSummary[] = [],
+): readonly SubagentSessionPresentation[] {
+  const projected = presentSubagentSessions(events);
+  const bySession = new Map(durable.map((child) => [child.childSessionId, child]));
+  const merged = projected.map((session) => {
+    const durableSession = session.childSessionId ? bySession.get(session.childSessionId) : undefined;
+    if (!durableSession) return session;
+    return {
+      ...session,
+      ...(durableSession.callId ? { callId: durableSession.callId } : {}),
+      ...(durableSession.name || durableSession.nickname ? { name: durableSession.nickname ?? durableSession.name } : {}),
+      ...(durableSession.task ? { task: durableSession.task } : {}),
+      status: durableStatus(durableSession.status),
+    };
+  });
+  const known = new Set(projected.map((session) => session.childSessionId).filter(Boolean));
+  for (const child of durable) {
+    if (known.has(child.childSessionId)) continue;
+    merged.push({
+      callId: child.callId ?? child.childSessionId,
+      childSessionId: child.childSessionId,
+      ...(child.name || child.nickname ? { name: child.nickname ?? child.name } : {}),
+      ...(child.task ? { task: child.task } : {}),
+      status: durableStatus(child.status),
+    });
+  }
+  return merged;
+}
+
+function durableStatus(status: AgentSubagentSummary["status"]): SubagentSessionPresentation["status"] {
+  if (status === "interrupted" || status === "closed") return "cancelled";
+  return status;
+}
 
 export type AgentTurnPresentation = {
   readonly endedAt?: number;

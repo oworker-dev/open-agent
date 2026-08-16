@@ -13,7 +13,10 @@ export {
 } from "./http-thread-storage.js";
 export { AgentMessage } from "./agent-message.js";
 export type { AgentInputResponse } from "./agent-message.js";
+export { createHttpAgentAssetUploadAdapter } from "./browser-asset-upload.js";
 export type {
+  AgentAssetUpload,
+  AgentAssetUploadAdapter,
   AgentExtensionInfo,
   AgentAssetEndpoint,
   AgentSessionAsset,
@@ -32,6 +35,8 @@ export type {
   AgentWorkspaceMailbox,
   AgentMailboxItemStatus,
   AgentMailboxReceipt,
+  AgentSubagentLoader,
+  AgentSubagentSummary,
 } from "./contracts.js";
 export {
   filterPromptMenuItems,

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type {
   AgentSubagentRecord,
   AgentSubagentSnapshot,
@@ -11,12 +11,14 @@ import type { AgentMailboxStore } from "../data/agent-mailbox-store.ts";
 import { enqueueAgentMailboxMessage } from "../agent-mailbox/service.ts";
 import { eveAgentSessionRuntime } from "./service.ts";
 import { createEveAgentMailboxRuntime } from "../agent-mailbox/eve-runtime.ts";
+import { isAgentRuntimeConfigured, startEveAgentRun } from "../agent-runs/eve-adapter.ts";
+import { readDeploymentAgentRuntimeConfig } from "../../lib/agent-runtime-config.ts";
 
 export class AgentSubagentError extends Error {
   readonly status: number;
   readonly code: string;
-  constructor(status: number, code: string, message: string) {
-    super(message);
+  constructor(status: number, code: string, message: string, options?: ErrorOptions) {
+    super(message, options);
     this.name = "AgentSubagentError";
     this.status = status;
     this.code = code;
@@ -28,6 +30,7 @@ export type AgentSubagentRuntime = {
     readonly accessToken: string;
     readonly owner: AgentSessionOwner;
     readonly parentSessionId: string;
+    readonly depth: number;
     readonly task: string;
     readonly name?: string;
     readonly waitPolicy: AgentSubagentWaitPolicy;
@@ -37,9 +40,49 @@ export type AgentSubagentRuntime = {
     readonly activeTurnId?: string;
   }>;
   readonly cancel: (input: { readonly accessToken: string; readonly sessionId: string }) => Promise<"accepted" | "no_active_turn">;
+  readonly reset?: (input: {
+    readonly accessToken: string;
+    readonly reason?: string;
+    readonly sessionId: string;
+  }) => Promise<"no_active_session" | "reset">;
 };
 
 export const eveAgentSubagentRuntime: AgentSubagentRuntime = {
+  async spawn(input) {
+    const config = readDeploymentAgentRuntimeConfig();
+    const parentRunId = `arun_${stableRunId(input.parentSessionId)}`;
+    const childRunId = `arun_${randomUUID().replaceAll("-", "")}`;
+    const session = await startEveAgentRun(
+      {
+        correlationId: `subagent-${randomUUID()}`,
+        idempotencyKey: `subagent-${randomUUID()}`,
+        message: input.task,
+        metadata: {
+          openAgent: {
+            kind: "external-subagent",
+            parentSessionId: input.parentSessionId,
+            waitPolicy: input.waitPolicy,
+          },
+        },
+        parent: {
+          depth: input.depth,
+          parentRunId,
+          rootRunId: parentRunId,
+          source: "agent",
+        },
+        profile: {
+          profileId: config.profile.id,
+          version: config.profile.version,
+        },
+      },
+      childRunId,
+      input.accessToken,
+    );
+    return {
+      childSessionId: session.sessionId,
+      ...(input.name ? { name: input.name } : {}),
+    };
+  },
   async inspect(input) {
     const boundary = await createEveAgentMailboxRuntime().inspect(input);
     return boundary.state === "running"
@@ -50,6 +93,19 @@ export const eveAgentSubagentRuntime: AgentSubagentRuntime = {
   },
   async cancel(input) {
     return await eveAgentSessionRuntime.cancel(input);
+  },
+  async reset(input) {
+    const runtime = createEveAgentMailboxRuntime();
+    if (!runtime.reset) throw new Error("The Agent runtime does not expose session retirement.");
+    return await runtime.reset({
+      owner: {
+        principalId: "open-agent-subagent-supervisor",
+        principalType: "service",
+        tenantId: "open-agent-runtime",
+      },
+      ...(input.reason ? { reason: input.reason } : {}),
+      sessionId: input.sessionId,
+    });
   },
 };
 
@@ -68,7 +124,14 @@ export async function listAgentSubagents(options: AgentSubagentSupervisorOptions
   const ownership = await options.ownershipStore.verify(options.parentSessionId, options.identity);
   if (ownership !== "owned") return undefined;
   const children = await options.store.listOwned(options.identity, options.parentSessionId);
-  return snapshot(options.parentSessionId, children);
+  if (!options.runtime && !isAgentRuntimeConfigured()) return snapshot(options.parentSessionId, children);
+  // The parent event stream is only an optimistic projection. Refresh each
+  // child boundary before returning the list so a lost parent completion event
+  // cannot leave a child permanently marked as running after a reload.
+  const refreshed = await Promise.all(children.map(async (child) => {
+    return await inspectAgentSubagent({ ...options, childSessionId: child.childSessionId }) ?? child;
+  }));
+  return snapshot(options.parentSessionId, refreshed);
 }
 
 /**
@@ -110,15 +173,25 @@ export async function syncAgentSubagentsFromEvents(options: AgentSubagentSupervi
   if (ownership !== "owned") return [];
   const children = new Map((await options.store.listOwned(options.identity, options.parentSessionId)).map((item) => [item.childSessionId, item]));
   const byCall = new Map([...children.values()].filter((item) => item.callId).map((item) => [item.callId!, item]));
+  const agentIdByCall = new Map<string, string>();
   const parentCancelled = options.events.some((event) => event.type === "turn.cancelled");
   const parentTerminal = options.events.some((event) => event.type === "session.failed" || event.type === "session.completed");
   for (const event of options.events) {
     const data = eventData(event);
     if (!data) continue;
+    if (event.type === "actions.requested" && Array.isArray(data.actions)) {
+      for (const action of data.actions) {
+        if (!isRecord(action) || typeof action.callId !== "string" || !isRecord(action.input)) continue;
+        const agentId = action.input.agentId;
+        if (typeof agentId === "string" && agentId.trim()) agentIdByCall.set(action.callId, agentId.trim());
+      }
+      continue;
+    }
     if (event.type === "subagent.called" && typeof data.childSessionId === "string" && data.childSessionId.trim()) {
       const childSessionId = data.childSessionId;
       const created = await options.store.create({
         childSessionId,
+        ...(typeof data.callId === "string" && agentIdByCall.get(data.callId) ? { agentId: agentIdByCall.get(data.callId) } : {}),
         parentSessionId: options.parentSessionId,
         owner: options.identity,
         ...(typeof data.agentId === "string" ? { agentId: data.agentId } : {}),
@@ -142,8 +215,12 @@ export async function syncAgentSubagentsFromEvents(options: AgentSubagentSupervi
         result.isError === true ||
         typeof result.error === "string"
       );
+      const completionStatus = failed
+        ? "failed" as const
+        : await statusAfterSubagentCompletion(options, child, agentIdByCall.get(callId ?? ""));
       const updated = await options.store.updateOwned(options.identity, child.childSessionId, {
-        status: failed ? "failed" : "completed",
+        ...(agentIdByCall.get(callId ?? "") ? { agentId: agentIdByCall.get(callId ?? "") } : {}),
+        status: completionStatus,
         ...(failed && isRecord(result) && typeof result.error === "string" ? { lastError: result.error.slice(0, 2_000) } : {}),
       });
       if (updated) children.set(updated.childSessionId, updated);
@@ -153,6 +230,9 @@ export async function syncAgentSubagentsFromEvents(options: AgentSubagentSupervi
     const status: AgentSubagentStatus = parentCancelled ? "interrupted" : "failed";
     for (const child of children.values()) {
       if (child.status !== "starting" && child.status !== "running" && child.status !== "waiting") continue;
+      // A detached child is deliberately allowed to outlive normal parent
+      // completion. Explicit parent cancellation still interrupts every child.
+      if (parentTerminal && child.waitPolicy === "no-wait") continue;
       const updated = await options.store.updateOwned(options.identity, child.childSessionId, { status });
       if (updated) children.set(updated.childSessionId, updated);
     }
@@ -175,26 +255,51 @@ export async function spawnAgentSubagent(options: AgentSubagentSupervisorOptions
   if (!runtime.spawn) throw new AgentSubagentError(501, "agent_subagent_spawn_unsupported", "The active Agent runtime does not expose external subagent spawning; ask the parent Agent to delegate the task.");
   const active = (await options.store.listOwned(options.identity, options.parentSessionId)).filter((item) => item.status === "starting" || item.status === "running" || item.status === "waiting");
   if (active.length >= 16) throw new AgentSubagentError(429, "agent_subagent_limit_reached", "A session may have at most sixteen active subagents.");
+  const parentRecord = await options.store.findOwned(options.identity, options.parentSessionId);
+  const depth = (parentRecord?.depth ?? 0) + 1;
+  if (depth > 8) throw new AgentSubagentError(429, "agent_subagent_depth_limit_reached", "The maximum nested subagent depth is eight.");
   const child = await runtime.spawn({
     accessToken: options.accessToken,
     owner: options.identity,
     parentSessionId: options.parentSessionId,
+    depth,
     task,
     ...(options.name ? { name: options.name } : {}),
     waitPolicy: options.waitPolicy ?? "wait",
   });
-  return await options.store.create({
-    childSessionId: child.childSessionId,
-    ...(child.agentId ? { agentId: child.agentId } : {}),
-    parentSessionId: options.parentSessionId,
-    owner: options.identity,
-    ...(options.name || child.name ? { name: options.name ?? child.name } : {}),
-    ...(options.nickname ? { nickname: options.nickname } : {}),
-    task,
-    status: "starting",
-    waitPolicy: options.waitPolicy ?? "wait",
-    depth: 1,
-  });
+  try {
+    return await options.store.create({
+      childSessionId: child.childSessionId,
+      ...(child.agentId ? { agentId: child.agentId } : {}),
+      parentSessionId: options.parentSessionId,
+      owner: options.identity,
+      ...(options.name || child.name ? { name: options.name ?? child.name } : {}),
+      ...(options.nickname ? { nickname: options.nickname } : {}),
+      task,
+      status: "starting",
+      waitPolicy: options.waitPolicy ?? "wait",
+      depth,
+    });
+  } catch (error) {
+    // Eve has already created the child session. Compensate if durable
+    // projection fails so an unowned/orphaned child cannot consume resources.
+    try {
+      await retireChildSession(runtime, {
+        accessToken: options.accessToken,
+        reason: "subagent-projection-persistence-failed",
+        sessionId: child.childSessionId,
+      });
+    } catch (retirementError) {
+      throw new AgentSubagentError(
+        503,
+        "agent_subagent_orphan_retirement_failed",
+        `The subagent projection failed and the child could not be retired (${child.childSessionId}). ` +
+          "Operator reconciliation is required before retrying.",
+        { cause: retirementError },
+      );
+    }
+    throw error;
+  }
 }
 
 export async function sendAgentSubagentMessage(options: AgentSubagentSupervisorOptions & {
@@ -203,8 +308,15 @@ export async function sendAgentSubagentMessage(options: AgentSubagentSupervisorO
   readonly resume?: boolean;
   readonly operationId?: string;
 }): Promise<AgentSubagentRecord | undefined> {
-  const child = await ownedChild(options);
+  let child = await ownedChild(options);
   if (!child) return undefined;
+  // A persistent Eve child parks after its answer. The parent event projection
+  // may have recorded `completed` before the child boundary was observed, so
+  // reconcile once before rejecting a resume request.
+  if (options.resume && (child.status === "completed" || child.status === "interrupted")) {
+    const inspected = await inspectAgentSubagent(options);
+    child = inspected ?? child;
+  }
   if (child.status === "closed" || child.status === "completed" || child.status === "interrupted" && !options.resume) {
     throw new AgentSubagentError(409, "agent_subagent_not_resumable", "This subagent is not accepting messages in its current state.");
   }
@@ -240,6 +352,25 @@ export async function sendAgentSubagentMessage(options: AgentSubagentSupervisorO
   return await options.store.updateOwned(options.identity, child.childSessionId, { status: "running" });
 }
 
+async function statusAfterSubagentCompletion(
+  options: AgentSubagentSupervisorOptions,
+  child: AgentSubagentRecord,
+  agentId: string | undefined,
+): Promise<AgentSubagentStatus> {
+  // Native Eve persistent children are parked, not terminal, after the parent
+  // receives `subagent.completed`. Ask the runtime boundary before treating
+  // the event as a final lifecycle state. One-shot children remain completed.
+  try {
+    const inspected = await (options.runtime ?? eveAgentSubagentRuntime).inspect({
+      owner: options.identity,
+      sessionId: child.childSessionId,
+    });
+    return mapRuntimeStatus(inspected.status);
+  } catch {
+    return agentId ? "waiting" : "completed";
+  }
+}
+
 export async function waitForAgentSubagent(options: AgentSubagentSupervisorOptions & {
   readonly childSessionId: string;
   readonly timeoutMs?: number;
@@ -264,16 +395,30 @@ export async function waitForAgentSubagent(options: AgentSubagentSupervisorOptio
 export async function interruptAgentSubagent(options: AgentSubagentSupervisorOptions & { readonly childSessionId: string }): Promise<AgentSubagentRecord | undefined> {
   const child = await ownedChild(options);
   if (!child) return undefined;
-  const result = await (options.runtime ?? eveAgentSubagentRuntime).cancel({ accessToken: options.accessToken, sessionId: child.childSessionId });
-  return await options.store.updateOwned(options.identity, child.childSessionId, { status: result === "accepted" ? "interrupted" : child.status });
+  const runtime = options.runtime ?? eveAgentSubagentRuntime;
+  const result = await runtime.cancel({ accessToken: options.accessToken, sessionId: child.childSessionId });
+  if (result === "accepted") {
+    return await options.store.updateOwned(options.identity, child.childSessionId, { status: "interrupted" });
+  }
+  try {
+    const inspected = await runtime.inspect({ owner: options.identity, sessionId: child.childSessionId });
+    return await options.store.updateOwned(options.identity, child.childSessionId, {
+      status: mapRuntimeStatus(inspected.status),
+    }) ?? child;
+  } catch {
+    return child;
+  }
 }
 
 export async function closeAgentSubagent(options: AgentSubagentSupervisorOptions & { readonly childSessionId: string }): Promise<AgentSubagentRecord | undefined> {
   const child = await ownedChild(options);
   if (!child) return undefined;
-  if (child.status === "running" || child.status === "starting") {
-    await (options.runtime ?? eveAgentSubagentRuntime).cancel({ accessToken: options.accessToken, sessionId: child.childSessionId });
-  }
+  const runtime = options.runtime ?? eveAgentSubagentRuntime;
+  await retireChildSession(runtime, {
+    accessToken: options.accessToken,
+    reason: "subagent-closed-by-owner",
+    sessionId: child.childSessionId,
+  });
   return await options.store.updateOwned(options.identity, child.childSessionId, { status: "closed" });
 }
 
@@ -301,3 +446,30 @@ function eventData(event: { readonly data?: unknown }): Record<string, unknown> 
 }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
 function delay(milliseconds: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, milliseconds)); }
+
+function stableRunId(value: string): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 32);
+}
+
+async function retireChildSession(
+  runtime: AgentSubagentRuntime,
+  input: { readonly accessToken: string; readonly reason: string; readonly sessionId: string },
+): Promise<void> {
+  if (!runtime.reset) {
+    throw new Error("The Agent runtime does not expose terminal session retirement.");
+  }
+  // Reset is terminal and also handles parked children, while cancel only
+  // cooperatively stops an active turn. Retry transport failures without
+  // changing the target session id so compensation remains idempotent.
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      await runtime.reset(input);
+      return;
+    } catch (error) {
+      lastError = error;
+      if (attempt < 3) await delay(50 * 2 ** (attempt - 1));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("The child session could not be retired.");
+}

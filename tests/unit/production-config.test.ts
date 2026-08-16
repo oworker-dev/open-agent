@@ -5,6 +5,7 @@ import {
   inspectProductionConfiguration,
   readAgentDeploymentTenancy,
   readAgentSandboxBackend,
+  readAgentSandboxWorkspaceQuota,
 } from "../../lib/production-config.ts";
 import {
   readAgentEvalContextWindowTokens,
@@ -117,6 +118,22 @@ test("allows automatic sandbox discovery only outside production", () => {
   assert.throws(
     () => readAgentSandboxBackend({ NODE_ENV: "production" }),
     /must explicitly select/,
+  );
+});
+
+test("bounds the logical sandbox import quota", () => {
+  assert.equal(readAgentSandboxWorkspaceQuota({}), 10 * 1024 ** 3);
+  assert.equal(
+    readAgentSandboxWorkspaceQuota({ AGENT_SANDBOX_WORKSPACE_QUOTA_BYTES: "512MiB" }),
+    512 * 1024 ** 2,
+  );
+  assert.throws(
+    () => readAgentSandboxWorkspaceQuota({ AGENT_SANDBOX_WORKSPACE_QUOTA_BYTES: "0" }),
+    /between 1 byte/u,
+  );
+  assert.throws(
+    () => readAgentSandboxWorkspaceQuota({ AGENT_SANDBOX_WORKSPACE_QUOTA_BYTES: "not-a-size" }),
+    /positive byte count/u,
   );
 });
 

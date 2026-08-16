@@ -540,9 +540,17 @@
     width: calc(var(--spacing) * 10);
     height: calc(var(--spacing) * 10);
   }
+  .size-12 {
+    width: calc(var(--spacing) * 12);
+    height: calc(var(--spacing) * 12);
+  }
   .size-16 {
     width: calc(var(--spacing) * 16);
     height: calc(var(--spacing) * 16);
+  }
+  .size-24 {
+    width: calc(var(--spacing) * 24);
+    height: calc(var(--spacing) * 24);
   }
   .size-auto {
     width: auto;
@@ -846,11 +854,17 @@
   .max-w-52 {
     max-width: calc(var(--spacing) * 52);
   }
+  .max-w-72 {
+    max-width: calc(var(--spacing) * 72);
+  }
   .max-w-\[75\%\] {
     max-width: 75%;
   }
   .max-w-\[80\%\] {
     max-width: 80%;
+  }
+  .max-w-\[88\%\] {
+    max-width: 88%;
   }
   .max-w-\[90vw\] {
     max-width: 90vw;
@@ -866,6 +880,9 @@
   }
   .max-w-\[min\(44rem\,88\%\)\] {
     max-width: min(44rem, 88%);
+  }
+  .max-w-\[min\(100\%\,28rem\)\] {
+    max-width: min(100%, 28rem);
   }
   .max-w-full {
     max-width: 100%;
@@ -2066,6 +2083,9 @@
   }
   .px-6 {
     padding-inline: calc(var(--spacing) * 6);
+  }
+  .py-0 {
+    padding-block: calc(var(--spacing) * 0);
   }
   .py-0\.5 {
     padding-block: calc(var(--spacing) * 0.5);
@@ -6318,6 +6338,12 @@
     @media (width >= 40rem) {
       width: calc(var(--spacing) * 8);
       height: calc(var(--spacing) * 8);
+    }
+  }
+  .sm\:size-28 {
+    @media (width >= 40rem) {
+      width: calc(var(--spacing) * 28);
+      height: calc(var(--spacing) * 28);
     }
   }
   .sm\:h-8 {

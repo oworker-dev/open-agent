@@ -5,6 +5,7 @@ import {
   CheckCircle2Icon,
   ChevronRightIcon,
   CircleStopIcon,
+  Clock3Icon,
   LoaderCircleIcon,
   NetworkIcon,
   XCircleIcon,
@@ -18,24 +19,27 @@ import {
 import { cn } from "../utils.js";
 import type { AgentLocale } from "./i18n.js";
 import {
-  presentSubagentSessions,
+  mergeSubagentSessions,
   type SubagentSessionPresentation,
 } from "./turn-presentation.js";
+import type { AgentSubagentSummary } from "./contracts.js";
 
 type DisplayedSubagent = SubagentSessionPresentation & { readonly ordinal: number };
 
 export function AgentSubagentMenu({
   activeSessionId,
   events,
+  durableSessions = [],
   locale,
   onOpen,
 }: {
   readonly activeSessionId?: string;
   readonly events: readonly MessageStreamEvent[];
+  readonly durableSessions?: readonly AgentSubagentSummary[];
   readonly locale: AgentLocale;
   readonly onOpen: (sessionId: string) => void;
 }) {
-  const sessions = presentSubagentSessions(events)
+  const sessions = mergeSubagentSessions(events, durableSessions)
     .filter((session) => session.childSessionId)
     .map((session, index) => ({ ...session, ordinal: index + 1 }));
   if (sessions.length === 0) return null;
@@ -139,6 +143,9 @@ function SubagentStatusIcon({ status }: { readonly status: SubagentSessionPresen
   if (status === "completed") {
     return <CheckCircle2Icon className="size-4 shrink-0 text-emerald-600 dark:text-emerald-300" />;
   }
+  if (status === "waiting") {
+    return <Clock3Icon className="size-4 shrink-0 text-amber-600 dark:text-amber-300" />;
+  }
   if (status === "cancelled") {
     return <CircleStopIcon className="size-4 shrink-0 text-muted-foreground" />;
   }
@@ -160,11 +167,12 @@ function statusLabel(
   if (status === "completed") return localize(locale, "Completed", "已完成");
   if (status === "cancelled") return localize(locale, "Stopped", "已停止");
   if (status === "failed") return localize(locale, "Failed", "失败");
+  if (status === "waiting") return localize(locale, "Waiting for input", "等待消息");
   return localize(locale, "Working", "正在执行");
 }
 
 function isActive(session: SubagentSessionPresentation): boolean {
-  return session.status === "running" || session.status === "starting";
+  return session.status === "running" || session.status === "starting" || session.status === "waiting";
 }
 
 function localize(locale: AgentLocale, english: string, chinese: string): string {

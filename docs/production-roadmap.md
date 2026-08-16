@@ -29,11 +29,11 @@ for that topology.
 | Message edit/append | Main-session UI and mailbox paths exist | Formalize operation IDs, thread versions, idempotency, and child parity |
 | Approvals and ask | Eve pause/resume exists | Persist request lifecycle so refresh cannot reopen completed requests; Composer must become the active approval surface |
 | Tool streaming | Eve partial/result events exist for authored generators | Add typed deltas and custom UI for patch, terminal, todo, and image tools |
-| Attachments | assistant-ui primitives upload through an `AssetStore` in 8 MiB chunks; PostgreSQL metadata + S3-compatible multipart adapter is implemented and a real local MinIO gate passed for a 100 MiB upload with interrupted-part retry, Range reads, isolation, provisional browser-session binding, and expiry cleanup; quota admission is covered under concurrent unit tests | Repeat concurrent uploads against the selected Muses object store with host quota, retention, scanning, and lifecycle evidence |
+| Attachments | assistant-ui uploads immediately with real progress through a host-replaceable adapter; production S3 uses short-lived direct multipart PUT targets while filesystem development keeps bounded proxy parts; PostgreSQL stores ETags/metadata only and completion verifies size, identity, and streamed SHA-256 | Run the 100 MiB direct-upload gate against real PostgreSQL + selected S3/OSS with bucket CORS, Host JWT, scanner, quota, retention, and lifecycle evidence |
 | Result artifacts | Static preview and bounded artifact stores exist | Keep as output projection; do not use it for user uploads |
 | Vision | `view_image` validates signatures, bounds payloads, resizes oversized images, and emits typed file output | Verify provider capability negotiation and visual rendering across hosts |
 | Host SDK and Muses bridge | Contracts, client, host, UI, and MCP packages exist as alpha artifacts | Publish only after cross-host, auth, quota, and failure conformance |
-| Capacity | Unit and local production evidence exists; provider failure gate, bounded 100 MiB S3 gate, Docker sandbox/reaper gate, asset cleanup worker, and terminal sandbox retention worker are covered | No deployed SLO, target object-store load, sandbox admission, or ten-thousand-user evidence |
+| Capacity | Deterministic unit/build gates and external verification scripts exist; provider failure handling and cleanup selection are covered locally | No current real 100 MiB object-store pass, deployed SLO, sandbox admission evidence, or ten-thousand-user capacity report |
 
 The current upload and vision contract is specified in
 [Assets, Uploads, And Vision](./assets-and-vision.md). That document is a

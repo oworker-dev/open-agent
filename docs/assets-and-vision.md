@@ -6,9 +6,9 @@ from the conversation UI and from the Muses domain model. The same contract
 must work for the standalone Open Agent product, Muses, and another host that
 provides an object store and a sandbox adapter.
 
-## Why the current attachment path is not production-ready
+## Why the legacy inline attachment path was not production-ready
 
-The current browser attachment adapter has three incompatible properties for a
+The legacy browser attachment adapter had three incompatible properties for a
 web Agent product:
 
 - it rejects files above 20 MiB;
@@ -21,7 +21,7 @@ keeps bytes in PostgreSQL `bytea` or a local filesystem and caps one artifact at
 database bloat, and event replay worse. It is not a solution for 100 MiB+ user
 uploads.
 
-The current message projection also rewrites image parts to the generic
+The legacy inline message projection also rewrote image parts to the generic
 `image/*` MIME type. The asset contract must preserve the authoritative media
 type (`image/png`, `image/jpeg`, `image/webp`, and so on) so model adapters and
 browser previews can apply the correct decoder and safety policy.
@@ -49,7 +49,7 @@ type AssetRecord = {
   sizeBytes: number;
   sha256?: string;
   storageKey: string;
-  status: "pending" | "uploading" | "available" | "scanning" | "rejected" | "expired";
+  status: "uploading" | "ready" | "failed" | "expired";
   visibility: "session" | "thread" | "private" | "published";
   createdAt: string;
   expiresAt?: string;
@@ -74,6 +74,9 @@ replace it with its own OSS/S3/R2 adapter through the same interface.
 ```ts
 interface AssetStore {
   createUpload(input: CreateUploadInput): Promise<UploadSession>;
+  createPartUpload?(input: CreatePartUploadInput): Promise<AssetPartUploadTarget>;
+  acknowledgePart?(input: AcknowledgePartInput): Promise<AssetPart>;
+  writePart(input: WritePartInput): Promise<AssetPart>; // development/custom proxy only
   completeUpload(input: CompleteUploadInput): Promise<AssetRecord>;
   abortUpload(uploadId: string): Promise<void>;
   getAsset(assetId: string, owner: AssetOwner): Promise<AssetRecord>;
@@ -115,10 +118,14 @@ policy.
 The repository now includes a host-neutral `AssetStore` contract in
 `@oworker/open-agent-contracts/asset`, a filesystem development adapter in
 `server/data/asset-store.ts`, and resumable HTTP endpoints under
-`/api/assets/uploads`. The adapters accept declarations up to 10 GiB, write
-bounded parts (8 MiB by default, 16 MiB maximum), verify the completed SHA-256
-checksum, support owner-scoped range reads, and stream completed objects to a
-sandbox. Neither adapter puts content in Eve messages or PostgreSQL bytea.
+`/api/assets/uploads`. The adapters accept declarations up to 10 GiB and use
+8 MiB parts. The filesystem development adapter proxies bounded parts through
+Next.js. The production S3 adapter returns `transferStrategy: "direct"`, signs
+short-lived per-part PUT targets, and prevents its binary PUT route from
+reading S3-bound bodies. Completion verifies provider ETags, exact final size,
+authenticated object metadata, and a streamed SHA-256 digest. Both adapters
+support owner-scoped range reads and stream completed objects to a sandbox.
+Neither adapter puts content in Eve messages or PostgreSQL `bytea`.
 
 The built-in production adapter combines PostgreSQL metadata with an
 S3-compatible multipart object store (`AGENT_ASSET_STORAGE_BACKEND=s3`). It
@@ -127,9 +134,21 @@ bucket, credentials, and path-style settings. A host can still register a
 custom `AssetStore` with `configureAssetStore()` when it owns a different
 storage system. Setting `AGENT_ASSET_STORAGE_BACKEND` to an unsupported value
 fails closed rather than silently falling back to local disk. The migrations
-`server/data/migrations/0002_asset_metadata.sql` and
-`0005_asset_scan_status.sql` contain metadata, upload, part-pointer, and scan
-state only; they intentionally have no bytea content columns.
+`server/data/migrations/0002_asset_metadata.sql`,
+`0005_asset_scan_status.sql`, `0006_asset_completion_leases.sql`, and
+`0007_asset_owner_identity.sql` contain metadata, upload, part-pointer, scan,
+completion-lease, and issuer/principal-type state only; they intentionally have
+no bytea content columns. The provider multipart row has an internal
+`completing` state while the S3 completion lease is active; the public contract
+projects that state as `uploading` and exposes `ready` only after provider and
+metadata reconciliation succeeds.
+
+S3 object metadata contains SHA-256 identity projections for the asset, tenant,
+principal, principal type, issuer, and session. Completion
+fails closed when `HeadObject` does not match those values. A host bucket must
+allow browser-origin `PUT` and expose the `ETag` response header through CORS.
+Signed URLs default to 15 minutes and are configurable with
+`AGENT_ASSET_UPLOAD_URL_TTL_SECONDS`.
 
 `AGENT_ASSET_MAX_BYTES` limits one object. `AGENT_ASSET_QUOTA_BYTES` is the
 aggregate per-tenant/principal reservation limit and is required for production
@@ -159,14 +178,23 @@ part capped at 3 MiB. When the sandbox provides ImageMagick, oversized images
 are downscaled to a bounded JPEG preview before being sent to the model;
 otherwise the tool returns a recoverable instruction to resize the image. The
 S3 adapter is storage-production-capable once its object-store lifecycle,
-quota, retention, and credentials are configured; a real local MinIO gate has
-validated a 100 MiB upload, interrupted-part retry, Range reads, and owner
-isolation. It still needs a host scanner before it can be promoted for
-untrusted uploads. Both built-in adapters expose
+quota, retention, credentials, CORS, and scanner are configured. The repository
+contains a 100 MiB direct-upload load gate covering interrupted-part retry,
+Range reads, and owner isolation, but that gate still requires real Host JWT,
+PostgreSQL, and S3-compatible infrastructure and has not been re-run in the
+current environment. Unit tests are not a substitute for that evidence. Both
+built-in adapters expose
 an optional bounded `cleanupExpired()` hook; production deployments should run
 `npm run reap:assets` from a scheduler so expired objects and abandoned
 multipart uploads are removed even when no user requests arrive. The
 filesystem adapter remains development-only.
+
+`AGENT_SANDBOX_WORKSPACE_QUOTA_BYTES` is a logical per-session reservation
+limit for files materialized by `import_asset` (10 GiB by default, bounded by
+the production config parser). It protects the durable import path but does not
+replace the selected sandbox backend's physical disk, memory, CPU, PID, or
+network limits. Production must configure both layers and keep the logical
+quota at or below the physical workspace limit.
 
 ## Message and model boundary
 
@@ -235,6 +263,17 @@ The model adapter must declare `vision` capability. If the selected model is
 text-only, the runtime must report that limitation instead of silently sending
 an unusable image part. Multiple images are bounded by turn and tenant quota.
 
+Eve 0.31 projects the final tool result into model content through
+`toModelOutput`, but still publishes and persists the complete final result on
+`action.result`. Consequently, model-facing image bytes must never be returned
+from `execute()`. `view_image` keeps the bounded preview in a process-local,
+strictly capped one-shot observation registry until Eve immediately invokes
+`toModelOutput`; the entry is consumed and deleted while the public result
+contains only `assetId`, `assetRef`, path, media type, dimensions, and byte
+counts. For authenticated sessions the same bounded preview is written to the
+host-neutral `AssetStore`, so the default UI and embedded hosts render it from
+an authorized asset resolver instead of a durable Base64 result.
+
 ### Remote binary import
 
 `web_fetch` is intentionally a bounded metadata/text tool and currently drops
@@ -284,10 +323,21 @@ and a short-lived preview/download URL. The assistant-ui card remains usable
 after a refresh by resolving that reference through the authenticated host
 adapter.
 
+The default assistant-ui adapter uploads as soon as a file is added, uses an
+async generator to project real aggregate multipart progress, uploads three S3
+parts concurrently, retries transient control/provider failures, and persists
+each returned ETag before completion. `AgentWorkspaceClientConfig` accepts a
+host-provided `assetUpload` adapter, so Muses can replace storage transport
+without replacing the conversation UI.
+
 Upload progress, retry, cancel, and quota errors are visible inline. A large
 upload must not block stream reconnect, message history hydration, or the
 Composer. Mobile layout uses a horizontal scroll group and an image preview
 sheet rather than a full-width card that changes the input height unpredictably.
+Browser security prevents silently restoring a `File` handle after a full page
+reload; default retry resumes individual failed parts while the page remains
+open. A host that needs cross-reload continuation must persist an upload id and
+re-request file permission through its injected upload adapter.
 
 ## Security, retention, and capacity
 

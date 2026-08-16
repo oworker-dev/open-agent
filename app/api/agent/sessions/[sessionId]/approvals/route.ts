@@ -1,4 +1,4 @@
-import { authenticateHostRequest } from "@/server/http/host-request-auth";
+import { authenticateHostRequest, HOST_AGENT_SCOPE, requireHostScope } from "@/server/http/host-request-auth";
 import { readAgentSession, AgentSessionDeletionError } from "@/server/agent-sessions/service";
 import { syncAgentSessionApprovalsFromEvents } from "@/server/agent-sessions/approval";
 import { createPostgresSessionOwnershipStoreFromEnvironment } from "@/server/data/session-ownership-store";
@@ -10,7 +10,10 @@ const approvalStore = createPostgresAgentSessionApprovalStoreFromEnvironment();
 type RouteContext = { readonly params: Promise<{ readonly sessionId: string }> };
 
 export async function GET(request: Request, context: RouteContext): Promise<Response> {
-  const authenticated = await authenticateHostRequest(request);
+  const authenticated = requireHostScope(
+    await authenticateHostRequest(request),
+    HOST_AGENT_SCOPE.approvalRead,
+  );
   if (!authenticated.ok) return authenticated.response;
   if (!ownershipStore || !approvalStore) return problem(503, "agent_database_unavailable", "AGENT_DATABASE_URL is not configured.");
   const { sessionId } = await context.params;
