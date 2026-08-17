@@ -14,7 +14,7 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 const LABEL = "open-agent.topology=local-production-v1";
 const POSTGRES_IMAGE = "postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193";
 const MINIO_IMAGE = "minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e";
-const CLAMAV_IMAGE = "open-agent-clamav:1.4.3-local";
+const CLAMAV_IMAGE = "open-agent-clamav:1.4.6-local";
 const BUCKET = "open-agent-assets";
 const containers = {
   agentDatabase: "open-agent-gate-data",
@@ -101,12 +101,27 @@ function ensureMinio() {
 }
 
 function ensureClamAv() {
+  replaceManagedContainerForImage(containers.clamav, CLAMAV_IMAGE);
   ensureContainer(containers.clamav, CLAMAV_IMAGE, [
     "--restart", "unless-stopped",
     "--publish", "127.0.0.1:53310:3310",
     "--volume", `${containers.clamav}-database:/var/lib/clamav`,
     "--env", "CLAMD_STARTUP_TIMEOUT=1800",
   ]);
+}
+
+function replaceManagedContainerForImage(name, image) {
+  const existing = inspectContainer(name);
+  if (!existing) return;
+  if (existing.Config?.Labels?.["open-agent.topology"] !== "local-production-v1") {
+    throw new Error(`Refusing to replace unmanaged Docker container ${name}.`);
+  }
+  const imageId = execFileSync("docker", ["image", "inspect", "--format", "{{.Id}}", image], {
+    encoding: "utf8",
+  }).trim();
+  if (existing.Image === imageId) return;
+  if (existing.State?.Running) execFileSync("docker", ["stop", name], { stdio: "ignore" });
+  execFileSync("docker", ["rm", name], { stdio: "ignore" });
 }
 
 function ensureContainer(name, image, createOptions, command = []) {
@@ -264,21 +279,6 @@ function assertCorsResponse(response, origin, label) {
   if (allowed !== "*" && allowed !== origin) {
     throw new Error(`${label} did not allow the browser origin.`);
   }
-}
-
-async function resolvePublicOrigin() {
-  const configured = process.env.AGENT_LOCAL_PRODUCTION_PUBLIC_ORIGIN?.trim();
-  if (configured) return new URL(configured).origin;
-  try {
-    const response = await fetch("https://api.ipify.org", { signal: AbortSignal.timeout(5_000) });
-    const address = response.ok ? (await response.text()).trim() : "";
-    if (/^[0-9a-f:.]+$/iu.test(address)) {
-      return `http://${address.includes(":") ? `[${address}]` : address}:3100`;
-    }
-  } catch {
-    // The loopback origin below remains valid for an offline staging host.
-  }
-  return "http://127.0.0.1:3100";
 }
 
 function containerEnvironment(name) {

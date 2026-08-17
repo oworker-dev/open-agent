@@ -1,4 +1,4 @@
-FROM clamav/clamav@sha256:75fb5fd95fcbe1d7e6d240c369c1572b686ee2c95949d1042b5148de8eddebb4
+FROM clamav/clamav@sha256:7173cd3d57a839c6fee673b07246301e0d1f68f5a14a5ca063f502323bf1cc61
 
 # The default clamd stream limit is too small for the 100 MiB production gate.
 # Keep this aligned with the staged AGENT_ASSET_MAX_BYTES policy.

@@ -32,6 +32,25 @@ Sandbox; the production doctor rejects multi-tenant Docker.
 
 ## Preflight
 
+For a reproducible single-host local gate, start the loopback-only PostgreSQL,
+MinIO, and ClamAV dependencies before the production preview:
+
+```bash
+npm run infra:local-production
+npm run infra:local-production:status
+npm run start:preview
+```
+
+The preview listens on port `3100`; its Eve runtime listens on `4275`. Use
+`npm run infra:local-production:stop` to stop only containers carrying the
+Open Agent local-topology ownership label. Named database, object, and ClamAV
+signature volumes are retained. This HTTP topology is local evidence only:
+external production still requires HTTPS ingress and must pass
+`doctor:production` with its real public origin and collector. The pinned local
+MinIO release uses a loopback-only wildcard CORS policy because it does not
+implement `PutBucketCors`; configure an explicit Web-origin allowlist on the
+target S3/R2 service.
+
 Pin the exact source revision and container digest. Load secrets from the target
 secret manager, then run:
 
