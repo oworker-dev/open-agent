@@ -233,6 +233,19 @@ test("composer exposes assistant-ui attachments, permissions, and safe trigger s
     name: "brief.txt",
   });
   await expect(page.getByText("brief.txt", { exact: true })).toBeVisible();
+  const imageChooserPromise = page.waitForEvent("filechooser");
+  await page.getByRole("button", { name: "Add files" }).click();
+  const imageChooser = await imageChooserPromise;
+  await imageChooser.setFiles({
+    buffer: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"),
+    mimeType: "image/png",
+    name: "reference.png",
+  });
+  const imageAttachment = page.locator('[data-slot="attachment"][data-orientation="vertical"]');
+  await expect(imageAttachment).toBeVisible();
+  await imageAttachment.getByRole("button", { name: "Attachment: reference.png" }).click();
+  await expect(page.getByRole("button", { name: "Dismiss" })).toBeVisible();
+  await page.getByRole("button", { name: "Dismiss" }).click();
 
   await page.getByRole("button", { name: "Approval mode" }).click();
   await expect(page.getByText("Ask before commands and file changes.")).toBeVisible();
@@ -666,7 +679,7 @@ test("assistant content keeps markdown, reasoning state, and action affordances"
   await expect(page.getByRole("heading", { name: "Result", exact: true, level: 2 })).toBeVisible();
   await expect(page.locator(".aui-md-ul")).toHaveCSS("list-style-type", "disc");
   await expect(page.locator(".aui-md-pre")).toContainText("const ready = true;");
-  await expect(page.getByRole("button", { name: /Reasoning complete/u })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Reasoning complete 1s", exact: true })).toBeVisible();
   await expect(page.getByText("Reasoning", { exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Regenerate" })).toHaveCount(0);
 
@@ -816,15 +829,15 @@ test(`editing the latest user turn with ${editScenario.label} waits for clear an
 });
 }
 
-test("file patch tools render with the assistant-ui diff viewer", async ({ page }) => {
+test("Codex apply_patch envelopes render with the assistant-ui diff viewer and live counts", async ({ page }) => {
   const sessionId = "mock-patch-viewer-session";
   const patch = [
-    "diff --git a/src/app.ts b/src/app.ts",
-    "--- a/src/app.ts",
-    "+++ b/src/app.ts",
+    "*** Begin Patch",
+    "*** Update File: src/app.ts",
     "@@ -1 +1 @@",
     "-export const ready = false;",
     "+export const ready = true;",
+    "*** End Patch",
   ].join("\n");
   await page.route("**/eve/v1/session", async (route) => {
     await route.fulfill({
@@ -838,7 +851,7 @@ test("file patch tools render with the assistant-ui diff viewer", async ({ page 
     await route.fulfill({
       body: mockToolTurn("Update the application", "The patch is applied.", {
         input: { patch },
-        output: "Done",
+        output: { changes: [{ addedLines: 1, deletedLines: 1, kind: "update", path: "/workspace/src/app.ts" }], filesChanged: 1, totalAddedLines: 1, totalDeletedLines: 1 },
         toolName: "apply_patch",
       }),
       contentType: "application/x-ndjson",
@@ -855,6 +868,8 @@ test("file patch tools render with the assistant-ui diff viewer", async ({ page 
 
   const diffViewer = page.locator('[data-tool-view="diff"] [data-slot="diff-viewer"]');
   await expect(diffViewer).toBeVisible();
+  await expect(diffViewer.locator('[data-slot="diff-viewer-stats"]')).toHaveText("+1-1");
+  await expect(diffViewer).toContainText("export const ready = false;");
   await expect(diffViewer).toContainText("export const ready = true;");
 });
 
@@ -2068,12 +2083,15 @@ test("a proxied child approval stays attached to the parent task and resumes it"
   await expect(editComposer).toBeVisible();
   await expect(editComposer.getByRole("button", { name: "Send", exact: true })).toBeEnabled();
   await editComposer.getByRole("button", { name: "Cancel", exact: true }).click();
-  const approve = page.getByRole("radio", { name: "Approve", exact: true });
-  await expect(approve).toBeEnabled();
-  await expect(page.getByRole("textbox", { name: "Do anything" })).toBeDisabled();
+  const approvalTakeover = page.locator("[data-agent-approval-takeover]");
+  await expect(approvalTakeover).toBeVisible();
+  await expect(approvalTakeover).toContainText("Approve tool call: Terminal command");
+  await expect(page.getByRole("textbox", { name: "Do anything" })).toHaveCount(0);
+  await expect(page.getByRole("radio", { name: "Approve", exact: true })).toHaveCount(0);
+  await expect(page.locator('[data-input-request-kind="tool-approval"]')).toHaveCount(0);
+  await page.screenshot({ path: "/tmp/open-agent-approval-takeover.png" });
 
-  await approve.click();
-  await page.getByRole("button", { name: "Confirm", exact: true }).click();
+  await approvalTakeover.getByRole("button", { name: "Approve", exact: true }).click();
   await expect.poll(() => responseBody).toMatchObject({
     inputResponses: [{ optionId: "approve", requestId: "request-child-bash" }],
   });
@@ -2090,6 +2108,9 @@ test("a proxied child approval stays attached to the parent task and resumes it"
   await expect(page.getByText("Child stylesheet complete.", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Back to parent session" }).click();
   await expect(page).toHaveURL(/\/threads\/child-approval-thread$/);
+  await expect(page.getByRole("textbox", { name: "Do anything" })).toBeEnabled();
+  await page.reload();
+  await expect(page.locator("[data-agent-approval-takeover]")).toHaveCount(0);
   await expect(page.getByRole("textbox", { name: "Do anything" })).toBeEnabled();
 });
 

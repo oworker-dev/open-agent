@@ -1,13 +1,17 @@
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { access, readFile } from "node:fs/promises";
+import { createServer } from "node:net";
 import {
   assertBuiltEveProxy,
   assertBuiltEveWorkflowWorld,
   configureEveNextProductionPort,
   PRODUCTION_PREVIEW_PORTS,
 } from "./production-preview-topology.mjs";
-import { resolveProductionPreviewSigningSecret } from "./production-preview-secret.mjs";
+import {
+  resolveProductionPreviewHostJwtSecret,
+  resolveProductionPreviewSigningSecret,
+} from "./production-preview-secret.mjs";
 
 const WEB_PORT = PRODUCTION_PREVIEW_PORTS.web;
 const EVE_PORT = configureEveNextProductionPort();
@@ -32,6 +36,8 @@ assertBuiltEveWorkflowWorld(compiledAgentManifest);
 
 const publicOrigin = await resolvePublicOrigin();
 const previewSigningSecret = await resolveProductionPreviewSigningSecret();
+const hostJwtSecret = await resolveProductionPreviewHostJwtSecret();
+const minioEnvironment = containerEnvironment("open-agent-gate-minio");
 const mailboxDispatchSecret = process.env.AGENT_MAILBOX_DISPATCH_SECRET?.trim() || randomBytes(32).toString("base64url");
 const mailboxWorkerSecret = process.env.AGENT_MAILBOX_WORKER_SECRET?.trim() || randomBytes(32).toString("base64url");
 const runtimeEnvironment = {
@@ -40,12 +46,29 @@ const runtimeEnvironment = {
   AGENT_DATABASE_SCHEMA: "open_agent",
   AGENT_ASSET_CLEANUP_INTERVAL_MS: "3600000",
   AGENT_ASSET_CLEANUP_LIMIT: "100",
-  AGENT_DATABASE_URL: postgresUrl("open-agent-prod-data", 55432),
+  AGENT_ASSET_CLAMAV_HOST: "127.0.0.1",
+  AGENT_ASSET_CLAMAV_PORT: "53310",
+  AGENT_ASSET_CLAMAV_TIMEOUT_MS: "600000",
+  AGENT_ASSET_MAX_BYTES: "1GiB",
+  AGENT_ASSET_QUOTA_BYTES: "2GiB",
+  AGENT_ASSET_S3_ACCESS_KEY_ID: requiredContainerValue(minioEnvironment, "MINIO_ROOT_USER", "open-agent-gate-minio"),
+  AGENT_ASSET_S3_BUCKET: "open-agent-assets",
+  AGENT_ASSET_S3_ENDPOINT: "http://127.0.0.1:59000",
+  AGENT_ASSET_S3_FORCE_PATH_STYLE: "true",
+  AGENT_ASSET_S3_REGION: "us-east-1",
+  AGENT_ASSET_S3_SECRET_ACCESS_KEY: requiredContainerValue(minioEnvironment, "MINIO_ROOT_PASSWORD", "open-agent-gate-minio"),
+  AGENT_ASSET_SCAN_MODE: "required",
+  AGENT_ASSET_STORAGE_BACKEND: "s3",
+  AGENT_DATABASE_URL: postgresUrl("open-agent-gate-data", 56432),
   AGENT_DEPLOYMENT_TENANCY: "single-tenant",
   AGENT_EMBED_ALLOWED_ORIGINS: process.env.AGENT_EMBED_ALLOWED_ORIGINS || "http://localhost:4730,http://127.0.0.1:4730",
+  AGENT_HOST_JWT_AUDIENCE: process.env.AGENT_HOST_JWT_AUDIENCE || "open-agent-local-production",
+  AGENT_HOST_JWT_ISSUER: process.env.AGENT_HOST_JWT_ISSUER || "https://open-agent.local",
+  AGENT_HOST_JWT_SECRET: hostJwtSecret,
   AGENT_MODEL_MAX_OUTPUT_TOKENS: "4096",
   AGENT_MAILBOX_DISPATCH_SECRET: mailboxDispatchSecret,
   AGENT_MAILBOX_WORKER_SECRET: mailboxWorkerSecret,
+  AGENT_MAILBOX_WORKER_INTERVAL_MS: process.env.AGENT_MAILBOX_WORKER_INTERVAL_MS || "1000",
   AGENT_PREVIEW_SIGNING_SECRET: previewSigningSecret,
   AGENT_PROVIDER_HTTP_TIMEOUT_MS: "600000",
   AGENT_PROVIDER_MODE: "live",
@@ -56,20 +79,32 @@ const runtimeEnvironment = {
   AGENT_SANDBOX_TERMINAL_RETENTION_HOURS: process.env.AGENT_SANDBOX_TERMINAL_RETENTION_HOURS || "168",
   AGENT_SANDBOX_CLEANUP_INTERVAL_MS: process.env.AGENT_SANDBOX_CLEANUP_INTERVAL_MS || "900000",
   AGENT_SANDBOX_CLEANUP_MAX_SESSIONS: process.env.AGENT_SANDBOX_CLEANUP_MAX_SESSIONS || "25",
+  EVE_SANDBOX_RETENTION_HOURS: process.env.EVE_SANDBOX_RETENTION_HOURS || "168",
+  EVE_SANDBOX_REAPER_MAX_REMOVALS: process.env.EVE_SANDBOX_REAPER_MAX_REMOVALS || "50",
   EVE_NEXT_PRODUCTION_PORT: String(EVE_PORT),
   NODE_ENV: previewNodeEnv,
+  OTEL_EXPORTER_OTLP_PROTOCOL: process.env.OTEL_EXPORTER_OTLP_PROTOCOL || "http/json",
+  OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT || "http://127.0.0.1:4318/v1/traces",
   WORKFLOW_POSTGRES_JOB_PREFIX: "open_agent_",
   WORKFLOW_POSTGRES_MAX_POOL_SIZE: "22",
-  WORKFLOW_POSTGRES_URL: postgresUrl("open-agent-prod-world", 55433),
+  WORKFLOW_POSTGRES_URL: postgresUrl("open-agent-gate-world", 56433),
   WORKFLOW_POSTGRES_WORKER_CONCURRENCY: "20",
   WORKFLOW_TARGET_WORLD: "@workflow/world-postgres",
 };
+
+await assertPortsAvailable([WEB_PORT, EVE_PORT, 4318]);
 
 const migration = spawnSync(process.execPath, ["scripts/migrate-agent-data.mjs"], {
   env: runtimeEnvironment,
   stdio: "inherit",
 });
 if (migration.status !== 0) process.exit(migration.status ?? 1);
+
+const collector = spawn(process.execPath, ["scripts/mock-otlp-json.mjs"], {
+  env: { ...runtimeEnvironment, MOCK_OTLP_PORT: "4318" },
+  stdio: "inherit",
+});
+await waitForHealth("http://127.0.0.1:4318/debug/traces", collector);
 
 const eve = spawn(process.execPath, [".output/server/index.mjs"], {
   env: {
@@ -120,6 +155,7 @@ const stop = (signal = "SIGTERM") => {
   mailboxWorker.kill(signal);
   assetCleanupWorker.kill(signal);
   sandboxCleanupWorker.kill(signal);
+  collector.kill(signal);
 };
 for (const signal of ["SIGINT", "SIGTERM"]) {
   process.on(signal, () => {
@@ -134,6 +170,7 @@ const outcome = await Promise.race([
   childExit("mailbox-worker", mailboxWorker),
   childExit("asset-cleanup-worker", assetCleanupWorker),
   childExit("sandbox-cleanup-worker", sandboxCleanupWorker),
+  childExit("otel-collector", collector),
 ]);
 stop();
 await Promise.allSettled([
@@ -142,28 +179,35 @@ await Promise.allSettled([
   childExit("mailbox-worker", mailboxWorker),
   childExit("asset-cleanup-worker", assetCleanupWorker),
   childExit("sandbox-cleanup-worker", sandboxCleanupWorker),
+  childExit("otel-collector", collector),
 ]);
 if (!stopping || outcome.code !== 0) {
   console.error(`${outcome.name} exited`, { code: outcome.code, signal: outcome.signal });
 }
 process.exitCode = shutdownRequested ? 0 : outcome.code ?? (outcome.signal ? 1 : 0);
 
-function postgresUrl(container, port) {
-  const raw = execFileSync(
-    "docker",
-    ["inspect", "--format", "{{json .Config.Env}}", container],
-    { encoding: "utf8" },
-  );
-  const values = Object.fromEntries(JSON.parse(raw).map((entry) => {
+function containerEnvironment(container) {
+  const raw = execFileSync("docker", ["inspect", "--format", "{{json .Config.Env}}", container], { encoding: "utf8" });
+  return Object.fromEntries(JSON.parse(raw).map((entry) => {
     const separator = entry.indexOf("=");
     return [entry.slice(0, separator), entry.slice(separator + 1)];
   }));
+}
+
+function postgresUrl(container, port) {
+  const values = containerEnvironment(container);
   const url = new URL(
     `postgresql://127.0.0.1:${port}/${values.POSTGRES_DB || "postgres"}`,
   );
   url.username = values.POSTGRES_USER || "postgres";
   url.password = values.POSTGRES_PASSWORD || "";
   return url.toString();
+}
+
+function requiredContainerValue(environment, name, container) {
+  const value = environment[name]?.trim();
+  if (!value) throw new Error(`${container} does not provide ${name}.`);
+  return value;
 }
 
 async function resolvePublicOrigin() {
@@ -193,6 +237,16 @@ async function waitForHealth(url, child) {
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   throw new Error("Eve did not become healthy within 30 seconds.");
+}
+
+async function assertPortsAvailable(ports) {
+  for (const port of ports) {
+    await new Promise((resolve, reject) => {
+      const server = createServer();
+      server.once("error", () => reject(new Error(`Local production port ${port} is already in use.`)));
+      server.listen(port, "127.0.0.1", () => server.close((error) => error ? reject(error) : resolve()));
+    });
+  }
 }
 
 function childExit(name, child) {

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { AssetMetadata } from "@oworker/open-agent-contracts/asset";
 import { scanAsset } from "../../server/data/asset-store-core.ts";
+import { configureAssetScanner, createAssetStoreFromEnvironment } from "../../server/data/asset-store.ts";
 
 const metadata: AssetMetadata = {
   assetId: "asset-1",
@@ -56,4 +57,17 @@ test("scanAsset fails closed on scanner errors and bypasses only explicit disabl
   );
   assert.equal(disabled.scanStatus, "disabled");
   assert.equal(called, false);
+});
+
+test("every process resolves the environment ClamAV scanner through the AssetStore factory", () => {
+  configureAssetScanner(undefined);
+  assert.doesNotThrow(() => createAssetStoreFromEnvironment({
+    AGENT_ASSET_CLAMAV_HOST: "127.0.0.1",
+    AGENT_ASSET_SCAN_MODE: "required",
+    AGENT_ASSET_S3_ACCESS_KEY_ID: "fixture-access",
+    AGENT_ASSET_S3_BUCKET: "fixture-bucket",
+    AGENT_ASSET_S3_SECRET_ACCESS_KEY: "fixture-secret",
+    AGENT_ASSET_STORAGE_BACKEND: "s3",
+    AGENT_DATABASE_URL: "postgresql://fixture:fixture@127.0.0.1:5432/fixture",
+  }));
 });

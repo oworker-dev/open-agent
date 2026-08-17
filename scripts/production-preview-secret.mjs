@@ -4,6 +4,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const DEFAULT_SECRET_FILE = new URL("../.eve/production-preview-signing-secret", import.meta.url);
+const DEFAULT_HOST_JWT_SECRET_FILE = new URL("../.eve/production-preview-host-jwt-secret", import.meta.url);
 
 /**
  * @param {{
@@ -25,6 +26,36 @@ export async function resolveProductionPreviewSigningSecret({
     if (!isMissingFile(error)) throw error;
   }
 
+  await mkdir(dirname(path), { mode: 0o700, recursive: true });
+  const generated = randomBytes(32).toString("base64url");
+  try {
+    await writeFile(path, `${generated}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    return generated;
+  } catch (error) {
+    if (!isAlreadyExists(error)) throw error;
+    return assertSigningSecret((await readFile(path, "utf8")).trim(), path);
+  }
+}
+
+export async function resolveProductionPreviewHostJwtSecret({
+  environment = process.env,
+  secretFile = DEFAULT_HOST_JWT_SECRET_FILE,
+} = {}) {
+  return resolvePersistedSecret({
+    configured: environment.AGENT_HOST_JWT_SECRET,
+    environmentName: "AGENT_HOST_JWT_SECRET",
+    secretFile,
+  });
+}
+
+async function resolvePersistedSecret({ configured, environmentName, secretFile }) {
+  if (configured?.trim()) return assertSigningSecret(configured.trim(), environmentName);
+  const path = secretFile instanceof URL ? fileURLToPath(secretFile) : resolve(secretFile);
+  try {
+    return assertSigningSecret((await readFile(path, "utf8")).trim(), path);
+  } catch (error) {
+    if (!isMissingFile(error)) throw error;
+  }
   await mkdir(dirname(path), { mode: 0o700, recursive: true });
   const generated = randomBytes(32).toString("base64url");
   try {

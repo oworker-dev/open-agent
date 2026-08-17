@@ -578,8 +578,8 @@ export function createS3AssetStore(options: S3AssetStoreOptions): AssetStore {
            from ${table.uploads} upload
            join ${table.assets} asset on asset.asset_id = upload.asset_id
              where (upload.status = 'uploading'
-               or (upload.status = 'completing' and upload.updated_at <= $1 - interval '5 minutes'))
-             and asset.expires_at is not null and asset.expires_at <= $1
+               or (upload.status = 'completing' and upload.updated_at <= $1::timestamptz - interval '5 minutes'))
+             and asset.expires_at is not null and asset.expires_at <= $1::timestamptz
            order by asset.expires_at asc
            limit $2`,
           [now, remaining],

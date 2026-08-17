@@ -29,6 +29,7 @@ import {
   scanAsset,
 } from "./asset-store-core.ts";
 import { createS3AssetStore } from "./s3-asset-store.ts";
+import { createClamAvAssetScannerFromEnvironment } from "./clamav-asset-scanner.ts";
 
 export {
   ASSET_CHUNK_SIZE_BYTES,
@@ -387,6 +388,7 @@ export function createAssetStoreFromEnvironment(
 ): AssetStore {
   if (configuredHostAssetStore) return configuredHostAssetStore;
   const backend = environment.AGENT_ASSET_STORAGE_BACKEND?.trim().toLowerCase();
+  const scanner = configuredHostAssetScanner ?? createClamAvAssetScannerFromEnvironment(environment);
   if (backend === "s3" || backend === "object-store" || backend === "object_store") {
     const database = readAgentDatabaseConfig(environment);
     if (!database) throw new Error("S3 AssetStore requires AGENT_DATABASE_URL for metadata.");
@@ -409,7 +411,7 @@ export function createAssetStoreFromEnvironment(
       maxBytes: parseAssetMaxBytes(environment.AGENT_ASSET_MAX_BYTES, MAX_ASSET_BYTES),
       quotaBytes: parseOptionalAssetQuota(environment.AGENT_ASSET_QUOTA_BYTES),
       prefix: environment.AGENT_ASSET_S3_PREFIX,
-      scanner: configuredHostAssetScanner,
+      scanner,
       scanMode: readAssetScanMode(environment),
       uploadUrlExpiresSeconds: parseUploadUrlExpiry(environment.AGENT_ASSET_UPLOAD_URL_TTL_SECONDS),
     });
@@ -428,7 +430,7 @@ export function createAssetStoreFromEnvironment(
     root: configuredRoot ? resolve(configuredRoot) : resolve(process.cwd(), ".eve", "assets"),
     maxBytes: parseAssetMaxBytes(environment.AGENT_ASSET_MAX_BYTES, MAX_ASSET_BYTES),
     quotaBytes: parseOptionalAssetQuota(environment.AGENT_ASSET_QUOTA_BYTES),
-    scanner: configuredHostAssetScanner,
+    scanner,
     scanMode: readAssetScanMode(environment),
   });
 }

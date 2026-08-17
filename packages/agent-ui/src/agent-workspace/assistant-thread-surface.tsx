@@ -63,6 +63,7 @@ import type { AgentUsageSummary } from "./usage.js";
 export type AgentCancellationState = "idle" | "requested" | "cancelling";
 
 export type AgentApprovalTakeover = {
+  readonly input?: unknown;
   readonly requestId: string;
   readonly prompt: string;
   readonly toolName: string;
@@ -582,14 +583,19 @@ export function AssistantComposer({
         }}
       >
         <div className="flex w-full flex-col gap-2 rounded-[1.5rem] border border-border/70 bg-background p-2.5 shadow-[0_8px_24px_-16px_rgba(0,0,0,0.24)]">
-          {approvalTakeover ? <ApprovalComposerTakeover locale={locale} onRespond={onInputResponses} request={approvalTakeover} /> : null}
-          {composerTop}
-          <ComposerPrimitive.Attachments>
-            {({ attachment }) => (
-              <ComposerAttachment attachment={attachment} messages={messages} />
-            )}
-          </ComposerPrimitive.Attachments>
-          <LexicalComposerInput
+          {approvalTakeover ? (
+            <ApprovalComposerTakeover locale={locale} onRespond={onInputResponses} request={approvalTakeover} />
+          ) : (
+            <>
+              {composerTop}
+              <AttachmentGroup className="px-1 py-0.5 empty:hidden">
+                <ComposerPrimitive.Attachments>
+                  {({ attachment }) => (
+                    <ComposerAttachment attachment={attachment} messages={messages} />
+                  )}
+                </ComposerPrimitive.Attachments>
+              </AttachmentGroup>
+              <LexicalComposerInput
             aria-disabled={composerDisabled}
             directiveChip={DirectiveChip}
             placeholder={messages.inputPlaceholder}
@@ -607,15 +613,15 @@ export function AssistantComposer({
               blurComposerOnTouch(composerInputRef);
             }}
             className="aui-composer-input relative max-h-40 min-h-12 w-full resize-none overflow-y-auto bg-transparent px-2 py-1 text-[15px] leading-6 outline-none aria-disabled:pointer-events-none aria-disabled:opacity-50 [&_.aui-directive-chip]:inline-flex [&_.aui-directive-chip]:items-center [&_.aui-directive-chip]:gap-1 [&_.aui-directive-chip]:rounded-md [&_.aui-directive-chip]:bg-muted [&_.aui-directive-chip]:px-1.5 [&_.aui-directive-chip]:py-0.5 [&_.aui-directive-chip]:text-[13px] [&_.aui-directive-chip]:font-medium [&_.aui-directive-chip]:text-foreground [&_.aui-directive-chip-icon]:text-muted-foreground [&_.aui-lexical-input]:min-h-6 [&_.aui-lexical-input]:outline-none [&_.aui-lexical-placeholder]:pointer-events-none [&_.aui-lexical-placeholder]:absolute [&_.aui-lexical-placeholder]:inset-x-0 [&_.aui-lexical-placeholder]:top-0 [&_.aui-lexical-placeholder]:truncate [&_.aui-lexical-placeholder]:px-2 [&_.aui-lexical-placeholder]:py-1 [&_.aui-lexical-placeholder]:text-muted-foreground"
-          />
-          <div className="flex min-h-9 items-center gap-0.5 sm:min-h-8 sm:gap-1">
-            <ComposerPrimitive.AddAttachment asChild>
-              <Button aria-label={messages.addFiles} className="size-9 rounded-full text-muted-foreground sm:size-8" size="icon-sm" type="button" variant="ghost">
-                <PlusIcon className="size-4" />
-              </Button>
-            </ComposerPrimitive.AddAttachment>
-            <ExecutionModeMenu messages={messages} onChange={(executionMode) => onPreferencesChange({ ...preferences, executionMode })} value={preferences.executionMode ?? "standard"} />
-            <ModelSelector
+              />
+              <div className="flex min-h-9 items-center gap-0.5 sm:min-h-8 sm:gap-1">
+                <ComposerPrimitive.AddAttachment asChild>
+                  <Button aria-label={messages.addFiles} className="size-9 rounded-full text-muted-foreground sm:size-8" size="icon-sm" type="button" variant="ghost">
+                    <PlusIcon className="size-4" />
+                  </Button>
+                </ComposerPrimitive.AddAttachment>
+                <ExecutionModeMenu messages={messages} onChange={(executionMode) => onPreferencesChange({ ...preferences, executionMode })} value={preferences.executionMode ?? "standard"} />
+                <ModelSelector
               align="start"
               className="h-9 min-w-0 max-w-48 rounded-full px-2 text-muted-foreground sm:h-8 sm:max-w-64"
               contentClassName="w-72 max-w-[calc(100vw-1.5rem)]"
@@ -630,8 +636,8 @@ export function AssistantComposer({
               valueClassName="text-xs font-normal"
               variant="ghost"
               triggerLabel={messages.model}
-            />
-            <span className="ml-auto flex min-w-0 items-center gap-0.5 sm:gap-1">
+                />
+                <span className="ml-auto flex min-w-0 items-center gap-0.5 sm:gap-1">
               {model && usage.contextInputTokens > 0 ? (
                 <ContextDisplay.Ring
                   className="h-9 shrink-0 rounded-full px-1.5 sm:h-8"
@@ -683,8 +689,10 @@ export function AssistantComposer({
               >
                 <ArrowUpIcon className="size-4" />
               </Button>
-            </span>
-          </div>
+                </span>
+              </div>
+            </>
+          )}
         </div>
 
         <ComposerTriggerPopover char="@" {...mention} emptyItemsLabel={messages.noPromptItems} />
@@ -703,6 +711,7 @@ function blurComposerOnTouch(inputRef: React.RefObject<HTMLDivElement | null>) {
 
 function ComposerAttachment({ attachment, messages }: { readonly attachment: AssistantAttachment; readonly messages: AgentMessages }) {
   const [previewUrl, setPreviewUrl] = useState<string>();
+  const [previewOpen, setPreviewOpen] = useState(false);
   useEffect(() => {
     if (!attachment.file || !attachment.contentType?.startsWith("image/")) {
       setPreviewUrl(undefined);
@@ -713,11 +722,35 @@ function ComposerAttachment({ attachment, messages }: { readonly attachment: Ass
     return () => URL.revokeObjectURL(url);
   }, [attachment.contentType, attachment.file]);
   const isImage = attachment.contentType?.startsWith("image/") ?? attachment.type === "image";
+  const state = attachment.status.type === "incomplete" ? "error" : attachment.status.type === "running" ? "uploading" : "done";
+  if (isImage) {
+    return (
+      <>
+        <Attachment className="size-20 min-w-0 overflow-hidden p-0" orientation="vertical" size="sm" state={state}>
+          <AttachmentMedia className="size-full rounded-xl" variant={previewUrl ? "image" : "icon"}>
+            {previewUrl ? <img alt={attachment.name} src={previewUrl} /> : <ImageIcon className="size-5" />}
+          </AttachmentMedia>
+          {previewUrl ? <AttachmentTrigger aria-label={`${messages.attachment}: ${attachment.name}`} onClick={() => setPreviewOpen(true)} /> : null}
+          {attachment.status.type === "running" ? (
+            <span className="pointer-events-none absolute inset-x-1 bottom-1 z-20 rounded-full bg-background/90 px-1 py-0.5 text-center text-[10px] tabular-nums text-foreground">
+              {Math.round(attachment.status.progress)}%
+            </span>
+          ) : null}
+          <AttachmentPrimitive.Remove aria-label={messages.removeAttachment} className="absolute right-1 top-1 z-20 flex size-5 items-center justify-center rounded-full bg-background/90 text-muted-foreground hover:text-foreground">
+            <XIcon className="size-3" />
+          </AttachmentPrimitive.Remove>
+        </Attachment>
+        {previewOpen && previewUrl ? (
+          <button aria-label={messages.dismiss} className="fixed inset-0 z-50 flex cursor-zoom-out items-center justify-center bg-black/70 p-4" onClick={() => setPreviewOpen(false)} type="button">
+            <img alt={attachment.name} className="max-h-[90vh] max-w-[90vw] rounded-xl object-contain" src={previewUrl} />
+          </button>
+        ) : null}
+      </>
+    );
+  }
   return (
-    <Attachment className="mr-1.5 max-w-[min(22rem,calc(100vw-2rem))]" size="sm" state={attachment.status.type === "incomplete" ? "error" : attachment.status.type === "running" ? "uploading" : "done"}>
-      <AttachmentMedia variant={isImage ? "image" : "icon"}>
-        {isImage && previewUrl ? <img alt={attachment.name} src={previewUrl} /> : <FileIcon className="size-4" />}
-      </AttachmentMedia>
+    <Attachment className="max-w-[min(18rem,calc(100vw-2rem))]" size="sm" state={state}>
+      <AttachmentMedia variant="icon"><FileIcon className="size-4" /></AttachmentMedia>
       <AttachmentContent>
         <AttachmentTitle>{attachment.name}</AttachmentTitle>
         <AttachmentDescription>
@@ -729,7 +762,7 @@ function ComposerAttachment({ attachment, messages }: { readonly attachment: Ass
         </AttachmentDescription>
       </AttachmentContent>
       <AttachmentPrimitive.Remove aria-label={messages.removeAttachment} className="relative z-20 rounded-sm text-muted-foreground hover:text-foreground">
-        <span aria-hidden>×</span>
+        <XIcon className="size-3" />
       </AttachmentPrimitive.Remove>
     </Attachment>
   );
@@ -756,18 +789,60 @@ function ApprovalComposerTakeover({
     }
   };
   return (
-    <section className="flex items-start gap-3 border-b border-border/60 px-1 pb-2" data-agent-approval-takeover>
-      <ShieldCheckIcon className="mt-0.5 size-4 shrink-0 text-amber-600" />
+    <section
+      aria-label={isZh ? "工具调用等待批准" : "Tool call awaiting approval"}
+      className="flex min-h-28 items-start gap-3 px-1 py-1"
+      data-agent-approval-takeover
+      role="alertdialog"
+    >
+      <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-amber-500/10 text-amber-700 dark:text-amber-300">
+        <ShieldCheckIcon className="size-4" />
+      </span>
       <div className="min-w-0 flex-1">
-        <p className="text-sm font-medium text-foreground">{isZh ? "需要批准后继续" : "Approval required to continue"}</p>
-        <p className="mt-0.5 truncate text-xs text-muted-foreground">{request.toolName}: {request.prompt}</p>
-        <div className="mt-2 flex gap-2">
-          <Button disabled={submitting} onClick={() => void respond("deny")} size="sm" variant="ghost">{isZh ? "拒绝" : "Deny"}</Button>
-          <Button disabled={submitting} onClick={() => void respond("approve")} size="sm">{isZh ? "批准" : "Approve"}</Button>
+        <p className="text-sm font-medium text-foreground">
+          {isZh ? `批准工具调用：${approvalToolLabel(request.toolName, locale)}` : `Approve tool call: ${approvalToolLabel(request.toolName, locale)}`}
+        </p>
+        <p className="mt-1 line-clamp-2 text-xs leading-5 text-muted-foreground">{request.prompt}</p>
+        <ApprovalTakeoverDetails input={request.input} toolName={request.toolName} />
+        <div className="mt-3 flex justify-end gap-2">
+          <Button className="min-w-16" disabled={submitting} onClick={() => void respond("deny")} size="sm" variant="ghost">{isZh ? "拒绝" : "Deny"}</Button>
+          <Button className="min-w-16" disabled={submitting} onClick={() => void respond("approve")} size="sm">
+            {submitting ? <LoaderCircleIcon className="size-3.5 animate-spin" /> : null}
+            {isZh ? "批准" : "Approve"}
+          </Button>
         </div>
       </div>
     </section>
   );
+}
+
+function ApprovalTakeoverDetails({ input, toolName }: { readonly input: unknown; readonly toolName: string }) {
+  if (input === undefined) return null;
+  const normalized = toolName.toLocaleLowerCase().replaceAll("-", "_");
+  const record = typeof input === "object" && input !== null && !Array.isArray(input)
+    ? input as Record<string, unknown>
+    : undefined;
+  const command = ["bash", "shell", "terminal", "exec_command"].includes(normalized)
+    ? [record?.command, record?.cmd].find((value): value is string => typeof value === "string")
+    : undefined;
+  let detail: string | undefined = command;
+  if (!detail) {
+    try {
+      detail = typeof input === "string" ? input : JSON.stringify(input, null, 2);
+    } catch {
+      detail = String(input);
+    }
+  }
+  if (!detail) return null;
+  return <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-muted/60 px-3 py-2 font-mono text-xs text-foreground">{detail}</pre>;
+}
+
+function approvalToolLabel(toolName: string, locale: AgentLocale): string {
+  const normalized = toolName.toLocaleLowerCase().replaceAll("-", "_");
+  if (["bash", "shell", "terminal", "exec_command"].includes(normalized)) return locale === "zh-CN" ? "终端命令" : "Terminal command";
+  if (["apply_patch", "patch_file", "write_file", "edit_file"].includes(normalized)) return locale === "zh-CN" ? "文件变更" : "File change";
+  if (["web_fetch", "fetch_url", "web_search", "search_web"].includes(normalized)) return locale === "zh-CN" ? "网络访问" : "Network access";
+  return toolName;
 }
 
 function DirectiveChip({ directiveId, directiveType, label }: DirectiveChipProps) {
@@ -852,31 +927,6 @@ function localizePromptMenuItem(
     description: translation.description ?? item.description,
     label: translation.label ?? item.label,
   };
-}
-
-function CopyTextAction({ label, text }: { readonly label: string; readonly text: string }) {
-  const [copied, setCopied] = useState(false);
-  const timeout = useRef<number | undefined>(undefined);
-  useEffect(() => () => window.clearTimeout(timeout.current), []);
-  return (
-    <Button
-      aria-label={label}
-      className="size-7 text-muted-foreground hover:bg-accent hover:text-foreground"
-      disabled={!text}
-      onClick={() => {
-        void copyText(text).then(() => {
-          setCopied(true);
-          window.clearTimeout(timeout.current);
-          timeout.current = window.setTimeout(() => setCopied(false), 1_500);
-        }).catch(() => setCopied(false));
-      }}
-      size="icon-sm"
-      type="button"
-      variant="ghost"
-    >
-      {copied ? <CheckIcon className="size-3.5" /> : <CopyIcon className="size-3.5" />}
-    </Button>
-  );
 }
 
 function AssistantEmptyState({ messages }: { readonly messages: AgentMessages }) {

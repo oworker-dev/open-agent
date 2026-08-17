@@ -12,7 +12,7 @@ export function createAutonomyEvalModel() {
 
 function respond(request: MockModelRequest) {
   if (isCompactionRequest(request)) return compactionCheckpoint(request);
-  const task = request.lastUserMessage ?? "";
+  const task = latestEvalTask(request);
   if (task.includes("EVAL_AUTONOMY_FILE")) return autonomyFile(request);
   if (task.includes("EVAL_WEBSITE_PREVIEW")) return websitePreview(request);
   if (task.includes("EVAL_ARTIFACT_DELIVERY")) return artifactDelivery(request);
@@ -29,6 +29,32 @@ function respond(request: MockModelRequest) {
   if (task.includes("EVAL_COMPACTION_MUTATE")) return compactionMutate(request);
   if (task.includes("EVAL_COMPACTION_VERIFY")) return compactionVerify(request);
   return "EVAL_FIXTURE_UNKNOWN_TASK";
+}
+
+function latestEvalTask(request: MockModelRequest): string {
+  const messages = request.messages.map((message) => message.text);
+  if (request.lastUserMessage) messages.push(request.lastUserMessage);
+  const markers = [
+    "EVAL_AUTONOMY_FILE",
+    "EVAL_WEBSITE_PREVIEW",
+    "EVAL_ARTIFACT_DELIVERY",
+    "EVAL_MEDIA_PROCESSING",
+    "EVAL_FAILURE_RECOVERY",
+    "EVAL_APPROVAL",
+    "EVAL_CANCEL",
+    "EVAL_CONTEXT_STORE",
+    "EVAL_CONTEXT_RECALL",
+    "EVAL_COMPACTION_SETUP",
+    "EVAL_COMPACTION_FILL",
+    "EVAL_COMPACTION_MUTATE",
+    "EVAL_COMPACTION_VERIFY",
+  ] as const;
+  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+    const message = messages[messageIndex] ?? "";
+    const markerIndex = Math.max(...markers.map((marker) => message.lastIndexOf(marker)));
+    if (markerIndex >= 0) return message.slice(markerIndex);
+  }
+  return request.lastUserMessage ?? "";
 }
 
 function isCompactionRequest(request: MockModelRequest): boolean {
@@ -123,17 +149,17 @@ function compactionVerify(request: MockModelRequest) {
   const prompt = request.messages.map((message) => message.text).join("\n");
   const file = JSON.stringify(resultById(request, "eval-compaction-read-final")?.output);
   const todos = JSON.stringify(resultById(request, "eval-compaction-todo-final")?.output);
-  const verified =
-    prompt.includes("COMPACTION_CHECKPOINT_INCREMENTAL") &&
-    prompt.includes("[Your task list was preserved across context compaction]") &&
-    prompt.includes("Verify compaction invariants") &&
-    file.includes("CERULEAN-47") &&
-    file.includes("ORBIT-73") &&
-    file.includes("BETA-91") &&
-    todos.includes("Verify compaction invariants");
+  const evidence = {
+    checkpoint: prompt.includes("fact=CERULEAN-47") && prompt.includes("tool=ORBIT-73"),
+    preservedTodoPrompt: prompt.includes("[Your task list was preserved across context compaction]") &&
+      prompt.includes("Verify compaction invariants"),
+    file: ["CERULEAN-47", "ORBIT-73", "BETA-91"].every((value) => file.includes(value)),
+    todos: todos.includes("Verify compaction invariants"),
+  };
+  const verified = Object.values(evidence).every(Boolean);
   return verified
     ? "COMPACTION_VERIFIED CERULEAN-47 ORBIT-73 BETA-91 TODO_PRESERVED"
-    : "COMPACTION_VERIFICATION_FAILED";
+    : `COMPACTION_VERIFICATION_FAILED ${JSON.stringify(evidence)}`;
 }
 
 function autonomyFile(request: MockModelRequest) {
@@ -224,7 +250,7 @@ function mediaProcessing(request: MockModelRequest) {
   const rendered = resultById(request, "eval-media-render");
   if (!rendered) {
     return tool("bash", {
-      command: "convert /workspace/source.ppm -resize 320x180! /workspace/frame.png && ffmpeg -loglevel error -y -loop 1 -i /workspace/frame.png -t 1 -pix_fmt yuv420p /workspace/preview.mp4 && test -s /workspace/preview.mp4",
+      command: "magick /workspace/source.ppm -resize 320x180! /workspace/frame.png && ffmpeg -loglevel error -y -loop 1 -i /workspace/frame.png -t 1 -pix_fmt yuv420p /workspace/preview.mp4 && test -s /workspace/preview.mp4",
     }, "eval-media-render");
   }
   if (!toolExitSucceeded(rendered.output)) return "MEDIA_PROCESSING_FAILED";
@@ -266,7 +292,7 @@ function failureRecovery(request: MockModelRequest) {
 function approval(request: MockModelRequest) {
   if (!hasResult(request, "bash")) {
     return tool("bash", {
-      command: "rm -f /workspace/approval-target.txt && printf APPROVED",
+      command: "false && git push origin main; printf APPROVED",
     }, "eval-risky-bash");
   }
   return "APPROVAL_COMPLETED";

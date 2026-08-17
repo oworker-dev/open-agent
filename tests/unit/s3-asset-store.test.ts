@@ -597,6 +597,24 @@ test("S3 retention deletes a provider object before retiring a stale completion"
   assert.ok(queries.some((query) => query.includes("delete from \"open_agent\".\"agent_assets\"")));
 });
 
+test("S3 retention casts its shared cleanup timestamp for real PostgreSQL", async () => {
+  const queries: string[] = [];
+  const store = createS3AssetStore({
+    bucket: "assets",
+    client: { async send() { throw new Error("no provider call expected"); } } as never,
+    pool: {
+      async query(sql: string) {
+        queries.push(sql);
+        return { rows: [] };
+      },
+    } as never,
+  });
+  await store.cleanupExpired?.({ now: new Date("2030-01-01T00:00:00.000Z") });
+  const cleanup = queries.find((sql) => sql.includes("upload.updated_at"));
+  assert.match(cleanup ?? "", /\$1::timestamptz - interval '5 minutes'/u);
+  assert.match(cleanup ?? "", /asset\.expires_at <= \$1::timestamptz/u);
+});
+
 test("S3 retention keeps upload metadata when provider cleanup fails", async () => {
   const uploading = {
     asset_id: "asset-retry-cleanup",

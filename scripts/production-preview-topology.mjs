@@ -1,6 +1,6 @@
 export const PRODUCTION_PREVIEW_PORTS = Object.freeze({
   eve: 4275,
-  web: 3000,
+  web: 3100,
 });
 
 export function configureEveNextProductionPort(environment = process.env) {

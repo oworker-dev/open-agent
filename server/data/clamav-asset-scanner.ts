@@ -49,29 +49,51 @@ async function scanClamdStream(
   const socket = createConnection({ host: options.host, port: options.port });
   socket.setNoDelay(true);
   socket.setTimeout(options.timeoutMs);
-  const response = readResponse(socket);
   try {
-    await once(socket, "connect");
-    await writeSocket(socket, Buffer.from("zINSTREAM\0", "ascii"));
-    const reader = stream.getReader();
+    await connectSocket(socket);
+    const response = readResponse(socket);
     try {
-      for (;;) {
-        const next = await reader.read();
-        if (next.done) break;
-        if (next.value.byteLength === 0) continue;
-        const header = Buffer.allocUnsafe(4);
-        header.writeUInt32BE(next.value.byteLength, 0);
-        await writeSocket(socket, header);
-        await writeSocket(socket, Buffer.from(next.value.buffer, next.value.byteOffset, next.value.byteLength));
+      await writeSocket(socket, Buffer.from("zINSTREAM\0", "ascii"));
+      const reader = stream.getReader();
+      try {
+        for (;;) {
+          const next = await reader.read();
+          if (next.done) break;
+          if (next.value.byteLength === 0) continue;
+          const header = Buffer.allocUnsafe(4);
+          header.writeUInt32BE(next.value.byteLength, 0);
+          await writeSocket(socket, header);
+          await writeSocket(socket, Buffer.from(next.value.buffer, next.value.byteOffset, next.value.byteLength));
+        }
+      } finally {
+        reader.releaseLock();
       }
-    } finally {
-      reader.releaseLock();
+      await writeSocket(socket, Buffer.alloc(4));
+      return await response;
+    } catch (error) {
+      socket.destroy();
+      await response.catch(() => undefined);
+      throw error;
     }
-    await writeSocket(socket, Buffer.alloc(4));
-    return await response;
   } finally {
     socket.destroy();
   }
+}
+
+function connectSocket(socket: Socket): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      socket.off("connect", onConnect);
+      socket.off("error", onError);
+      socket.off("timeout", onTimeout);
+    };
+    const onConnect = () => { cleanup(); resolve(); };
+    const onError = () => { cleanup(); reject(new Error("The asset scanner connection failed.")); };
+    const onTimeout = () => { cleanup(); reject(new Error("The asset scanner connection timed out.")); };
+    socket.once("connect", onConnect);
+    socket.once("error", onError);
+    socket.once("timeout", onTimeout);
+  });
 }
 
 function readResponse(socket: Socket): Promise<string> {
@@ -80,6 +102,7 @@ function readResponse(socket: Socket): Promise<string> {
     let total = 0;
     const cleanup = () => {
       socket.off("data", onData);
+      socket.off("close", onClose);
       socket.off("end", onEnd);
       socket.off("error", onError);
       socket.off("timeout", onTimeout);
@@ -103,9 +126,11 @@ function readResponse(socket: Socket): Promise<string> {
       if (chunk.includes(0)) finish();
     };
     const onEnd = () => finish();
+    const onClose = () => fail(new Error("The asset scanner connection closed without a result."));
     const onError = () => fail(new Error("The asset scanner connection failed."));
     const onTimeout = () => fail(new Error("The asset scanner timed out."));
     socket.on("data", onData);
+    socket.once("close", onClose);
     socket.once("end", onEnd);
     socket.once("error", onError);
     socket.once("timeout", onTimeout);

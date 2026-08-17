@@ -171,6 +171,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, isRecoverin
     const approvalRequest = pendingInputRequests.find((request) => request.kind === "tool-approval");
     const approvalTakeover = approvalRequest
         ? {
+            input: approvalRequest.action.input,
             requestId: approvalRequest.requestId,
             prompt: approvalRequest.prompt,
             toolName: approvalRequest.action.toolName,

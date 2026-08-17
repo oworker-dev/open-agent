@@ -359,8 +359,7 @@ function countContentLines(value) {
 }
 function StepActivity({ events, locale, stepIndex, turnId, }) {
     const step = presentAgentStep(events, turnId, stepIndex);
-    const durationSeconds = useElapsedSeconds(step.startedAt, step.endedAt);
-    return (_jsxs(_Fragment, { children: [step.status === "running" && step.retry ? (_jsx(RetryStatus, { locale: locale, retry: step.retry })) : null, _jsx(ReasoningRoot, { className: "mb-1", role: "status", streaming: step.status === "running", variant: "ghost", children: _jsx(ReasoningTrigger, { active: step.status === "running", duration: step.status === "completed" && durationSeconds > 0 ? durationSeconds : undefined, hideChevron: true, label: step.status === "running"
+    return (_jsxs(_Fragment, { children: [step.status === "running" && step.retry ? (_jsx(RetryStatus, { locale: locale, retry: step.retry })) : null, _jsx(ReasoningRoot, { className: "mb-1", role: "status", streaming: step.status === "running", variant: "ghost", children: _jsx(ReasoningTrigger, { active: step.status === "running", hideChevron: true, label: step.status === "running"
                         ? localize(locale, "Thinking", "正在思考")
                         : localize(locale, "Reasoning complete", "思考完成") }) })] }));
 }
@@ -372,7 +371,7 @@ function ReasoningPart({ events, locale, part, turnId, }) {
     const step = presentAgentStep(events, turnId, part.stepIndex ?? 0);
     const durationSeconds = useElapsedSeconds(timing.startedAt, timing.endedAt);
     const streaming = part.state === "streaming";
-    return (_jsxs(_Fragment, { children: [streaming && step.retry ? _jsx(RetryStatus, { locale: locale, retry: step.retry }) : null, _jsxs(ReasoningRoot, { className: "mb-1", streaming: streaming, variant: "ghost", children: [_jsx(ReasoningTrigger, { active: streaming, duration: !streaming && timing.startedAt && durationSeconds > 0 ? durationSeconds : undefined, label: streaming
+    return (_jsxs(_Fragment, { children: [streaming && step.retry ? _jsx(RetryStatus, { locale: locale, retry: step.retry }) : null, _jsxs(ReasoningRoot, { className: "mb-1", streaming: streaming, variant: "ghost", children: [_jsx(ReasoningTrigger, { active: streaming, duration: timing.startedAt && durationSeconds > 0 ? durationSeconds : undefined, label: streaming
                             ? reasoningSummary(part.text) ?? localize(locale, "Thinking", "正在思考")
                             : localize(locale, "Reasoning complete", "思考完成") }), _jsx(ReasoningContent, { "aria-busy": streaming, children: _jsx(ReasoningText, { children: _jsx(StaticMarkdownText, { text: part.text }) }) })] })] }));
 }
@@ -387,10 +386,10 @@ function reasoningSummary(text) {
     return firstLine.length > 64 ? `${firstLine.slice(0, 63)}…` : firstLine;
 }
 function reasoningTiming(events, turnId, stepIndex) {
-    const matching = events.filter((event) => (event.type === "step.started" || event.type === "reasoning.appended" || event.type === "reasoning.completed") &&
+    const matching = events.filter((event) => (event.type === "reasoning.appended" || event.type === "reasoning.completed") &&
         (turnId === undefined || event.data.turnId === turnId) &&
         (stepIndex === undefined || ("stepIndex" in event.data && event.data.stepIndex === stepIndex)));
-    const startedAt = eventTime(matching[0]);
+    const startedAt = eventTime(matching.find((event) => event.type === "reasoning.appended") ?? matching[0]);
     const completed = [...matching].reverse().find((event) => event.type === "reasoning.completed");
     return {
         ...(startedAt ? { startedAt } : {}),
@@ -566,15 +565,105 @@ function toolPatch(part) {
 }
 function patchFromValue(value) {
     if (typeof value === "string")
-        return looksLikeUnifiedDiff(value) ? value : undefined;
+        return displayablePatch(value);
     if (!value || typeof value !== "object" || Array.isArray(value))
         return undefined;
     const record = value;
     const patch = record.patch ?? record.diff;
-    return typeof patch === "string" && looksLikeUnifiedDiff(patch) ? patch : undefined;
+    return typeof patch === "string" ? displayablePatch(patch) : undefined;
+}
+function displayablePatch(value) {
+    if (looksLikeUnifiedDiff(value))
+        return value;
+    return codexPatchToUnifiedDiff(value);
 }
 function looksLikeUnifiedDiff(value) {
     return /^(?:diff --git |--- )/m.test(value) && /^\+\+\+ /m.test(value) && /^@@ /m.test(value);
+}
+function codexPatchToUnifiedDiff(value) {
+    const lines = value.replace(/\r\n?/gu, "\n").split("\n");
+    const begin = lines.findIndex((line) => line.trim() === "*** Begin Patch");
+    const end = lines.findIndex((line, index) => index > begin && line.trim() === "*** End Patch");
+    if (begin < 0 || end < 0)
+        return undefined;
+    const sections = [];
+    for (let index = begin + 1; index < end;) {
+        if (!lines[index]?.trim()) {
+            index += 1;
+            continue;
+        }
+        const directive = /^\*\*\* (Add|Update|Delete) File:\s*(.+?)\s*$/u.exec(lines[index]);
+        if (!directive)
+            return undefined;
+        const operation = directive[1];
+        const sourcePath = directive[2];
+        index += 1;
+        let destinationPath = sourcePath;
+        if (operation === "Update") {
+            const move = /^\*\*\* Move to:\s*(.+?)\s*$/u.exec(lines[index] ?? "");
+            if (move) {
+                destinationPath = move[1];
+                index += 1;
+            }
+        }
+        const body = [];
+        while (index < end && !lines[index].startsWith("*** ")) {
+            body.push(lines[index]);
+            index += 1;
+        }
+        const oldName = operation === "Add" ? "/dev/null" : `a/${sourcePath}`;
+        const newName = operation === "Delete" ? "/dev/null" : `b/${destinationPath}`;
+        const hunks = operation === "Add"
+            ? addFileHunk(body)
+            : operation === "Delete"
+                ? []
+                : normalizeCodexHunks(body);
+        sections.push([
+            `diff --git a/${sourcePath} b/${destinationPath}`,
+            `--- ${oldName}`,
+            `+++ ${newName}`,
+            ...hunks,
+        ].join("\n"));
+    }
+    return sections.length > 0 ? sections.join("\n") : undefined;
+}
+function addFileHunk(lines) {
+    const additions = lines.filter((line) => line.startsWith("+"));
+    return additions.length > 0
+        ? [`@@ -0,0 +1,${additions.length} @@`, ...additions]
+        : [];
+}
+function normalizeCodexHunks(lines) {
+    if (lines.length === 0)
+        return [];
+    const hunkStarts = lines.flatMap((line, index) => line.startsWith("@@") ? [index] : []);
+    if (hunkStarts.length === 0)
+        return normalizedHunk(lines, 1, 1);
+    const normalized = [];
+    let fallbackOldStart = 1;
+    let fallbackNewStart = 1;
+    for (let hunkIndex = 0; hunkIndex < hunkStarts.length; hunkIndex += 1) {
+        const start = hunkStarts[hunkIndex];
+        const end = hunkStarts[hunkIndex + 1] ?? lines.length;
+        const header = lines[start];
+        const body = lines.slice(start + 1, end);
+        if (/^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/u.test(header)) {
+            normalized.push(header, ...body);
+        }
+        else {
+            normalized.push(...normalizedHunk(body, fallbackOldStart, fallbackNewStart, header.slice(2).trim()));
+        }
+        fallbackOldStart += body.filter((line) => line.startsWith(" ") || line.startsWith("-")).length;
+        fallbackNewStart += body.filter((line) => line.startsWith(" ") || line.startsWith("+")).length;
+    }
+    return normalized;
+}
+function normalizedHunk(lines, oldStart, newStart, suffix = "") {
+    const body = lines.filter((line) => /^(?: |\+|-|\\)/u.test(line));
+    const oldCount = body.filter((line) => line.startsWith(" ") || line.startsWith("-")).length;
+    const newCount = body.filter((line) => line.startsWith(" ") || line.startsWith("+")).length;
+    const trailer = suffix ? ` ${suffix}` : "";
+    return [`@@ -${oldStart},${oldCount} +${newStart},${newCount} @@${trailer}`, ...body];
 }
 function SubagentProgress({ events, locale, onOpenSubagent, part, }) {
     const presentation = presentSubagentCall(events, part.toolCallId);
@@ -766,7 +855,7 @@ function InputRequestCard({ canRespond, closed, events, locale, onClose, onInput
     const eyebrow = isQuestion
         ? localize(locale, "Agent question", "Agent 需要确认")
         : isApproval
-            ? localize(locale, "Approval required", "请求批准")
+            ? localize(locale, `Approve tool call: ${approvalToolName(part.toolName, locale)}`, `批准工具调用：${approvalToolName(part.toolName, locale)}`)
             : localize(locale, "Session limit reached", "已达到会话限制");
     const choices = inputRequest.options ?? [];
     const settled = Boolean(inputResponse) || closed;
@@ -775,6 +864,8 @@ function InputRequestCard({ canRespond, closed, events, locale, onClose, onInput
         if (settled)
             setOpen(false);
     }, [settled]);
+    if (isApproval && !settled)
+        return null;
     const status = closed
         ? localize(locale, "Closed", "已关闭")
         : inputResponse
@@ -782,7 +873,17 @@ function InputRequestCard({ canRespond, closed, events, locale, onClose, onInput
             : isQuestion
                 ? localize(locale, "Waiting for confirmation", "等待确认")
                 : undefined;
-    return (_jsx(Collapsible, { className: cn("my-1 max-w-full transition-[width] duration-200", open ? "w-full max-w-xl" : "w-fit"), onOpenChange: setOpen, open: open, children: _jsx("section", { className: "rounded-xl border border-border/70 bg-background px-3.5 py-3", "data-input-request-kind": inputRequest.kind, children: _jsxs("div", { className: "flex items-start gap-2.5", children: [_jsx(Icon, { className: "mt-0.5 size-4 shrink-0 text-muted-foreground" }), _jsxs("div", { className: "min-w-0 flex-1", children: [_jsxs("div", { className: "flex items-center gap-2", children: [_jsx(CollapsibleTrigger, { asChild: true, children: _jsxs("button", { className: "group/request flex min-w-0 flex-1 items-center gap-1.5 text-left text-sm font-medium text-muted-foreground hover:text-foreground", type: "button", children: [_jsx("span", { className: "truncate", children: eyebrow }), status ? _jsxs("span", { className: "shrink-0 font-normal text-muted-foreground/80", children: ["\u00B7 ", status] }) : null, _jsx(ChevronDownIcon, { className: "size-3.5 shrink-0 transition-transform group-data-[state=open]/request:rotate-180" })] }) }), !inputResponse && !closed && isQuestion ? _jsx(Button, { className: "h-6 shrink-0 px-2 text-xs", onClick: () => onClose(inputRequest.requestId), size: "sm", type: "button", variant: "ghost", children: localize(locale, "Close", "关闭") }) : null] }), _jsxs(CollapsibleContent, { className: "overflow-hidden", children: [_jsx("p", { className: "mt-1 text-sm leading-6 text-foreground", children: inputRequest.prompt }), isApproval ? _jsx(ApprovalActionPreview, { events: events, locale: locale, part: part }) : null, settled ? (_jsx(InputRequestReview, { closed: closed, inputResponse: inputResponse, locale: locale, options: choices, selectedOptionId: selectedOption?.id })) : (_jsx(QuestionnaireResponseForm, { acceptsFreeform: acceptsFreeform, canRespond: canRespond, locale: locale, onInputResponses: onInputResponses, options: choices, prompt: inputRequest.prompt, requestId: inputRequest.requestId }))] })] })] }) }) }));
+    return (_jsx(Collapsible, { className: cn("my-1 max-w-full transition-[width] duration-200", open ? "w-full max-w-xl" : "w-fit"), onOpenChange: setOpen, open: open, children: _jsx("section", { className: "rounded-xl border border-border/70 bg-background px-3.5 py-3", "data-input-request-kind": inputRequest.kind, children: _jsxs("div", { className: "flex items-start gap-2.5", children: [_jsx(Icon, { className: "mt-0.5 size-4 shrink-0 text-muted-foreground" }), _jsxs("div", { className: "min-w-0 flex-1", children: [_jsxs("div", { className: "flex items-center gap-2", children: [_jsx(CollapsibleTrigger, { asChild: true, children: _jsxs("button", { className: "group/request flex min-w-0 flex-1 items-center gap-1.5 text-left text-sm font-medium text-muted-foreground hover:text-foreground", type: "button", children: [_jsx("span", { className: "truncate", children: eyebrow }), status ? _jsxs("span", { className: "shrink-0 font-normal text-muted-foreground/80", children: ["\u00B7 ", status] }) : null, _jsx(ChevronDownIcon, { className: "size-3.5 shrink-0 transition-transform group-data-[state=open]/request:rotate-180" })] }) }), !inputResponse && !closed && isQuestion ? _jsx(Button, { className: "h-6 shrink-0 px-2 text-xs", onClick: () => onClose(inputRequest.requestId), size: "sm", type: "button", variant: "ghost", children: localize(locale, "Close", "关闭") }) : null] }), _jsxs(CollapsibleContent, { className: "overflow-hidden", children: [_jsx("p", { className: "mt-1 text-sm leading-6 text-foreground", children: inputRequest.prompt }), isApproval ? _jsx(ApprovalActionPreview, { events: events, locale: locale, part: part }) : null, settled ? (_jsx(InputRequestReview, { closed: closed, inputResponse: inputResponse, locale: locale, options: choices, selectedOptionId: selectedOption?.id })) : isApproval ? (_jsx("p", { className: "mt-3 text-xs leading-5 text-muted-foreground", children: localize(locale, "Respond using the approval controls below.", "请使用下方批准控件继续。") })) : (_jsx(QuestionnaireResponseForm, { acceptsFreeform: acceptsFreeform, canRespond: canRespond, locale: locale, onInputResponses: onInputResponses, options: choices, prompt: inputRequest.prompt, requestId: inputRequest.requestId }))] })] })] }) }) }));
+}
+function approvalToolName(toolName, locale) {
+    const normalized = normalizeToolName(toolName);
+    if (["bash", "shell", "terminal", "exec_command"].includes(normalized))
+        return localize(locale, "Terminal command", "终端命令");
+    if (["apply_patch", "patch_file", "write_file", "edit_file"].includes(normalized))
+        return localize(locale, "File change", "文件变更");
+    if (["web_fetch", "fetch_url", "web_search", "search_web"].includes(normalized))
+        return localize(locale, "Network access", "网络访问");
+    return toolName;
 }
 function ApprovalActionPreview({ events, locale, part, }) {
     const normalized = normalizeToolName(part.toolName);

@@ -2,6 +2,8 @@ import { createHash, createHmac, randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
+import http from "node:http";
+import https from "node:https";
 
 import {
   ASSET_LOAD_MAX_PART_BYTES,
@@ -14,16 +16,19 @@ const config = parseAssetLoadConfig();
 const tenantId = `asset-load-tenant-${randomUUID()}`;
 const accessToken = signToken({
   actorType: "service",
+  scope: ["asset:read", "asset:write"],
   sub: `asset-load-runner-${randomUUID()}`,
   tenantId,
 });
 const sameTenantOtherPrincipalToken = signToken({
   actorType: "service",
+  scope: ["asset:read"],
   sub: `asset-load-other-principal-${randomUUID()}`,
   tenantId,
 });
 const otherAccessToken = signToken({
   actorType: "service",
+  scope: ["asset:read"],
   sub: `asset-load-other-${randomUUID()}`,
   tenantId: `asset-load-other-tenant-${randomUUID()}`,
 });
@@ -127,7 +132,7 @@ async function uploadOne(uploadIndex) {
         // must work in either case.
         const partial = bytes.subarray(0, Math.max(1, Math.floor(bytes.byteLength / 2)));
         const partialTarget = await signPart(uploadRecord.uploadId, partNumber, bytes.byteLength);
-        const partialResult = await partialDirectPart(partialTarget, partial);
+        const partialResult = await partialDirectPart(partialTarget, partial, bytes.byteLength);
         assert(partialResult.status !== 401 && partialResult.status !== 403, "The partial part request was rejected by authentication.");
         interruptedParts += 1;
         retries += 1;
@@ -245,18 +250,35 @@ async function signPart(uploadId, partNumber, sizeBytes) {
   return response.target;
 }
 
-async function partialDirectPart(target, bytes) {
-  try {
-    const response = await fetch(target.url, {
-      body: bytes,
-      headers: target.headers,
+async function partialDirectPart(target, bytes, declaredSizeBytes) {
+  return new Promise((resolve) => {
+    const url = new URL(target.url);
+    const transport = url.protocol === "https:" ? https : http;
+    let settled = false;
+    const finish = (status) => {
+      if (settled) return;
+      settled = true;
+      resolve({ status });
+    };
+    const request = transport.request(url, {
+      headers: { ...(target.headers ?? {}), "content-length": String(declaredSizeBytes) },
       method: target.method,
-      signal: AbortSignal.timeout(config.deadlineMs),
+    }, (response) => {
+      response.resume();
+      response.once("end", () => finish(response.statusCode ?? 500));
     });
-    return { status: response.status };
-  } catch {
-    return { status: 499 };
-  }
+    request.setTimeout(Math.min(config.deadlineMs, 30_000), () => {
+      request.destroy();
+      finish(499);
+    });
+    request.once("error", () => finish(499));
+    request.write(bytes, () => {
+      // Preserve the declared full part length and sever the transport after
+      // only half the body, matching an XHR/browser disconnect.
+      request.destroy();
+      finish(499);
+    });
+  });
 }
 
 async function directPart(target, bytes) {

@@ -962,7 +962,7 @@ export function AgentWorkspace({
         }} /> : null}
         <ResizablePanel className="min-w-0 p-0" data-workbench-panel defaultSize="100%" id="agent-workbench" minSize="0px">
           <ResizablePanelGroup className="h-full" orientation="horizontal">
-            <ResizablePanel className="min-w-0" defaultSize={secondaryOpen && !desktopLayout ? "0%" : secondaryOpen ? "70%" : "100%"} id="agent-primary" minSize="0px">
+            <ResizablePanel className={cn("min-w-0", secondaryOpen && !desktopLayout && "hidden")} defaultSize={secondaryOpen && !desktopLayout ? "0%" : secondaryOpen ? "70%" : "100%"} id="agent-primary" minSize="0px">
       <section className="flex h-full min-w-0 flex-col overflow-hidden bg-card" data-slot="agent-workbench">
         <header className="flex h-12 shrink-0 items-center justify-between border-b border-border/70 px-3 lg:h-13 lg:px-4">
           <div className="flex min-w-0 items-center gap-2">
@@ -1069,7 +1069,7 @@ export function AgentWorkspace({
             </ResizablePanel>
             {secondaryOpen ? (
               <>
-                <ResizableHandle className="flex bg-transparent after:w-2" data-secondary-resize-handle />
+                {desktopLayout ? <ResizableHandle className="flex bg-transparent after:w-2" data-secondary-resize-handle /> : null}
                 <ResizablePanel className="min-w-0 border-l border-border/70" defaultSize={desktopLayout ? "30%" : "100%"} id="agent-secondary" maxSize={desktopLayout ? "50%" : "100%"} minSize={desktopLayout ? "260px" : "0px"}>
                   <AgentSecondaryView
                     assetUrl={client?.assetUrl}

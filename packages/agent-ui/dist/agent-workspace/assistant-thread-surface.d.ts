@@ -7,6 +7,7 @@ import type { AgentLocale, AgentMessages } from "./i18n.js";
 import type { AgentUsageSummary } from "./usage.js";
 export type AgentCancellationState = "idle" | "requested" | "cancelling";
 export type AgentApprovalTakeover = {
+    readonly input?: unknown;
     readonly requestId: string;
     readonly prompt: string;
     readonly toolName: string;

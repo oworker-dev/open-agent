@@ -280,6 +280,7 @@ export function AgentThreadView({
   const approvalRequest = pendingInputRequests.find((request) => request.kind === "tool-approval");
   const approvalTakeover: AgentApprovalTakeover | undefined = approvalRequest
     ? {
+        input: approvalRequest.action.input,
         requestId: approvalRequest.requestId,
         prompt: approvalRequest.prompt,
         toolName: approvalRequest.action.toolName,

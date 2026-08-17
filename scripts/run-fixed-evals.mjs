@@ -22,6 +22,10 @@ const environment = {
   AGENT_PREVIEW_STORAGE_PATH: join(publicationRoot, "previews"),
   AGENT_PUBLIC_BASE_URL: "http://127.0.0.1:3000",
   AGENT_SANDBOX_BACKEND: process.env.FIXED_EVAL_SANDBOX_BACKEND?.trim() || "docker",
+  AGENT_SANDBOX_IMAGE:
+    process.env.FIXED_EVAL_SANDBOX_IMAGE?.trim() ||
+    process.env.AGENT_SANDBOX_IMAGE?.trim() ||
+    "ghcr.io/oworker-dev/open-agent-sandbox:0.1.0-alpha.9@sha256:44e675839b0e4e16a97e5aceb86ef001fd379ae2642efe4d3bbead9d333f14d9",
 };
 
 const child = spawn(process.execPath, [
