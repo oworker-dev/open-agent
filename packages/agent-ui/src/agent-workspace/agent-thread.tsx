@@ -13,7 +13,7 @@ import { createBrowserAttachmentAdapter, createHttpAgentAssetUploadAdapter } fro
 import { convertEveMessages, getEveMessageContent } from "./eve-message-adapter.js";
 import type { AgentInputResponse } from "./agent-message.js";
 import { AssistantThreadSurface, type AgentApprovalTakeover } from "./assistant-thread-surface.js";
-import type { AgentInterruptedTurn, AgentModelOption, AgentPromptMenuItem, AgentQueuedTurn, AgentThread, AgentThreadPatch, AgentWorkspaceClientConfig, AgentWorkspaceMailbox, PromptInputMessage } from "./contracts.js";
+import type { AgentInterruptedTurn, AgentModelOption, AgentPromptMenuItem, AgentQueuedTurn, AgentSessionDeliverable, AgentThread, AgentThreadPatch, AgentWorkspaceClientConfig, AgentWorkspaceMailbox, PromptInputMessage } from "./contracts.js";
 import { sanitizeAgentError } from "./error-presentation.js";
 import { AgentMailboxHttpError } from "./http-agent-mailbox.js";
 import { messagesFor, type AgentLocale, type AgentMessages } from "./i18n.js";
@@ -64,6 +64,7 @@ export function AgentThreadView({
   onChange,
   onCancelRecovery,
   onEvent,
+  onOpenDeliverable,
   onOpenSubagent,
   onRetryRecovery,
   onRecoveryNeeded,
@@ -83,6 +84,7 @@ export function AgentThreadView({
   readonly onChange: (patch: AgentThreadPatch) => void;
   readonly onCancelRecovery?: () => void;
   readonly onEvent?: (event: MessageStreamEvent) => void;
+  readonly onOpenDeliverable?: (deliverable: AgentSessionDeliverable) => void;
   readonly onOpenSubagent?: (sessionId: string) => void;
   readonly onRetryRecovery?: () => void;
   readonly onRecoveryNeeded: () => void;
@@ -1176,6 +1178,7 @@ export function AgentThreadView({
           models={models}
           onInputResponses={respond}
           onCloseInputRequest={closeInputRequest}
+          onOpenDeliverable={onOpenDeliverable}
           onOpenSubagent={onOpenSubagent}
           onPreferencesChange={(preferences) => onChange({ preferences })}
           onDraftRestoreConsumed={(id) => {

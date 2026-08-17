@@ -1,0 +1,1 @@
+{"version":3,"file":"session-deliverables.d.ts","sourceRoot":"","sources":["../../src/agent-workspace/session-deliverables.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,EAAE,wBAAwB,EAAE,uBAAuB,EAAE,MAAM,gBAAgB,CAAC;AAExF,wBAAgB,iCAAiC,CAAC,QAAQ,EAAE,wBAAwB,EAAE,SAAS,EAAE,MAAM,GAAG,MAAM,CAM/G;AAED,wBAAgB,wBAAwB,CAAC,OAAO,EAAE,OAAO,GAAG,SAAS,uBAAuB,EAAE,CAoC7F"}

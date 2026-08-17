@@ -24,14 +24,16 @@ import {
   FileSearchIcon,
   ListChecksIcon,
   MessageCircleQuestionIcon,
+  MonitorIcon,
   ShieldCheckIcon,
   WifiIcon,
   XCircleIcon,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { createContext, useContext, useEffect, useRef, useState } from "react";
 import type { InputResponse, MessageStreamEvent } from "eve/client";
 import { useScrollLock } from "@assistant-ui/react";
 import { StaticMarkdownText } from "../assistant-ui/markdown-text.js";
+import { ArtifactCard } from "../assistant-ui/artifact-card.js";
 import { copyText } from "../assistant-ui/copy-text.js";
 import {
   ReasoningContent,
@@ -64,6 +66,7 @@ import {
 } from "../ui/questionnaire.js";
 import { cn } from "../utils.js";
 import type { AgentLocale } from "./i18n.js";
+import type { AgentSessionDeliverable } from "./contracts.js";
 import {
   failureForTurn,
   presentAgentTurn,
@@ -101,6 +104,7 @@ export type AgentInputResponse = {
 
 type EveFilePart = Extract<EveMessagePart, { type: "file" }>;
 const EMPTY_CLOSED_INPUT_REQUEST_IDS: ReadonlySet<string> = new Set();
+const DeliverableOpenContext = createContext<((deliverable: AgentSessionDeliverable) => void) | undefined>(undefined);
 
 export function AgentMessage({
   assetUrl,
@@ -111,6 +115,7 @@ export function AgentMessage({
   isStreaming,
   locale,
   message,
+  onOpenDeliverable,
   onOpenSubagent,
   onInputResponses,
   onCloseInputRequest = () => undefined,
@@ -124,6 +129,7 @@ export function AgentMessage({
   readonly isStreaming: boolean;
   readonly locale: AgentLocale;
   readonly message: EveMessage;
+  readonly onOpenDeliverable?: (deliverable: AgentSessionDeliverable) => void;
   readonly onOpenSubagent?: (sessionId: string) => void;
   readonly onInputResponses: (responses: readonly AgentInputResponse[]) => void | Promise<void>;
   readonly onCloseInputRequest?: (requestId: string) => void;
@@ -143,6 +149,7 @@ export function AgentMessage({
   const hasVisiblePart = displayMessage.parts.some((part) => part.type !== "step-start");
 
   return (
+    <DeliverableOpenContext.Provider value={onOpenDeliverable}>
     <Message
       data-optimistic={message.metadata?.optimistic ? "true" : undefined}
       from={message.role}
@@ -236,6 +243,7 @@ export function AgentMessage({
         <CopyResponseAction locale={locale} text={responseText} />
       ) : null}
     </Message>
+    </DeliverableOpenContext.Provider>
   );
 }
 
@@ -582,6 +590,7 @@ function KnownToolContent({
   const output = "output" in part ? part.output : undefined;
   const patch = toolPatch(part);
   const fileChange = toolFileChange(part, events);
+  const openDeliverable = useContext(DeliverableOpenContext);
 
   if (part.toolMetadata?.eve?.kind === "subagent-call") {
     return <SubagentProgress events={events} locale={locale} onOpenSubagent={onOpenSubagent} part={part} />;
@@ -679,10 +688,14 @@ function KnownToolContent({
   if (["publish_preview", "website_preview"].includes(normalized)) {
     const result = readableOutput(output);
     const url = firstUrl(output) ?? firstString(input, ["url"]);
+    const deliverable = publishedDeliverable(output, "website-preview", url);
     return url ? (
-      <a className="inline-flex items-center gap-1.5 text-sm underline underline-offset-4" href={url} rel="noreferrer" target="_blank">
-        {url}<ExternalLinkIcon className="size-3.5" />
-      </a>
+      <ArtifactCard
+        icon={<MonitorIcon className="size-4" />}
+        meta={localize(locale, "Website preview", "网站预览")}
+        onClick={() => deliverable && openDeliverable ? openDeliverable(deliverable) : window.open(url, "_blank", "noopener,noreferrer")}
+        title={firstString(asRecord(output), ["title", "entrypoint"]) ?? localize(locale, "Published website", "已发布网站")}
+      />
     ) : result ? <p className="whitespace-pre-wrap text-xs text-muted-foreground">{result}</p> : null;
   }
 
@@ -704,10 +717,13 @@ function KnownToolContent({
     const record = asRecord(output);
     const url = firstUrl(output);
     const filename = firstString(record, ["filename", "name"]) ?? firstString(input, ["filename", "path"]);
+    const deliverable = publishedDeliverable(output, "artifact", url);
     return url ? (
-      <a className="inline-flex items-center gap-1.5 text-sm underline underline-offset-4" href={url} rel="noreferrer" target="_blank">
-        {filename ?? localize(locale, "Open artifact", "打开产物")}<ExternalLinkIcon className="size-3.5" />
-      </a>
+      <ArtifactCard
+        meta={[firstString(record, ["mediaType"]), formatBytes(firstNumber(record, ["bytes", "sizeBytes"]))].filter(Boolean).join(" · ") || localize(locale, "Session artifact", "会话产物")}
+        onClick={() => deliverable && openDeliverable ? openDeliverable(deliverable) : window.open(url, "_blank", "noopener,noreferrer")}
+        title={filename ?? localize(locale, "Open artifact", "打开产物")}
+      />
     ) : <p className="text-xs text-muted-foreground">{filename ?? localize(locale, "Publishing artifact...", "正在发布产物…")}</p>;
   }
 
@@ -1238,8 +1254,42 @@ function stringArray(value: unknown): readonly string[] {
 function firstUrl(value: unknown): string | undefined {
   const direct = typeof value === "string" ? value : firstString(asRecord(value), ["url", "previewUrl", "preview_url"]);
   if (!direct) return undefined;
+  if (direct.startsWith("/") && !direct.startsWith("//")) return direct;
+  try {
+    const parsed = new URL(direct);
+    if (parsed.protocol === "http:" || parsed.protocol === "https:") return parsed.toString();
+  } catch {
+    // Some tool outputs wrap the URL in explanatory text; recover it below.
+  }
   const match = direct.match(/https?:\/\/[^\s"'<>]+/u);
   return match?.[0];
+}
+
+function publishedDeliverable(
+  value: unknown,
+  kind: "artifact" | "website-preview",
+  url: string | undefined,
+): AgentSessionDeliverable | undefined {
+  const record = asRecord(value);
+  const id = firstString(record, kind === "artifact" ? ["artifactId", "id"] : ["previewId", "id"]);
+  if (!record || !id || !url) return undefined;
+  const title = firstString(record, kind === "artifact" ? ["filename", "name"] : ["title", "entrypoint"])
+    ?? (kind === "artifact" ? "Artifact" : "Website preview");
+  const createdAt = firstString(record, ["createdAt"]);
+  const expiresAt = firstString(record, ["expiresAt"]);
+  const fileCount = firstNumber(record, ["fileCount"]);
+  const mediaType = firstString(record, ["mediaType"]);
+  return {
+    createdAt: createdAt ?? new Date().toISOString(),
+    ...(expiresAt ? { expiresAt } : {}),
+    ...(fileCount !== undefined ? { fileCount } : {}),
+    id,
+    kind,
+    ...(mediaType ? { mediaType } : {}),
+    sizeBytes: firstNumber(record, ["bytes", "sizeBytes"]) ?? 0,
+    title,
+    url,
+  };
 }
 
 function todoItems(inputValue: unknown, outputValue: unknown): readonly { readonly done: boolean; readonly label: string }[] {

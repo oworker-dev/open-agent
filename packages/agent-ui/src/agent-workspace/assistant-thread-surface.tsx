@@ -56,7 +56,7 @@ import {
   DropdownMenuTrigger,
 } from "../ui/dropdown-menu.js";
 import { AgentMessage, type AgentInputResponse } from "./agent-message.js";
-import type { AgentComposerDraftRestore, AgentExecutionMode, AgentModelOption, AgentPromptMenuItem, AgentThreadPreferences } from "./contracts.js";
+import type { AgentComposerDraftRestore, AgentExecutionMode, AgentModelOption, AgentPromptMenuItem, AgentSessionDeliverable, AgentThreadPreferences } from "./contracts.js";
 import type { AgentLocale, AgentMessages } from "./i18n.js";
 import type { AgentUsageSummary } from "./usage.js";
 
@@ -90,6 +90,7 @@ export function AssistantThreadSurface({
   onInputResponses,
   onCloseInputRequest,
   onDraftRestoreConsumed,
+  onOpenDeliverable,
   onOpenSubagent,
   onPreferencesChange,
   onRetryRuntimeError,
@@ -119,6 +120,7 @@ export function AssistantThreadSurface({
   readonly onInputResponses: (responses: readonly AgentInputResponse[]) => void | Promise<void>;
   readonly onCloseInputRequest: (requestId: string) => void;
   readonly onDraftRestoreConsumed: (id: string) => void;
+  readonly onOpenDeliverable?: (deliverable: AgentSessionDeliverable) => void;
   readonly onOpenSubagent?: (sessionId: string) => void;
   readonly onPreferencesChange: (preferences: AgentThreadPreferences) => void;
   readonly onRetryRuntimeError?: () => void;
@@ -171,6 +173,7 @@ export function AssistantThreadSurface({
                 messages={messages}
                 onInputResponses={onInputResponses}
                 onCloseInputRequest={onCloseInputRequest}
+                onOpenDeliverable={onOpenDeliverable}
                 onOpenSubagent={onOpenSubagent}
                 closedInputRequestIds={closedInputRequestIds}
               />
@@ -353,6 +356,7 @@ function AssistantMessage({
   messages,
   onInputResponses,
   onCloseInputRequest,
+  onOpenDeliverable,
   onOpenSubagent,
 }: {
   readonly assetUrl?: (assetId: string) => string;
@@ -366,6 +370,7 @@ function AssistantMessage({
   readonly messages: AgentMessages;
   readonly onInputResponses: (responses: readonly AgentInputResponse[]) => void | Promise<void>;
   readonly onCloseInputRequest: (requestId: string) => void;
+  readonly onOpenDeliverable?: (deliverable: AgentSessionDeliverable) => void;
   readonly onOpenSubagent?: (sessionId: string) => void;
 }) {
   const hasCopyableText = message?.parts.some((part) => part.type === "text" && part.text.trim().length > 0) ?? false;
@@ -384,6 +389,7 @@ function AssistantMessage({
             message={message}
             onInputResponses={onInputResponses}
             onCloseInputRequest={onCloseInputRequest}
+            onOpenDeliverable={onOpenDeliverable}
             onOpenSubagent={onOpenSubagent}
             showCopyAction={false}
           />

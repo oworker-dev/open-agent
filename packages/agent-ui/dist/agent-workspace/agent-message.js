@@ -1,9 +1,10 @@
 "use client";
 import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-runtime";
-import { BracesIcon, CheckIcon, CheckCircleIcon, ChevronDownIcon, CircleStopIcon, CopyIcon, ExternalLinkIcon, FileIcon, ImageIcon, KeyRoundIcon, LoaderCircleIcon, NetworkIcon, SearchIcon, TerminalIcon, FileSearchIcon, ListChecksIcon, MessageCircleQuestionIcon, ShieldCheckIcon, WifiIcon, XCircleIcon, } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { BracesIcon, CheckIcon, CheckCircleIcon, ChevronDownIcon, CircleStopIcon, CopyIcon, ExternalLinkIcon, FileIcon, ImageIcon, KeyRoundIcon, LoaderCircleIcon, NetworkIcon, SearchIcon, TerminalIcon, FileSearchIcon, ListChecksIcon, MessageCircleQuestionIcon, MonitorIcon, ShieldCheckIcon, WifiIcon, XCircleIcon, } from "lucide-react";
+import { createContext, useContext, useEffect, useRef, useState } from "react";
 import { useScrollLock } from "@assistant-ui/react";
 import { StaticMarkdownText } from "../assistant-ui/markdown-text.js";
+import { ArtifactCard } from "../assistant-ui/artifact-card.js";
 import { copyText } from "../assistant-ui/copy-text.js";
 import { ReasoningContent, ReasoningRoot, ReasoningText, ReasoningTrigger, } from "../assistant-ui/reasoning.js";
 import { ToolFallbackContent, ToolFallbackRoot, } from "../assistant-ui/tool-fallback.js";
@@ -36,7 +37,8 @@ function safeStringify(value) {
     }
 }
 const EMPTY_CLOSED_INPUT_REQUEST_IDS = new Set();
-export function AgentMessage({ assetUrl, canRespond, closedInputRequestIds = EMPTY_CLOSED_INPUT_REQUEST_IDS, events, fallbackStartedAt, isStreaming, locale, message, onOpenSubagent, onInputResponses, onCloseInputRequest = () => undefined, showCopyAction = true, }) {
+const DeliverableOpenContext = createContext(undefined);
+export function AgentMessage({ assetUrl, canRespond, closedInputRequestIds = EMPTY_CLOSED_INPUT_REQUEST_IDS, events, fallbackStartedAt, isStreaming, locale, message, onOpenDeliverable, onOpenSubagent, onInputResponses, onCloseInputRequest = () => undefined, showCopyAction = true, }) {
     const displayMessage = assetUrl
         ? {
             ...message,
@@ -49,8 +51,8 @@ export function AgentMessage({ assetUrl, canRespond, closedInputRequestIds = EMP
     const responseText = task?.finalPart?.text ?? (task ? undefined : lastText(displayMessage.parts));
     const failure = failureForTurn(events, displayMessage.metadata?.turnId);
     const hasVisiblePart = displayMessage.parts.some((part) => part.type !== "step-start");
-    return (_jsxs(Message, { "data-optimistic": message.metadata?.optimistic ? "true" : undefined, from: message.role, children: [_jsxs(MessageContent, { className: message.role === "assistant" ? "w-full" : undefined, children: [message.role === "assistant" && isStreaming && !hasVisiblePart ? (_jsx(ReasoningRoot, { className: "mb-1", role: "status", streaming: true, variant: "ghost", children: _jsx(ReasoningTrigger, { active: true, label: localize(locale, "Thinking", "正在思考") }) })) : null, task ? (_jsxs(_Fragment, { children: [_jsxs(ExecutionGroup, { collapseWhenSettled: task.status === "completed" && Boolean(task.finalPart?.text.trim() ||
-                                    hasLaterFinalDelivery(events, message.metadata?.turnId)), fallbackStartedAt: fallbackStartedAt, locale: locale, task: task, children: [_jsx(ProcessParts, { assetUrl: assetUrl, canRespond: canRespond, closedInputRequestIds: closedInputRequestIds, events: events, inActiveExecution: task.status === "running" || task.status === "waiting", locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, parts: task.processParts, turnId: message.metadata?.turnId }), task.proxiedInputParts.map((part) => (_jsxs("div", { className: "space-y-2", children: [_jsx("p", { className: "text-xs font-medium text-amber-700 dark:text-amber-300", children: localize(locale, "A delegated task needs your approval", "子代理任务需要你的批准") }), _jsx(AgentMessagePart, { assetUrl: assetUrl, canRespond: canRespond, closedInputRequestIds: closedInputRequestIds, events: events, inActiveExecution: true, locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, part: part, turnId: message.metadata?.turnId })] }, `proxied-input:${part.toolCallId}`)))] }), task.finalPart ? (_jsx("div", { className: "pt-3", children: _jsx(AgentMessagePart, { assetUrl: assetUrl, canRespond: canRespond, events: events, inActiveExecution: false, locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, part: task.finalPart, turnId: message.metadata?.turnId }) })) : null] })) : displayMessage.parts.map((part, index) => (_jsx(AgentMessagePart, { assetUrl: assetUrl, canRespond: canRespond, events: events, inActiveExecution: false, locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, part: part, turnId: message.metadata?.turnId }, partKey(part, index)))), failure ? _jsx(TurnFailure, { failure: failure, locale: locale }) : null] }), showCopyAction && message.role === "assistant" && responseText && !isStreaming ? (_jsx(CopyResponseAction, { locale: locale, text: responseText })) : null] }));
+    return (_jsx(DeliverableOpenContext.Provider, { value: onOpenDeliverable, children: _jsxs(Message, { "data-optimistic": message.metadata?.optimistic ? "true" : undefined, from: message.role, children: [_jsxs(MessageContent, { className: message.role === "assistant" ? "w-full" : undefined, children: [message.role === "assistant" && isStreaming && !hasVisiblePart ? (_jsx(ReasoningRoot, { className: "mb-1", role: "status", streaming: true, variant: "ghost", children: _jsx(ReasoningTrigger, { active: true, label: localize(locale, "Thinking", "正在思考") }) })) : null, task ? (_jsxs(_Fragment, { children: [_jsxs(ExecutionGroup, { collapseWhenSettled: task.status === "completed" && Boolean(task.finalPart?.text.trim() ||
+                                        hasLaterFinalDelivery(events, message.metadata?.turnId)), fallbackStartedAt: fallbackStartedAt, locale: locale, task: task, children: [_jsx(ProcessParts, { assetUrl: assetUrl, canRespond: canRespond, closedInputRequestIds: closedInputRequestIds, events: events, inActiveExecution: task.status === "running" || task.status === "waiting", locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, parts: task.processParts, turnId: message.metadata?.turnId }), task.proxiedInputParts.map((part) => (_jsxs("div", { className: "space-y-2", children: [_jsx("p", { className: "text-xs font-medium text-amber-700 dark:text-amber-300", children: localize(locale, "A delegated task needs your approval", "子代理任务需要你的批准") }), _jsx(AgentMessagePart, { assetUrl: assetUrl, canRespond: canRespond, closedInputRequestIds: closedInputRequestIds, events: events, inActiveExecution: true, locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, part: part, turnId: message.metadata?.turnId })] }, `proxied-input:${part.toolCallId}`)))] }), task.finalPart ? (_jsx("div", { className: "pt-3", children: _jsx(AgentMessagePart, { assetUrl: assetUrl, canRespond: canRespond, events: events, inActiveExecution: false, locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, part: task.finalPart, turnId: message.metadata?.turnId }) })) : null] })) : displayMessage.parts.map((part, index) => (_jsx(AgentMessagePart, { assetUrl: assetUrl, canRespond: canRespond, events: events, inActiveExecution: false, locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, part: part, turnId: message.metadata?.turnId }, partKey(part, index)))), failure ? _jsx(TurnFailure, { failure: failure, locale: locale }) : null] }), showCopyAction && message.role === "assistant" && responseText && !isStreaming ? (_jsx(CopyResponseAction, { locale: locale, text: responseText })) : null] }) }));
 }
 function AgentMessagePart({ assetUrl, canRespond, closedInputRequestIds = EMPTY_CLOSED_INPUT_REQUEST_IDS, events, inActiveExecution, locale, onOpenSubagent, onInputResponses, onCloseInputRequest = () => undefined, part, turnId, }) {
     switch (part.type) {
@@ -144,6 +146,7 @@ function KnownToolContent({ assetUrl, events, locale, onOpenSubagent, part, }) {
     const output = "output" in part ? part.output : undefined;
     const patch = toolPatch(part);
     const fileChange = toolFileChange(part, events);
+    const openDeliverable = useContext(DeliverableOpenContext);
     if (part.toolMetadata?.eve?.kind === "subagent-call") {
         return _jsx(SubagentProgress, { events: events, locale: locale, onOpenSubagent: onOpenSubagent, part: part });
     }
@@ -189,7 +192,8 @@ function KnownToolContent({ assetUrl, events, locale, onOpenSubagent, part, }) {
     if (["publish_preview", "website_preview"].includes(normalized)) {
         const result = readableOutput(output);
         const url = firstUrl(output) ?? firstString(input, ["url"]);
-        return url ? (_jsxs("a", { className: "inline-flex items-center gap-1.5 text-sm underline underline-offset-4", href: url, rel: "noreferrer", target: "_blank", children: [url, _jsx(ExternalLinkIcon, { className: "size-3.5" })] })) : result ? _jsx("p", { className: "whitespace-pre-wrap text-xs text-muted-foreground", children: result }) : null;
+        const deliverable = publishedDeliverable(output, "website-preview", url);
+        return url ? (_jsx(ArtifactCard, { icon: _jsx(MonitorIcon, { className: "size-4" }), meta: localize(locale, "Website preview", "网站预览"), onClick: () => deliverable && openDeliverable ? openDeliverable(deliverable) : window.open(url, "_blank", "noopener,noreferrer"), title: firstString(asRecord(output), ["title", "entrypoint"]) ?? localize(locale, "Published website", "已发布网站") })) : result ? _jsx("p", { className: "whitespace-pre-wrap text-xs text-muted-foreground", children: result }) : null;
     }
     if (["import_remote_asset", "remote_asset_import"].includes(normalized)) {
         const record = asRecord(output);
@@ -202,7 +206,8 @@ function KnownToolContent({ assetUrl, events, locale, onOpenSubagent, part, }) {
         const record = asRecord(output);
         const url = firstUrl(output);
         const filename = firstString(record, ["filename", "name"]) ?? firstString(input, ["filename", "path"]);
-        return url ? (_jsxs("a", { className: "inline-flex items-center gap-1.5 text-sm underline underline-offset-4", href: url, rel: "noreferrer", target: "_blank", children: [filename ?? localize(locale, "Open artifact", "打开产物"), _jsx(ExternalLinkIcon, { className: "size-3.5" })] })) : _jsx("p", { className: "text-xs text-muted-foreground", children: filename ?? localize(locale, "Publishing artifact...", "正在发布产物…") });
+        const deliverable = publishedDeliverable(output, "artifact", url);
+        return url ? (_jsx(ArtifactCard, { meta: [firstString(record, ["mediaType"]), formatBytes(firstNumber(record, ["bytes", "sizeBytes"]))].filter(Boolean).join(" · ") || localize(locale, "Session artifact", "会话产物"), onClick: () => deliverable && openDeliverable ? openDeliverable(deliverable) : window.open(url, "_blank", "noopener,noreferrer"), title: filename ?? localize(locale, "Open artifact", "打开产物") })) : _jsx("p", { className: "text-xs text-muted-foreground", children: filename ?? localize(locale, "Publishing artifact...", "正在发布产物…") });
     }
     if (["record_checkpoint", "checkpoint"].includes(normalized)) {
         const checkpoint = asRecord(output) ?? input;
@@ -529,8 +534,40 @@ function firstUrl(value) {
     const direct = typeof value === "string" ? value : firstString(asRecord(value), ["url", "previewUrl", "preview_url"]);
     if (!direct)
         return undefined;
+    if (direct.startsWith("/") && !direct.startsWith("//"))
+        return direct;
+    try {
+        const parsed = new URL(direct);
+        if (parsed.protocol === "http:" || parsed.protocol === "https:")
+            return parsed.toString();
+    }
+    catch {
+    }
     const match = direct.match(/https?:\/\/[^\s"'<>]+/u);
     return match?.[0];
+}
+function publishedDeliverable(value, kind, url) {
+    const record = asRecord(value);
+    const id = firstString(record, kind === "artifact" ? ["artifactId", "id"] : ["previewId", "id"]);
+    if (!record || !id || !url)
+        return undefined;
+    const title = firstString(record, kind === "artifact" ? ["filename", "name"] : ["title", "entrypoint"])
+        ?? (kind === "artifact" ? "Artifact" : "Website preview");
+    const createdAt = firstString(record, ["createdAt"]);
+    const expiresAt = firstString(record, ["expiresAt"]);
+    const fileCount = firstNumber(record, ["fileCount"]);
+    const mediaType = firstString(record, ["mediaType"]);
+    return {
+        createdAt: createdAt ?? new Date().toISOString(),
+        ...(expiresAt ? { expiresAt } : {}),
+        ...(fileCount !== undefined ? { fileCount } : {}),
+        id,
+        kind,
+        ...(mediaType ? { mediaType } : {}),
+        sizeBytes: firstNumber(record, ["bytes", "sizeBytes"]) ?? 0,
+        title,
+        url,
+    };
 }
 function todoItems(inputValue, outputValue) {
     const source = todoArray(inputValue) ?? todoArray(outputValue) ?? [];

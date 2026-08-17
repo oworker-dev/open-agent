@@ -222,11 +222,28 @@ export type AgentSessionAsset = {
 
 export type AgentAssetEndpoint = string | ((sessionId: string) => string);
 
+export type AgentSessionDeliverable = {
+  readonly createdAt: string;
+  readonly expiresAt?: string;
+  readonly fileCount?: number;
+  readonly id: string;
+  readonly kind: "artifact" | "asset" | "website-preview";
+  readonly mediaType?: string;
+  readonly sizeBytes: number;
+  readonly title: string;
+  readonly url: string;
+};
+
+export type AgentDeliverableEndpoint = string | ((sessionId: string) => string);
+
 export type AgentWorkspaceConfig = {
   readonly agentName: string;
   /** Optional GET endpoint (or resolver) returning `{ assets: [...] }` metadata for the active session. */
   readonly assetEndpoint?: AgentAssetEndpoint;
+  /** Optional GET endpoint (or resolver) returning `{ deliverables: [...] }` for the active session. */
+  readonly deliverableEndpoint?: AgentDeliverableEndpoint;
   readonly onOpenAsset?: (asset: AgentSessionAsset) => void;
+  readonly onOpenDeliverable?: (deliverable: AgentSessionDeliverable) => void;
   readonly client?: AgentWorkspaceClientConfig;
   readonly commands?: readonly AgentPromptMenuItem[];
   readonly defaultPreferences: AgentThreadPreferences;

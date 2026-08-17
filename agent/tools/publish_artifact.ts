@@ -41,6 +41,7 @@ export default defineTool({
     return {
       artifactId: record.artifactId,
       bytes: record.totalBytes,
+      createdAt: record.createdAt,
       expiresAt: record.expiresAt,
       filename: record.filename,
       kind: "artifact",

@@ -63,6 +63,8 @@ export default defineTool({
     const url = baseUrl ? new URL(path, `${baseUrl.replace(/\/$/u, "")}/`).toString() : path;
     return {
       bytes: record.totalBytes,
+      createdAt: record.createdAt,
+      entrypoint: record.entrypoint,
       expiresAt: record.expiresAt,
       fileCount: record.fileCount,
       kind: "website-preview",

@@ -26,6 +26,10 @@
       "types": "./dist/ui/*.d.ts",
       "import": "./dist/ui/*.js"
     },
+    "./assistant-ui/*": {
+      "types": "./dist/assistant-ui/*.d.ts",
+      "import": "./dist/assistant-ui/*.js"
+    },
     "./styles.css": "./dist/styles.css",
     "./package.json": "./package.json"
   },

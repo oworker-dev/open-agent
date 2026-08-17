@@ -1788,6 +1788,12 @@
       background-color: color-mix(in oklab, var(--background, oklch(1 0 0)) 50%, transparent);
     }
   }
+  .bg-background\/75 {
+    background-color: var(--background, oklch(1 0 0));
+    @supports (color: color-mix(in lab, red, red)) {
+      background-color: color-mix(in oklab, var(--background, oklch(1 0 0)) 75%, transparent);
+    }
+  }
   .bg-background\/80 {
     background-color: var(--background, oklch(1 0 0));
     @supports (color: color-mix(in lab, red, red)) {
@@ -1917,10 +1923,22 @@
       background-color: color-mix(in oklab, var(--muted, oklch(0.94 0 0)) 40%, transparent);
     }
   }
+  .bg-muted\/45 {
+    background-color: var(--muted, oklch(0.94 0 0));
+    @supports (color: color-mix(in lab, red, red)) {
+      background-color: color-mix(in oklab, var(--muted, oklch(0.94 0 0)) 45%, transparent);
+    }
+  }
   .bg-muted\/50 {
     background-color: var(--muted, oklch(0.94 0 0));
     @supports (color: color-mix(in lab, red, red)) {
       background-color: color-mix(in oklab, var(--muted, oklch(0.94 0 0)) 50%, transparent);
+    }
+  }
+  .bg-muted\/55 {
+    background-color: var(--muted, oklch(0.94 0 0));
+    @supports (color: color-mix(in lab, red, red)) {
+      background-color: color-mix(in oklab, var(--muted, oklch(0.94 0 0)) 55%, transparent);
     }
   }
   .bg-muted\/60 {
@@ -2865,6 +2883,11 @@
       @media (hover: hover) {
         opacity: 100%;
       }
+    }
+  }
+  .group-focus-visible\:opacity-100 {
+    &:is(:where(.group):focus-visible *) {
+      opacity: 100%;
     }
   }
   .group-has-focus-visible\:pe-9 {
@@ -4310,6 +4333,16 @@
       }
     }
   }
+  .hover\:bg-muted\/70 {
+    &:hover {
+      @media (hover: hover) {
+        background-color: var(--muted, oklch(0.94 0 0));
+        @supports (color: color-mix(in lab, red, red)) {
+          background-color: color-mix(in oklab, var(--muted, oklch(0.94 0 0)) 70%, transparent);
+        }
+      }
+    }
+  }
   .hover\:bg-primary\/90 {
     &:hover {
       @media (hover: hover) {
@@ -4633,6 +4666,11 @@
   .active\:scale-\[0\.98\] {
     &:active {
       scale: 0.98;
+    }
+  }
+  .active\:bg-muted {
+    &:active {
+      background-color: var(--muted, oklch(0.94 0 0));
     }
   }
   .active\:bg-sidebar-accent {

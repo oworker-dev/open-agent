@@ -2,7 +2,7 @@ import type { MessageStreamEvent } from "eve/client";
 import type { EveMessage } from "eve/react";
 import { type ReactNode } from "react";
 import { type AgentInputResponse } from "./agent-message.js";
-import type { AgentComposerDraftRestore, AgentModelOption, AgentPromptMenuItem, AgentThreadPreferences } from "./contracts.js";
+import type { AgentComposerDraftRestore, AgentModelOption, AgentPromptMenuItem, AgentSessionDeliverable, AgentThreadPreferences } from "./contracts.js";
 import type { AgentLocale, AgentMessages } from "./i18n.js";
 import type { AgentUsageSummary } from "./usage.js";
 export type AgentCancellationState = "idle" | "requested" | "cancelling";
@@ -12,7 +12,7 @@ export type AgentApprovalTakeover = {
     readonly prompt: string;
     readonly toolName: string;
 };
-export declare function AssistantThreadSurface({ assetUrl, approvalTakeover, cancellationState, closedInputRequestIds, commands, composerTop, draftStorageKey, draftRestore, events, eveMessages, fallbackStartedAt, inputDisabled, isBusy, locale, mentions, messages, models, onInputResponses, onCloseInputRequest, onDraftRestoreConsumed, onOpenSubagent, onPreferencesChange, onRetryRuntimeError, preferences, reasoningLevels, runtimeError, usage, }: {
+export declare function AssistantThreadSurface({ assetUrl, approvalTakeover, cancellationState, closedInputRequestIds, commands, composerTop, draftStorageKey, draftRestore, events, eveMessages, fallbackStartedAt, inputDisabled, isBusy, locale, mentions, messages, models, onInputResponses, onCloseInputRequest, onDraftRestoreConsumed, onOpenDeliverable, onOpenSubagent, onPreferencesChange, onRetryRuntimeError, preferences, reasoningLevels, runtimeError, usage, }: {
     readonly assetUrl?: (assetId: string) => string;
     readonly approvalTakeover?: AgentApprovalTakeover;
     readonly cancellationState: AgentCancellationState;
@@ -33,6 +33,7 @@ export declare function AssistantThreadSurface({ assetUrl, approvalTakeover, can
     readonly onInputResponses: (responses: readonly AgentInputResponse[]) => void | Promise<void>;
     readonly onCloseInputRequest: (requestId: string) => void;
     readonly onDraftRestoreConsumed: (id: string) => void;
+    readonly onOpenDeliverable?: (deliverable: AgentSessionDeliverable) => void;
     readonly onOpenSubagent?: (sessionId: string) => void;
     readonly onPreferencesChange: (preferences: AgentThreadPreferences) => void;
     readonly onRetryRuntimeError?: () => void;
