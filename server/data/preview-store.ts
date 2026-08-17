@@ -1,13 +1,14 @@
 import type { Pool } from "pg";
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import {
   getAgentDatabasePool,
   quoteIdentifier,
   readAgentDatabaseConfig,
   type AgentDatabaseConfig,
-} from "./agent-database";
+} from "./agent-database.ts";
+import type { PublicationOwner } from "./artifact-store.ts";
 
 export type PreviewFileInput = {
   readonly content: Uint8Array;
@@ -44,6 +45,7 @@ export interface PreviewStore {
     readonly tenantId: string;
   }): Promise<PreviewRecord>;
   find(previewId: string): Promise<PreviewRecord | undefined>;
+  list(sessionId: string, owner: PublicationOwner): Promise<readonly PreviewRecord[]>;
   readFile(previewId: string, path: string): Promise<PreviewFile | undefined>;
 }
 
@@ -118,6 +120,19 @@ function postgresPreviewStore(pool: Pool, previews: string, files: string): Prev
       );
       return result.rows[0] ? toRecord(result.rows[0]) : undefined;
     },
+    async list(sessionId, owner) {
+      assertListInput(sessionId, owner);
+      const result = await pool.query<PreviewRow>(
+        `select preview_id, session_id, tenant_id, principal_id, entrypoint,
+           expires_at, created_at, file_count, total_bytes
+         from ${previews}
+         where session_id = $1 and tenant_id = $2 and principal_id = $3 and expires_at > now()
+         order by created_at desc
+         limit 200`,
+        [sessionId, owner.tenantId, owner.principalId],
+      );
+      return result.rows.map(toRecord);
+    },
     async readFile(previewId, path) {
       const result = await pool.query<{ path: string; media_type: string; content: Buffer }>(
         `select path, media_type, content from ${files}
@@ -165,6 +180,30 @@ function createFilesystemPreviewStore(root: string): PreviewStore {
       } catch {
         return undefined;
       }
+    },
+    async list(sessionId, owner) {
+      assertListInput(sessionId, owner);
+      let entries;
+      try {
+        entries = await readdir(root, { withFileTypes: true });
+      } catch {
+        return [];
+      }
+      const records = await Promise.all(entries
+        .filter((entry) => entry.isDirectory() && /^prv_[a-f0-9-]{36}$/u.test(entry.name))
+        .slice(0, 2_000)
+        .map((entry) => this.find(entry.name)));
+      const now = Date.now();
+      return records
+        .filter((record): record is PreviewRecord => Boolean(
+          record
+          && record.sessionId === sessionId
+          && record.tenantId === owner.tenantId
+          && record.principalId === owner.principalId
+          && new Date(record.expiresAt).getTime() > now,
+        ))
+        .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+        .slice(0, 200);
     },
     async readFile(previewId, path) {
       if (!safePath(path)) return undefined;
@@ -228,6 +267,12 @@ function assertPreviewInput(input: {
     if (!safePath(file.path) || paths.has(file.path)) throw new Error("Preview files contain a duplicate or unsafe path.");
     if (!file.mediaType || file.content.byteLength > 10 * 1024 * 1024) throw new Error("A preview file is invalid or too large.");
     paths.add(file.path);
+  }
+}
+
+function assertListInput(sessionId: string, owner: PublicationOwner): void {
+  if (!sessionId || sessionId.length > 512 || !owner.tenantId || !owner.principalId) {
+    throw new Error("A publication list requires a valid session and authenticated owner.");
   }
 }
 

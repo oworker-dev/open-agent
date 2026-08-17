@@ -1,6 +1,6 @@
 import type { Pool } from "pg";
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
   getAgentDatabasePool,
@@ -29,6 +29,11 @@ export type ArtifactFile = {
   readonly mediaType: string;
 };
 
+export type PublicationOwner = {
+  readonly principalId: string;
+  readonly tenantId: string;
+};
+
 export interface ArtifactStore {
   create(input: {
     readonly artifactId?: string;
@@ -41,6 +46,7 @@ export interface ArtifactStore {
     readonly tenantId: string;
   }): Promise<ArtifactRecord>;
   find(artifactId: string): Promise<ArtifactRecord | undefined>;
+  list(sessionId: string, owner: PublicationOwner): Promise<readonly ArtifactRecord[]>;
   read(artifactId: string): Promise<ArtifactFile | undefined>;
 }
 
@@ -95,6 +101,19 @@ function postgresArtifactStore(pool: Pool, table: string): ArtifactStore {
       );
       return result.rows[0] ? toRecord(result.rows[0]) : undefined;
     },
+    async list(sessionId, owner) {
+      assertListInput(sessionId, owner);
+      const result = await pool.query<ArtifactRow>(
+        `select artifact_id, session_id, tenant_id, principal_id, filename,
+           media_type, expires_at, created_at, total_bytes
+         from ${table}
+         where session_id = $1 and tenant_id = $2 and principal_id = $3 and expires_at > now()
+         order by created_at desc
+         limit 200`,
+        [sessionId, owner.tenantId, owner.principalId],
+      );
+      return result.rows.map(toRecord);
+    },
     async read(artifactId) {
       const result = await pool.query<ArtifactRow & { content: Buffer }>(
         `select artifact_id, session_id, tenant_id, principal_id, filename,
@@ -139,6 +158,30 @@ function createFilesystemArtifactStore(root: string): ArtifactStore {
       } catch {
         return undefined;
       }
+    },
+    async list(sessionId, owner) {
+      assertListInput(sessionId, owner);
+      let entries;
+      try {
+        entries = await readdir(root, { withFileTypes: true });
+      } catch {
+        return [];
+      }
+      const records = await Promise.all(entries
+        .filter((entry) => entry.isDirectory() && /^art_[a-f0-9-]{36}$/u.test(entry.name))
+        .slice(0, 2_000)
+        .map((entry) => this.find(entry.name)));
+      const now = Date.now();
+      return records
+        .filter((record): record is ArtifactRecord => Boolean(
+          record
+          && record.sessionId === sessionId
+          && record.tenantId === owner.tenantId
+          && record.principalId === owner.principalId
+          && new Date(record.expiresAt).getTime() > now,
+        ))
+        .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+        .slice(0, 200);
     },
     async read(artifactId) {
       const record = await this.find(artifactId);
@@ -200,6 +243,12 @@ function assertArtifactInput(input: {
   }
   if (!Number.isFinite(input.expiresAt.getTime()) || input.expiresAt <= new Date()) {
     throw new Error("The artifact expiration must be in the future.");
+  }
+}
+
+function assertListInput(sessionId: string, owner: PublicationOwner): void {
+  if (!sessionId || sessionId.length > 512 || !owner.tenantId || !owner.principalId) {
+    throw new Error("A publication list requires a valid session and authenticated owner.");
   }
 }
 
