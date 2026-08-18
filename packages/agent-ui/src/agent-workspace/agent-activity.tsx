@@ -20,12 +20,15 @@ export function AgentActivity({
 }) {
   const mountedAt = useRef(Date.now());
   const label = activityLabel(events, messages, { mode, mountedAt: mountedAt.current, now: Date.now() });
+  const hasReasoning = events.some((event) =>
+    event.type === "reasoning.appended" || event.type === "reasoning.completed",
+  );
   // Keep one calm reasoning disclosure visible from admission onward. The
   // label intentionally stays provider-neutral; transport retries belong in
   // the error/reconnect projection, not in the conversation body.
   return (
     <ReasoningRoot className="mb-1" role="status" streaming variant="ghost">
-      <ReasoningTrigger active label={label} />
+      <ReasoningTrigger active label={label} hideChevron={!hasReasoning} />
     </ReasoningRoot>
   );
 }

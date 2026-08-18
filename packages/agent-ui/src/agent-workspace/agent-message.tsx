@@ -160,7 +160,7 @@ export function AgentMessage({
       <MessageContent className={message.role === "assistant" ? "w-full" : undefined}>
         {message.role === "assistant" && isStreaming && !hasVisiblePart ? (
           <ReasoningRoot className="mb-1" role="status" streaming variant="ghost">
-            <ReasoningTrigger active label={localize(locale, "Thinking", "正在思考")} />
+            <ReasoningTrigger active hideChevron label={localize(locale, "Thinking", "正在思考")} />
           </ReasoningRoot>
         ) : null}
         {task ? (
@@ -245,7 +245,9 @@ export function AgentMessage({
             turnId={message.metadata?.turnId}
           />
         ))}
-        {failure ? <TurnFailure failure={failure} locale={locale} /> : null}
+        {failure && !(task?.status === "failed" && events.some((event) =>
+          event.type === "step.failed" && event.data.turnId === message.metadata?.turnId
+        )) ? <TurnFailure failure={failure} locale={locale} /> : null}
       </MessageContent>
       {showCopyAction && message.role === "assistant" && responseText && !isStreaming ? (
         <CopyResponseAction locale={locale} text={responseText} />
@@ -983,9 +985,10 @@ function StepActivity({
   const step = presentAgentStep(events, turnId, stepIndex);
   return (
     <>
-      {step.status === "running" && step.retry ? (
+      {step.retry ? (
         <RetryStatus locale={locale} retry={step.retry} />
       ) : null}
+      {step.status === "failed" && step.failure ? <StepFailure failure={step.failure} locale={locale} /> : null}
       <ReasoningRoot className="mb-1" role="status" streaming={step.status === "running"} variant="ghost">
         <ReasoningTrigger
           active={step.status === "running"}
@@ -996,6 +999,23 @@ function StepActivity({
         />
       </ReasoningRoot>
     </>
+  );
+}
+
+function StepFailure({
+  failure,
+  locale,
+}: {
+  readonly failure: { readonly code: string; readonly message: string };
+  readonly locale: AgentLocale;
+}) {
+  return (
+    <div className="mb-1 flex items-start gap-2 text-sm text-destructive" role="alert">
+      <XCircleIcon className="mt-0.5 size-4 shrink-0" />
+      <span className="min-w-0 break-words">
+        {localize(locale, "Execution failed", "执行失败")}: {sanitizeFailureMessage(failure.message)}
+      </span>
+    </div>
   );
 }
 
@@ -1042,7 +1062,8 @@ function ReasoningPart({
   const streaming = part.state === "streaming";
   return (
     <>
-      {streaming && step.retry ? <RetryStatus locale={locale} retry={step.retry} /> : null}
+      {step.retry ? <RetryStatus locale={locale} retry={step.retry} /> : null}
+      {step.status === "failed" && step.failure ? <StepFailure failure={step.failure} locale={locale} /> : null}
       <ReasoningRoot className="mb-1" streaming={streaming} variant="ghost">
         <ReasoningTrigger
           active={streaming}
@@ -1355,7 +1376,9 @@ function todoArray(value: unknown): readonly unknown[] | undefined {
 function toolPatch(part: EveDynamicToolPart): string | undefined {
   const toolName = part.toolName.toLocaleLowerCase().replaceAll("-", "_");
   if (!["apply_patch", "patch_file"].includes(toolName)) return undefined;
-  return patchFromValue(part.input) ?? patchFromValue(part.output);
+  return patchFromValue(part.input) ??
+    patchFromValue(part.output) ??
+    partialPatchFromText(part.inputText);
 }
 
 function patchFromValue(value: unknown): string | undefined {
@@ -1371,24 +1394,56 @@ function displayablePatch(value: string): string | undefined {
   return codexPatchToUnifiedDiff(value);
 }
 
+/**
+ * Provider tool arguments arrive as JSON fragments. During input streaming the
+ * JSON envelope is intentionally incomplete, so parse the completed value
+ * when possible and otherwise recover the patch string without waiting for a
+ * closing brace or `*** End Patch` marker.
+ */
+function partialPatchFromText(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const direct = displayablePatch(value);
+  if (direct) return direct;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    const complete = patchFromValue(parsed);
+    if (complete) return complete;
+  } catch {
+    // The provider is still streaming the JSON envelope.
+  }
+  const match = value.match(/"(?:patch|diff)"\s*:\s*"((?:\\.|[^"\\])*)/u);
+  if (!match?.[1]) return undefined;
+  let patchText: string;
+  try {
+    patchText = JSON.parse(`"${match[1]}"`) as string;
+  } catch {
+    return undefined;
+  }
+  return codexPatchToUnifiedDiff(patchText, true) ?? displayablePatch(patchText);
+}
+
 function looksLikeUnifiedDiff(value: string): boolean {
   return /^(?:diff --git |--- )/m.test(value) && /^\+\+\+ /m.test(value) && /^@@ /m.test(value);
 }
 
 /** Convert the model-facing Codex patch envelope into a display-only unified diff. */
-function codexPatchToUnifiedDiff(value: string): string | undefined {
+function codexPatchToUnifiedDiff(value: string, allowPartial = false): string | undefined {
   const lines = value.replace(/\r\n?/gu, "\n").split("\n");
   const begin = lines.findIndex((line) => line.trim() === "*** Begin Patch");
   const end = lines.findIndex((line, index) => index > begin && line.trim() === "*** End Patch");
-  if (begin < 0 || end < 0) return undefined;
+  if (begin < 0 || (!allowPartial && end < 0)) return undefined;
+  const stop = end >= 0 ? end : lines.length;
   const sections: string[] = [];
-  for (let index = begin + 1; index < end;) {
+  for (let index = begin + 1; index < stop;) {
     if (!lines[index]?.trim()) {
       index += 1;
       continue;
     }
     const directive = /^\*\*\* (Add|Update|Delete) File:\s*(.+?)\s*$/u.exec(lines[index]!);
-    if (!directive) return undefined;
+    if (!directive) {
+      if (allowPartial && sections.length > 0) break;
+      return undefined;
+    }
     const operation = directive[1]!;
     const sourcePath = directive[2]!;
     index += 1;
@@ -1401,7 +1456,7 @@ function codexPatchToUnifiedDiff(value: string): string | undefined {
       }
     }
     const body: string[] = [];
-    while (index < end && !lines[index]!.startsWith("*** ")) {
+    while (index < stop && !lines[index]!.startsWith("*** ")) {
       body.push(lines[index]!);
       index += 1;
     }

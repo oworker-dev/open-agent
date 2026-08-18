@@ -8,6 +8,7 @@ const workspaceRoot = new URL("../", import.meta.url).pathname;
 const temporaryRoot = await mkdtemp(join(tmpdir(), "open-agent-sdk-"));
 const packageDirectory = join(temporaryRoot, "packages");
 const consumerDirectory = join(temporaryRoot, "consumer");
+const headlessConsumerDirectory = join(temporaryRoot, "headless-consumer");
 const pnpmConsumerDirectory = join(temporaryRoot, "pnpm-consumer");
 const publicPackages = [
   "@oworker/open-agent-contracts",
@@ -21,6 +22,7 @@ try {
   await Promise.all([
     mkdir(packageDirectory, { recursive: true }),
     mkdir(consumerDirectory, { recursive: true }),
+    mkdir(headlessConsumerDirectory, { recursive: true }),
     mkdir(pnpmConsumerDirectory, { recursive: true }),
   ]);
   for (const workspace of publicPackages) {
@@ -87,6 +89,41 @@ try {
   });
 
   await writeFile(
+    join(headlessConsumerDirectory, "package.json"),
+    JSON.stringify({ name: "agent-sdk-headless-consumer", private: true, type: "module" }),
+  );
+  execFileSync("npm", [
+    "install",
+    "--ignore-scripts",
+    "--no-audit",
+    "--no-fund",
+    "--omit=optional",
+    localPackageSpecs["@oworker/open-agent-contracts"],
+    localPackageSpecs["@oworker/open-agent-client"],
+  ], {
+    cwd: headlessConsumerDirectory,
+    stdio: "pipe",
+  });
+  const headlessProbe = `
+    import assert from "node:assert/strict";
+    import * as agentClient from "@oworker/open-agent-client";
+    assert.equal(typeof agentClient.createAgentRunClient, "function");
+    assert.equal("createEveAgentSessionClient" in agentClient, false);
+    assert.match(
+      import.meta.resolve("@oworker/open-agent-client/eve-session"),
+      /eve-session-client\\.js$/,
+    );
+    await assert.rejects(
+      import("eve"),
+      (error) => error?.code === "ERR_MODULE_NOT_FOUND",
+    );
+  `;
+  execFileSync("node", ["--input-type=module", "--eval", headlessProbe], {
+    cwd: headlessConsumerDirectory,
+    stdio: "pipe",
+  });
+
+  await writeFile(
     join(pnpmConsumerDirectory, "package.json"),
     JSON.stringify({
       dependencies: {
@@ -119,7 +156,7 @@ try {
   process.stdout.write(
     JSON.stringify({
       archives: archives.map((path) => path.split("/").at(-1)),
-      consumers: ["npm", "pnpm"],
+      consumers: ["npm", "npm-headless", "pnpm"],
       ok: true,
     }) + "\n",
   );

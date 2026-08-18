@@ -19,8 +19,10 @@ const getUsagePercent = (totalTokens, modelContextWindow) => {
     return Math.min((totalTokens / modelContextWindow) * 100, 100);
 };
 const defaultLabels = {
+    cacheWrite: "Cache write",
     cachedInput: "Cached input",
     contextUsage: "Context usage",
+    estimatedCost: "Estimated cost",
     input: "Input",
     of: "of",
     output: "Output",
@@ -135,6 +137,7 @@ const getContextSegments = (usage, labels) => {
     return [
         { label: labels.input, tokens: usage.inputTokens ?? 0 },
         { label: labels.cachedInput, tokens: usage.cachedInputTokens ?? 0 },
+        { label: labels.cacheWrite, tokens: usage.cacheWriteTokens ?? 0 },
         { label: labels.output, tokens: usage.outputTokens ?? 0 },
         { label: labels.reasoning, tokens: usage.reasoningTokens ?? 0 },
     ].filter((segment) => segment.tokens > 0);
@@ -142,7 +145,7 @@ const getContextSegments = (usage, labels) => {
 function ContextDisplayContent({ side = "top", className, }) {
     const { interaction, labels, sessionUsage, totalTokens, percent, modelContextWindow } = useContextDisplay();
     const segments = getContextSegments(sessionUsage, labels);
-    const content = (_jsxs("div", { className: "text-xs", children: [_jsxs("div", { className: "flex items-baseline justify-between gap-6 whitespace-nowrap", children: [_jsx("span", { className: "font-medium", children: labels.contextUsage }), _jsxs("span", { className: "text-muted-foreground tabular-nums", children: [formatTokenCount(Math.min(totalTokens, modelContextWindow)), " ", labels.of, " ", formatTokenCount(modelContextWindow)] })] }), _jsx("div", { className: "bg-muted mt-2.5 h-1 overflow-hidden rounded-full", children: _jsx("div", { className: cn("h-full w-(--usage-width) rounded-full transition-[width] duration-300", totalTokens > 0 && "min-w-1", getBarColor(percent)), style: { "--usage-width": `${percent}%` } }) }), segments.length > 0 && (_jsxs("div", { className: "mt-3 grid gap-1.5", children: [_jsx("span", { className: "font-medium", children: labels.sessionUsage }), segments.map((segment) => (_jsxs("div", { className: "flex items-baseline justify-between gap-6", children: [_jsx("span", { className: "text-muted-foreground", children: segment.label }), _jsx("span", { className: "tabular-nums", children: formatTokenCount(segment.tokens) })] }, segment.label)))] }))] }));
+    const content = (_jsxs("div", { className: "text-xs", children: [_jsxs("div", { className: "flex items-baseline justify-between gap-6 whitespace-nowrap", children: [_jsx("span", { className: "font-medium", children: labels.contextUsage }), _jsxs("span", { className: "text-muted-foreground tabular-nums", children: [formatTokenCount(Math.min(totalTokens, modelContextWindow)), " ", labels.of, " ", formatTokenCount(modelContextWindow)] })] }), _jsx("div", { className: "bg-muted mt-2.5 h-1 overflow-hidden rounded-full", children: _jsx("div", { className: cn("h-full w-(--usage-width) rounded-full transition-[width] duration-300", totalTokens > 0 && "min-w-1", getBarColor(percent)), style: { "--usage-width": `${percent}%` } }) }), segments.length > 0 && (_jsxs("div", { className: "mt-3 grid gap-1.5", children: [_jsx("span", { className: "font-medium", children: labels.sessionUsage }), segments.map((segment) => (_jsxs("div", { className: "flex items-baseline justify-between gap-6", children: [_jsx("span", { className: "text-muted-foreground", children: segment.label }), _jsx("span", { className: "tabular-nums", children: formatTokenCount(segment.tokens) })] }, segment.label)))] })), sessionUsage?.costUsd && sessionUsage.costUsd > 0 ? (_jsxs("div", { className: "mt-3 flex items-baseline justify-between gap-6 border-t border-border/50 pt-2", children: [_jsx("span", { className: "text-muted-foreground", children: labels.estimatedCost }), _jsxs("span", { className: "tabular-nums", children: ["$", sessionUsage.costUsd.toFixed(4)] })] })) : null] }));
     const contentClassName = cn("bg-popover text-popover-foreground w-52 rounded-lg border p-2.5 text-left shadow-md", className);
     return interaction === "touch" ? (_jsx(PopoverContent, { align: "end", side: side, sideOffset: 8, "data-slot": "context-display-popover", className: contentClassName, children: content })) : (_jsx(TooltipContent, { side: side, sideOffset: 8, hideArrow: true, "data-slot": "context-display-popover", className: contentClassName, children: content }));
 }

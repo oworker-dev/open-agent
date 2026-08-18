@@ -44,8 +44,10 @@ const getUsagePercent = (
 type UsageSeverity = "normal" | "warning" | "critical";
 
 export type ContextDisplayLabels = {
+  readonly cacheWrite: string;
   readonly cachedInput: string;
   readonly contextUsage: string;
+  readonly estimatedCost: string;
   readonly input: string;
   readonly of: string;
   readonly output: string;
@@ -54,8 +56,10 @@ export type ContextDisplayLabels = {
 };
 
 const defaultLabels: ContextDisplayLabels = {
+  cacheWrite: "Cache write",
   cachedInput: "Cached input",
   contextUsage: "Context usage",
+  estimatedCost: "Estimated cost",
   input: "Input",
   of: "of",
   output: "Output",
@@ -86,13 +90,18 @@ const getBarColor = (percent: number): string => {
 type ContextDisplayContextValue = {
   interaction: "hover" | "touch";
   labels: ContextDisplayLabels;
-  usage: ThreadTokenUsage | undefined;
-  sessionUsage: ThreadTokenUsage | undefined;
+  usage: ExtendedThreadTokenUsage | undefined;
+  sessionUsage: ExtendedThreadTokenUsage | undefined;
   totalTokens: number;
   percent: number;
   modelContextWindow: number;
   open: boolean;
   setOpen: (open: boolean) => void;
+};
+
+type ExtendedThreadTokenUsage = ThreadTokenUsage & {
+  readonly cacheWriteTokens?: number;
+  readonly costUsd?: number;
 };
 
 const ContextDisplayContext = createContext<ContextDisplayContextValue | null>(
@@ -113,16 +122,16 @@ type PresetProps = {
   label?: string;
   labels?: Partial<ContextDisplayLabels>;
   side?: "top" | "bottom" | "left" | "right";
-  usage?: ThreadTokenUsage | undefined;
-  sessionUsage?: ThreadTokenUsage | undefined;
+  usage?: ExtendedThreadTokenUsage | undefined;
+  sessionUsage?: ExtendedThreadTokenUsage | undefined;
 };
 
 type ContextDisplayRootProps = {
   modelContextWindow: number;
   children: ReactNode;
   labels?: Partial<ContextDisplayLabels>;
-  usage?: ThreadTokenUsage | undefined;
-  sessionUsage?: ThreadTokenUsage | undefined;
+  usage?: ExtendedThreadTokenUsage | undefined;
+  sessionUsage?: ExtendedThreadTokenUsage | undefined;
 };
 
 function ContextDisplayRootBase({
@@ -135,8 +144,8 @@ function ContextDisplayRootBase({
   modelContextWindow: number;
   children: ReactNode;
   labels: Partial<ContextDisplayLabels> | undefined;
-  usage: ThreadTokenUsage | undefined;
-  sessionUsage: ThreadTokenUsage | undefined;
+  usage: ExtendedThreadTokenUsage | undefined;
+  sessionUsage: ExtendedThreadTokenUsage | undefined;
 }) {
   const threadId = useAuiState((s) => s.threadListItem.id);
   const rawTokens = usage?.totalTokens ?? 0;
@@ -286,13 +295,14 @@ type ContextSegment = {
 };
 
 const getContextSegments = (
-  usage: ThreadTokenUsage | undefined,
+  usage: ExtendedThreadTokenUsage | undefined,
   labels: ContextDisplayLabels,
 ): ContextSegment[] => {
   if (!usage) return [];
   return [
     { label: labels.input, tokens: usage.inputTokens ?? 0 },
     { label: labels.cachedInput, tokens: usage.cachedInputTokens ?? 0 },
+    { label: labels.cacheWrite, tokens: usage.cacheWriteTokens ?? 0 },
     { label: labels.output, tokens: usage.outputTokens ?? 0 },
     { label: labels.reasoning, tokens: usage.reasoningTokens ?? 0 },
   ].filter((segment) => segment.tokens > 0);
@@ -343,6 +353,12 @@ function ContextDisplayContent({
           ))}
         </div>
       )}
+      {sessionUsage?.costUsd && sessionUsage.costUsd > 0 ? (
+        <div className="mt-3 flex items-baseline justify-between gap-6 border-t border-border/50 pt-2">
+          <span className="text-muted-foreground">{labels.estimatedCost}</span>
+          <span className="tabular-nums">${sessionUsage.costUsd.toFixed(4)}</span>
+        </div>
+      ) : null}
     </div>
   );
   const contentClassName = cn(

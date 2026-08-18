@@ -54,8 +54,8 @@ export function AgentMessage({ assetUrl, canRespond, closedInputRequestIds = EMP
     const publishedDeliverables = task?.status === "completed"
         ? deliverablesForTurn(events, displayMessage.metadata?.turnId)
         : [];
-    return (_jsx(DeliverableOpenContext.Provider, { value: onOpenDeliverable, children: _jsxs(Message, { "data-optimistic": message.metadata?.optimistic ? "true" : undefined, from: message.role, children: [_jsxs(MessageContent, { className: message.role === "assistant" ? "w-full" : undefined, children: [message.role === "assistant" && isStreaming && !hasVisiblePart ? (_jsx(ReasoningRoot, { className: "mb-1", role: "status", streaming: true, variant: "ghost", children: _jsx(ReasoningTrigger, { active: true, label: localize(locale, "Thinking", "正在思考") }) })) : null, task ? (_jsxs(_Fragment, { children: [_jsxs(ExecutionGroup, { collapseWhenSettled: task.status === "completed" && Boolean(task.finalPart?.text.trim() ||
-                                        hasLaterFinalDelivery(events, message.metadata?.turnId)), fallbackStartedAt: fallbackStartedAt, locale: locale, task: task, children: [_jsx(ProcessParts, { assetUrl: assetUrl, canRespond: canRespond, closedInputRequestIds: closedInputRequestIds, events: events, inActiveExecution: task.status === "running" || task.status === "waiting", locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, parts: task.processParts, turnId: message.metadata?.turnId }), task.proxiedInputParts.map((part) => (_jsxs("div", { className: "space-y-2", children: [_jsx("p", { className: "text-xs font-medium text-amber-700 dark:text-amber-300", children: localize(locale, "A delegated task needs your approval", "子代理任务需要你的批准") }), _jsx(AgentMessagePart, { assetUrl: assetUrl, canRespond: canRespond, closedInputRequestIds: closedInputRequestIds, events: events, inActiveExecution: true, locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, part: part, turnId: message.metadata?.turnId })] }, `proxied-input:${part.toolCallId}`)))] }), task.finalPart ? (_jsx("div", { className: "pt-3", children: _jsx(AgentMessagePart, { assetUrl: assetUrl, canRespond: canRespond, events: events, inActiveExecution: false, locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, part: task.finalPart, turnId: message.metadata?.turnId }) })) : null, publishedDeliverables.length > 0 ? (_jsx("div", { className: "space-y-2 pt-3", "data-turn-deliverables": true, children: publishedDeliverables.map((deliverable) => _jsx(PublishedDeliverableCard, { deliverable: deliverable, locale: locale }, `${deliverable.kind}:${deliverable.id}`)) })) : null] })) : displayMessage.parts.map((part, index) => (_jsx(AgentMessagePart, { assetUrl: assetUrl, canRespond: canRespond, events: events, inActiveExecution: false, locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, part: part, turnId: message.metadata?.turnId }, partKey(part, index)))), failure ? _jsx(TurnFailure, { failure: failure, locale: locale }) : null] }), showCopyAction && message.role === "assistant" && responseText && !isStreaming ? (_jsx(CopyResponseAction, { locale: locale, text: responseText })) : null] }) }));
+    return (_jsx(DeliverableOpenContext.Provider, { value: onOpenDeliverable, children: _jsxs(Message, { "data-optimistic": message.metadata?.optimistic ? "true" : undefined, from: message.role, children: [_jsxs(MessageContent, { className: message.role === "assistant" ? "w-full" : undefined, children: [message.role === "assistant" && isStreaming && !hasVisiblePart ? (_jsx(ReasoningRoot, { className: "mb-1", role: "status", streaming: true, variant: "ghost", children: _jsx(ReasoningTrigger, { active: true, hideChevron: true, label: localize(locale, "Thinking", "正在思考") }) })) : null, task ? (_jsxs(_Fragment, { children: [_jsxs(ExecutionGroup, { collapseWhenSettled: task.status === "completed" && Boolean(task.finalPart?.text.trim() ||
+                                        hasLaterFinalDelivery(events, message.metadata?.turnId)), fallbackStartedAt: fallbackStartedAt, locale: locale, task: task, children: [_jsx(ProcessParts, { assetUrl: assetUrl, canRespond: canRespond, closedInputRequestIds: closedInputRequestIds, events: events, inActiveExecution: task.status === "running" || task.status === "waiting", locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, parts: task.processParts, turnId: message.metadata?.turnId }), task.proxiedInputParts.map((part) => (_jsxs("div", { className: "space-y-2", children: [_jsx("p", { className: "text-xs font-medium text-amber-700 dark:text-amber-300", children: localize(locale, "A delegated task needs your approval", "子代理任务需要你的批准") }), _jsx(AgentMessagePart, { assetUrl: assetUrl, canRespond: canRespond, closedInputRequestIds: closedInputRequestIds, events: events, inActiveExecution: true, locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, part: part, turnId: message.metadata?.turnId })] }, `proxied-input:${part.toolCallId}`)))] }), task.finalPart ? (_jsx("div", { className: "pt-3", children: _jsx(AgentMessagePart, { assetUrl: assetUrl, canRespond: canRespond, events: events, inActiveExecution: false, locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, part: task.finalPart, turnId: message.metadata?.turnId }) })) : null, publishedDeliverables.length > 0 ? (_jsx("div", { className: "space-y-2 pt-3", "data-turn-deliverables": true, children: publishedDeliverables.map((deliverable) => _jsx(PublishedDeliverableCard, { deliverable: deliverable, locale: locale }, `${deliverable.kind}:${deliverable.id}`)) })) : null] })) : displayMessage.parts.map((part, index) => (_jsx(AgentMessagePart, { assetUrl: assetUrl, canRespond: canRespond, events: events, inActiveExecution: false, locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, part: part, turnId: message.metadata?.turnId }, partKey(part, index)))), failure && !(task?.status === "failed" && events.some((event) => event.type === "step.failed" && event.data.turnId === message.metadata?.turnId)) ? _jsx(TurnFailure, { failure: failure, locale: locale }) : null] }), showCopyAction && message.role === "assistant" && responseText && !isStreaming ? (_jsx(CopyResponseAction, { locale: locale, text: responseText })) : null] }) }));
 }
 function AgentMessagePart({ assetUrl, canRespond, closedInputRequestIds = EMPTY_CLOSED_INPUT_REQUEST_IDS, events, inActiveExecution, locale, onOpenSubagent, onInputResponses, onCloseInputRequest = () => undefined, part, turnId, }) {
     switch (part.type) {
@@ -367,9 +367,12 @@ function countContentLines(value) {
 }
 function StepActivity({ events, locale, stepIndex, turnId, }) {
     const step = presentAgentStep(events, turnId, stepIndex);
-    return (_jsxs(_Fragment, { children: [step.status === "running" && step.retry ? (_jsx(RetryStatus, { locale: locale, retry: step.retry })) : null, _jsx(ReasoningRoot, { className: "mb-1", role: "status", streaming: step.status === "running", variant: "ghost", children: _jsx(ReasoningTrigger, { active: step.status === "running", hideChevron: true, label: step.status === "running"
+    return (_jsxs(_Fragment, { children: [step.retry ? (_jsx(RetryStatus, { locale: locale, retry: step.retry })) : null, step.status === "failed" && step.failure ? _jsx(StepFailure, { failure: step.failure, locale: locale }) : null, _jsx(ReasoningRoot, { className: "mb-1", role: "status", streaming: step.status === "running", variant: "ghost", children: _jsx(ReasoningTrigger, { active: step.status === "running", hideChevron: true, label: step.status === "running"
                         ? localize(locale, "Thinking", "正在思考")
                         : localize(locale, "Reasoning complete", "思考完成") }) })] }));
+}
+function StepFailure({ failure, locale, }) {
+    return (_jsxs("div", { className: "mb-1 flex items-start gap-2 text-sm text-destructive", role: "alert", children: [_jsx(XCircleIcon, { className: "mt-0.5 size-4 shrink-0" }), _jsxs("span", { className: "min-w-0 break-words", children: [localize(locale, "Execution failed", "执行失败"), ": ", sanitizeFailureMessage(failure.message)] })] }));
 }
 function RetryStatus({ locale, retry, }) {
     return (_jsxs(Collapsible, { className: "mb-1 text-sm text-muted-foreground", children: [_jsxs(CollapsibleTrigger, { className: "group/retry flex max-w-full items-center gap-2 py-1.5 text-left hover:text-foreground", children: [_jsx(WifiIcon, { className: "size-4 shrink-0" }), _jsxs("span", { children: [localize(locale, "Reconnecting", "正在重新连接"), " ", retry.attempt, "/", retry.maximum] }), retry.error ? _jsx(ChevronDownIcon, { className: "size-3.5 -rotate-90 transition-transform group-data-[state=open]/retry:rotate-0" }) : null] }), retry.error ? (_jsx(CollapsibleContent, { className: "overflow-hidden", children: _jsxs("div", { className: "ml-6 rounded-lg border border-border/60 px-3 py-2 text-xs", children: [_jsx("p", { className: "break-words text-foreground", children: sanitizeFailureMessage(retry.error.message) }), _jsx("code", { className: "mt-1 block text-muted-foreground", children: retry.error.code })] }) })) : null] }));
@@ -379,7 +382,7 @@ function ReasoningPart({ events, locale, part, turnId, }) {
     const step = presentAgentStep(events, turnId, part.stepIndex ?? 0);
     const durationSeconds = useElapsedSeconds(timing.startedAt, timing.endedAt);
     const streaming = part.state === "streaming";
-    return (_jsxs(_Fragment, { children: [streaming && step.retry ? _jsx(RetryStatus, { locale: locale, retry: step.retry }) : null, _jsxs(ReasoningRoot, { className: "mb-1", streaming: streaming, variant: "ghost", children: [_jsx(ReasoningTrigger, { active: streaming, duration: timing.startedAt && durationSeconds > 0 ? durationSeconds : undefined, label: streaming
+    return (_jsxs(_Fragment, { children: [step.retry ? _jsx(RetryStatus, { locale: locale, retry: step.retry }) : null, step.status === "failed" && step.failure ? _jsx(StepFailure, { failure: step.failure, locale: locale }) : null, _jsxs(ReasoningRoot, { className: "mb-1", streaming: streaming, variant: "ghost", children: [_jsx(ReasoningTrigger, { active: streaming, duration: timing.startedAt && durationSeconds > 0 ? durationSeconds : undefined, label: streaming
                             ? reasoningSummary(part.text) ?? localize(locale, "Thinking", "正在思考")
                             : localize(locale, "Reasoning complete", "思考完成") }), _jsx(ReasoningContent, { "aria-busy": streaming, children: _jsx(ReasoningText, { children: _jsx(StaticMarkdownText, { text: part.text }) }) })] })] }));
 }
@@ -628,7 +631,9 @@ function toolPatch(part) {
     const toolName = part.toolName.toLocaleLowerCase().replaceAll("-", "_");
     if (!["apply_patch", "patch_file"].includes(toolName))
         return undefined;
-    return patchFromValue(part.input) ?? patchFromValue(part.output);
+    return patchFromValue(part.input) ??
+        patchFromValue(part.output) ??
+        partialPatchFromText(part.inputText);
 }
 function patchFromValue(value) {
     if (typeof value === "string")
@@ -644,24 +649,54 @@ function displayablePatch(value) {
         return value;
     return codexPatchToUnifiedDiff(value);
 }
+function partialPatchFromText(value) {
+    if (!value)
+        return undefined;
+    const direct = displayablePatch(value);
+    if (direct)
+        return direct;
+    try {
+        const parsed = JSON.parse(value);
+        const complete = patchFromValue(parsed);
+        if (complete)
+            return complete;
+    }
+    catch {
+    }
+    const match = value.match(/"(?:patch|diff)"\s*:\s*"((?:\\.|[^"\\])*)/u);
+    if (!match?.[1])
+        return undefined;
+    let patchText;
+    try {
+        patchText = JSON.parse(`"${match[1]}"`);
+    }
+    catch {
+        return undefined;
+    }
+    return codexPatchToUnifiedDiff(patchText, true) ?? displayablePatch(patchText);
+}
 function looksLikeUnifiedDiff(value) {
     return /^(?:diff --git |--- )/m.test(value) && /^\+\+\+ /m.test(value) && /^@@ /m.test(value);
 }
-function codexPatchToUnifiedDiff(value) {
+function codexPatchToUnifiedDiff(value, allowPartial = false) {
     const lines = value.replace(/\r\n?/gu, "\n").split("\n");
     const begin = lines.findIndex((line) => line.trim() === "*** Begin Patch");
     const end = lines.findIndex((line, index) => index > begin && line.trim() === "*** End Patch");
-    if (begin < 0 || end < 0)
+    if (begin < 0 || (!allowPartial && end < 0))
         return undefined;
+    const stop = end >= 0 ? end : lines.length;
     const sections = [];
-    for (let index = begin + 1; index < end;) {
+    for (let index = begin + 1; index < stop;) {
         if (!lines[index]?.trim()) {
             index += 1;
             continue;
         }
         const directive = /^\*\*\* (Add|Update|Delete) File:\s*(.+?)\s*$/u.exec(lines[index]);
-        if (!directive)
+        if (!directive) {
+            if (allowPartial && sections.length > 0)
+                break;
             return undefined;
+        }
         const operation = directive[1];
         const sourcePath = directive[2];
         index += 1;
@@ -674,7 +709,7 @@ function codexPatchToUnifiedDiff(value) {
             }
         }
         const body = [];
-        while (index < end && !lines[index].startsWith("*** ")) {
+        while (index < stop && !lines[index].startsWith("*** ")) {
             body.push(lines[index]);
             index += 1;
         }

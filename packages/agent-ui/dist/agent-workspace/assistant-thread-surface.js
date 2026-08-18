@@ -57,7 +57,7 @@ function attachmentContentUrl(attachment) {
 }
 function AssistantMessage({ assetUrl, canRespond, closedInputRequestIds, events, fallbackStartedAt, isStreaming, locale, message, messages, onInputResponses, onCloseInputRequest, onOpenDeliverable, onOpenSubagent, }) {
     const hasCopyableText = message?.parts.some((part) => part.type === "text" && part.text.trim().length > 0) ?? false;
-    return (_jsxs(MessagePrimitive.Root, { className: "group mx-auto flex w-full max-w-(--thread-max-width) flex-col", children: [_jsx("div", { className: "min-w-0 px-1 text-[15px] leading-7 text-foreground", children: message ? (_jsx(AgentMessage, { assetUrl: assetUrl, canRespond: canRespond, closedInputRequestIds: closedInputRequestIds, events: events, fallbackStartedAt: fallbackStartedAt, isStreaming: isStreaming, locale: locale, message: message, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, showCopyAction: false })) : (_jsx(MessagePrimitive.Parts, { components: { Text: MarkdownText, tools: { Fallback: ToolFallback } } })) }), !isStreaming && hasCopyableText ? (_jsx(ActionBarPrimitive.Root, { className: "mt-1 flex min-h-7 items-center opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100", children: _jsx(ActionBarPrimitive.Copy, { "aria-label": messages.copyResponse, className: "inline-flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground", children: _jsx(CopyIcon, { className: "size-3.5" }) }) })) : _jsx("div", { className: "min-h-7" })] }));
+    return (_jsxs(MessagePrimitive.Root, { className: "group mx-auto flex w-full max-w-(--thread-max-width) flex-col", children: [_jsx("div", { className: "min-w-0 px-1 text-[15px] leading-7 text-foreground", children: message ? (_jsx(AgentMessage, { assetUrl: assetUrl, canRespond: canRespond, closedInputRequestIds: closedInputRequestIds, events: events, fallbackStartedAt: fallbackStartedAt, isStreaming: isStreaming, locale: locale, message: message, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, showCopyAction: false })) : (_jsx(MessagePrimitive.Parts, { components: { Text: MarkdownText, tools: { Fallback: ToolFallback } } })) }), !isStreaming && hasCopyableText ? (_jsx(ActionBarPrimitive.Root, { className: "mt-1 flex min-h-7 items-center opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100", children: _jsx(ActionBarPrimitive.Copy, { "aria-label": messages.copyResponse, className: "inline-flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground", children: _jsx(CopyIcon, { className: "size-3.5" }) }) })) : null] }));
 }
 function EditMessage({ messages }) {
     const aui = useAui();
@@ -157,7 +157,9 @@ export function AssistantComposer({ approvalTakeover, cancellationState, command
     })), [models, reasoningLevels]);
     const contextLabels = {
         cachedInput: messages.cacheReadTokens,
+        cacheWrite: messages.cacheWriteTokens,
         contextUsage: messages.contextUsage,
+        estimatedCost: messages.estimatedCost,
         input: messages.inputTokens,
         of: messages.tokenUsageOf,
         output: messages.outputTokens,
@@ -169,6 +171,8 @@ export function AssistantComposer({ approvalTakeover, cancellationState, command
     };
     const sessionUsage = {
         cachedInputTokens: usage.cacheReadTokens,
+        cacheWriteTokens: usage.cacheWriteTokens,
+        costUsd: usage.costUsd,
         inputTokens: usage.inputTokens,
         outputTokens: usage.outputTokens,
         reasoningTokens: 0,

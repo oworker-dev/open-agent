@@ -403,7 +403,7 @@ function AssistantMessage({
             <CopyIcon className="size-3.5" />
           </ActionBarPrimitive.Copy>
         </ActionBarPrimitive.Root>
-      ) : <div className="min-h-7" />}
+      ) : null}
     </MessagePrimitive.Root>
   );
 }
@@ -558,7 +558,9 @@ export function AssistantComposer({
   })), [models, reasoningLevels]);
   const contextLabels = {
     cachedInput: messages.cacheReadTokens,
+    cacheWrite: messages.cacheWriteTokens,
     contextUsage: messages.contextUsage,
+    estimatedCost: messages.estimatedCost,
     input: messages.inputTokens,
     of: messages.tokenUsageOf,
     output: messages.outputTokens,
@@ -570,6 +572,8 @@ export function AssistantComposer({
   };
   const sessionUsage = {
     cachedInputTokens: usage.cacheReadTokens,
+    cacheWriteTokens: usage.cacheWriteTokens,
+    costUsd: usage.costUsd,
     inputTokens: usage.inputTokens,
     outputTokens: usage.outputTokens,
     reasoningTokens: 0,

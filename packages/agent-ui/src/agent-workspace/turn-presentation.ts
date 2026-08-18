@@ -71,6 +71,7 @@ export type AgentTurnFailure = {
 
 export type AgentStepPresentation = {
   readonly endedAt?: number;
+  readonly failure?: AgentTurnFailure;
   readonly retry?: {
     readonly attempt: number;
     readonly error?: AgentTurnFailure;
@@ -221,10 +222,12 @@ export function presentAgentStep(
       )
     : undefined;
   const latestFailure = failures.at(-1);
-  const retryAttempt = Math.max(
-    starts.length - 1,
-    latestFailure && !terminalFailure && !completed ? failures.length : 0,
-  );
+  const retryAttempt = terminalFailure || completed
+    ? 0
+    : Math.max(
+        starts.length - 1,
+        latestFailure ? failures.length : 0,
+      );
   const latestStartIndex = stepEvents.findLastIndex((event) => event.type === "step.started");
   const latestAttemptEvents = latestStartIndex >= 0 ? stepEvents.slice(latestStartIndex) : stepEvents;
   const latestAttemptFailed = latestAttemptEvents.some((event) => event.type === "step.failed");
@@ -233,6 +236,9 @@ export function presentAgentStep(
     : modelOutputBoundaryTime(latestAttemptEvents) ?? eventTimestamp(completed ?? terminalFailure);
   return {
     ...(endedAt ? { endedAt } : {}),
+    ...(terminalFailure?.type === "turn.failed"
+      ? { failure: { code: terminalFailure.data.code, message: terminalFailure.data.message } }
+      : {}),
     ...(retryAttempt > 0
       ? {
           retry: {

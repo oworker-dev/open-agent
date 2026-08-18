@@ -599,6 +599,37 @@ test("an interrupted durable model step remains visibly retrying", () => {
   });
 });
 
+test("a terminal step failure is attached to its step and does not masquerade as a retry", () => {
+  const failedAt = "2026-08-06T01:00:03.000Z";
+  const events = [
+    event("turn.started", startedAt, { sequence: 0, turnId: "turn-failed" }),
+    event("step.started", startedAt, { sequence: 0, stepIndex: 0, turnId: "turn-failed" }),
+    event("step.failed", failedAt, {
+      code: "provider_rejected",
+      message: "The model Provider rejected this turn.",
+      sequence: 0,
+      stepIndex: 0,
+      turnId: "turn-failed",
+    }),
+    event("turn.failed", failedAt, {
+      code: "provider_rejected",
+      message: "The model Provider rejected this turn.",
+      sequence: 0,
+      turnId: "turn-failed",
+    }),
+  ];
+
+  assert.deepEqual(presentAgentStep(events, "turn-failed", 0), {
+    endedAt: Date.parse(failedAt),
+    failure: {
+      code: "provider_rejected",
+      message: "The model Provider rejected this turn.",
+    },
+    startedAt: Date.parse(startedAt),
+    status: "failed",
+  });
+});
+
 test("normal and recovery activity use one calm thinking state without transport details", () => {
   const messages = messagesFor("en");
   const events = [event("step.started", startedAt, { sequence: 0, stepIndex: 0, turnId: "turn-task" })];

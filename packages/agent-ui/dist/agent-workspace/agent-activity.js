@@ -6,6 +6,7 @@ import { activityLabel } from "./agent-activity-state.js";
 export function AgentActivity({ events, messages, mode = "live", }) {
     const mountedAt = useRef(Date.now());
     const label = activityLabel(events, messages, { mode, mountedAt: mountedAt.current, now: Date.now() });
-    return (_jsx(ReasoningRoot, { className: "mb-1", role: "status", streaming: true, variant: "ghost", children: _jsx(ReasoningTrigger, { active: true, label: label }) }));
+    const hasReasoning = events.some((event) => event.type === "reasoning.appended" || event.type === "reasoning.completed");
+    return (_jsx(ReasoningRoot, { className: "mb-1", role: "status", streaming: true, variant: "ghost", children: _jsx(ReasoningTrigger, { active: true, label: label, hideChevron: !hasReasoning }) }));
 }
 //# sourceMappingURL=agent-activity.js.map

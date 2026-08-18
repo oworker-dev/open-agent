@@ -31,6 +31,7 @@ export type AgentTurnFailure = {
 };
 export type AgentStepPresentation = {
     readonly endedAt?: number;
+    readonly failure?: AgentTurnFailure;
     readonly retry?: {
         readonly attempt: number;
         readonly error?: AgentTurnFailure;
