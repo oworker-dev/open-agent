@@ -246,3 +246,45 @@ test("view_image persists an authenticated UI preview while keeping bytes privat
     await rm(root, { force: true, recursive: true });
   }
 });
+
+test("view_image keeps the model observation when optional UI asset persistence is unavailable", async () => {
+  configureAssetStore({
+    async createUpload() {
+      throw new Error("object store temporarily unavailable");
+    },
+  } as never);
+  const bytes = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    "base64",
+  );
+  const sandbox = {
+    async readFile() {
+      return new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(bytes);
+          controller.close();
+        },
+      });
+    },
+  };
+  const context = {
+    getSandbox: async () => sandbox,
+    session: {
+      auth: {
+        current: {
+          attributes: { tenantId: "vision-degraded-tenant" },
+          principalId: "vision-degraded-user",
+          principalType: "user",
+        },
+      },
+      id: "vision-degraded-session",
+    },
+  };
+  const output = await (viewImageTool as unknown as {
+    execute(input: { path: string }, context: unknown): Promise<{ assetId?: string; bytes: number }>;
+  }).execute({ path: "reference.png" }, context);
+  assert.equal(output.bytes, bytes.byteLength);
+  assert.equal(output.assetId, undefined);
+  const modelOutput = (viewImageTool as unknown as { toModelOutput(value: typeof output): { type: string } }).toModelOutput(output);
+  assert.equal(modelOutput.type, "content");
+});

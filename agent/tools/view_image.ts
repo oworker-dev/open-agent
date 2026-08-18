@@ -90,6 +90,11 @@ export default defineTool({
       filename: basename(path),
       mediaType: outputMediaType,
     });
+    // The model observation is the capability of this tool; the persisted
+    // asset is only a UI convenience for a host's artifact panel. A temporary
+    // object-store outage, quota rejection, or an unconfigured standalone
+    // store must not turn a readable image into a failed vision turn. The
+    // private observation remains available for toModelOutput below.
     try {
       const assetId = await persistPreviewAsset({
         bytes,
@@ -98,11 +103,12 @@ export default defineTool({
         mediaType: outputMediaType,
       });
       if (assetId) output.assetId = assetId;
-      return output;
-    } catch (error) {
-      consumeModelObservation(output);
-      throw error;
+    } catch {
+      // Best effort only. The image bytes never leave the model output path
+      // unless Eve asks toModelOutput, and that path is independent of UI
+      // asset persistence.
     }
+    return output;
   },
   toModelOutput(output) {
     const observation = consumeModelObservation(output);
