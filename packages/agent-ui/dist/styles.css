@@ -726,6 +726,9 @@
   .min-h-28 {
     min-height: calc(var(--spacing) * 28);
   }
+  .min-h-\[20rem\] {
+    min-height: 20rem;
+  }
   .min-h-\[200px\] {
     min-height: 200px;
   }
@@ -860,6 +863,9 @@
   }
   .max-w-40 {
     max-width: calc(var(--spacing) * 40);
+  }
+  .max-w-44 {
+    max-width: calc(var(--spacing) * 44);
   }
   .max-w-48 {
     max-width: calc(var(--spacing) * 48);
@@ -1090,9 +1096,6 @@
   }
   .rotate-90 {
     rotate: 90deg;
-  }
-  .rotate-180 {
-    rotate: 180deg;
   }
   .transform {
     transform: var(--tw-rotate-x,) var(--tw-rotate-y,) var(--tw-rotate-z,) var(--tw-skew-x,) var(--tw-skew-y,);
@@ -4263,6 +4266,16 @@
     &:hover {
       @media (hover: hover) {
         background-color: var(--background, oklch(1 0 0));
+      }
+    }
+  }
+  .hover\:bg-background\/80 {
+    &:hover {
+      @media (hover: hover) {
+        background-color: var(--background, oklch(1 0 0));
+        @supports (color: color-mix(in lab, red, red)) {
+          background-color: color-mix(in oklab, var(--background, oklch(1 0 0)) 80%, transparent);
+        }
       }
     }
   }

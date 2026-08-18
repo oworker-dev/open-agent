@@ -65,6 +65,20 @@ export type AgentRunResult = {
     readonly kind: "text";
     readonly value: string;
 };
+/** A structured answer to one currently pending Eve input request. */
+export type AgentRunInputResponse = {
+    readonly requestId: string;
+    readonly optionId?: string;
+    readonly text?: string;
+};
+/**
+ * Resume a parked AgentRun. The idempotency key covers the complete response
+ * batch so hosts can retry an ambiguous HTTP request without answering twice.
+ */
+export type RespondAgentRunRequest = {
+    readonly idempotencyKey: string;
+    readonly inputResponses: readonly AgentRunInputResponse[];
+};
 export type AgentRunSnapshot = {
     readonly contractVersion: typeof AGENT_RUN_CONTRACT_VERSION;
     readonly cancellationRequestedAt?: string;
@@ -91,7 +105,7 @@ export type AgentRunSnapshot = {
     readonly updatedAt: string;
     readonly usage: AgentRunUsage;
 };
-export type AgentEventType = "run.started" | "run.completed" | "run.failed" | "run.cancelled" | "message.received" | "message.delta" | "message.completed" | "reasoning.delta" | "reasoning.completed" | "tool.requested" | "tool.completed" | "input.requested" | "authorization.required" | "authorization.completed" | "result.completed" | "usage.recorded" | "runtime.event";
+export type AgentEventType = "run.started" | "run.completed" | "run.failed" | "run.cancelled" | "message.received" | "message.delta" | "message.completed" | "reasoning.delta" | "reasoning.completed" | "tool.input.delta" | "tool.requested" | "tool.completed" | "input.requested" | "authorization.required" | "authorization.completed" | "result.completed" | "usage.recorded" | "runtime.event";
 export type AgentEvent = {
     readonly contractVersion: typeof AGENT_RUN_CONTRACT_VERSION;
     readonly createdAt?: string;

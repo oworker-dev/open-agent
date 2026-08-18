@@ -121,7 +121,7 @@ function dynamicToolPart(part: EveDynamicToolPart): ToolCallMessagePart {
   const base: ToolCallMessagePart = {
     ...(approval ? { approval } : {}),
     args: jsonObject(part.input),
-    argsText: safeStringify(part.input),
+    argsText: part.inputText ?? safeStringify(part.input),
     toolCallId: part.toolCallId,
     toolName: part.toolName,
     type: "tool-call",

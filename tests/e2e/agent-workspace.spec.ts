@@ -1032,6 +1032,97 @@ test("secondary view lists session assets and previews markdown, images, and dow
   await expect(download).toHaveAttribute("download", "site.zip");
 });
 
+test("published turn results open a durable multi-tab workbench with an isolated website preview", async ({ page }) => {
+  const sessionId = "deliverable-workbench-session";
+  const previewId = "prv_123e4567-e89b-12d3-a456-426614174000";
+  const artifactId = "art_123e4567-e89b-12d3-a456-426614174000";
+  const previewUrl = `/api/previews/${previewId}/index.html?token=signed-preview`;
+  const artifactUrl = `/api/artifacts/${artifactId}?token=signed-artifact`;
+  const createdAt = "2029-01-01T00:00:00.000Z";
+  const expiresAt = "2030-01-01T00:00:00.000Z";
+  const events = eventsFromNdjson(mockToolTurn("Publish the website", "The website is ready.", {
+    input: { entrypoint: "index.html", root: "." },
+    output: {
+      bytes: 512,
+      createdAt,
+      entrypoint: "index.html",
+      expiresAt,
+      fileCount: 2,
+      kind: "website-preview",
+      previewId,
+      url: previewUrl,
+    },
+    toolName: "publish_preview",
+  }));
+  setFakeThreadCollection(page, {
+    activeThreadId: "deliverable-workbench-thread",
+    threads: [{
+      closedInputRequestIds: [],
+      createdAt: Date.now(),
+      events,
+      id: "deliverable-workbench-thread",
+      preferences: { executionMode: "standard", modelId: "gpt-5.6-sol", reasoning: "medium" },
+      queuedTurns: [],
+      session: { sessionId, streamIndex: events.length },
+      status: "ready",
+      title: "Published website",
+      updatedAt: Date.now(),
+      version: 2,
+    }],
+    version: 2,
+  });
+  await page.route(`**/api/deliverables?sessionId=${sessionId}`, async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({
+        deliverables: [
+          { createdAt, expiresAt, fileCount: 2, id: previewId, kind: "website-preview", mediaType: "text/html", sizeBytes: 512, title: "index.html", url: previewUrl },
+          { createdAt, expiresAt, id: artifactId, kind: "artifact", mediaType: "text/markdown", sizeBytes: 32, title: "result.md", url: artifactUrl },
+        ],
+        ok: true,
+      }),
+      contentType: "application/json",
+      status: 200,
+    });
+  });
+  await page.route(`**/api/assets?sessionId=${sessionId}`, async (route) => {
+    await route.fulfill({ body: JSON.stringify({ assets: [], ok: true }), contentType: "application/json", status: 200 });
+  });
+  await page.route(`**/api/previews/${previewId}/**`, async (route) => {
+    const pathname = new URL(route.request().url()).pathname;
+    await route.fulfill(pathname.endsWith("styles.css")
+      ? { body: "h1 { color: rgb(12, 90, 180); }", contentType: "text/css", status: 200 }
+      : { body: '<!doctype html><link rel="stylesheet" href="styles.css"><h1>Durable preview</h1>', contentType: "text/html", status: 200 });
+  });
+  await page.route(`**/api/artifacts/${artifactId}**`, async (route) => {
+    await route.fulfill({ body: "# Published result\n\nReady for review.", contentType: "text/markdown", status: 200 });
+  });
+
+  await page.goto("/threads/deliverable-workbench-thread");
+  const resultCard = page.locator('[data-turn-deliverables] [data-slot="artifact-card"]');
+  await expect(resultCard).toBeVisible();
+  await expect(resultCard).toContainText("index.html");
+  await resultCard.click();
+
+  const secondary = page.locator("[data-agent-secondary-view]");
+  await expect(secondary).toBeVisible();
+  await expect(secondary.locator("h2")).toHaveText("index.html");
+  await expect(secondary.locator('[data-slot="web-preview"]')).toBeVisible();
+  const previewFrame = secondary.frameLocator('iframe[title="index.html"]');
+  await expect(previewFrame.getByRole("heading", { name: "Durable preview" })).toBeVisible();
+  await expect(previewFrame.getByRole("heading", { name: "Durable preview" })).toHaveCSS("color", "rgb(12, 90, 180)");
+
+  await secondary.getByRole("button", { name: "Back to list", exact: true }).click();
+  await secondary.getByRole("button", { name: "Open result.md", exact: true }).click();
+  await expect(secondary.locator("h2")).toHaveText("result.md");
+  await expect(secondary.locator(".aui-md")).toContainText("Published result");
+  await expect(secondary.getByRole("button", { name: "index.html", exact: true })).toBeVisible();
+  await expect(secondary.getByRole("button", { name: "result.md", exact: true })).toBeVisible();
+  await secondary.getByRole("button", { name: "index.html", exact: true }).click();
+  await expect(secondary.locator('[data-slot="web-preview"]')).toBeVisible();
+  await secondary.getByRole("button", { name: "Close result.md", exact: true }).click();
+  await expect(secondary.getByRole("button", { name: "result.md", exact: true })).toHaveCount(0);
+});
+
 test("a live autonomous website task survives refresh and publishes a usable preview", async ({ page }) => {
   test.skip(process.env.RUN_AGENT_AUTONOMY_E2E !== "1", "Requires a healthy live model provider and sandbox.");
   test.setTimeout(20 * 60_000);

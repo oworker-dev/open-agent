@@ -21,6 +21,15 @@ keeps bytes in PostgreSQL `bytea` or a local filesystem and caps one artifact at
 database bloat, and event replay worse. It is not a solution for 100 MiB+ user
 uploads.
 
+Uploads and published results keep those separate physical lifecycles, but the
+product exposes one authenticated session deliverable registry. `GET
+/api/deliverables?sessionId=...` joins ready uploads, `publish_artifact`
+records, and `publish_preview` records only after filtering by tenant,
+principal, and durable Eve session. The response contains bounded metadata and
+short-lived signed result URLs, never file bytes or object-store keys. Embedded
+hosts can replace the endpoint and opening behavior through the reusable UI
+SDK without changing Agent events.
+
 The legacy inline message projection also rewrote image parts to the generic
 `image/*` MIME type. The asset contract must preserve the authoritative media
 type (`image/png`, `image/jpeg`, `image/webp`, and so on) so model adapters and
@@ -30,6 +39,13 @@ The production rule is therefore: **conversation events contain asset
 references and metadata, never large file bytes**. The original bytes belong in
 an object store and are mounted into a session sandbox only when the Agent or a
 host operation needs them.
+
+Published result tool events contain the result id, kind, title, media type,
+size, creation/expiration timestamps, and signed URL so the active turn can
+render an assistant-ui Artifact Card immediately. The session registry is the
+durable recovery path after refresh. Website results open in an isolated frame
+inside assistant-ui Web Preview chrome; the frame, response CSP, and signed
+preview cookie provide isolation, not the visual component itself.
 
 ## Asset model
 

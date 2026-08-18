@@ -146,6 +146,7 @@ function eventType(type: MessageStreamEvent["type"]): AgentEventType {
     case "message.completed": return "message.completed";
     case "reasoning.appended": return "reasoning.delta";
     case "reasoning.completed": return "reasoning.completed";
+    case "action.input.partial": return "tool.input.delta";
     case "actions.requested": return "tool.requested";
     case "action.result": return "tool.completed";
     case "input.requested": return "input.requested";

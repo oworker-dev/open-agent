@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import {
+  type AgentRunInputResponse,
+  type RespondAgentRunRequest,
   type JsonValue,
   type StartAgentRunRequest,
 } from "@oworker/open-agent-contracts/agent-run";
@@ -54,7 +56,29 @@ const startSchema = z.object({
   }).strict(),
 }).strict();
 
+const inputResponseSchema = z.object({
+  optionId: z.string().trim().min(1).max(512).optional(),
+  requestId: z.string().trim().min(1).max(512),
+  text: z.string().trim().min(1).max(65_536).optional(),
+}).strict().superRefine((response, context) => {
+  if (response.optionId === undefined && response.text === undefined) {
+    context.addIssue({
+      code: "custom",
+      message: "An input response requires optionId or text.",
+    });
+  }
+});
+
+const respondSchema = z.object({
+  idempotencyKey: z.string().trim().min(8).max(200)
+    .regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{7,199}$/),
+  inputResponses: z.array(inputResponseSchema).min(1).max(16),
+}).strict();
+
 export type ParsedStartAgentRun = StartAgentRunRequest & { readonly correlationId: string };
+export type ParsedRespondAgentRun = RespondAgentRunRequest & {
+  readonly inputResponses: readonly AgentRunInputResponse[];
+};
 
 export function parseStartAgentRun(
   value: unknown,
@@ -111,6 +135,27 @@ export function parseStartAgentRun(
 export function requestFingerprint(request: ParsedStartAgentRun): string {
   const { correlationId: _correlationId, idempotencyKey: _idempotencyKey, ...semanticRequest } = request;
   return createHash("sha256").update(canonicalJson(semanticRequest)).digest("hex");
+}
+
+export function parseRespondAgentRun(
+  value: unknown,
+): { readonly ok: true; readonly value: ParsedRespondAgentRun }
+  | { readonly error: string; readonly ok: false } {
+  const parsed = respondSchema.safeParse(value);
+  if (!parsed.success) {
+    return { error: "The AgentRun input response does not match contract 0.1.0-draft.", ok: false };
+  }
+  const requestIds = parsed.data.inputResponses.map((response) => response.requestId);
+  if (new Set(requestIds).size !== requestIds.length) {
+    return { error: "inputResponses must contain unique requestId values.", ok: false };
+  }
+  return { ok: true, value: parsed.data };
+}
+
+export function inputResponseFingerprint(input: ParsedRespondAgentRun): string {
+  return createHash("sha256")
+    .update(canonicalJson([...input.inputResponses].sort((left, right) => left.requestId.localeCompare(right.requestId))))
+    .digest("hex");
 }
 
 function isJsonObject(value: unknown, maximumBytes: number): boolean {

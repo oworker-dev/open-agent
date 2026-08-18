@@ -537,7 +537,8 @@ export function createS3AssetStore(options: S3AssetStoreOptions): AssetStore {
            status, scan_status, expires_at, created_at
          from ${table.assets}
          where session_id = $1 and tenant_id = $2 and principal_id = $3
-           and coalesce(principal_type, '') = $4 and coalesce(issuer, '') = $5 and status = 'ready'
+           and coalesce(principal_type, '') = $4 and coalesce(issuer, '') = $5
+           and status = 'ready' and scan_status in ('clean', 'disabled')
          order by created_at desc`,
         [sessionId, owner.tenantId, owner.principalId, owner.principalType ?? "", owner.issuer ?? ""],
       );

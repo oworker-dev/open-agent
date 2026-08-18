@@ -389,6 +389,20 @@ Provider calls. The optional evidence path receives a versioned, secret-free
 JSON report even when a budget fails. This is a repeatable single-host baseline,
 not target-deployment capacity proof.
 
+Use the separate authenticated durable-stream gate for idle online capacity. It
+creates one real waiting session, opens cursor-addressed follower streams, holds
+them without model work, and records handshake latency, disconnects, and load
+client memory. Run 100 first, then 1k/5k/10k only on the selected deployment:
+
+```bash
+AGENT_STREAM_LOAD_BASE_URL=http://127.0.0.1:3100 \
+AGENT_STREAM_LOAD_TOTAL=1000 \
+AGENT_STREAM_LOAD_CONCURRENCY=250 \
+AGENT_STREAM_LOAD_HOLD_MS=30000 \
+AGENT_STREAM_LOAD_EVIDENCE_PATH=.tmp/idle-stream-load-evidence.json \
+  npm run verify:stream-load
+```
+
 ## Docker sandbox retention
 
 Eve's Docker backend preserves `/workspace` in a long-lived container for each

@@ -13,14 +13,24 @@ import type {
   ReserveAgentRunInput,
   ReserveAgentRunResult,
 } from "../../server/data/agent-run-store.ts";
+import type {
+  AgentRunInputRecord,
+  AgentRunInputStore,
+  ReserveAgentRunInputResult,
+} from "../../server/data/agent-run-input-store.ts";
 import type { AgentSessionOwner } from "../../server/data/session-ownership-store.ts";
-import { parseStartAgentRun, requestFingerprint } from "../../server/agent-runs/input.ts";
-import { projectAgentRun } from "../../server/agent-runs/projection.ts";
+import {
+  parseRespondAgentRun,
+  parseStartAgentRun,
+  requestFingerprint,
+} from "../../server/agent-runs/input.ts";
+import { projectAgentEvents, projectAgentRun } from "../../server/agent-runs/projection.ts";
 import {
   AgentRunOperationError,
   cancelAgentRun,
   inspectAgentRun,
   readAgentRunEvents,
+  respondAgentRun,
   startAgentRun,
   type AgentRunRuntime,
 } from "../../server/agent-runs/service.ts";
@@ -135,6 +145,89 @@ test("does not expose a run to another tenant or principal", async () => {
   assert.equal(otherTenant, undefined);
 });
 
+test("answers the current AgentRun input request exactly once", async () => {
+  const store = new MemoryAgentRunStore();
+  const inputStore = new MemoryAgentRunInputStore();
+  const runtime = fakeRuntime({ events: waitingInputEvents("approval-1") });
+  const started = await startAgentRun({
+    accessToken: "token",
+    identity: user,
+    request: parseRequest({ idempotencyKey: "request-input-1", message: "Modify the canvas" }),
+    runtime,
+    store,
+  });
+  const request = parseInputResponse({
+    idempotencyKey: "approval-response-1",
+    inputResponses: [{ optionId: "approve", requestId: "approval-1" }],
+  });
+
+  const accepted = await respondAgentRun({
+    accessToken: "token",
+    identity: user,
+    inputStore,
+    request,
+    runId: started.record.runId,
+    runtime,
+    store,
+  });
+  const replayed = await respondAgentRun({
+    accessToken: "token",
+    identity: user,
+    inputStore,
+    request,
+    runId: started.record.runId,
+    runtime,
+    store,
+  });
+
+  assert.equal(accepted?.disposition, "accepted");
+  assert.equal(replayed?.disposition, "replayed");
+  assert.equal(runtime.calls.respond, 1);
+  assert.deepEqual(runtime.calls.inputResponses, [request.inputResponses]);
+});
+
+test("rejects stale or foreign AgentRun input request ids", async () => {
+  const store = new MemoryAgentRunStore();
+  const runtime = fakeRuntime({ events: waitingInputEvents("approval-current") });
+  const started = await startAgentRun({
+    accessToken: "token",
+    identity: user,
+    request: parseRequest({ idempotencyKey: "request-input-stale", message: "Modify the canvas" }),
+    runtime,
+    store,
+  });
+
+  await assert.rejects(
+    respondAgentRun({
+      accessToken: "token",
+      identity: user,
+      inputStore: new MemoryAgentRunInputStore(),
+      request: parseInputResponse({
+        idempotencyKey: "approval-response-stale",
+        inputResponses: [{ optionId: "approve", requestId: "approval-old" }],
+      }),
+      runId: started.record.runId,
+      runtime,
+      store,
+    }),
+    (error: unknown) => error instanceof AgentRunOperationError && error.code === "agent_run_input_stale",
+  );
+  const foreign = await respondAgentRun({
+    accessToken: "token",
+    identity: { ...user, principalId: "issuer:foreign" },
+    inputStore: new MemoryAgentRunInputStore(),
+    request: parseInputResponse({
+      idempotencyKey: "approval-response-foreign",
+      inputResponses: [{ optionId: "approve", requestId: "approval-current" }],
+    }),
+    runId: started.record.runId,
+    runtime,
+    store,
+  });
+  assert.equal(foreign, undefined);
+  assert.equal(runtime.calls.respond, 0);
+});
+
 test("projects usage, result, status, and incremental event cursors", async () => {
   const events = completedEvents();
   const projection = projectAgentRun(events);
@@ -172,6 +265,26 @@ test("projects usage, result, status, and incremental event cursors", async () =
   assert.equal(result.nextCursor, events.length);
   assert.equal(result.record.eventCount, events.length);
   assert.deepEqual(runtime.calls.readStartIndexes, [0, 2]);
+});
+
+test("projects durable provider argument snapshots as typed AgentRun events", () => {
+  const [event] = projectAgentEvents("arun-stream", [{
+    data: {
+      callId: "call-patch",
+      input: { patch: "*** Begin Patch" },
+      inputTextDelta: "Patch",
+      inputTextSoFar: '{"patch":"*** Begin Patch',
+      sequence: 0,
+      stepIndex: 0,
+      toolName: "apply_patch",
+      turnId: "turn-stream",
+    },
+    meta: { at: "2026-08-17T00:00:00.000Z", id: "event-stream" },
+    type: "action.input.partial",
+  }]);
+  assert.equal(event?.type, "tool.input.delta");
+  assert.equal(event?.data.callId, "call-patch");
+  assert.equal(event?.data.inputTextSoFar, '{"patch":"*** Begin Patch');
 });
 
 test("synchronizes long AgentRuns in bounded cursor pages", async () => {
@@ -235,6 +348,43 @@ test("synchronizes long AgentRuns in bounded cursor pages", async () => {
   assert.equal(firstPage?.nextCursor, 200);
   assert.equal(secondPage?.events[0]?.sequence, 201);
   assert.equal(secondPage?.nextCursor, 400);
+});
+
+test("allows the Eve runtime to use a larger projection page without changing public cursors", async () => {
+  const events = longCompletedEvents(405);
+  const store = new MemoryAgentRunStore();
+  const runtime = {
+    ...fakeRuntime({ events }),
+    synchronizationPageSize: 1_000,
+  };
+  const started = await startAgentRun({
+    accessToken: "token",
+    identity: user,
+    request: parseRequest({ idempotencyKey: "request-runtime-page", message: "Run quickly" }),
+    runtime,
+    store,
+  });
+
+  const projected = await inspectAgentRun({
+    accessToken: "token",
+    identity: user,
+    runId: started.record.runId,
+    runtime,
+    store,
+  });
+  assert.equal(projected?.eventCount, events.length);
+  assert.equal(projected?.status, "completed");
+
+  const firstPage = await readAgentRunEvents({
+    accessToken: "token",
+    after: 0,
+    identity: user,
+    runId: started.record.runId,
+    runtime,
+    store,
+  });
+  assert.equal(firstPage?.events.length, 200);
+  assert.equal(firstPage?.nextCursor, 200);
 });
 
 test("does not let an older AgentRun projection overwrite a newer cursor", async () => {
@@ -557,6 +707,12 @@ function parseRequest(input: {
   return parsed.value;
 }
 
+function parseInputResponse(input: unknown) {
+  const parsed = parseRespondAgentRun(input);
+  assert.equal(parsed.ok, true);
+  return parsed.value;
+}
+
 function runningEvents(): readonly MessageStreamEvent[] {
   return [
     { type: "session.started", data: {}, meta: eventMeta(1) },
@@ -601,6 +757,35 @@ function cancelledEvents(): readonly MessageStreamEvent[] {
     { type: "turn.cancelled", data: { sequence: 2, turnId: "turn-1" }, meta: eventMeta(3) },
     waitingEvent(4),
   ];
+}
+
+function waitingInputEvents(requestId: string): readonly MessageStreamEvent[] {
+  return [
+    ...runningEvents(),
+    {
+      type: "input.requested",
+      data: {
+        requests: [{
+          action: {
+            callId: "call-canvas",
+            input: { title: "Canvas item" },
+            kind: "tool-call",
+            toolName: "canvas.item.put",
+          },
+          display: "confirmation",
+          kind: "tool-approval",
+          options: [{ id: "approve", label: "Yes" }, { id: "deny", label: "No" }],
+          prompt: "Approve tool call: canvas.item.put",
+          requestId,
+        }],
+        sequence: 2,
+        stepIndex: 0,
+        turnId: "turn-1",
+      },
+      meta: eventMeta(3),
+    },
+    waitingEvent(4),
+  ] as unknown as readonly MessageStreamEvent[];
 }
 
 function longCompletedEvents(count: number): readonly MessageStreamEvent[] {
@@ -653,11 +838,21 @@ function fakeRuntime(options: {
     cancel: number;
     read: number;
     readStartIndexes: number[];
+    respond: number;
+    inputResponses: unknown[];
     reset: number;
     start: number;
   };
 } {
-  const calls = { cancel: 0, read: 0, readStartIndexes: [] as number[], reset: 0, start: 0 };
+  const calls = {
+    cancel: 0,
+    inputResponses: [] as unknown[],
+    read: 0,
+    readStartIndexes: [] as number[],
+    reset: 0,
+    respond: 0,
+    start: 0,
+  };
   return {
     async cancel() {
       calls.cancel += 1;
@@ -670,6 +865,11 @@ function fakeRuntime(options: {
       calls.readStartIndexes.push(startIndex);
       return (options.events ?? runningEvents()).slice(startIndex, startIndex + limit);
     },
+    async respond(_runId, _correlationId, sessionId, _accessToken, inputResponses) {
+      calls.respond += 1;
+      calls.inputResponses.push(inputResponses);
+      return { sessionId };
+    },
     async reset() {
       calls.reset += 1;
       return "reset";
@@ -680,6 +880,75 @@ function fakeRuntime(options: {
       return { sessionId: `session-${calls.start}` };
     },
   };
+}
+
+class MemoryAgentRunInputStore implements AgentRunInputStore {
+  readonly records = new Map<string, AgentRunInputRecord>();
+  readonly byRequest = new Map<string, string>();
+  nextResponse = 1;
+
+  async find(runId: string, idempotencyKey: string) {
+    return this.records.get(`${runId}:${idempotencyKey}`);
+  }
+
+  async reserve(input: Parameters<AgentRunInputStore["reserve"]>[0]): Promise<ReserveAgentRunInputResult> {
+    const key = `${input.runId}:${input.idempotencyKey}`;
+    const existing = this.records.get(key);
+    if (existing) {
+      return {
+        record: existing,
+        status: existing.requestFingerprint === input.requestFingerprint ? "replay" : "conflict",
+      };
+    }
+    const overlapping = input.requestIds
+      .map((requestId) => this.byRequest.get(`${input.runId}:${requestId}`))
+      .find(Boolean);
+    if (overlapping) {
+      return { record: this.require(overlapping), status: "request-already-answered" };
+    }
+    const now = new Date().toISOString();
+    const record: AgentRunInputRecord = {
+      createdAt: now,
+      idempotencyKey: input.idempotencyKey,
+      inputResponses: input.inputResponses,
+      requestFingerprint: input.requestFingerprint,
+      requestIds: input.requestIds,
+      responseId: `arsp-${this.nextResponse++}`,
+      runId: input.runId,
+      status: "submitting",
+      updatedAt: now,
+    };
+    this.records.set(key, record);
+    this.records.set(record.responseId, record);
+    for (const requestId of input.requestIds) this.byRequest.set(`${input.runId}:${requestId}`, record.responseId);
+    return { record, status: "reserved" };
+  }
+
+  async markAccepted(responseId: string) {
+    return this.transition(responseId, "accepted");
+  }
+
+  async markFailed(responseId: string, message: string) {
+    return this.transition(responseId, "failed", message);
+  }
+
+  async markSubmissionAmbiguous(responseId: string, message: string) {
+    return this.transition(responseId, "submission-ambiguous", message);
+  }
+
+  private transition(responseId: string, status: AgentRunInputRecord["status"], lastError?: string) {
+    const current = this.require(responseId);
+    const updated = { ...current, ...(lastError ? { lastError } : {}), status, updatedAt: new Date().toISOString() };
+    this.records.set(responseId, updated);
+    this.records.set(`${current.runId}:${current.idempotencyKey}`, updated);
+    return updated;
+  }
+
+  private require(key: string): AgentRunInputRecord {
+    const record = this.records.get(key);
+    if (!record) throw new Error(`Missing input response ${key}`);
+    return record;
+  }
 }
 
 function eventMeta(sequence: number) {

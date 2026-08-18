@@ -61,6 +61,17 @@ export function createAgentRunClient(options) {
             const events = body.events.map((event) => parseAgentEvent(event, run.runId));
             return { events, nextCursor: body.nextCursor, run };
         },
+        async respond(runId, input, requestOptions) {
+            const body = await request(`/api/agent/runs/${encodeURIComponent(validRunId(runId))}/input`, {
+                body: JSON.stringify(input),
+                method: "POST",
+                signal: requestOptions?.signal,
+            });
+            if (!isRecord(body) || body.disposition !== "accepted" && body.disposition !== "replayed") {
+                throw contractError("respond", body);
+            }
+            return { disposition: body.disposition, run: parseRunSnapshot(body.run, "respond") };
+        },
         async cancel(runId, requestOptions) {
             const body = await request(`/api/agent/runs/${encodeURIComponent(validRunId(runId))}`, {
                 method: "DELETE",

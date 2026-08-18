@@ -152,6 +152,54 @@ test("reads a bounded no-store event page and closes at Eve's durable tail", asy
   assert.equal(cancelled, true);
 });
 
+test("stops a bounded event page at the requested limit before a large durable tail", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const originalRuntimeUrl = process.env.AGENT_RUNTIME_URL;
+  let cancelled = false;
+  let emitted = 0;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalRuntimeUrl === undefined) delete process.env.AGENT_RUNTIME_URL;
+    else process.env.AGENT_RUNTIME_URL = originalRuntimeUrl;
+  });
+  process.env.AGENT_RUNTIME_URL = "https://agent.example";
+  globalThis.fetch = async () => new Response(new ReadableStream<Uint8Array>({
+    cancel() {
+      cancelled = true;
+    },
+    pull(controller) {
+      const lines: string[] = [];
+      for (let index = 0; index < 25 && emitted < 1_000; index += 1) {
+        lines.push(JSON.stringify({
+          data: { value: emitted },
+          meta: { id: `evt_${emitted}` },
+          type: "action.input.partial",
+        }));
+        emitted += 1;
+      }
+      controller.enqueue(new TextEncoder().encode(`${lines.join("\n")}\n`));
+    },
+  }), { headers: { "x-eve-stream-tail-index": "999" } });
+
+  const events = await readEveAgentEvents(
+    "run-1",
+    "correlation-1",
+    "session-1",
+    "token",
+    0,
+    40,
+  );
+
+  assert.equal(events.length, 40);
+  assert.deepEqual(events.at(-1), {
+    data: { value: 39 },
+    meta: { id: "evt_39" },
+    type: "action.input.partial",
+  });
+  assert.equal(cancelled, true);
+  assert.ok(emitted < 1_000, "the reader should not drain the entire durable tail");
+});
+
 test("rejects a bounded event page without a valid durable tail", async (t) => {
   const originalFetch = globalThis.fetch;
   const originalRuntimeUrl = process.env.AGENT_RUNTIME_URL;

@@ -1,6 +1,7 @@
 import {
   AGENT_RUN_CONTRACT_VERSION,
   type AgentEvent,
+  type RespondAgentRunRequest,
   type AgentRunSnapshot,
   type StartAgentRunRequest,
 } from "@oworker/open-agent-contracts/agent-run";
@@ -44,10 +45,20 @@ export type AgentRunCancelResponse = {
   readonly run: AgentRunSnapshot;
 };
 
+export type AgentRunRespondResponse = {
+  readonly disposition: "accepted" | "replayed";
+  readonly run: AgentRunSnapshot;
+};
+
 export interface AgentRunClient {
   start(input: AgentRunStartInput, options?: AgentRunRequestOptions): Promise<AgentRunStartResponse>;
   inspect(runId: string, options?: AgentRunRequestOptions): Promise<AgentRunSnapshot>;
   events(runId: string, after?: number, options?: AgentRunRequestOptions): Promise<AgentRunEventsResponse>;
+  respond(
+    runId: string,
+    input: RespondAgentRunRequest,
+    options?: AgentRunRequestOptions,
+  ): Promise<AgentRunRespondResponse>;
   cancel(runId: string, options?: AgentRunRequestOptions): Promise<AgentRunCancelResponse>;
 }
 
@@ -117,6 +128,20 @@ export function createAgentRunClient(options: AgentRunClientOptions): AgentRunCl
       const run = parseRunSnapshot(body.run, "events");
       const events = body.events.map((event) => parseAgentEvent(event, run.runId));
       return { events, nextCursor: body.nextCursor as number, run };
+    },
+    async respond(runId, input, requestOptions) {
+      const body = await request(
+        `/api/agent/runs/${encodeURIComponent(validRunId(runId))}/input`,
+        {
+          body: JSON.stringify(input),
+          method: "POST",
+          signal: requestOptions?.signal,
+        },
+      );
+      if (!isRecord(body) || body.disposition !== "accepted" && body.disposition !== "replayed") {
+        throw contractError("respond", body);
+      }
+      return { disposition: body.disposition, run: parseRunSnapshot(body.run, "respond") };
     },
     async cancel(runId, requestOptions) {
       const body = await request(`/api/agent/runs/${encodeURIComponent(validRunId(runId))}`, {

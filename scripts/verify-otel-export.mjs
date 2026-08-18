@@ -1,3 +1,9 @@
+import {
+  anyValue,
+  attributeValue,
+  selectCorrelatedAgentIngress,
+} from "./otel-verification.mjs";
+
 const collectorUrl = process.env.OTEL_TEST_COLLECTOR_URL || "http://127.0.0.1:4318";
 const probe = process.env.OTEL_TEST_PRIVATE_PROBE;
 
@@ -40,32 +46,7 @@ const webSpans = spans.filter((span) => span.serviceName === "open-agent-web");
 if (agentSpans.length === 0) throw new Error("No Eve Agent runtime spans were exported.");
 if (webSpans.length === 0) throw new Error("No Agent Web service spans were exported.");
 
-const webSpanContexts = new Set(webSpans.map((span) => `${span.traceId}:${span.spanId}`));
-const ingressSpans = agentSpans.filter((span) => span.name === "open_agent.turn.accepted");
-const linkedIngress = ingressSpans.find((span) =>
-  (span.links || []).some((link) => webSpanContexts.has(`${link.traceId}:${link.spanId}`)),
-);
-if (!linkedIngress) {
-  throw new Error("The durable Agent turn did not link back to the Agent Web W3C span context.");
-}
-const turnTraceJoined = agentSpans.some(
-  (span) => span.name === "ai.eve.turn" && span.traceId === linkedIngress.traceId,
-);
-if (!turnTraceJoined) {
-  throw new Error("The Agent ingress link and Eve turn were not recorded in the same Agent trace.");
-}
-
-const runtimeAttributes = linkedIngress.attributes || [];
-for (const name of [
-  "open_agent.run_id",
-  "open_agent.correlation_id",
-  "open_agent.profile_id",
-  "open_agent.session_id",
-]) {
-  if (!runtimeAttributes.some((attribute) => attribute.key === name && anyValue(attribute.value) !== "")) {
-    throw new Error(`Agent runtime spans are missing correlation attribute ${name}.`);
-  }
-}
+const linkedIngress = selectCorrelatedAgentIngress(agentSpans, webSpans);
 
 console.log(JSON.stringify({
   durableTraceLink: true,
@@ -73,14 +54,6 @@ console.log(JSON.stringify({
   requestCount: requests.length,
   services: [...new Set(spans.map((span) => span.serviceName).filter(Boolean))].sort(),
   spanCount: spans.length,
+  traceId: linkedIngress.traceId,
+  verifiedRunId: attributeValue(linkedIngress.attributes, "open_agent.run_id"),
 }));
-
-function attributeValue(attributes, key) {
-  const attribute = (attributes || []).find((candidate) => candidate.key === key);
-  return attribute ? anyValue(attribute.value) : undefined;
-}
-
-function anyValue(value) {
-  if (!value || typeof value !== "object") return undefined;
-  return value.stringValue ?? value.intValue ?? value.doubleValue ?? value.boolValue;
-}

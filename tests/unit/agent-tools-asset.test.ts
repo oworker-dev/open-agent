@@ -201,6 +201,7 @@ test("import_asset rejects an asset whose content scan is not clean", async () =
     const asset = await store.completeUpload({ owner, uploadId: upload.uploadId });
     assert.equal(asset.scanStatus, "rejected");
     assert.equal(await store.openReadStream(asset.assetId, owner), undefined);
+    assert.deepEqual(await store.listAssets?.("session-a", owner), []);
     await assert.rejects(
       () => (importAssetTool as unknown as { execute(input: { assetId: string }, context: unknown): Promise<unknown> }).execute(
         { assetId: asset.assetId },

@@ -51,8 +51,11 @@ export function AgentMessage({ assetUrl, canRespond, closedInputRequestIds = EMP
     const responseText = task?.finalPart?.text ?? (task ? undefined : lastText(displayMessage.parts));
     const failure = failureForTurn(events, displayMessage.metadata?.turnId);
     const hasVisiblePart = displayMessage.parts.some((part) => part.type !== "step-start");
+    const publishedDeliverables = task?.status === "completed"
+        ? deliverablesForTurn(events, displayMessage.metadata?.turnId)
+        : [];
     return (_jsx(DeliverableOpenContext.Provider, { value: onOpenDeliverable, children: _jsxs(Message, { "data-optimistic": message.metadata?.optimistic ? "true" : undefined, from: message.role, children: [_jsxs(MessageContent, { className: message.role === "assistant" ? "w-full" : undefined, children: [message.role === "assistant" && isStreaming && !hasVisiblePart ? (_jsx(ReasoningRoot, { className: "mb-1", role: "status", streaming: true, variant: "ghost", children: _jsx(ReasoningTrigger, { active: true, label: localize(locale, "Thinking", "正在思考") }) })) : null, task ? (_jsxs(_Fragment, { children: [_jsxs(ExecutionGroup, { collapseWhenSettled: task.status === "completed" && Boolean(task.finalPart?.text.trim() ||
-                                        hasLaterFinalDelivery(events, message.metadata?.turnId)), fallbackStartedAt: fallbackStartedAt, locale: locale, task: task, children: [_jsx(ProcessParts, { assetUrl: assetUrl, canRespond: canRespond, closedInputRequestIds: closedInputRequestIds, events: events, inActiveExecution: task.status === "running" || task.status === "waiting", locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, parts: task.processParts, turnId: message.metadata?.turnId }), task.proxiedInputParts.map((part) => (_jsxs("div", { className: "space-y-2", children: [_jsx("p", { className: "text-xs font-medium text-amber-700 dark:text-amber-300", children: localize(locale, "A delegated task needs your approval", "子代理任务需要你的批准") }), _jsx(AgentMessagePart, { assetUrl: assetUrl, canRespond: canRespond, closedInputRequestIds: closedInputRequestIds, events: events, inActiveExecution: true, locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, part: part, turnId: message.metadata?.turnId })] }, `proxied-input:${part.toolCallId}`)))] }), task.finalPart ? (_jsx("div", { className: "pt-3", children: _jsx(AgentMessagePart, { assetUrl: assetUrl, canRespond: canRespond, events: events, inActiveExecution: false, locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, part: task.finalPart, turnId: message.metadata?.turnId }) })) : null] })) : displayMessage.parts.map((part, index) => (_jsx(AgentMessagePart, { assetUrl: assetUrl, canRespond: canRespond, events: events, inActiveExecution: false, locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, part: part, turnId: message.metadata?.turnId }, partKey(part, index)))), failure ? _jsx(TurnFailure, { failure: failure, locale: locale }) : null] }), showCopyAction && message.role === "assistant" && responseText && !isStreaming ? (_jsx(CopyResponseAction, { locale: locale, text: responseText })) : null] }) }));
+                                        hasLaterFinalDelivery(events, message.metadata?.turnId)), fallbackStartedAt: fallbackStartedAt, locale: locale, task: task, children: [_jsx(ProcessParts, { assetUrl: assetUrl, canRespond: canRespond, closedInputRequestIds: closedInputRequestIds, events: events, inActiveExecution: task.status === "running" || task.status === "waiting", locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, parts: task.processParts, turnId: message.metadata?.turnId }), task.proxiedInputParts.map((part) => (_jsxs("div", { className: "space-y-2", children: [_jsx("p", { className: "text-xs font-medium text-amber-700 dark:text-amber-300", children: localize(locale, "A delegated task needs your approval", "子代理任务需要你的批准") }), _jsx(AgentMessagePart, { assetUrl: assetUrl, canRespond: canRespond, closedInputRequestIds: closedInputRequestIds, events: events, inActiveExecution: true, locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, part: part, turnId: message.metadata?.turnId })] }, `proxied-input:${part.toolCallId}`)))] }), task.finalPart ? (_jsx("div", { className: "pt-3", children: _jsx(AgentMessagePart, { assetUrl: assetUrl, canRespond: canRespond, events: events, inActiveExecution: false, locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, part: task.finalPart, turnId: message.metadata?.turnId }) })) : null, publishedDeliverables.length > 0 ? (_jsx("div", { className: "space-y-2 pt-3", "data-turn-deliverables": true, children: publishedDeliverables.map((deliverable) => _jsx(PublishedDeliverableCard, { deliverable: deliverable, locale: locale }, `${deliverable.kind}:${deliverable.id}`)) })) : null] })) : displayMessage.parts.map((part, index) => (_jsx(AgentMessagePart, { assetUrl: assetUrl, canRespond: canRespond, events: events, inActiveExecution: false, locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, part: part, turnId: message.metadata?.turnId }, partKey(part, index)))), failure ? _jsx(TurnFailure, { failure: failure, locale: locale }) : null] }), showCopyAction && message.role === "assistant" && responseText && !isStreaming ? (_jsx(CopyResponseAction, { locale: locale, text: responseText })) : null] }) }));
 }
 function AgentMessagePart({ assetUrl, canRespond, closedInputRequestIds = EMPTY_CLOSED_INPUT_REQUEST_IDS, events, inActiveExecution, locale, onOpenSubagent, onInputResponses, onCloseInputRequest = () => undefined, part, turnId, }) {
     switch (part.type) {
@@ -568,6 +571,33 @@ function publishedDeliverable(value, kind, url) {
         title,
         url,
     };
+}
+function deliverablesForTurn(events, turnId) {
+    if (!turnId)
+        return [];
+    const deliverables = new Map();
+    for (const event of events) {
+        if (event.type !== "action.result" || event.data.turnId !== turnId || event.data.status !== "completed" || event.data.result.kind !== "tool-result")
+            continue;
+        const normalized = normalizeToolName(event.data.result.toolName);
+        const kind = ["publish_preview", "website_preview"].includes(normalized)
+            ? "website-preview"
+            : ["publish_artifact", "artifact_publish"].includes(normalized)
+                ? "artifact"
+                : undefined;
+        if (!kind)
+            continue;
+        const deliverable = publishedDeliverable(event.data.result.output, kind, firstUrl(event.data.result.output));
+        if (deliverable)
+            deliverables.set(`${deliverable.kind}:${deliverable.id}`, deliverable);
+    }
+    return [...deliverables.values()];
+}
+function PublishedDeliverableCard({ deliverable, locale }) {
+    const openDeliverable = useContext(DeliverableOpenContext);
+    return _jsx(ArtifactCard, { icon: deliverable.kind === "website-preview" ? _jsx(MonitorIcon, { className: "size-4" }) : undefined, meta: deliverable.kind === "website-preview"
+            ? [localize(locale, "Website preview", "网站预览"), deliverable.fileCount ? `${deliverable.fileCount} ${localize(locale, "files", "个文件")}` : undefined, formatBytes(deliverable.sizeBytes)].filter(Boolean).join(" · ")
+            : [deliverable.mediaType, formatBytes(deliverable.sizeBytes)].filter(Boolean).join(" · ") || localize(locale, "Session artifact", "会话产物"), onClick: () => openDeliverable ? openDeliverable(deliverable) : window.open(deliverable.url, "_blank", "noopener,noreferrer"), title: deliverable.title });
 }
 function todoItems(inputValue, outputValue) {
     const source = todoArray(inputValue) ?? todoArray(outputValue) ?? [];

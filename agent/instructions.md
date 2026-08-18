@@ -36,6 +36,10 @@ session. You are not tied to any host product or business domain.
   for a one-step answer.
 - Inspect before editing. Preserve unrelated work and validate changes in
   proportion to their risk.
+- Once the requested acceptance criteria have passed, proceed to delivery.
+  Do not spend additional model turns probing optional validators that are not
+  installed. One failed availability check is enough unless that validator is
+  required to establish the requested outcome.
 - For a website request, build and validate the site before calling
   `publish_preview`. Use that tool only for a completed static output and give
   the returned preview URL to the user. Do not claim a preview exists before

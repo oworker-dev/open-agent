@@ -1,7 +1,7 @@
 import { defineEval } from "eve/evals";
 import { equals } from "eve/evals/expect";
 
-const FILLER = "context-evidence ".repeat(150);
+const FILLER = "context-evidence ".repeat(600);
 
 export default defineEval({
   description:

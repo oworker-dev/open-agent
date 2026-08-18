@@ -1,12 +1,13 @@
 import { type MessageStreamEvent } from "eve/client";
-import type { AgentAssetEndpoint, AgentModelOption, AgentSessionAsset, AgentSubagentLoader, AgentThread, AgentThreadPreferences, AgentWorkspaceClientConfig, AgentWorkspaceMailbox } from "./contracts.js";
+import type { AgentAssetEndpoint, AgentDeliverableEndpoint, AgentModelOption, AgentSessionAsset, AgentSessionDeliverable, AgentSubagentLoader, AgentThread, AgentThreadPreferences, AgentWorkspaceClientConfig, AgentWorkspaceMailbox } from "./contracts.js";
 import { type AgentThreadStorage } from "./thread-storage.js";
-export declare function AgentWorkspace({ assetEndpoint, client, commands, defaultPreferences, extensions, hostSlots, initialSubagentSessionId, initialThreadId, loadSubagents, mailbox, models, mentions, onEvent, onOpenAsset, onDeleteThread, onActiveSubagentChange, onActiveThreadChange, onStorageError, productName, reasoningLevels, runtimeStatus, storageKey, threadStorage, }: {
+export declare function AgentWorkspace({ assetEndpoint, client, commands, defaultPreferences, deliverableEndpoint, extensions, hostSlots, initialSubagentSessionId, initialThreadId, loadSubagents, mailbox, models, mentions, onEvent, onOpenAsset, onDeleteThread, onActiveSubagentChange, onActiveThreadChange, onOpenDeliverable, onStorageError, productName, reasoningLevels, runtimeStatus, storageKey, threadStorage, }: {
     readonly agentName?: string;
     readonly assetEndpoint?: AgentAssetEndpoint;
     readonly client?: AgentWorkspaceClientConfig;
     readonly commands?: readonly import("./contracts.js").AgentPromptMenuItem[];
     readonly defaultPreferences: AgentThreadPreferences;
+    readonly deliverableEndpoint?: AgentDeliverableEndpoint;
     readonly extensions?: readonly import("./contracts.js").AgentExtensionInfo[];
     readonly hostSlots?: {
         readonly sidebarFooter?: React.ReactNode;
@@ -23,6 +24,7 @@ export declare function AgentWorkspace({ assetEndpoint, client, commands, defaul
     readonly onDeleteThread?: (thread: AgentThread) => void | Promise<void>;
     readonly onActiveSubagentChange?: (threadId: string, sessionId?: string) => void;
     readonly onActiveThreadChange?: (threadId?: string) => void;
+    readonly onOpenDeliverable?: (deliverable: AgentSessionDeliverable) => void;
     readonly onStorageError?: (error: unknown) => void;
     readonly productName?: string;
     readonly reasoningLevels: readonly string[];

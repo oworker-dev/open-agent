@@ -1,6 +1,9 @@
 import { createHash } from "node:crypto";
 import { Client, ClientError, type MessageStreamEvent } from "eve/client";
-import type { AgentRunPolicy } from "@oworker/open-agent-contracts/agent-run";
+import type {
+  AgentRunInputResponse,
+  AgentRunPolicy,
+} from "@oworker/open-agent-contracts/agent-run";
 import type { ParsedStartAgentRun } from "./input";
 
 const DEFAULT_RUNTIME_REQUEST_TIMEOUT_MS = 60_000;
@@ -71,6 +74,7 @@ export async function readEveAgentEvents(
         accessToken,
         correlationId,
         cursor,
+        limit: limit - events.length,
         runId,
         sessionId,
       });
@@ -118,6 +122,7 @@ async function readBoundedEventPage(input: {
   readonly accessToken: string;
   readonly correlationId: string;
   readonly cursor: number;
+  readonly limit: number;
   readonly runId: string;
   readonly sessionId: string;
 }): Promise<{ readonly events: readonly MessageStreamEvent[]; readonly tailIndex: number }> {
@@ -158,9 +163,9 @@ async function readBoundedEventPage(input: {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
-    let reachedTail = false;
+    let pageComplete = false;
     try {
-      while (!reachedTail) {
+      while (!pageComplete) {
         const next = await reader.read();
         if (next.done) break;
         buffer += decoder.decode(next.value, { stream: true });
@@ -170,15 +175,18 @@ async function readBoundedEventPage(input: {
           if (!line.trim()) continue;
           const event = parseEvent(line);
           events.push(event);
-          if (input.cursor + events.length - 1 >= tailIndex) {
-            reachedTail = true;
+          if (
+            events.length >= input.limit
+            || input.cursor + events.length - 1 >= tailIndex
+          ) {
+            pageComplete = true;
             break;
           }
         }
       }
-      if (!reachedTail) {
+      if (!pageComplete) {
         buffer += decoder.decode();
-        if (buffer.trim()) {
+        if (buffer.trim() && events.length < input.limit) {
           const event = parseEvent(buffer);
           events.push(event);
         }
@@ -242,6 +250,21 @@ export async function cancelEveAgentRun(
 ): Promise<"accepted" | "no_active_turn"> {
   const session = createClient(accessToken, runId, correlationId).sessions.attach(sessionId);
   return (await session.cancel()).status;
+}
+
+export async function respondEveAgentRun(
+  runId: string,
+  correlationId: string,
+  sessionId: string,
+  accessToken: string,
+  inputResponses: readonly AgentRunInputResponse[],
+): Promise<EveAgentSessionRef> {
+  const session = createClient(accessToken, runId, correlationId).sessions.attach(sessionId);
+  const response = await session.respond(inputResponses, {
+    signal: AbortSignal.timeout(runtimeRequestTimeoutMs()),
+    streamReconnectPolicy: { reconnect: false },
+  });
+  return { sessionId: response.sessionId };
 }
 
 export async function resetEveAgentRun(

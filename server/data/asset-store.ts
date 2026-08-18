@@ -304,7 +304,14 @@ export function createFilesystemAssetStore(options: FilesystemAssetStoreOptions)
       const result: AssetMetadata[] = [];
       for (const assetId of await childDirectories(join(root, "assets"))) {
         const metadata = await readAssetMetadata(root, assetId);
-        if (!metadata || metadata.sessionId !== sessionId || metadata.status !== "ready") continue;
+        if (
+          !metadata
+          || metadata.sessionId !== sessionId
+          || metadata.status !== "ready"
+          // A rejected/error scan is deliberately not a session deliverable,
+          // even though its bytes remain retained until expiry/cleanup.
+          || (metadata.scanStatus !== "clean" && metadata.scanStatus !== "disabled")
+        ) continue;
         if (metadata.expiresAt && Date.parse(metadata.expiresAt) <= Date.now()) continue;
         if (!sameOwner(metadata, owner)) continue;
         result.push(metadata);

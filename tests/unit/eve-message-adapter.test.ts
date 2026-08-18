@@ -89,6 +89,54 @@ test("Eve partial tool snapshots remain active until the final action result", (
   assert.deepEqual(settled?.output, { content: "first line\nsecond line\nthird line\n" });
 });
 
+test("provider tool arguments stream into one durable tool part before execution", () => {
+  const reducer = defaultMessageReducer();
+  let data = reducer.initial();
+  data = reducer.reduce(data, streamEvent("step.started", {
+    sequence: 0,
+    stepIndex: 0,
+    turnId: "turn-stream",
+  }));
+  data = reducer.reduce(data, streamEvent("action.input.partial", {
+    callId: "call-patch",
+    input: { patch: "*** Begin Patch\n*** Update File: site.css" },
+    inputTextDelta: "site.css",
+    inputTextSoFar: '{"patch":"*** Begin Patch\\n*** Update File: site.css',
+    sequence: 0,
+    stepIndex: 0,
+    toolName: "apply_patch",
+    turnId: "turn-stream",
+  }));
+
+  const streaming = data.messages[0]?.parts.find((part) => part.type === "dynamic-tool");
+  assert.equal(streaming?.type, "dynamic-tool");
+  assert.equal(streaming?.state, "input-streaming");
+  assert.equal(streaming?.toolName, "apply_patch");
+  assert.equal(streaming?.inputText, '{"patch":"*** Begin Patch\\n*** Update File: site.css');
+  assert.deepEqual(streaming?.input, { patch: "*** Begin Patch\n*** Update File: site.css" });
+
+  const [converted] = convertEveMessages(data);
+  assert.equal(converted?.role, "assistant");
+  const tool = converted?.content.find((part) => part.type === "tool-call");
+  assert.equal(tool?.type, "tool-call");
+  assert.equal(tool?.argsText, streaming?.inputText);
+
+  data = reducer.reduce(data, streamEvent("actions.requested", {
+    actions: [{
+      callId: "call-patch",
+      input: { patch: "*** Begin Patch\n*** Update File: site.css\n*** End Patch" },
+      kind: "tool-call",
+      toolName: "apply_patch",
+    }],
+    sequence: 0,
+    stepIndex: 0,
+    turnId: "turn-stream",
+  }));
+  const complete = data.messages[0]?.parts.find((part) => part.type === "dynamic-tool");
+  assert.equal(complete?.type, "dynamic-tool");
+  assert.equal(complete?.state, "input-available");
+});
+
 function streamEvent(
   type: MessageStreamEvent["type"],
   data: Record<string, unknown>,

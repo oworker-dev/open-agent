@@ -18,6 +18,7 @@ import { AgentThreadStorageConflictError } from "./http-thread-storage.js";
 import { messagesFor, resolveBrowserLocale } from "./i18n.js";
 import { AGENT_THREAD_STORAGE_VERSION, browserThreadStorage, appendThreadEvent, compactThreadEvents, createAgentThread, } from "./thread-storage.js";
 import { hasUnresolvedInputRequests, mergeSubagentSessions, shouldSuppressInterruptedTurnStreamEvent, } from "./turn-presentation.js";
+import { loadSessionDeliverables } from "./session-deliverables.js";
 const DEFAULT_STORAGE_KEY = "open-agent:threads:v1";
 const STORAGE_URGENT_SAVE_DELAY_MS = 50;
 const STORAGE_STREAM_CHECKPOINT_MS = 15_000;
@@ -27,7 +28,7 @@ const SIDEBAR_MAX_WIDTH = 420;
 const SIDEBAR_DEFAULT_WIDTH = 252;
 const SIDEBAR_COLLAPSED_THRESHOLD = 1;
 const FLOATING_SIDEBAR_DEFAULT_WIDTH = 288;
-export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPreferences, extensions = [], hostSlots, initialSubagentSessionId, initialThreadId, loadSubagents, mailbox, models, mentions = [], onEvent, onOpenAsset, onDeleteThread, onActiveSubagentChange, onActiveThreadChange, onStorageError, productName = "Agent", reasoningLevels, runtimeStatus = { provider: "ready" }, storageKey = DEFAULT_STORAGE_KEY, threadStorage = browserThreadStorage, }) {
+export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPreferences, deliverableEndpoint, extensions = [], hostSlots, initialSubagentSessionId, initialThreadId, loadSubagents, mailbox, models, mentions = [], onEvent, onOpenAsset, onDeleteThread, onActiveSubagentChange, onActiveThreadChange, onOpenDeliverable, onStorageError, productName = "Agent", reasoningLevels, runtimeStatus = { provider: "ready" }, storageKey = DEFAULT_STORAGE_KEY, threadStorage = browserThreadStorage, }) {
     validateWorkspaceCatalog(models, reasoningLevels, defaultPreferences);
     const catalogSignature = JSON.stringify({ models, reasoningLevels });
     const stableDefaults = useMemo(() => ({
@@ -55,6 +56,10 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
     const [secondaryTab, setSecondaryTab] = useState("home");
     const [secondaryChildSessionId, setSecondaryChildSessionId] = useState();
     const [sessionAssets, setSessionAssets] = useState([]);
+    const [sessionDeliverables, setSessionDeliverables] = useState([]);
+    const [deliverablesLoading, setDeliverablesLoading] = useState(false);
+    const [deliverablesError, setDeliverablesError] = useState();
+    const [requestedDeliverable, setRequestedDeliverable] = useState();
     const [durableSubagents, setDurableSubagents] = useState([]);
     const [assetsLoading, setAssetsLoading] = useState(false);
     const [assetsError, setAssetsError] = useState();
@@ -67,6 +72,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
     const storageSaveDueAt = useRef(undefined);
     const workbenchTransitionTimer = useRef(undefined);
     const workbenchTransition = useRef(undefined);
+    const deliverableRequestSequence = useRef(0);
     const lastSidebarWidth = useRef(SIDEBAR_DEFAULT_WIDTH);
     const pendingCollection = useRef(undefined);
     const messages = messagesFor(locale);
@@ -377,6 +383,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
         setRecoveringIds((current) => withoutSetValue(current, threadId));
     }, []);
     const activeThread = threads.find((thread) => thread.id === activeThreadId) ?? threads[0];
+    const publicationRefreshKey = activeThread ? latestPublicationResultKey(activeThread.events) : undefined;
     useEffect(() => {
         let cancelled = false;
         const sessionId = activeThread?.session.sessionId;
@@ -445,16 +452,51 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
         })();
         return () => controller.abort();
     }, [activeThread?.session.sessionId, assetEndpoint, client]);
+    const refreshDeliverables = useCallback(() => {
+        const sessionId = activeThread?.session.sessionId;
+        if (!sessionId) {
+            setSessionDeliverables([]);
+            setDeliverablesError(undefined);
+            return;
+        }
+        const controller = new AbortController();
+        setDeliverablesLoading(true);
+        setDeliverablesError(undefined);
+        void loadSessionDeliverables({ client, endpoint: deliverableEndpoint, sessionId, signal: controller.signal })
+            .then((items) => setSessionDeliverables(items))
+            .catch((error) => {
+            if (!controller.signal.aborted)
+                setDeliverablesError(error instanceof Error ? error.message : "The session deliverables could not be loaded.");
+        })
+            .finally(() => {
+            if (!controller.signal.aborted)
+                setDeliverablesLoading(false);
+        });
+        return () => controller.abort();
+    }, [activeThread?.session.sessionId, client, deliverableEndpoint]);
     useEffect(() => {
         if (!secondaryOpen || activeSubagentSessionId)
             return;
-        const cleanup = refreshAssets();
-        return typeof cleanup === "function" ? cleanup : undefined;
-    }, [activeSubagentSessionId, refreshAssets, secondaryOpen]);
+        const cleanups = [refreshAssets(), refreshDeliverables()];
+        return () => {
+            for (const cleanup of cleanups)
+                if (typeof cleanup === "function")
+                    cleanup();
+        };
+    }, [activeSubagentSessionId, publicationRefreshKey, refreshAssets, refreshDeliverables, secondaryOpen]);
     useEffect(() => {
         if (!activeThread?.session.sessionId)
             setSecondaryOpen(false);
     }, [activeThread?.session.sessionId]);
+    const openDeliverable = useCallback((deliverable) => {
+        if (onOpenDeliverable) {
+            onOpenDeliverable(deliverable);
+            return;
+        }
+        deliverableRequestSequence.current += 1;
+        setRequestedDeliverable({ deliverable, requestId: deliverableRequestSequence.current });
+        setSecondaryOpen(true);
+    }, [onOpenDeliverable]);
     const hydrateThread = useCallback((thread) => {
         if (thread.hydration !== "summary" || !threadStorage.loadThread)
             return;
@@ -823,13 +865,11 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
     return (_jsxs("div", { className: "open-agent-ui relative h-dvh overflow-hidden bg-sidebar text-foreground", "data-panel-resizing": panelResizing ? "true" : "false", "data-workbench-fullscreen": workbenchFullscreen ? "true" : "false", "data-workbench-mode": desktopLayout ? workbenchMode : "mobile", children: [!desktopLayout ? _jsx(AgentSidebar, { activeThreadId: activeThread.id, brand: productName, deletingThreadIds: deletingThreadIds, hostFooter: hostSlots?.sidebarFooter, locale: locale, messages: messages, onClose: () => setSidebarOpen(false), onDelete: deleteThread, onNew: createThread, onRename: renameThread, onSelect: selectThread, onSettings: () => setSettingsOpen(true), open: sidebarOpen, threads: threads, variant: "mobile" }) : null, _jsxs(ResizablePanelGroup, { className: "h-full", onLayoutChanged: handleDesktopLayoutChanged, orientation: "horizontal", children: [desktopLayout ? (_jsx(ResizablePanel, { className: "block", collapsedSize: "0px", collapsible: true, "data-sidebar-panel": true, defaultSize: `${SIDEBAR_DEFAULT_WIDTH}px`, id: "agent-sidebar", maxSize: `${SIDEBAR_MAX_WIDTH}px`, minSize: `${SIDEBAR_MIN_WIDTH}px`, onResize: handleSidebarResize, panelRef: sidebarPanelRef, children: _jsx(AgentSidebar, { activeThreadId: activeThread.id, brand: productName, deletingThreadIds: deletingThreadIds, hostFooter: hostSlots?.sidebarFooter, locale: locale, messages: messages, onClose: () => setSidebarOpen(false), onDelete: deleteThread, onNew: createThread, onRename: renameThread, onSelect: selectThread, onSettings: () => setSettingsOpen(true), open: sidebarOpen, threads: threads, variant: "desktop" }) })) : null, desktopLayout ? _jsx(ResizableHandle, { className: "flex bg-transparent after:w-2", "data-main-resize-handle": true, disabled: workbenchMode !== "split", onPointerDown: () => {
                             if (workbenchMode === "split")
                                 setPanelResizing(true);
-                        } }) : null, _jsx(ResizablePanel, { className: "min-w-0 p-0", "data-workbench-panel": true, defaultSize: "100%", id: "agent-workbench", minSize: "0px", children: _jsxs(ResizablePanelGroup, { className: "h-full", orientation: "horizontal", children: [_jsx(ResizablePanel, { className: cn("min-w-0", secondaryOpen && !desktopLayout && "hidden"), defaultSize: secondaryOpen && !desktopLayout ? "0%" : secondaryOpen ? "70%" : "100%", id: "agent-primary", minSize: "0px", children: _jsxs("section", { className: "flex h-full min-w-0 flex-col overflow-hidden bg-card", "data-slot": "agent-workbench", children: [_jsxs("header", { className: "flex h-12 shrink-0 items-center justify-between border-b border-border/70 px-3 lg:h-13 lg:px-4", children: [_jsxs("div", { className: "flex min-w-0 items-center gap-2", children: [_jsx(Button, { "aria-label": messages.openNavigation, className: "lg:hidden", onClick: () => setSidebarOpen(true), size: "icon-sm", variant: "ghost", children: _jsx(MenuIcon, { className: "size-4" }) }), _jsx(Button, { "aria-label": messages.toggleNavigation, className: "hidden lg:inline-flex", disabled: workbenchTransitioning, onClick: toggleDesktopSidebar, size: "icon-sm", variant: "ghost", children: workbenchMode === "split" ? _jsx(PanelLeftCloseIcon, { className: "size-4" }) : _jsx(PanelLeftIcon, { className: "size-4" }) }), activeSubagentSessionId ? (_jsx(Button, { "aria-label": messages.backToTask, onClick: closeSubagent, size: "icon-sm", variant: "ghost", children: _jsx(ArrowLeftIcon, { className: "size-4" }) })) : null, _jsx("h2", { className: "truncate font-medium text-[15px]", children: activeSubagentSessionId ? activeSubagent?.label ?? messages.subagentSession : activeThread.title })] }), _jsxs("div", { className: "flex items-center gap-1", children: [_jsx(Button, { "aria-label": secondaryOpen ? messages.closeSecondaryView : messages.openSecondaryView, onClick: () => setSecondaryOpen((open) => !open), size: "icon-sm", variant: "ghost", children: _jsx(PanelRightIcon, { className: "size-4" }) }), _jsx(AgentSubagentMenu, { activeSessionId: activeSubagentSessionId, durableSessions: durableSubagents, events: activeThread.events, locale: locale, onOpen: openSubagent }), hostSlots?.threadHeaderEnd] })] }), deletionIssue ? (_jsxs("div", { className: "flex shrink-0 items-center gap-3 border-b border-destructive/30 bg-destructive/5 px-4 py-2.5 text-sm", role: "alert", children: [_jsx(AlertCircleIcon, { className: "size-4 shrink-0 text-destructive" }), _jsx("p", { className: "min-w-0 flex-1 text-foreground", children: messages.deleteUnavailable }), _jsx(Button, { onClick: () => setDeletionIssue(false), size: "sm", variant: "outline", children: messages.dismiss })] })) : null, runtimeStatus.provider !== "ready" ? (_jsxs("div", { className: "flex shrink-0 items-start gap-3 border-b border-amber-500/30 bg-amber-500/8 px-4 py-2.5 text-sm", role: "status", children: [_jsx(ServerOffIcon, { className: "mt-0.5 size-4 shrink-0 text-amber-700 dark:text-amber-300" }), _jsx("p", { className: "min-w-0 flex-1 text-foreground", children: runtimeStatus.provider === "mock" ? messages.mockProvider : messages.providerUnconfigured })] })) : null, activeIsHydrating ? (_jsx("main", { className: "flex min-h-0 flex-1 items-center justify-center bg-background px-6", children: threadHydrationErrors.has(activeThread.id) ? (_jsxs("div", { className: "max-w-md text-center", role: "alert", children: [_jsx(AlertCircleIcon, { className: "mx-auto size-5 text-destructive" }), _jsx("p", { className: "mt-3 text-sm text-muted-foreground", children: threadHydrationErrors.get(activeThread.id) ?? messages.recoveryFailed }), _jsx(Button, { className: "mt-4", onClick: () => hydrateThread(activeThread), size: "sm", variant: "outline", children: messages.retry })] })) : (_jsx("p", { className: "text-sm text-muted-foreground", role: "status", children: messages.loading })) })) : activeSubagentSessionId ? (activeSubagent ? (_jsx(AgentChildSessionView, { client: client, commands: commands, locale: locale, mailbox: mailbox, mentions: mentions, models: models, onEvent: onEvent, onOpenSubagent: openSubagent, preferences: activeThread.preferences, reasoningLevels: reasoningLevels, sessionId: activeSubagentSessionId })) : (_jsx(UnavailableSubagentView, { locale: locale, onBack: closeSubagent }))) : (_jsx("div", { className: "flex min-h-0 flex-1 flex-col", children: _jsx(AgentThreadView, { client: client, commands: commands, draftStorageKey: ephemeralThreadIds.has(activeThread.id)
+                        } }) : null, _jsx(ResizablePanel, { className: "min-w-0 p-0", "data-workbench-panel": true, defaultSize: "100%", id: "agent-workbench", minSize: "0px", children: _jsxs(ResizablePanelGroup, { className: "h-full", orientation: "horizontal", children: [_jsx(ResizablePanel, { className: cn("min-w-0", secondaryOpen && !desktopLayout && "hidden"), defaultSize: secondaryOpen && !desktopLayout ? "0%" : secondaryOpen ? "70%" : "100%", id: "agent-primary", minSize: "0px", children: _jsxs("section", { className: "flex h-full min-w-0 flex-col overflow-hidden bg-card", "data-slot": "agent-workbench", children: [_jsxs("header", { className: "flex h-12 shrink-0 items-center justify-between border-b border-border/70 px-3 lg:h-13 lg:px-4", children: [_jsxs("div", { className: "flex min-w-0 items-center gap-2", children: [_jsx(Button, { "aria-label": messages.openNavigation, className: "lg:hidden", onClick: () => setSidebarOpen(true), size: "icon-sm", variant: "ghost", children: _jsx(MenuIcon, { className: "size-4" }) }), _jsx(Button, { "aria-label": messages.toggleNavigation, className: "hidden lg:inline-flex", disabled: workbenchTransitioning, onClick: toggleDesktopSidebar, size: "icon-sm", variant: "ghost", children: workbenchMode === "split" ? _jsx(PanelLeftCloseIcon, { className: "size-4" }) : _jsx(PanelLeftIcon, { className: "size-4" }) }), activeSubagentSessionId ? (_jsx(Button, { "aria-label": messages.backToTask, onClick: closeSubagent, size: "icon-sm", variant: "ghost", children: _jsx(ArrowLeftIcon, { className: "size-4" }) })) : null, _jsx("h2", { className: "truncate font-medium text-[15px]", children: activeSubagentSessionId ? activeSubagent?.label ?? messages.subagentSession : activeThread.title })] }), _jsxs("div", { className: "flex items-center gap-1", children: [_jsx(Button, { "aria-label": secondaryOpen ? messages.closeSecondaryView : messages.openSecondaryView, onClick: () => setSecondaryOpen((open) => !open), size: "icon-sm", variant: "ghost", children: _jsx(PanelRightIcon, { className: "size-4" }) }), _jsx(AgentSubagentMenu, { activeSessionId: activeSubagentSessionId, durableSessions: durableSubagents, events: activeThread.events, locale: locale, onOpen: openSubagent }), hostSlots?.threadHeaderEnd] })] }), deletionIssue ? (_jsxs("div", { className: "flex shrink-0 items-center gap-3 border-b border-destructive/30 bg-destructive/5 px-4 py-2.5 text-sm", role: "alert", children: [_jsx(AlertCircleIcon, { className: "size-4 shrink-0 text-destructive" }), _jsx("p", { className: "min-w-0 flex-1 text-foreground", children: messages.deleteUnavailable }), _jsx(Button, { onClick: () => setDeletionIssue(false), size: "sm", variant: "outline", children: messages.dismiss })] })) : null, runtimeStatus.provider !== "ready" ? (_jsxs("div", { className: "flex shrink-0 items-start gap-3 border-b border-amber-500/30 bg-amber-500/8 px-4 py-2.5 text-sm", role: "status", children: [_jsx(ServerOffIcon, { className: "mt-0.5 size-4 shrink-0 text-amber-700 dark:text-amber-300" }), _jsx("p", { className: "min-w-0 flex-1 text-foreground", children: runtimeStatus.provider === "mock" ? messages.mockProvider : messages.providerUnconfigured })] })) : null, activeIsHydrating ? (_jsx("main", { className: "flex min-h-0 flex-1 items-center justify-center bg-background px-6", children: threadHydrationErrors.has(activeThread.id) ? (_jsxs("div", { className: "max-w-md text-center", role: "alert", children: [_jsx(AlertCircleIcon, { className: "mx-auto size-5 text-destructive" }), _jsx("p", { className: "mt-3 text-sm text-muted-foreground", children: threadHydrationErrors.get(activeThread.id) ?? messages.recoveryFailed }), _jsx(Button, { className: "mt-4", onClick: () => hydrateThread(activeThread), size: "sm", variant: "outline", children: messages.retry })] })) : (_jsx("p", { className: "text-sm text-muted-foreground", role: "status", children: messages.loading })) })) : activeSubagentSessionId ? (activeSubagent ? (_jsx(AgentChildSessionView, { client: client, commands: commands, locale: locale, mailbox: mailbox, mentions: mentions, models: models, onEvent: onEvent, onOpenDeliverable: openDeliverable, onOpenSubagent: openSubagent, onStorageError: onStorageError, preferences: activeThread.preferences, providerReady: runtimeStatus.provider !== "unconfigured", reasoningLevels: reasoningLevels, sessionId: activeSubagentSessionId, storageKey: storageKey, threadStorage: threadStorage })) : (_jsx(UnavailableSubagentView, { locale: locale, onBack: closeSubagent }))) : (_jsx("div", { className: "flex min-h-0 flex-1 flex-col", children: _jsx(AgentThreadView, { client: client, commands: commands, draftStorageKey: ephemeralThreadIds.has(activeThread.id)
                                                         ? `${storageKey}:draft:new`
-                                                        : `${storageKey}:draft:${activeThread.id}`, isRecovering: activeIsRecovering, locale: locale, mailbox: mailbox, mentions: mentions, models: models, onCancelRecovery: () => cancelThreadRecovery(activeThread.id), onChange: changeActiveThread, onEvent: onEvent, onOpenSubagent: openSubagent, onRetryRecovery: () => requestThreadRecovery(activeThread.id), onRecoveryNeeded: recoverActiveThread, providerReady: runtimeStatus.provider !== "unconfigured", recoveryError: recoveryErrors.get(activeThread.id), reasoningLevels: reasoningLevels, thread: activeThread }, `${activeThread.id}:${activeThread.revision ?? 0}:${activeIsRecovering ? "recovering" : "ready"}`) }))] }) }), secondaryOpen ? (_jsxs(_Fragment, { children: [desktopLayout ? _jsx(ResizableHandle, { className: "flex bg-transparent after:w-2", "data-secondary-resize-handle": true }) : null, _jsx(ResizablePanel, { className: "min-w-0 border-l border-border/70", defaultSize: desktopLayout ? "30%" : "100%", id: "agent-secondary", maxSize: desktopLayout ? "50%" : "100%", minSize: desktopLayout ? "260px" : "0px", children: _jsx(AgentSecondaryView, { assetUrl: client?.assetUrl, assets: sessionAssets, assetsError: assetsError, assetsLoading: assetsLoading, children: activeThread ? subagentsForThread(activeThread.events, durableSubagents) : [], childContent: secondaryChildSessionId && activeThread ? (_jsx(AgentChildSessionView, { client: client, commands: commands, locale: locale, mailbox: mailbox, mentions: mentions, models: models, onEvent: onEvent, onOpenSubagent: openSubagent, preferences: activeThread.preferences, reasoningLevels: reasoningLevels, sessionId: secondaryChildSessionId })) : undefined, locale: locale, onClose: () => setSecondaryOpen(false), onOpenAsset: onOpenAsset ? (asset) => onOpenAsset(asset) : undefined, onOpenChild: (sessionId) => {
-                                                    setSecondaryTab("children");
+                                                        : `${storageKey}:draft:${activeThread.id}`, isRecovering: activeIsRecovering, locale: locale, mailbox: mailbox, mentions: mentions, models: models, onCancelRecovery: () => cancelThreadRecovery(activeThread.id), onChange: changeActiveThread, onEvent: onEvent, onOpenDeliverable: openDeliverable, onOpenSubagent: openSubagent, onRetryRecovery: () => requestThreadRecovery(activeThread.id), onRecoveryNeeded: recoverActiveThread, providerReady: runtimeStatus.provider !== "unconfigured", recoveryError: recoveryErrors.get(activeThread.id), reasoningLevels: reasoningLevels, thread: activeThread }, `${activeThread.id}:${activeThread.revision ?? 0}:${activeIsRecovering ? "recovering" : "ready"}`) }))] }) }), secondaryOpen ? (_jsxs(_Fragment, { children: [desktopLayout ? _jsx(ResizableHandle, { className: "flex bg-transparent after:w-2", "data-secondary-resize-handle": true }) : null, _jsx(ResizablePanel, { className: "min-w-0 border-l border-border/70", defaultSize: desktopLayout ? "30%" : "100%", id: "agent-secondary", maxSize: desktopLayout ? "50%" : "100%", minSize: desktopLayout ? "260px" : "0px", children: _jsx(AgentSecondaryView, { assetUrl: client?.assetUrl, assets: sessionAssets, assetsError: assetsError, assetsLoading: assetsLoading, deliverables: deliverablesError ? undefined : sessionDeliverables, deliverablesError: deliverablesError, deliverablesLoading: deliverablesLoading, children: activeThread ? subagentsForThread(activeThread.events, durableSubagents) : [], childContent: secondaryChildSessionId && activeThread ? (_jsx(AgentChildSessionView, { client: client, commands: commands, locale: locale, mailbox: mailbox, mentions: mentions, models: models, onEvent: onEvent, onOpenDeliverable: openDeliverable, onOpenSubagent: openSubagent, onStorageError: onStorageError, preferences: activeThread.preferences, providerReady: runtimeStatus.provider !== "unconfigured", reasoningLevels: reasoningLevels, sessionId: secondaryChildSessionId, storageKey: storageKey, threadStorage: threadStorage })) : undefined, locale: locale, onClose: () => setSecondaryOpen(false), onOpenAsset: onOpenAsset ? (asset) => onOpenAsset(asset) : undefined, onOpenDeliverable: onOpenDeliverable, onOpenChild: (sessionId) => {
                                                     setSecondaryChildSessionId(sessionId);
-                                                    setSecondaryTab("child");
-                                                }, onRefreshAssets: refreshAssets, onSelectTab: setSecondaryTab, tab: secondaryTab }) })] })) : null] }) })] }), workbenchFullscreen ? (_jsx(FloatingAgentSidebar, { activeThreadId: activeThread.id, brand: productName, deletingThreadIds: deletingThreadIds, hostFooter: hostSlots?.sidebarFooter, locale: locale, messages: messages, onDelete: deleteThread, onNew: createThread, onRename: renameThread, onSelect: selectThread, onSettings: () => setSettingsOpen(true), threads: threads })) : null, _jsx(AgentSettingsDialog, { extensions: extensions, locale: locale, messages: messages, onLocaleChange: setLocale, onOpenChange: setSettingsOpen, open: settingsOpen })] }));
+                                                }, onRefreshAssets: refreshAssets, onRefreshDeliverables: refreshDeliverables, onSelectTab: setSecondaryTab, requestedDeliverable: requestedDeliverable?.deliverable, requestedDeliverableRequestId: requestedDeliverable?.requestId, tab: secondaryTab }) })] })) : null] }) })] }), workbenchFullscreen ? (_jsx(FloatingAgentSidebar, { activeThreadId: activeThread.id, brand: productName, deletingThreadIds: deletingThreadIds, hostFooter: hostSlots?.sidebarFooter, locale: locale, messages: messages, onDelete: deleteThread, onNew: createThread, onRename: renameThread, onSelect: selectThread, onSettings: () => setSettingsOpen(true), threads: threads })) : null, _jsx(AgentSettingsDialog, { extensions: extensions, locale: locale, messages: messages, onLocaleChange: setLocale, onOpenChange: setSettingsOpen, open: settingsOpen })] }));
 }
 function FloatingAgentSidebar({ activeThreadId, brand, deletingThreadIds, hostFooter, locale, messages, onDelete, onNew, onRename, onSelect, onSettings, threads, }) {
     const [open, setOpen] = useState(false);
@@ -1295,6 +1335,18 @@ function resolveSessionAssetEndpoint(endpoint, sessionId) {
     if (endpoint.includes(":sessionId"))
         return endpoint.replaceAll(":sessionId", encoded);
     return `${endpoint}${endpoint.includes("?") ? "&" : "?"}sessionId=${encoded}`;
+}
+function latestPublicationResultKey(events) {
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+        const event = events[index];
+        if (event?.type !== "action.result" || event.data.status !== "completed" || event.data.result.kind !== "tool-result")
+            continue;
+        const name = event.data.result.toolName.toLowerCase().replaceAll("-", "_");
+        if (["publish_artifact", "artifact_publish", "publish_preview", "website_preview"].includes(name)) {
+            return `${event.data.result.callId}:${index}`;
+        }
+    }
+    return undefined;
 }
 function parseSessionAssets(payload) {
     const values = Array.isArray(payload)

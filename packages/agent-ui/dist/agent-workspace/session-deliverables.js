@@ -1,3 +1,24 @@
+export async function loadSessionDeliverables({ client, endpoint = "/api/deliverables", fetcher = fetch, sessionId, signal, }) {
+    const configuredHeaders = typeof client?.headers === "function" ? await client.headers() : client?.headers;
+    const headers = new Headers(configuredHeaders);
+    if (client?.auth && "bearer" in client.auth) {
+        const bearer = typeof client.auth.bearer === "function" ? await client.auth.bearer() : client.auth.bearer;
+        headers.set("authorization", `Bearer ${bearer}`);
+    }
+    const base = client?.host || (typeof window !== "undefined" ? window.location.origin : "http://localhost");
+    const endpointUrl = new URL(resolveSessionDeliverableEndpoint(endpoint, sessionId), base);
+    if (endpointUrl.protocol !== "http:" && endpointUrl.protocol !== "https:") {
+        throw new Error("The deliverable endpoint must use HTTP(S).");
+    }
+    const response = await fetcher(endpointUrl, {
+        credentials: "include",
+        headers,
+        signal,
+    });
+    if (!response.ok)
+        throw new Error(`Deliverable list failed (${response.status}).`);
+    return parseSessionDeliverables(await response.json());
+}
 export function resolveSessionDeliverableEndpoint(endpoint, sessionId) {
     if (typeof endpoint === "function")
         return endpoint(sessionId);
@@ -46,6 +67,30 @@ export function parseSessionDeliverables(payload) {
         });
     }
     return deliverables;
+}
+export function mergeSessionDeliverables(deliverables, assets) {
+    const merged = new Map();
+    for (const deliverable of deliverables ?? []) {
+        merged.set(`${deliverable.kind}:${deliverable.id}`, deliverable);
+    }
+    for (const asset of assets) {
+        const deliverable = assetToDeliverable(asset);
+        const key = `${deliverable.kind}:${deliverable.id}`;
+        if (!merged.has(key))
+            merged.set(key, deliverable);
+    }
+    return [...merged.values()];
+}
+function assetToDeliverable(asset) {
+    return {
+        createdAt: asset.createdAt ?? new Date(0).toISOString(),
+        id: asset.assetId,
+        kind: "asset",
+        mediaType: asset.mediaType,
+        sizeBytes: asset.sizeBytes,
+        title: asset.filename,
+        url: asset.previewUrl ?? asset.url ?? asset.downloadUrl ?? `/api/assets/${encodeURIComponent(asset.assetId)}`,
+    };
 }
 function isDeliverableKind(value) {
     return value === "artifact" || value === "asset" || value === "website-preview";

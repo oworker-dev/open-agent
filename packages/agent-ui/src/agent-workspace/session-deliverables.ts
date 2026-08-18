@@ -1,4 +1,37 @@
-import type { AgentDeliverableEndpoint, AgentSessionDeliverable } from "./contracts.js";
+import type { AgentDeliverableEndpoint, AgentSessionDeliverable, AgentWorkspaceClientConfig } from "./contracts.js";
+
+export async function loadSessionDeliverables({
+  client,
+  endpoint = "/api/deliverables",
+  fetcher = fetch,
+  sessionId,
+  signal,
+}: {
+  readonly client?: AgentWorkspaceClientConfig;
+  readonly endpoint?: AgentDeliverableEndpoint;
+  readonly fetcher?: typeof fetch;
+  readonly sessionId: string;
+  readonly signal?: AbortSignal;
+}): Promise<readonly AgentSessionDeliverable[]> {
+  const configuredHeaders = typeof client?.headers === "function" ? await client.headers() : client?.headers;
+  const headers = new Headers(configuredHeaders);
+  if (client?.auth && "bearer" in client.auth) {
+    const bearer = typeof client.auth.bearer === "function" ? await client.auth.bearer() : client.auth.bearer;
+    headers.set("authorization", `Bearer ${bearer}`);
+  }
+  const base = client?.host || (typeof window !== "undefined" ? window.location.origin : "http://localhost");
+  const endpointUrl = new URL(resolveSessionDeliverableEndpoint(endpoint, sessionId), base);
+  if (endpointUrl.protocol !== "http:" && endpointUrl.protocol !== "https:") {
+    throw new Error("The deliverable endpoint must use HTTP(S).");
+  }
+  const response = await fetcher(endpointUrl, {
+    credentials: "include",
+    headers,
+    signal,
+  });
+  if (!response.ok) throw new Error(`Deliverable list failed (${response.status}).`);
+  return parseSessionDeliverables(await response.json() as unknown);
+}
 
 export function resolveSessionDeliverableEndpoint(endpoint: AgentDeliverableEndpoint, sessionId: string): string {
   if (typeof endpoint === "function") return endpoint(sessionId);
@@ -44,6 +77,50 @@ export function parseSessionDeliverables(payload: unknown): readonly AgentSessio
     });
   }
   return deliverables;
+}
+
+/**
+ * Merge the host's unified deliverable registry with the legacy asset list.
+ * During migration a host may expose both endpoints; an empty registry must
+ * not hide assets that are still available through the legacy endpoint.
+ */
+export function mergeSessionDeliverables(
+  deliverables: readonly AgentSessionDeliverable[] | undefined,
+  assets: readonly AgentSessionAssetLike[],
+): readonly AgentSessionDeliverable[] {
+  const merged = new Map<string, AgentSessionDeliverable>();
+  for (const deliverable of deliverables ?? []) {
+    merged.set(`${deliverable.kind}:${deliverable.id}`, deliverable);
+  }
+  for (const asset of assets) {
+    const deliverable = assetToDeliverable(asset);
+    const key = `${deliverable.kind}:${deliverable.id}`;
+    if (!merged.has(key)) merged.set(key, deliverable);
+  }
+  return [...merged.values()];
+}
+
+export type AgentSessionAssetLike = {
+  readonly assetId: string;
+  readonly createdAt?: string;
+  readonly downloadUrl?: string;
+  readonly filename: string;
+  readonly mediaType: string;
+  readonly previewUrl?: string;
+  readonly sizeBytes: number;
+  readonly url?: string;
+};
+
+function assetToDeliverable(asset: AgentSessionAssetLike): AgentSessionDeliverable {
+  return {
+    createdAt: asset.createdAt ?? new Date(0).toISOString(),
+    id: asset.assetId,
+    kind: "asset",
+    mediaType: asset.mediaType,
+    sizeBytes: asset.sizeBytes,
+    title: asset.filename,
+    url: asset.previewUrl ?? asset.url ?? asset.downloadUrl ?? `/api/assets/${encodeURIComponent(asset.assetId)}`,
+  };
 }
 
 function isDeliverableKind(value: unknown): value is AgentSessionDeliverable["kind"] {

@@ -7,6 +7,7 @@ import { attachAgentSession, createAgentSession } from "./agent-client.js";
 import type {
   AgentModelOption,
   AgentPromptMenuItem,
+  AgentSessionDeliverable,
   AgentThread,
   AgentThreadPatch,
   AgentThreadPreferences,
@@ -14,6 +15,7 @@ import type {
   AgentWorkspaceMailbox,
 } from "./contracts.js";
 import type { AgentLocale } from "./i18n.js";
+import { AGENT_THREAD_STORAGE_VERSION, type AgentThreadCollection, type AgentThreadStorage } from "./thread-storage.js";
 
 /**
  * Child sessions intentionally use the same thread controller and assistant-ui
@@ -28,10 +30,15 @@ export function AgentChildSessionView({
   mentions,
   models,
   onEvent,
+  onOpenDeliverable,
   onOpenSubagent,
+  onStorageError,
   preferences,
+  providerReady = true,
   reasoningLevels,
   sessionId,
+  storageKey,
+  threadStorage,
 }: {
   readonly client?: AgentWorkspaceClientConfig;
   readonly commands: readonly AgentPromptMenuItem[];
@@ -40,20 +47,67 @@ export function AgentChildSessionView({
   readonly mentions: readonly AgentPromptMenuItem[];
   readonly models: readonly AgentModelOption[];
   readonly onEvent?: (event: MessageStreamEvent) => void;
+  readonly onOpenDeliverable?: (deliverable: AgentSessionDeliverable) => void;
   readonly onOpenSubagent?: (sessionId: string) => void;
+  readonly onStorageError?: (error: unknown) => void;
   readonly preferences: AgentThreadPreferences;
+  readonly providerReady?: boolean;
   readonly reasoningLevels: readonly string[];
   readonly sessionId: string;
+  /** Optional host storage for client-only child state such as queued follow-ups. */
+  readonly storageKey?: string;
+  readonly threadStorage?: AgentThreadStorage;
 }) {
   const [thread, setThread] = useState<AgentThread>();
   const [loadError, setLoadError] = useState<string>();
   const [reloadGeneration, setReloadGeneration] = useState(0);
+  const pendingPersistRef = useRef<AgentThread | undefined>(undefined);
+  const persistTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const childStorageKey = storageKey ? `${storageKey}:subagent:${sessionId}` : undefined;
+
+  const flushPersistedChild = useCallback(() => {
+    const next = pendingPersistRef.current;
+    if (!next || !childStorageKey || !threadStorage) return;
+    pendingPersistRef.current = undefined;
+    const persisted: AgentThread = {
+      ...next,
+      // Eve's durable stream is the source of truth for transcript/cursor.
+      // Keep the client-only controls here so a refresh does not lose a
+      // queued follow-up or an in-flight presentation state.
+      events: [],
+      hydration: "summary",
+      session: { streamIndex: 0 },
+      updatedAt: Date.now(),
+    };
+    const collection: AgentThreadCollection = {
+      activeThreadId: sessionId,
+      threads: [persisted],
+      version: AGENT_THREAD_STORAGE_VERSION,
+    };
+    void Promise.resolve(threadStorage.save(childStorageKey, collection)).catch((error: unknown) => onStorageError?.(error));
+  }, [childStorageKey, onStorageError, threadStorage]);
+
+  const schedulePersistedChild = useCallback((next: AgentThread) => {
+    if (!childStorageKey || !threadStorage) return;
+    pendingPersistRef.current = next;
+    if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
+    persistTimerRef.current = setTimeout(() => {
+      persistTimerRef.current = undefined;
+      flushPersistedChild();
+    }, 120);
+  }, [childStorageKey, flushPersistedChild, threadStorage]);
+
   const handleThreadChange = useCallback((patch: AgentThreadPatch) => {
     setThread((current) => {
       if (!current) return current;
-      return { ...current, ...patch, updatedAt: patch.updatedAt ?? Date.now() };
+      const next = { ...current, ...patch, updatedAt: patch.updatedAt ?? Date.now() };
+      // Stream events and the absolute cursor are already durable in Eve and
+      // can be very high frequency. Persist only presentation/control state.
+      const hasClientStateChange = Object.keys(patch).some((key) => key !== "events" && key !== "session" && key !== "updatedAt");
+      if (hasClientStateChange) schedulePersistedChild(next);
+      return next;
     });
-  }, []);
+  }, [schedulePersistedChild]);
 
   useEffect(() => {
     let disposed = false;
@@ -72,11 +126,21 @@ export function AgentChildSessionView({
         // after this snapshot is projected. Keeping a second child-local SSE
         // here caused duplicate readers and remounted the thread on every
         // event, which made long-running child sessions appear to replay.
-        const snapshot = await readChildSnapshot(session, controller.signal);
+        const [snapshot, storedCollection] = await Promise.all([
+          readChildSnapshot(session, controller.signal),
+          childStorageKey && threadStorage
+            ? Promise.resolve(threadStorage.load(childStorageKey))
+            : Promise.resolve<AgentThreadCollection | undefined>(undefined),
+        ]);
         if (disposed) return;
+        const storedThread = storedCollection?.threads.find((candidate) => candidate.id === sessionId);
+        const childDefaults = storedThread?.preferences ?? preferences;
         setThread({
           ...createChildThread(sessionId, preferences),
+          ...(storedThread ? persistedChildControls(storedThread) : {}),
           events: snapshot.events,
+          id: sessionId,
+          preferences: childDefaults,
           session: snapshot.session,
           status: statusFromEvents(snapshot.events),
           updatedAt: Date.now(),
@@ -90,7 +154,13 @@ export function AgentChildSessionView({
       disposed = true;
       controller.abort();
     };
-  }, [client, preferences, reloadGeneration, sessionId]);
+  }, [childStorageKey, client, preferences, reloadGeneration, sessionId, threadStorage]);
+
+  useEffect(() => () => {
+    if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
+    persistTimerRef.current = undefined;
+    flushPersistedChild();
+  }, [flushPersistedChild]);
 
   useEffect(() => {
     setThread((current) => current && current.id === sessionId
@@ -124,13 +194,30 @@ export function AgentChildSessionView({
       models={models}
       onChange={handleThreadChange}
       onEvent={onEvent}
+      onOpenDeliverable={onOpenDeliverable}
       onOpenSubagent={onOpenSubagent}
       onRecoveryNeeded={recoverChild}
-      providerReady
+      providerReady={providerReady}
       reasoningLevels={reasoningLevels}
       thread={thread}
     />
   );
+}
+
+function persistedChildControls(thread: AgentThread): Pick<AgentThread,
+  "closedInputRequestIds" | "preferences" | "queuedTurns"
+> & Partial<Pick<AgentThread,
+  "draftRestore" | "interruptedTurns" | "pendingTurn" | "retainedContext"
+>> {
+  return {
+    closedInputRequestIds: thread.closedInputRequestIds,
+    ...(thread.draftRestore ? { draftRestore: thread.draftRestore } : {}),
+    ...(thread.interruptedTurns ? { interruptedTurns: thread.interruptedTurns } : {}),
+    ...(thread.pendingTurn ? { pendingTurn: thread.pendingTurn } : {}),
+    preferences: thread.preferences,
+    ...(thread.retainedContext ? { retainedContext: thread.retainedContext } : {}),
+    queuedTurns: thread.queuedTurns,
+  };
 }
 
 /**

@@ -18,9 +18,9 @@ const timeoutMs = boundedInteger(
 );
 const maxInputTokens = boundedInteger(
   "AGENT_LIVE_E2E_MAX_INPUT_TOKENS",
-  160_000,
-  16_000,
-  272_000,
+  500_000,
+  100_000,
+  2_000_000,
 );
 const marker = `OPEN_AGENT_LIVE_${Date.now()}_${randomUUID().slice(0, 8)}`;
 const idempotencyKey = `live-autonomy:${marker}`;
@@ -40,9 +40,9 @@ const request = {
     limits: {
       maxDurationMs: runDurationMs,
       maxInputTokens,
-      maxModelCalls: 12,
+      maxModelCalls: 20,
       maxOutputTokens: 10_000,
-      maxToolCalls: 24,
+      maxToolCalls: 32,
       maxTurns: 1,
     },
   },

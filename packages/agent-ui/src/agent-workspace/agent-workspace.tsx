@@ -19,7 +19,7 @@ import { AgentSubagentMenu } from "./agent-subagent-menu.js";
 import { AgentSecondaryView, type AgentSecondaryChild, type AgentSecondaryTab } from "./agent-secondary-view.js";
 import { AgentThreadView } from "./agent-thread.js";
 import { cn } from "../utils.js";
-import type { AgentAssetEndpoint, AgentInterruptedTurn, AgentModelOption, AgentQueuedTurn, AgentSessionAsset, AgentSubagentLoader, AgentSubagentSummary, AgentThread, AgentThreadPatch, AgentThreadPreferences, AgentWorkspaceClientConfig, AgentWorkspaceMailbox } from "./contracts.js";
+import type { AgentAssetEndpoint, AgentDeliverableEndpoint, AgentInterruptedTurn, AgentModelOption, AgentQueuedTurn, AgentSessionAsset, AgentSessionDeliverable, AgentSubagentLoader, AgentSubagentSummary, AgentThread, AgentThreadPatch, AgentThreadPreferences, AgentWorkspaceClientConfig, AgentWorkspaceMailbox } from "./contracts.js";
 import { AgentThreadStorageConflictError } from "./http-thread-storage.js";
 import { messagesFor, resolveBrowserLocale, type AgentLocale, type AgentMessages } from "./i18n.js";
 import {
@@ -36,6 +36,7 @@ import {
   mergeSubagentSessions,
   shouldSuppressInterruptedTurnStreamEvent,
 } from "./turn-presentation.js";
+import { loadSessionDeliverables } from "./session-deliverables.js";
 
 const DEFAULT_STORAGE_KEY = "open-agent:threads:v1";
 const STORAGE_URGENT_SAVE_DELAY_MS = 50;
@@ -54,6 +55,7 @@ export function AgentWorkspace({
   client,
   commands = [],
   defaultPreferences,
+  deliverableEndpoint,
   extensions = [],
   hostSlots,
   initialSubagentSessionId,
@@ -67,6 +69,7 @@ export function AgentWorkspace({
   onDeleteThread,
   onActiveSubagentChange,
   onActiveThreadChange,
+  onOpenDeliverable,
   onStorageError,
   productName = "Agent",
   reasoningLevels,
@@ -79,6 +82,7 @@ export function AgentWorkspace({
   readonly client?: AgentWorkspaceClientConfig;
   readonly commands?: readonly import("./contracts.js").AgentPromptMenuItem[];
   readonly defaultPreferences: AgentThreadPreferences;
+  readonly deliverableEndpoint?: AgentDeliverableEndpoint;
   readonly extensions?: readonly import("./contracts.js").AgentExtensionInfo[];
   readonly hostSlots?: { readonly sidebarFooter?: React.ReactNode; readonly threadHeaderEnd?: React.ReactNode };
   readonly initialSubagentSessionId?: string;
@@ -92,6 +96,7 @@ export function AgentWorkspace({
   readonly onDeleteThread?: (thread: AgentThread) => void | Promise<void>;
   readonly onActiveSubagentChange?: (threadId: string, sessionId?: string) => void;
   readonly onActiveThreadChange?: (threadId?: string) => void;
+  readonly onOpenDeliverable?: (deliverable: AgentSessionDeliverable) => void;
   readonly onStorageError?: (error: unknown) => void;
   readonly productName?: string;
   readonly reasoningLevels: readonly string[];
@@ -129,6 +134,10 @@ export function AgentWorkspace({
   const [secondaryTab, setSecondaryTab] = useState<AgentSecondaryTab>("home");
   const [secondaryChildSessionId, setSecondaryChildSessionId] = useState<string>();
   const [sessionAssets, setSessionAssets] = useState<readonly AgentSessionAsset[]>([]);
+  const [sessionDeliverables, setSessionDeliverables] = useState<readonly AgentSessionDeliverable[]>([]);
+  const [deliverablesLoading, setDeliverablesLoading] = useState(false);
+  const [deliverablesError, setDeliverablesError] = useState<string>();
+  const [requestedDeliverable, setRequestedDeliverable] = useState<{ readonly deliverable: AgentSessionDeliverable; readonly requestId: number }>();
   const [durableSubagents, setDurableSubagents] = useState<readonly AgentSubagentSummary[]>([]);
   const [assetsLoading, setAssetsLoading] = useState(false);
   const [assetsError, setAssetsError] = useState<string>();
@@ -141,6 +150,7 @@ export function AgentWorkspace({
   const storageSaveDueAt = useRef<number | undefined>(undefined);
   const workbenchTransitionTimer = useRef<number | undefined>(undefined);
   const workbenchTransition = useRef<"collapsing" | "expanding" | undefined>(undefined);
+  const deliverableRequestSequence = useRef(0);
   const lastSidebarWidth = useRef(SIDEBAR_DEFAULT_WIDTH);
   const pendingCollection = useRef<AgentThreadCollection | undefined>(undefined);
   const messages = messagesFor(locale);
@@ -469,6 +479,7 @@ export function AgentWorkspace({
   }, []);
 
   const activeThread = threads.find((thread) => thread.id === activeThreadId) ?? threads[0];
+  const publicationRefreshKey = activeThread ? latestPublicationResultKey(activeThread.events) : undefined;
 
   useEffect(() => {
     let cancelled = false;
@@ -534,15 +545,48 @@ export function AgentWorkspace({
     return () => controller.abort();
   }, [activeThread?.session.sessionId, assetEndpoint, client]);
 
+  const refreshDeliverables = useCallback(() => {
+    const sessionId = activeThread?.session.sessionId;
+    if (!sessionId) {
+      setSessionDeliverables([]);
+      setDeliverablesError(undefined);
+      return;
+    }
+    const controller = new AbortController();
+    setDeliverablesLoading(true);
+    setDeliverablesError(undefined);
+    void loadSessionDeliverables({ client, endpoint: deliverableEndpoint, sessionId, signal: controller.signal })
+      .then((items) => setSessionDeliverables(items))
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) setDeliverablesError(error instanceof Error ? error.message : "The session deliverables could not be loaded.");
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setDeliverablesLoading(false);
+      });
+    return () => controller.abort();
+  }, [activeThread?.session.sessionId, client, deliverableEndpoint]);
+
   useEffect(() => {
     if (!secondaryOpen || activeSubagentSessionId) return;
-    const cleanup = refreshAssets();
-    return typeof cleanup === "function" ? cleanup : undefined;
-  }, [activeSubagentSessionId, refreshAssets, secondaryOpen]);
+    const cleanups = [refreshAssets(), refreshDeliverables()];
+    return () => {
+      for (const cleanup of cleanups) if (typeof cleanup === "function") cleanup();
+    };
+  }, [activeSubagentSessionId, publicationRefreshKey, refreshAssets, refreshDeliverables, secondaryOpen]);
 
   useEffect(() => {
     if (!activeThread?.session.sessionId) setSecondaryOpen(false);
   }, [activeThread?.session.sessionId]);
+
+  const openDeliverable = useCallback((deliverable: AgentSessionDeliverable) => {
+    if (onOpenDeliverable) {
+      onOpenDeliverable(deliverable);
+      return;
+    }
+    deliverableRequestSequence.current += 1;
+    setRequestedDeliverable({ deliverable, requestId: deliverableRequestSequence.current });
+    setSecondaryOpen(true);
+  }, [onOpenDeliverable]);
   const hydrateThread = useCallback((thread: AgentThread) => {
     if (thread.hydration !== "summary" || !threadStorage.loadThread) return;
     setThreadHydrationErrors((current) => withoutMapKey(current, thread.id));
@@ -1030,10 +1074,15 @@ export function AgentWorkspace({
               mentions={mentions}
               models={models}
               onEvent={onEvent}
+              onOpenDeliverable={openDeliverable}
               onOpenSubagent={openSubagent}
+              onStorageError={onStorageError}
               preferences={activeThread.preferences}
+              providerReady={runtimeStatus.provider !== "unconfigured"}
               reasoningLevels={reasoningLevels}
               sessionId={activeSubagentSessionId}
+              storageKey={storageKey}
+              threadStorage={threadStorage}
             />
           ) : (
             <UnavailableSubagentView locale={locale} onBack={closeSubagent} />
@@ -1055,6 +1104,7 @@ export function AgentWorkspace({
               onCancelRecovery={() => cancelThreadRecovery(activeThread.id)}
               onChange={changeActiveThread}
               onEvent={onEvent}
+              onOpenDeliverable={openDeliverable}
               onOpenSubagent={openSubagent}
               onRetryRecovery={() => requestThreadRecovery(activeThread.id)}
               onRecoveryNeeded={recoverActiveThread}
@@ -1076,6 +1126,9 @@ export function AgentWorkspace({
                     assets={sessionAssets}
                     assetsError={assetsError}
                     assetsLoading={assetsLoading}
+                    deliverables={deliverablesError ? undefined : sessionDeliverables}
+                    deliverablesError={deliverablesError}
+                    deliverablesLoading={deliverablesLoading}
                     children={activeThread ? subagentsForThread(activeThread.events, durableSubagents) : []}
                     childContent={secondaryChildSessionId && activeThread ? (
                       <AgentChildSessionView
@@ -1086,22 +1139,29 @@ export function AgentWorkspace({
                         mentions={mentions}
                         models={models}
                         onEvent={onEvent}
+                        onOpenDeliverable={openDeliverable}
                         onOpenSubagent={openSubagent}
+                        onStorageError={onStorageError}
                         preferences={activeThread.preferences}
+                        providerReady={runtimeStatus.provider !== "unconfigured"}
                         reasoningLevels={reasoningLevels}
                         sessionId={secondaryChildSessionId}
+                        storageKey={storageKey}
+                        threadStorage={threadStorage}
                       />
                     ) : undefined}
                     locale={locale}
                     onClose={() => setSecondaryOpen(false)}
                     onOpenAsset={onOpenAsset ? (asset) => onOpenAsset(asset) : undefined}
+                    onOpenDeliverable={onOpenDeliverable}
                     onOpenChild={(sessionId) => {
-                      setSecondaryTab("children");
                       setSecondaryChildSessionId(sessionId);
-                      setSecondaryTab("child");
                     }}
                     onRefreshAssets={refreshAssets}
+                    onRefreshDeliverables={refreshDeliverables}
                     onSelectTab={setSecondaryTab}
+                    requestedDeliverable={requestedDeliverable?.deliverable}
+                    requestedDeliverableRequestId={requestedDeliverable?.requestId}
                     tab={secondaryTab}
                   />
                 </ResizablePanel>
@@ -1806,6 +1866,18 @@ function resolveSessionAssetEndpoint(endpoint: AgentAssetEndpoint, sessionId: st
   if (endpoint.includes("{sessionId}")) return endpoint.replaceAll("{sessionId}", encoded);
   if (endpoint.includes(":sessionId")) return endpoint.replaceAll(":sessionId", encoded);
   return `${endpoint}${endpoint.includes("?") ? "&" : "?"}sessionId=${encoded}`;
+}
+
+function latestPublicationResultKey(events: readonly MessageStreamEvent[]): string | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event?.type !== "action.result" || event.data.status !== "completed" || event.data.result.kind !== "tool-result") continue;
+    const name = event.data.result.toolName.toLowerCase().replaceAll("-", "_");
+    if (["publish_artifact", "artifact_publish", "publish_preview", "website_preview"].includes(name)) {
+      return `${event.data.result.callId}:${index}`;
+    }
+  }
+  return undefined;
 }
 
 function parseSessionAssets(payload: unknown): readonly AgentSessionAsset[] {

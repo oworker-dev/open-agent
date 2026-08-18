@@ -1,4 +1,4 @@
-import { type AgentEvent, type AgentRunSnapshot, type StartAgentRunRequest } from "@oworker/open-agent-contracts/agent-run";
+import { type AgentEvent, type RespondAgentRunRequest, type AgentRunSnapshot, type StartAgentRunRequest } from "@oworker/open-agent-contracts/agent-run";
 export declare const AGENT_CLIENT_VERSION: "0.1.0-alpha.9";
 export declare const AGENT_HOST_SDK_VERSION: "0.1.0-draft";
 export type AgentClientHeaders = Readonly<Record<string, string>> | (() => Readonly<Record<string, string>> | Promise<Readonly<Record<string, string>>>);
@@ -28,10 +28,15 @@ export type AgentRunCancelResponse = {
     readonly cancellation: "accepted" | "already_requested" | "no_active_turn" | "terminal";
     readonly run: AgentRunSnapshot;
 };
+export type AgentRunRespondResponse = {
+    readonly disposition: "accepted" | "replayed";
+    readonly run: AgentRunSnapshot;
+};
 export interface AgentRunClient {
     start(input: AgentRunStartInput, options?: AgentRunRequestOptions): Promise<AgentRunStartResponse>;
     inspect(runId: string, options?: AgentRunRequestOptions): Promise<AgentRunSnapshot>;
     events(runId: string, after?: number, options?: AgentRunRequestOptions): Promise<AgentRunEventsResponse>;
+    respond(runId: string, input: RespondAgentRunRequest, options?: AgentRunRequestOptions): Promise<AgentRunRespondResponse>;
     cancel(runId: string, options?: AgentRunRequestOptions): Promise<AgentRunCancelResponse>;
 }
 export declare function createAgentRunClient(options: AgentRunClientOptions): AgentRunClient;

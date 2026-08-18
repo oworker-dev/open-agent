@@ -66,7 +66,7 @@ function isCompactionRequest(request: MockModelRequest): boolean {
 }
 
 function compactionCheckpoint(request: MockModelRequest) {
-  const prompt = request.lastUserMessage ?? "";
+  const prompt = compactionPrompt(request);
   const hasPreviousCheckpoint = !prompt.includes("<previous-checkpoint>\n(none)");
   const facts = [
     prompt.includes("CERULEAN-47") ? "fact=CERULEAN-47" : "fact=missing",
@@ -78,6 +78,13 @@ function compactionCheckpoint(request: MockModelRequest) {
     ...facts,
     "constraint=preserve exact facts, active todo, and read-before-write safety",
   ].join("; ");
+}
+
+function compactionPrompt(request: MockModelRequest): string {
+  return [
+    ...request.messages.map((message) => message.text),
+    request.lastUserMessage ?? "",
+  ].join("\n");
 }
 
 function compactionSetup(request: MockModelRequest) {
@@ -146,11 +153,12 @@ function compactionVerify(request: MockModelRequest) {
   if (!resultById(request, "eval-compaction-todo-final")) {
     return tool("todo", {}, "eval-compaction-todo-final");
   }
+  const checkpoint = latestCompactionCheckpoint(request);
   const prompt = request.messages.map((message) => message.text).join("\n");
   const file = JSON.stringify(resultById(request, "eval-compaction-read-final")?.output);
   const todos = JSON.stringify(resultById(request, "eval-compaction-todo-final")?.output);
   const evidence = {
-    checkpoint: prompt.includes("fact=CERULEAN-47") && prompt.includes("tool=ORBIT-73"),
+    checkpoint: ["CERULEAN-47", "ORBIT-73"].every((value) => checkpoint.includes(value)),
     preservedTodoPrompt: prompt.includes("[Your task list was preserved across context compaction]") &&
       prompt.includes("Verify compaction invariants"),
     file: ["CERULEAN-47", "ORBIT-73", "BETA-91"].every((value) => file.includes(value)),
@@ -159,7 +167,22 @@ function compactionVerify(request: MockModelRequest) {
   const verified = Object.values(evidence).every(Boolean);
   return verified
     ? "COMPACTION_VERIFIED CERULEAN-47 ORBIT-73 BETA-91 TODO_PRESERVED"
-    : `COMPACTION_VERIFICATION_FAILED ${JSON.stringify(evidence)}`;
+    : `COMPACTION_VERIFICATION_FAILED ${JSON.stringify({ evidence, checkpoint })}`;
+}
+
+function latestCompactionCheckpoint(request: MockModelRequest): string {
+  for (let index = request.messages.length - 2; index >= 0; index -= 1) {
+    const marker = request.messages[index];
+    const checkpoint = request.messages[index + 1];
+    if (
+      marker?.role === "user" &&
+      marker.text === "Summary of our conversation so far:" &&
+      checkpoint?.role === "assistant"
+    ) {
+      return checkpoint.text;
+    }
+  }
+  return "";
 }
 
 function autonomyFile(request: MockModelRequest) {
