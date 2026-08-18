@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import type {
   AgentSubagentRecord,
   AgentSubagentSnapshot,
@@ -8,10 +8,12 @@ import type {
 import type { AgentSessionOwner, AgentSessionOwnershipStore } from "../data/session-ownership-store.ts";
 import type { AgentSubagentStore, CreateAgentSubagentInput } from "../data/agent-subagent-store.ts";
 import type { AgentMailboxStore } from "../data/agent-mailbox-store.ts";
+import type { AgentRunStore } from "../data/agent-run-store.ts";
 import { enqueueAgentMailboxMessage } from "../agent-mailbox/service.ts";
 import { eveAgentSessionRuntime } from "./service.ts";
 import { createEveAgentMailboxRuntime } from "../agent-mailbox/eve-runtime.ts";
 import { isAgentRuntimeConfigured, startEveAgentRun } from "../agent-runs/eve-adapter.ts";
+import { eveAgentRunRuntime, startAgentRun, type AgentRunRuntime } from "../agent-runs/service.ts";
 import { readDeploymentAgentRuntimeConfig } from "../../lib/agent-runtime-config.ts";
 
 export class AgentSubagentError extends Error {
@@ -48,10 +50,11 @@ export type AgentSubagentRuntime = {
 };
 
 export const eveAgentSubagentRuntime: AgentSubagentRuntime = {
+  // Explicit children with a persisted parent are created through
+  // startAgentRun below. This fallback remains for session-only hosts, but it
+  // deliberately does not manufacture a parentRunId.
   async spawn(input) {
     const config = readDeploymentAgentRuntimeConfig();
-    const parentRunId = `arun_${stableRunId(input.parentSessionId)}`;
-    const childRunId = `arun_${randomUUID().replaceAll("-", "")}`;
     const session = await startEveAgentRun(
       {
         correlationId: `subagent-${randomUUID()}`,
@@ -61,21 +64,16 @@ export const eveAgentSubagentRuntime: AgentSubagentRuntime = {
           openAgent: {
             kind: "external-subagent",
             parentSessionId: input.parentSessionId,
+            depth: input.depth,
             waitPolicy: input.waitPolicy,
           },
-        },
-        parent: {
-          depth: input.depth,
-          parentRunId,
-          rootRunId: parentRunId,
-          source: "agent",
         },
         profile: {
           profileId: config.profile.id,
           version: config.profile.version,
         },
       },
-      childRunId,
+      `arun_${randomUUID().replaceAll("-", "")}`,
       input.accessToken,
     );
     return {
@@ -114,6 +112,10 @@ export type AgentSubagentSupervisorOptions = {
   readonly identity: AgentSessionOwner;
   readonly ownershipStore: AgentSessionOwnershipStore;
   readonly store: AgentSubagentStore;
+  /** Production persistence used to establish real AgentRun lineage. */
+  readonly runStore?: AgentRunStore;
+  /** Injectable runtime for lineage tests and alternate Eve adapters. */
+  readonly agentRunRuntime?: AgentRunRuntime;
   readonly mailboxStore?: AgentMailboxStore;
   readonly runtime?: AgentSubagentRuntime;
 };
@@ -252,21 +254,36 @@ export async function spawnAgentSubagent(options: AgentSubagentSupervisorOptions
   const task = options.task.trim();
   if (!task || task.length > 100_000) throw new AgentSubagentError(400, "agent_subagent_task_invalid", "The subagent task must contain between 1 and 100000 characters.");
   const runtime = options.runtime ?? eveAgentSubagentRuntime;
-  if (!runtime.spawn) throw new AgentSubagentError(501, "agent_subagent_spawn_unsupported", "The active Agent runtime does not expose external subagent spawning; ask the parent Agent to delegate the task.");
+  if (!runtime.spawn && !options.runStore?.findOwnedBySession) {
+    throw new AgentSubagentError(501, "agent_subagent_spawn_unsupported", "The active Agent runtime does not expose external subagent spawning; ask the parent Agent to delegate the task.");
+  }
   const active = (await options.store.listOwned(options.identity, options.parentSessionId)).filter((item) => item.status === "starting" || item.status === "running" || item.status === "waiting");
   if (active.length >= 16) throw new AgentSubagentError(429, "agent_subagent_limit_reached", "A session may have at most sixteen active subagents.");
   const parentRecord = await options.store.findOwned(options.identity, options.parentSessionId);
   const depth = (parentRecord?.depth ?? 0) + 1;
   if (depth > 8) throw new AgentSubagentError(429, "agent_subagent_depth_limit_reached", "The maximum nested subagent depth is eight.");
-  const child = await runtime.spawn({
-    accessToken: options.accessToken,
-    owner: options.identity,
-    parentSessionId: options.parentSessionId,
-    depth,
-    task,
-    ...(options.name ? { name: options.name } : {}),
-    waitPolicy: options.waitPolicy ?? "wait",
-  });
+  const parentRun = options.runStore?.findOwnedBySession
+    ? await options.runStore.findOwnedBySession(
+        options.identity.tenantId,
+        options.identity.principalId,
+        options.parentSessionId,
+      )
+    : undefined;
+  const child = parentRun
+    ? await spawnPersistedAgentRun({
+        ...options,
+        name: options.name,
+        parentSessionId: options.parentSessionId,
+        task,
+        waitPolicy: options.waitPolicy ?? "wait",
+      }, parentRun, { depth, task })
+    : await spawnSessionOnlySubagent({
+        ...options,
+        name: options.name,
+        parentSessionId: options.parentSessionId,
+        task,
+        waitPolicy: options.waitPolicy ?? "wait",
+      }, runtime, { depth, task });
   try {
     return await options.store.create({
       childSessionId: child.childSessionId,
@@ -447,8 +464,84 @@ function eventData(event: { readonly data?: unknown }): Record<string, unknown> 
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
 function delay(milliseconds: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, milliseconds)); }
 
-function stableRunId(value: string): string {
-  return createHash("sha256").update(value).digest("hex").slice(0, 32);
+async function spawnSessionOnlySubagent(
+  options: AgentSubagentSupervisorOptions & {
+    readonly parentSessionId: string;
+    readonly task: string;
+    readonly name?: string;
+    readonly waitPolicy?: AgentSubagentWaitPolicy;
+  },
+  runtime: AgentSubagentRuntime,
+  input: { readonly depth: number; readonly task: string },
+): Promise<{ readonly childSessionId: string; readonly agentId?: string; readonly name?: string }> {
+  // A direct Eve session is still supported for hosts that do not persist
+  // AgentRuns. It deliberately carries no fabricated parent run id.
+  if (!runtime.spawn) {
+    throw new AgentSubagentError(501, "agent_subagent_spawn_unsupported", "The active Agent runtime does not expose external subagent spawning; ask the parent Agent to delegate the task.");
+  }
+  return await runtime.spawn({
+    accessToken: options.accessToken,
+    owner: options.identity,
+    parentSessionId: options.parentSessionId,
+    depth: input.depth,
+    task: input.task,
+    ...(options.name ? { name: options.name } : {}),
+    waitPolicy: options.waitPolicy ?? "wait",
+  });
+}
+
+async function spawnPersistedAgentRun(
+  options: AgentSubagentSupervisorOptions & {
+    readonly parentSessionId: string;
+    readonly task: string;
+    readonly name?: string;
+    readonly waitPolicy?: AgentSubagentWaitPolicy;
+  },
+  parentRun: NonNullable<Awaited<ReturnType<NonNullable<AgentRunStore["findOwnedBySession"]>>>>,
+  input: { readonly depth: number; readonly task: string },
+): Promise<{ readonly childSessionId: string; readonly agentId?: string; readonly name?: string }> {
+  if (!options.runStore) throw new Error("AgentRun persistence is unavailable.");
+  const rootRunId = parentRun.parent?.rootRunId ?? parentRun.runId;
+  const outcome = await startAgentRun({
+    accessToken: options.accessToken,
+    identity: options.identity,
+    request: {
+      correlationId: `subagent-${randomUUID()}`,
+      idempotencyKey: `subagent-${randomUUID()}`,
+      message: input.task,
+      metadata: {
+        openAgent: {
+          kind: "external-subagent",
+          parentSessionId: options.parentSessionId,
+          parentRunId: parentRun.runId,
+          waitPolicy: options.waitPolicy ?? "wait",
+        },
+      },
+      parent: {
+        depth: input.depth,
+        parentRunId: parentRun.runId,
+        rootRunId,
+        source: "agent",
+      },
+      policy: parentRun.policy,
+      profile: parentRun.profile,
+    },
+    runtime: options.agentRunRuntime ?? eveAgentRunRuntime,
+    store: options.runStore,
+  });
+  if (!outcome.record.sessionId) {
+    throw new AgentSubagentError(
+      outcome.disposition === "ambiguous" ? 503 : 502,
+      "agent_subagent_run_not_started",
+      outcome.disposition === "ambiguous"
+        ? "The child AgentRun submission is ambiguous and was not attached to a session."
+        : "The child AgentRun did not return a session.",
+    );
+  }
+  return {
+    childSessionId: outcome.record.sessionId,
+    ...(options.name ? { name: options.name } : {}),
+  };
 }
 
 async function retireChildSession(

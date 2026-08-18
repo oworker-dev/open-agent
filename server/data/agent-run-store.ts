@@ -67,6 +67,12 @@ export type AgentRunProjection = {
 export interface AgentRunStore {
   attachSession(runId: string, sessionId: string): Promise<AgentRunRecord>;
   findOwned(tenantId: string, principalId: string, runId: string): Promise<AgentRunRecord | undefined>;
+  /**
+   * Resolve a run by its Eve session identity. This is optional so lightweight
+   * host integrations can remain session-only, while production persistence
+   * can establish real parent/child AgentRun lineage.
+   */
+  findOwnedBySession?(tenantId: string, principalId: string, sessionId: string): Promise<AgentRunRecord | undefined>;
   markCancelled(runId: string): Promise<AgentRunRecord>;
   markCancellationRequested(runId: string): Promise<AgentRunRecord>;
   markSubmissionFailed(runId: string, message: string): Promise<AgentRunRecord>;
@@ -144,6 +150,16 @@ function postgresAgentRunStore(pool: Pool, table: string): AgentRunStore {
         `select ${selectColumns()} from ${table}
           where run_id = $1 and tenant_id = $2 and principal_id = $3`,
         [runId, tenantId, principalId],
+      );
+      return result.rows[0] ? toRecord(result.rows[0]) : undefined;
+    },
+    async findOwnedBySession(tenantId, principalId, sessionId) {
+      const result = await pool.query<AgentRunRow>(
+        `select ${selectColumns()} from ${table}
+          where eve_session_id = $1 and tenant_id = $2 and principal_id = $3
+          order by created_at desc
+          limit 1`,
+        [sessionId, tenantId, principalId],
       );
       return result.rows[0] ? toRecord(result.rows[0]) : undefined;
     },

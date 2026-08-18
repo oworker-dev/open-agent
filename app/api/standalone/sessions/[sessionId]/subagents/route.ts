@@ -1,5 +1,6 @@
 import { listAgentSubagents } from "@/server/agent-sessions/subagents";
 import { createPostgresAgentSubagentStoreFromEnvironment } from "@/server/data/agent-subagent-store";
+import { createPostgresAgentRunStoreFromEnvironment } from "@/server/data/agent-run-store";
 import { createPostgresSessionOwnershipStoreFromEnvironment } from "@/server/data/session-ownership-store";
 import { authenticateStandaloneRequest } from "@/server/http/standalone-request-auth";
 
@@ -7,6 +8,7 @@ export const runtime = "nodejs";
 
 const ownershipStore = createPostgresSessionOwnershipStoreFromEnvironment();
 const subagentStore = createPostgresAgentSubagentStoreFromEnvironment();
+const runStore = createPostgresAgentRunStoreFromEnvironment();
 
 type RouteContext = {
   readonly params: Promise<{ readonly sessionId: string }>;
@@ -35,6 +37,7 @@ export async function GET(request: Request, context: RouteContext): Promise<Resp
     identity: authenticated.identity,
     ownershipStore,
     parentSessionId: sessionId,
+    runStore: runStore ?? undefined,
     store: subagentStore,
   });
   return result

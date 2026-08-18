@@ -1,12 +1,14 @@
 import { authenticateHostRequest, HOST_AGENT_SCOPE, requireHostScope } from "@/server/http/host-request-auth";
 import { createPostgresSessionOwnershipStoreFromEnvironment } from "@/server/data/session-ownership-store";
 import { createPostgresAgentSubagentStoreFromEnvironment } from "@/server/data/agent-subagent-store";
+import { createPostgresAgentRunStoreFromEnvironment } from "@/server/data/agent-run-store";
 import { createPostgresAgentMailboxStoreFromEnvironment } from "@/server/data/agent-mailbox-store";
 import { AgentSubagentError, listAgentSubagents, spawnAgentSubagent } from "@/server/agent-sessions/subagents";
 
 export const runtime = "nodejs";
 const ownershipStore = createPostgresSessionOwnershipStoreFromEnvironment();
 const subagentStore = createPostgresAgentSubagentStoreFromEnvironment();
+const runStore = createPostgresAgentRunStoreFromEnvironment();
 const mailboxStore = createPostgresAgentMailboxStoreFromEnvironment();
 type RouteContext = { readonly params: Promise<{ readonly sessionId: string }> };
 
@@ -23,6 +25,7 @@ export async function GET(request: Request, context: RouteContext): Promise<Resp
     identity: authenticated.identity,
     ownershipStore,
     parentSessionId: sessionId,
+    runStore: runStore ?? undefined,
     store: subagentStore,
   });
   return result ? Response.json({ ok: true, ...result }, { headers: noStore() }) : problem(404, "agent_session_not_found", "The parent Agent session was not found.");
@@ -49,6 +52,7 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
       nickname: typeof body.nickname === "string" ? body.nickname : undefined,
       ownershipStore,
       parentSessionId: sessionId,
+      runStore: runStore ?? undefined,
       store: subagentStore,
       task: body.task,
       waitPolicy: body.waitPolicy === "no-wait" ? "no-wait" : "wait",

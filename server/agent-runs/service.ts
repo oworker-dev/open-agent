@@ -583,13 +583,10 @@ async function validateParent(
   request: ParsedStartAgentRun,
 ): Promise<void> {
   if (!request.parent) return;
-  if (identity.principalType !== "service") {
-    throw new AgentRunOperationError(
-      403,
-      "agent_run_parent_forbidden",
-      "Only an authenticated service principal can submit a child AgentRun.",
-    );
-  }
+  // A host may create a child for a run it owns. The previous service-only
+  // restriction forced web hosts to bypass AgentRun persistence and resulted
+  // in fake parent ids. Ownership is enforced by the tenant/principal lookup
+  // below; service principals remain valid for internal orchestration.
   const parent = await store.findOwned(
     identity.tenantId,
     identity.principalId,

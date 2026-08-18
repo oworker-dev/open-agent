@@ -13,6 +13,9 @@ import {
 } from "../../server/agent-sessions/subagents.ts";
 import type { AgentSessionOwner, AgentSessionOwnershipStore } from "../../server/data/session-ownership-store.ts";
 import type { AgentMailboxStore } from "../../server/data/agent-mailbox-store.ts";
+import type { AgentRunRecord, AgentRunStore, ReserveAgentRunInput, ReserveAgentRunResult } from "../../server/data/agent-run-store.ts";
+import type { AgentRunRuntime } from "../../server/agent-runs/service.ts";
+import type { AgentProfileRef, AgentRunPolicy } from "@oworker/open-agent-contracts/agent-run";
 
 const owner: AgentSessionOwner = { tenantId: "tenant-1", principalId: "user-1", principalType: "user" };
 const ownershipStore: AgentSessionOwnershipStore = {
@@ -297,3 +300,148 @@ test("normal parent completion does not terminate a detached no-wait child", asy
   });
   assert.equal(result[0]?.status, "running");
 });
+
+test("persisted child subagents use the real parent AgentRun lineage", async () => {
+  const store = createMemoryAgentSubagentStore();
+  const parentRun = makeRun({ runId: "arun_parent", sessionId: "ses_parent" });
+  let capturedParent: AgentRunRecord["parent"];
+  let capturedSessionId: string | undefined;
+  const runStore = createLineageRunStore(parentRun, (request) => {
+    capturedParent = request.parent;
+  });
+  const runtime = fakeAgentRunRuntime((input) => {
+    capturedSessionId = input.message === "Build the child task" ? "ses_child" : undefined;
+    return { sessionId: capturedSessionId ?? "ses_child" };
+  });
+
+  const result = await spawnAgentSubagent({
+    accessToken: "token",
+    agentRunRuntime: runtime,
+    identity: owner,
+    ownershipStore,
+    parentSessionId: "ses_parent",
+    runStore,
+    store,
+    task: "Build the child task",
+  });
+
+  assert.equal(result.childSessionId, "ses_child");
+  assert.deepEqual(capturedParent, {
+    depth: 1,
+    parentRunId: "arun_parent",
+    rootRunId: "arun_parent",
+    source: "agent",
+  });
+  assert.equal(capturedSessionId, "ses_child");
+});
+
+test("session-only subagent adapters remain supported without fabricated lineage", async () => {
+  const store = createMemoryAgentSubagentStore();
+  let spawnInput: { readonly parentSessionId: string; readonly depth: number } | undefined;
+  const runtime = {
+    async spawn(input: { readonly parentSessionId: string; readonly depth: number }) {
+      spawnInput = input;
+      return { childSessionId: "ses_session_only" };
+    },
+    async inspect() { return { status: "waiting" as const }; },
+    async cancel() { return "no_active_turn" as const; },
+  };
+  const result = await spawnAgentSubagent({
+    accessToken: "token",
+    identity: owner,
+    ownershipStore,
+    parentSessionId: "ses_parent",
+    runtime,
+    store,
+    task: "Keep this session-only",
+  });
+
+  assert.equal(result.childSessionId, "ses_session_only");
+  assert.deepEqual(
+    { depth: spawnInput?.depth, parentSessionId: spawnInput?.parentSessionId },
+    { depth: 1, parentSessionId: "ses_parent" },
+  );
+});
+
+function makeRun(input: { readonly runId: string; readonly sessionId: string }): AgentRunRecord {
+  const profile: AgentProfileRef = { profileId: "open-agent", version: "1" };
+  const policy: AgentRunPolicy = {};
+  const now = new Date().toISOString();
+  return {
+    correlationId: "parent-correlation",
+    createdAt: now,
+    eventCount: 0,
+    idempotencyKey: "parent-idempotency",
+    metadata: {},
+    policy,
+    principalId: owner.principalId,
+    profile,
+    requestFingerprint: "parent-fingerprint",
+    revision: 1,
+    runId: input.runId,
+    sessionId: input.sessionId,
+    status: "running",
+    tenantId: owner.tenantId,
+    updatedAt: now,
+    usage: {
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      costUsd: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      steps: 0,
+    },
+  };
+}
+
+function createLineageRunStore(
+  parent: AgentRunRecord,
+  onReserve: (request: ReserveAgentRunInput) => void,
+): AgentRunStore {
+  let child: AgentRunRecord | undefined;
+  return {
+    async findOwned(_tenantId, _principalId, runId) {
+      return runId === parent.runId ? parent : undefined;
+    },
+    async findOwnedBySession(tenantId, principalId, sessionId) {
+      return tenantId === parent.tenantId && principalId === parent.principalId && sessionId === parent.sessionId
+        ? parent
+        : undefined;
+    },
+    async reserve(input): Promise<ReserveAgentRunResult> {
+      onReserve(input);
+      child = {
+        ...makeRun({ runId: "arun_child", sessionId: "ses_child" }),
+        correlationId: input.correlationId,
+        idempotencyKey: input.idempotencyKey,
+        metadata: input.metadata,
+        ...(input.parent ? { parent: input.parent } : {}),
+        policy: input.policy,
+        profile: input.profile,
+      };
+      return { record: child, status: "reserved" };
+    },
+    async attachSession(_runId, sessionId) {
+      child = child ? { ...child, sessionId, status: "running" } : undefined;
+      if (!child) throw new Error("missing child run");
+      return child;
+    },
+    async markCancelled() { throw new Error("unused"); },
+    async markCancellationRequested() { throw new Error("unused"); },
+    async markSubmissionFailed() { throw new Error("unused"); },
+    async markSubmissionAmbiguous() { throw new Error("unused"); },
+    async updateProjection() { throw new Error("unused"); },
+  };
+}
+
+function fakeAgentRunRuntime(
+  start: (input: { readonly message: string }) => { readonly sessionId: string },
+): AgentRunRuntime {
+  return {
+    async start(input) { return start(input); },
+    async cancel() { return "no_active_turn"; },
+    async readEvents() { return []; },
+    async respond() { return { sessionId: "ses_child" }; },
+    async reset() { return "no_active_session"; },
+  } as AgentRunRuntime;
+}
