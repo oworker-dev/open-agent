@@ -44,6 +44,7 @@ export function AgentSubagentMenu({
   readonly onOpen: (sessionId: string) => void;
 }) {
   const [busySessionId, setBusySessionId] = useState<string>();
+  const [closedSessions, setClosedSessions] = useState<ReadonlySet<string>>(new Set());
   const [statusOverrides, setStatusOverrides] = useState<ReadonlyMap<string, SubagentSessionPresentation["status"]>>(new Map());
   const sessions = mergeSubagentSessions(events, durableSessions)
     .filter((session) => session.childSessionId)
@@ -87,7 +88,9 @@ export function AgentSubagentMenu({
           onOpen={onOpen}
           onControl={onControl}
           busySessionId={busySessionId}
+          closedSessions={closedSessions}
           setBusySessionId={setBusySessionId}
+          setClosedSessions={setClosedSessions}
           setStatusOverrides={setStatusOverrides}
           sessions={active}
         />
@@ -98,7 +101,9 @@ export function AgentSubagentMenu({
           onOpen={onOpen}
           onControl={onControl}
           busySessionId={busySessionId}
+          closedSessions={closedSessions}
           setBusySessionId={setBusySessionId}
+          setClosedSessions={setClosedSessions}
           setStatusOverrides={setStatusOverrides}
           sessions={done}
         />
@@ -113,7 +118,9 @@ function SubagentGroup({
   locale,
   onControl,
   busySessionId,
+  closedSessions,
   setBusySessionId,
+  setClosedSessions,
   setStatusOverrides,
   onOpen,
   sessions,
@@ -123,7 +130,9 @@ function SubagentGroup({
   readonly locale: AgentLocale;
   readonly onControl?: AgentSubagentController;
   readonly busySessionId?: string;
+  readonly closedSessions: ReadonlySet<string>;
   readonly setBusySessionId: (sessionId: string | undefined) => void;
+  readonly setClosedSessions: Dispatch<SetStateAction<ReadonlySet<string>>>;
   readonly setStatusOverrides: Dispatch<SetStateAction<ReadonlyMap<string, SubagentSessionPresentation["status"]>>>;
   readonly onOpen: (sessionId: string) => void;
   readonly sessions: readonly DisplayedSubagent[];
@@ -160,7 +169,7 @@ function SubagentGroup({
                 </span>
                 <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground" />
               </button>
-              {onControl ? (
+              {onControl && !closedSessions.has(sessionId) ? (
                 <Button
                   aria-label={controlLabel(session.status, locale)}
                   className="size-7 shrink-0 text-muted-foreground hover:text-foreground"
@@ -171,7 +180,10 @@ function SubagentGroup({
                     void onControl({ action, sessionId })
                       .then((next) => {
                         if (next) {
-                      setStatusOverrides((current) => new Map(current).set(
+                          if (next.status === "closed") {
+                            setClosedSessions((current) => new Set(current).add(sessionId));
+                          }
+                          setStatusOverrides((current) => new Map(current).set(
                             sessionId,
                             next.status === "interrupted" || next.status === "closed" ? "cancelled" : next.status,
                           ));
