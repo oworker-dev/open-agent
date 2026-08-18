@@ -1,6 +1,7 @@
 "use client";
 
 import type { MessageStreamEvent } from "eve/client";
+import { useState, type Dispatch, type SetStateAction } from "react";
 import {
   CheckCircle2Icon,
   ChevronRightIcon,
@@ -8,6 +9,7 @@ import {
   Clock3Icon,
   LoaderCircleIcon,
   NetworkIcon,
+  SquareIcon,
   XCircleIcon,
 } from "lucide-react";
 import { Button } from "../ui/button.js";
@@ -22,7 +24,7 @@ import {
   mergeSubagentSessions,
   type SubagentSessionPresentation,
 } from "./turn-presentation.js";
-import type { AgentSubagentSummary } from "./contracts.js";
+import type { AgentSubagentController, AgentSubagentSummary } from "./contracts.js";
 
 type DisplayedSubagent = SubagentSessionPresentation & { readonly ordinal: number };
 
@@ -31,17 +33,27 @@ export function AgentSubagentMenu({
   events,
   durableSessions = [],
   locale,
+  onControl,
   onOpen,
 }: {
   readonly activeSessionId?: string;
   readonly events: readonly MessageStreamEvent[];
   readonly durableSessions?: readonly AgentSubagentSummary[];
   readonly locale: AgentLocale;
+  readonly onControl?: AgentSubagentController;
   readonly onOpen: (sessionId: string) => void;
 }) {
+  const [busySessionId, setBusySessionId] = useState<string>();
+  const [statusOverrides, setStatusOverrides] = useState<ReadonlyMap<string, SubagentSessionPresentation["status"]>>(new Map());
   const sessions = mergeSubagentSessions(events, durableSessions)
     .filter((session) => session.childSessionId)
-    .map((session, index) => ({ ...session, ordinal: index + 1 }));
+    .map((session, index) => ({
+      ...session,
+      ...(session.childSessionId && statusOverrides.has(session.childSessionId)
+        ? { status: statusOverrides.get(session.childSessionId)! }
+        : {}),
+      ordinal: index + 1,
+    }));
   if (sessions.length === 0) return null;
   const active = sessions.filter((session) => isActive(session));
   const done = sessions.filter((session) => !isActive(session));
@@ -73,6 +85,10 @@ export function AgentSubagentMenu({
           label={localize(locale, "Active", "正在执行")}
           locale={locale}
           onOpen={onOpen}
+          onControl={onControl}
+          busySessionId={busySessionId}
+          setBusySessionId={setBusySessionId}
+          setStatusOverrides={setStatusOverrides}
           sessions={active}
         />
         <SubagentGroup
@@ -80,6 +96,10 @@ export function AgentSubagentMenu({
           label={localize(locale, "Done", "已完成")}
           locale={locale}
           onOpen={onOpen}
+          onControl={onControl}
+          busySessionId={busySessionId}
+          setBusySessionId={setBusySessionId}
+          setStatusOverrides={setStatusOverrides}
           sessions={done}
         />
       </PopoverContent>
@@ -91,12 +111,20 @@ function SubagentGroup({
   activeSessionId,
   label,
   locale,
+  onControl,
+  busySessionId,
+  setBusySessionId,
+  setStatusOverrides,
   onOpen,
   sessions,
 }: {
   readonly activeSessionId?: string;
   readonly label: string;
   readonly locale: AgentLocale;
+  readonly onControl?: AgentSubagentController;
+  readonly busySessionId?: string;
+  readonly setBusySessionId: (sessionId: string | undefined) => void;
+  readonly setStatusOverrides: Dispatch<SetStateAction<ReadonlyMap<string, SubagentSessionPresentation["status"]>>>;
   readonly onOpen: (sessionId: string) => void;
   readonly sessions: readonly DisplayedSubagent[];
 }) {
@@ -108,27 +136,59 @@ function SubagentGroup({
         {sessions.map((session) => {
           const sessionId = session.childSessionId!;
           return (
-            <button
-              aria-current={activeSessionId === sessionId ? "page" : undefined}
+            <div
               className={cn(
-                "flex w-full items-center gap-2 rounded-sm px-2 py-2 text-left outline-hidden transition-colors hover:bg-accent focus-visible:bg-accent focus-visible:ring-2 focus-visible:ring-ring",
+                "flex w-full items-center gap-1 rounded-sm px-1 py-0.5 transition-colors hover:bg-accent",
                 activeSessionId === sessionId && "bg-accent",
               )}
-              key={session.callId}
-              onClick={() => onOpen(sessionId)}
-              type="button"
+              key={session.callId ?? sessionId}
             >
-              <SubagentStatusIcon status={session.status} />
-              <span className="min-w-0 flex-1">
-                <span className="block truncate text-sm font-medium text-foreground">
-                  {subagentLabel(session, locale)}
+              <button
+                aria-current={activeSessionId === sessionId ? "page" : undefined}
+                className="flex min-w-0 flex-1 items-center gap-2 rounded-sm px-1 py-1.5 text-left outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+                onClick={() => onOpen(sessionId)}
+                type="button"
+              >
+                <SubagentStatusIcon status={session.status} />
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-sm font-medium text-foreground">
+                    {subagentLabel(session, locale)}
+                  </span>
+                  <span className="block truncate text-xs text-muted-foreground">
+                    {session.task ?? statusLabel(session.status, locale)}
+                  </span>
                 </span>
-                <span className="block truncate text-xs text-muted-foreground">
-                  {session.task ?? statusLabel(session.status, locale)}
-                </span>
-              </span>
-              <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground" />
-            </button>
+                <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground" />
+              </button>
+              {onControl ? (
+                <Button
+                  aria-label={controlLabel(session.status, locale)}
+                  className="size-7 shrink-0 text-muted-foreground hover:text-foreground"
+                  disabled={busySessionId === sessionId}
+                  onClick={() => {
+                    const action = isActive(session) ? "interrupt" : "close";
+                    setBusySessionId(sessionId);
+                    void onControl({ action, sessionId })
+                      .then((next) => {
+                        if (next) {
+                      setStatusOverrides((current) => new Map(current).set(
+                            sessionId,
+                            next.status === "interrupted" || next.status === "closed" ? "cancelled" : next.status,
+                          ));
+                        }
+                      })
+                      .catch(() => undefined)
+                      .finally(() => setBusySessionId(undefined));
+                  }}
+                  size="icon-sm"
+                  title={controlLabel(session.status, locale)}
+                  type="button"
+                  variant="ghost"
+                >
+                  {busySessionId === sessionId ? <LoaderCircleIcon className="size-3.5 animate-spin" /> : isActive(session) ? <SquareIcon className="size-3.5" /> : <XCircleIcon className="size-3.5" />}
+                </Button>
+              ) : null}
+            </div>
           );
         })}
       </div>
@@ -173,6 +233,12 @@ function statusLabel(
 
 function isActive(session: SubagentSessionPresentation): boolean {
   return session.status === "running" || session.status === "starting" || session.status === "waiting";
+}
+
+function controlLabel(status: SubagentSessionPresentation["status"], locale: AgentLocale): string {
+  return isActive({ status, callId: "control" })
+    ? localize(locale, "Stop sub-agent", "停止子代理")
+    : localize(locale, "Close sub-agent", "关闭子代理");
 }
 
 function localize(locale: AgentLocale, english: string, chinese: string): string {

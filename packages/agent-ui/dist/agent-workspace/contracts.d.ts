@@ -98,6 +98,11 @@ export type AgentSubagentSummary = {
     readonly status: "starting" | "running" | "waiting" | "completed" | "failed" | "cancelled" | "interrupted" | "closed";
     readonly task?: string;
 };
+export type AgentSubagentControlAction = "close" | "interrupt" | "wait";
+export type AgentSubagentController = (input: {
+    readonly action: AgentSubagentControlAction;
+    readonly sessionId: string;
+}) => Promise<AgentSubagentSummary | undefined>;
 export type AgentSubagentLoader = (parentSessionId: string) => Promise<readonly AgentSubagentSummary[]>;
 export type AgentRuntimeStatus = {
     readonly provider: "mock" | "ready" | "unconfigured";
@@ -207,5 +212,6 @@ export type AgentWorkspaceConfig = {
     readonly storageKey?: string;
     readonly threadStorage?: AgentThreadStorage;
     readonly loadSubagents?: AgentSubagentLoader;
+    readonly controlSubagent?: AgentSubagentController;
 };
 //# sourceMappingURL=contracts.d.ts.map

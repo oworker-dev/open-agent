@@ -140,21 +140,36 @@ async function readChildSnapshot(session, signal) {
             throw error;
     }
     const events = [];
-    for await (const event of session.stream({
-        follow: true,
-        signal,
-        startIndex: 0,
-        streamReconnectPolicy: { reconnect: false },
-    })) {
-        events.push(event);
-        if (isChildSnapshotBoundary(event))
-            break;
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    const timeout = window.setTimeout(abort, CHILD_SNAPSHOT_FALLBACK_TIMEOUT_MS);
+    signal.addEventListener("abort", abort, { once: true });
+    try {
+        for await (const event of session.stream({
+            follow: true,
+            signal: controller.signal,
+            startIndex: 0,
+            streamReconnectPolicy: { reconnect: false },
+        })) {
+            events.push(event);
+            if (isChildSnapshotBoundary(event))
+                break;
+        }
+    }
+    catch (error) {
+        if (!controller.signal.aborted || signal.aborted)
+            throw error;
+    }
+    finally {
+        window.clearTimeout(timeout);
+        signal.removeEventListener("abort", abort);
     }
     return {
         events,
         session: { sessionId: session.state.sessionId, streamIndex: events.length },
     };
 }
+const CHILD_SNAPSHOT_FALLBACK_TIMEOUT_MS = 5_000;
 function isMissingTailBoundaryError(error) {
     return error instanceof Error && error.message.includes("x-eve-stream-tail-index");
 }

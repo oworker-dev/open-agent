@@ -137,6 +137,14 @@ export type AgentSubagentSummary = {
   readonly task?: string;
 };
 
+export type AgentSubagentControlAction = "close" | "interrupt" | "wait";
+
+/** Host-provided lifecycle bridge for durable child sessions. */
+export type AgentSubagentController = (input: {
+  readonly action: AgentSubagentControlAction;
+  readonly sessionId: string;
+}) => Promise<AgentSubagentSummary | undefined>;
+
 /** Host-provided durable loader. Event streams remain the optimistic fast path. */
 export type AgentSubagentLoader = (parentSessionId: string) => Promise<readonly AgentSubagentSummary[]>;
 
@@ -265,4 +273,5 @@ export type AgentWorkspaceConfig = {
   readonly storageKey?: string;
   readonly threadStorage?: AgentThreadStorage;
   readonly loadSubagents?: AgentSubagentLoader;
+  readonly controlSubagent?: AgentSubagentController;
 };

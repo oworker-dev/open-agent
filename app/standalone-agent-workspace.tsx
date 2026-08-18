@@ -66,6 +66,19 @@ export function StandaloneAgentWorkspace({
     const body = await response.json() as { children?: unknown };
     return Array.isArray(body.children) ? body.children.filter(isSubagentSummary) : [];
   }, [storageMode]);
+  const controlSubagent = useCallback(async (input: { readonly action: "close" | "interrupt" | "wait"; readonly sessionId: string }): Promise<AgentSubagentSummary | undefined> => {
+    if (storageMode !== "server") return undefined;
+    const response = await fetch(`/api/standalone/subagents/${encodeURIComponent(input.sessionId)}`, {
+      body: JSON.stringify({ action: input.action }),
+      credentials: "same-origin",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      method: "POST",
+      cache: "no-store",
+    });
+    if (!response.ok) throw new Error(`Subagent control request failed (${response.status}).`);
+    const body = await response.json() as { subagent?: unknown };
+    return isSubagentSummary(body.subagent) ? body.subagent : undefined;
+  }, [storageMode]);
   const handleActiveThreadChange = useCallback((threadId?: string) => {
     const target = threadId ? `/threads/${encodeURIComponent(threadId)}` : "/";
     if (window.location.pathname !== target) window.history.replaceState(null, "", target);
@@ -81,6 +94,7 @@ export function StandaloneAgentWorkspace({
     <AgentWorkspace
       agentName="open-agent"
       commands={commands}
+      controlSubagent={controlSubagent}
       defaultPreferences={defaultPreferences}
       extensions={extensions}
       initialSubagentSessionId={initialSubagentSessionId}

@@ -1,7 +1,7 @@
 import { type MessageStreamEvent } from "eve/client";
-import type { AgentAssetEndpoint, AgentDeliverableEndpoint, AgentModelOption, AgentSessionAsset, AgentSessionDeliverable, AgentSubagentLoader, AgentThread, AgentThreadPreferences, AgentWorkspaceClientConfig, AgentWorkspaceMailbox } from "./contracts.js";
+import type { AgentAssetEndpoint, AgentDeliverableEndpoint, AgentModelOption, AgentSessionAsset, AgentSessionDeliverable, AgentSubagentController, AgentSubagentLoader, AgentThread, AgentThreadPreferences, AgentWorkspaceClientConfig, AgentWorkspaceMailbox } from "./contracts.js";
 import { type AgentThreadStorage } from "./thread-storage.js";
-export declare function AgentWorkspace({ assetEndpoint, client, commands, defaultPreferences, deliverableEndpoint, extensions, hostSlots, initialSubagentSessionId, initialThreadId, loadSubagents, mailbox, models, mentions, onEvent, onOpenAsset, onDeleteThread, onActiveSubagentChange, onActiveThreadChange, onOpenDeliverable, onStorageError, productName, reasoningLevels, runtimeStatus, storageKey, threadStorage, }: {
+export declare function AgentWorkspace({ assetEndpoint, client, commands, defaultPreferences, deliverableEndpoint, extensions, hostSlots, initialSubagentSessionId, initialThreadId, loadSubagents, controlSubagent, mailbox, models, mentions, onEvent, onOpenAsset, onDeleteThread, onActiveSubagentChange, onActiveThreadChange, onOpenDeliverable, onStorageError, productName, reasoningLevels, runtimeStatus, storageKey, threadStorage, }: {
     readonly agentName?: string;
     readonly assetEndpoint?: AgentAssetEndpoint;
     readonly client?: AgentWorkspaceClientConfig;
@@ -17,6 +17,7 @@ export declare function AgentWorkspace({ assetEndpoint, client, commands, defaul
     readonly initialThreadId?: string;
     readonly mailbox?: AgentWorkspaceMailbox;
     readonly loadSubagents?: AgentSubagentLoader;
+    readonly controlSubagent?: AgentSubagentController;
     readonly models: readonly AgentModelOption[];
     readonly mentions?: readonly import("./contracts.js").AgentPromptMenuItem[];
     readonly onEvent?: (event: MessageStreamEvent) => void;

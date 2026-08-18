@@ -4558,11 +4558,6 @@
       border-color: var(--ring, oklch(0.708 0 0));
     }
   }
-  .focus-visible\:bg-accent {
-    &:focus-visible {
-      background-color: var(--accent, oklch(0.94 0 0));
-    }
-  }
   .focus-visible\:bg-muted {
     &:focus-visible {
       background-color: var(--muted, oklch(0.94 0 0));

@@ -19,7 +19,7 @@ import { AgentSubagentMenu } from "./agent-subagent-menu.js";
 import { AgentSecondaryView, type AgentSecondaryChild, type AgentSecondaryTab } from "./agent-secondary-view.js";
 import { AgentThreadView } from "./agent-thread.js";
 import { cn } from "../utils.js";
-import type { AgentAssetEndpoint, AgentDeliverableEndpoint, AgentInterruptedTurn, AgentModelOption, AgentQueuedTurn, AgentSessionAsset, AgentSessionDeliverable, AgentSubagentLoader, AgentSubagentSummary, AgentThread, AgentThreadPatch, AgentThreadPreferences, AgentWorkspaceClientConfig, AgentWorkspaceMailbox } from "./contracts.js";
+import type { AgentAssetEndpoint, AgentDeliverableEndpoint, AgentInterruptedTurn, AgentModelOption, AgentQueuedTurn, AgentSessionAsset, AgentSessionDeliverable, AgentSubagentController, AgentSubagentLoader, AgentSubagentSummary, AgentThread, AgentThreadPatch, AgentThreadPreferences, AgentWorkspaceClientConfig, AgentWorkspaceMailbox } from "./contracts.js";
 import { AgentThreadStorageConflictError } from "./http-thread-storage.js";
 import { messagesFor, resolveBrowserLocale, type AgentLocale, type AgentMessages } from "./i18n.js";
 import {
@@ -61,6 +61,7 @@ export function AgentWorkspace({
   initialSubagentSessionId,
   initialThreadId,
   loadSubagents,
+  controlSubagent,
   mailbox,
   models,
   mentions = [],
@@ -89,6 +90,7 @@ export function AgentWorkspace({
   readonly initialThreadId?: string;
   readonly mailbox?: AgentWorkspaceMailbox;
   readonly loadSubagents?: AgentSubagentLoader;
+  readonly controlSubagent?: AgentSubagentController;
   readonly models: readonly AgentModelOption[];
   readonly mentions?: readonly import("./contracts.js").AgentPromptMenuItem[];
   readonly onEvent?: (event: MessageStreamEvent) => void;
@@ -1027,10 +1029,11 @@ export function AgentWorkspace({
             </Button>
             <AgentSubagentMenu
               activeSessionId={activeSubagentSessionId}
-              durableSessions={durableSubagents}
-              events={activeThread.events}
-              locale={locale}
-              onOpen={openSubagent}
+            durableSessions={durableSubagents}
+            events={activeThread.events}
+            locale={locale}
+            onControl={controlSubagent}
+            onOpen={openSubagent}
             />
             {hostSlots?.threadHeaderEnd}
           </div>

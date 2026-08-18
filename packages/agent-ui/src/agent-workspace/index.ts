@@ -38,6 +38,8 @@ export type {
   AgentMailboxItemStatus,
   AgentMailboxReceipt,
   AgentSubagentLoader,
+  AgentSubagentController,
+  AgentSubagentControlAction,
   AgentSubagentSummary,
 } from "./contracts.js";
 export {
