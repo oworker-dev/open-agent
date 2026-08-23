@@ -33,7 +33,7 @@ for that topology.
 | Result artifacts | Static preview and bounded artifact stores exist | Keep as output projection; do not use it for user uploads |
 | Vision | `view_image` validates signatures, bounds payloads, resizes oversized images, and emits typed file output | Verify provider capability negotiation and visual rendering across hosts |
 | Host SDK and Muses bridge | Contracts, client, host, UI, and MCP packages exist as alpha artifacts | Publish only after cross-host, auth, quota, and failure conformance |
-| Capacity | Deterministic unit/build gates and external verification scripts exist; provider failure handling and cleanup selection are covered locally | No current real 100 MiB object-store pass, deployed SLO, sandbox admission evidence, or ten-thousand-user capacity report |
+| Capacity | Deterministic unit/build gates, guarded retention, disk-safe capacity matrix, Provider-observation mode, and resource/event-loop evidence exist | No current real 1k/5k/10k stream run, deployed SLO, sandbox admission evidence, stale-run reconciliation, or ten-thousand-user capacity report |
 
 The current upload and vision contract is specified in
 [Assets, Uploads, And Vision](./assets-and-vision.md). That document is a

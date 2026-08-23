@@ -338,10 +338,14 @@ Run `npm run verify:capacity` against an isolated deployment. It sequentially
 raises idle stream and simple AgentRun levels using the existing bounded gates,
 stops at the first failed level, and writes one redacted report plus per-level
 evidence. Configure `AGENT_CAPACITY_STREAM_LEVELS` and
-`AGENT_CAPACITY_RUN_LEVELS` for the target machine. The result reports the
+`AGENT_CAPACITY_RUN_LEVELS` for the target machine. The runner refuses to
+start when free disk is below `AGENT_CAPACITY_MIN_FREE_DISK_BYTES`; this
+protects the Workflow World from the load test itself. The result reports the
 highest passing test level only; it is not a claim that the same number of
 users can run long sandbox tasks or that ten thousand/one hundred thousand
-users are supported.
+users are supported. Capacity runs use
+`AGENT_LOAD_COMPLETION_SLO_MODE=observe` so Provider latency remains visible
+without being confused with local admission saturation.
 
 Host JWTs for the interactive control plane use separate least-privilege
 scopes. Grant only the operations that the embedding surface exposes:

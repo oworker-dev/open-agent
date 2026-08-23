@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  evaluateHostLoadSlo,
   evaluateLoadSlo,
   summarizeLatencies,
 } from "../../lib/load-slo.ts";
@@ -68,6 +69,26 @@ test("accepts metrics within all configured budgets", () => {
         p95AdmissionMs: 100,
         p95CompletionMs: 1_000,
         p99CompletionMs: 1_200,
+      },
+    ),
+    [],
+  );
+});
+
+test("host capacity gate does not classify slow Provider completion as local saturation", () => {
+  assert.deepEqual(
+    evaluateHostLoadSlo(
+      {
+        admission: summarizeLatencies([20, 30]),
+        completion: summarizeLatencies([60_000, 90_000]),
+        errorRate: 0,
+        throughputPerSecond: 8,
+      },
+      {
+        maxErrorRate: 0,
+        minThroughputPerSecond: 5,
+        p95AdmissionMs: 100,
+        p95CompletionMs: 1_000,
       },
     ),
     [],

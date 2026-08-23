@@ -1,9 +1,9 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import { performance } from "node:perf_hooks";
+import { monitorEventLoopDelay, performance } from "node:perf_hooks";
 
-import { evaluateLoadSlo, summarizeLatencies } from "../lib/load-slo.ts";
+import { evaluateHostLoadSlo, evaluateLoadSlo, summarizeLatencies } from "../lib/load-slo.ts";
 
 const baseUrl = (
   process.env.AGENT_LOAD_BASE_URL?.trim() || "http://127.0.0.1:3100"
@@ -32,6 +32,9 @@ const deadlineMs = boundedInteger(
   1_000,
   900_000,
 );
+const completionSloMode = process.env.AGENT_LOAD_COMPLETION_SLO_MODE?.trim() === "observe"
+  ? "observe"
+  : "enforce";
 const batchId = `load-${Date.now()}-${randomUUID()}`;
 const accessToken = signToken({
   actorType: "service",
@@ -44,6 +47,7 @@ const providerBefore = providerDebugUrl
   ? await providerRequestCount(providerDebugUrl)
   : undefined;
 const generatedAt = new Date().toISOString();
+const resourceSampler = createResourceSampler();
 
 const warmup = await runPhase("warmup", warmupRuns);
 const measuredStartedAt = performance.now();
@@ -70,6 +74,7 @@ const providerRequests =
   providerAfter !== undefined && providerBefore !== undefined
     ? providerAfter - providerBefore
     : undefined;
+const resource = resourceSampler.result();
 const expectedProviderRequests = warmupRuns + totalRuns;
 const metrics = {
   admission: summarizeLatencies(succeeded.map((entry) => entry.admissionMs)),
@@ -77,7 +82,9 @@ const metrics = {
   errorRate: failed.length / totalRuns,
   throughputPerSecond: round(succeeded.length / Math.max(measuredDurationMs / 1_000, 0.001), 2),
 };
-const violations = [...evaluateLoadSlo(metrics, budgets)];
+const violations = [...(completionSloMode === "observe"
+  ? evaluateHostLoadSlo(metrics, budgets)
+  : evaluateLoadSlo(metrics, budgets))];
 const warmupFailures = warmup.filter((entry) => !entry.ok);
 if (warmupFailures.length > 0) {
   violations.push(`${warmupFailures.length} of ${warmupRuns} warmup runs failed.`);
@@ -107,6 +114,7 @@ const evidence = {
     deadlineMs,
     totalRuns,
     warmupRuns,
+    completionSloMode,
   },
   budgets,
   metrics: {
@@ -117,6 +125,7 @@ const evidence = {
     eventCount: succeeded.reduce((total, entry) => total + entry.eventCount, 0),
     idempotencyReplays: succeeded.length - replayFailures.length,
     providerRequests,
+    resource,
   },
   failures: failed.map(({ index, stage, error }) => ({ index, stage, error })),
   warmupFailures: warmupFailures.map(({ index, stage, error }) => ({ index, stage, error })),
@@ -128,6 +137,37 @@ const evidence = {
 await writeEvidence(evidence);
 console.log(JSON.stringify(evidence));
 assert(evidence.ok, `Load SLO gate failed: ${violations.join(" ")}`);
+
+function createResourceSampler() {
+  const initial = process.memoryUsage();
+  let peakRss = initial.rss;
+  let peakHeapUsed = initial.heapUsed;
+  const eventLoop = monitorEventLoopDelay({ resolution: 20 });
+  eventLoop.enable();
+  const timer = setInterval(() => {
+    const current = process.memoryUsage();
+    peakRss = Math.max(peakRss, current.rss);
+    peakHeapUsed = Math.max(peakHeapUsed, current.heapUsed);
+  }, 100);
+  timer.unref();
+  return {
+    result() {
+      const final = process.memoryUsage();
+      eventLoop.disable();
+      clearInterval(timer);
+      return {
+        initialRssBytes: initial.rss,
+        finalRssBytes: final.rss,
+        peakRssBytes: peakRss,
+        initialHeapUsedBytes: initial.heapUsed,
+        finalHeapUsedBytes: final.heapUsed,
+        peakHeapUsedBytes: peakHeapUsed,
+        eventLoopP95Ms: round(eventLoop.percentile(95) / 1e6, 2),
+        eventLoopMaxMs: round(eventLoop.max / 1e6, 2),
+      };
+    },
+  };
+}
 
 async function runPhase(phase, count) {
   const cases = Array.from({ length: count }, (_, index) => createCase(phase, index));

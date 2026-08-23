@@ -99,6 +99,41 @@ export function evaluateLoadSlo(
   return violations;
 }
 
+/**
+ * Evaluate only the dimensions controlled by the local Agent service.
+ * Provider completion time is intentionally excluded: it is still recorded
+ * by the load runner, but a slow upstream must not be reported as local host
+ * saturation. Use the full evaluateLoadSlo gate when an end-to-end Provider
+ * SLO is the explicit subject of a test.
+ */
+export function evaluateHostLoadSlo(
+  metrics: LoadSloMetrics,
+  budgets: LoadSloBudgets,
+): readonly string[] {
+  const violations: string[] = [];
+  if (metrics.admission.p95Ms === null) {
+    violations.push("No successful AgentRun admissions were observed.");
+  } else if (metrics.admission.p95Ms > budgets.p95AdmissionMs) {
+    violations.push(
+      `Admission p95 ${metrics.admission.p95Ms}ms exceeded ${budgets.p95AdmissionMs}ms.`,
+    );
+  }
+  if (metrics.errorRate > budgets.maxErrorRate) {
+    violations.push(
+      `Error rate ${formatRate(metrics.errorRate)} exceeded ${formatRate(budgets.maxErrorRate)}.`,
+    );
+  }
+  if (
+    budgets.minThroughputPerSecond !== undefined &&
+    metrics.throughputPerSecond < budgets.minThroughputPerSecond
+  ) {
+    violations.push(
+      `Throughput ${metrics.throughputPerSecond.toFixed(2)}/s was below ${budgets.minThroughputPerSecond.toFixed(2)}/s.`,
+    );
+  }
+  return violations;
+}
+
 function nearestRank(sorted: readonly number[], percentile: number): number {
   return sorted[Math.max(0, Math.ceil(sorted.length * percentile) - 1)] ?? 0;
 }

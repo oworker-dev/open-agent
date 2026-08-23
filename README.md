@@ -390,6 +390,14 @@ Provider calls. The optional evidence path receives a versioned, secret-free
 JSON report even when a budget fails. This is a repeatable single-host baseline,
 not target-deployment capacity proof.
 
+For the single-server capacity matrix, set
+`AGENT_LOAD_COMPLETION_SLO_MODE=observe`. That mode still records Provider
+completion p50/p95/p99, but the pass/fail gate uses local admission, error rate,
+and throughput dimensions; it also records RSS, heap, and event-loop delay.
+Use the default `enforce` mode for a true end-to-end Provider SLO gate. A slow
+upstream response must not be “fixed” by truncating durable events or imposing
+an arbitrary per-session payload limit.
+
 Use the separate authenticated durable-stream gate for idle online capacity. It
 creates one real waiting session, opens cursor-addressed follower streams, holds
 them without model work, and records handshake latency, disconnects, and load

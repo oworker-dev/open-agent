@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, statfs, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { performance } from "node:perf_hooks";
@@ -10,13 +10,48 @@ import {
 
 const root = process.cwd();
 const streamLevels = parseCapacityLevels(process.env.AGENT_CAPACITY_STREAM_LEVELS, [100, 250, 500, 1_000]);
-const runLevels = parseCapacityLevels(process.env.AGENT_CAPACITY_RUN_LEVELS, [2, 4, 8, 16]);
+const runLevels = parseCapacityLevels(process.env.AGENT_CAPACITY_RUN_LEVELS, [1, 2, 4, 8]);
 const stopOnFailure = process.env.AGENT_CAPACITY_STOP_ON_FAILURE !== "0";
 const batchTimeoutMs = boundedInteger("AGENT_CAPACITY_BATCH_TIMEOUT_MS", 900_000, 30_000, 3_600_000);
 const evidenceDirectory = resolve(process.env.AGENT_CAPACITY_EVIDENCE_DIR?.trim() || ".tmp/capacity");
 const generatedAt = new Date().toISOString();
+const minFreeDiskBytes = boundedBytes(
+  "AGENT_CAPACITY_MIN_FREE_DISK_BYTES",
+  2 * 1024 ** 3,
+  256 * 1024 ** 2,
+  100 * 1024 ** 3,
+);
+const aggregateEvidencePath = resolve(
+  process.env.AGENT_CAPACITY_EVIDENCE_PATH?.trim() || `${evidenceDirectory}/summary.json`,
+);
 
 await mkdir(evidenceDirectory, { recursive: true });
+
+const disk = await readDiskCapacity();
+if (disk.availableBytes < minFreeDiskBytes) {
+  const evidence = {
+    schemaVersion: "open-agent.single-server-capacity-evidence.v1",
+    generatedAt,
+    completedAt: new Date().toISOString(),
+    policy: {
+      stopOnFailure,
+      batchTimeoutMs,
+      streamLevels,
+      runLevels,
+      minFreeDiskBytes,
+      note: "Capacity load was not started because the host did not have the configured free-disk safety margin.",
+    },
+    preflight: { disk, ok: false },
+    streams: { highestPassingLevel: null, results: [] },
+    agentRuns: { highestPassingLevel: null, results: [] },
+    ok: false,
+  };
+  await writeEvidence(evidence, aggregateEvidencePath);
+  console.error(JSON.stringify(evidence));
+  process.exitCode = 1;
+  process.exit();
+}
+
 const streamResults = await runCapacityLevels("streams", streamLevels, {
   AGENT_STREAM_LOAD_BASE_URL: process.env.AGENT_STREAM_LOAD_BASE_URL,
   AGENT_STREAM_LOAD_HOLD_MS: process.env.AGENT_STREAM_LOAD_HOLD_MS || "10000",
@@ -25,6 +60,10 @@ const streamResults = await runCapacityLevels("streams", streamLevels, {
 const runResults = await runCapacityLevels("agent-runs", runLevels, {
   AGENT_LOAD_BASE_URL: process.env.AGENT_LOAD_BASE_URL,
   AGENT_LOAD_DEADLINE_MS: process.env.AGENT_LOAD_DEADLINE_MS || "120000",
+  // Provider completion latency is reported separately from the single-host
+  // admission/error gate. A slow upstream must be visible in evidence without
+  // being misclassified as local saturation.
+  AGENT_LOAD_COMPLETION_SLO_MODE: "observe",
 });
 
 const evidence = {
@@ -36,8 +75,10 @@ const evidence = {
     batchTimeoutMs,
     streamLevels,
     runLevels,
+    minFreeDiskBytes,
     note: "Levels are sequential and each batch must pass its configured SLO. This is not evidence of ten-thousand or one-hundred-thousand user capacity.",
   },
+  preflight: { disk, ok: true },
   streams: {
     highestPassingLevel: highestPassingLevel(streamResults),
     results: streamResults,
@@ -50,7 +91,7 @@ const evidence = {
     streamResults.some((result) => result.ok) && runResults.some((result) => result.ok),
 };
 
-await writeEvidence(evidence);
+await writeEvidence(evidence, aggregateEvidencePath);
 console.log(JSON.stringify(evidence));
 if (!evidence.ok) process.exitCode = 1;
 
@@ -136,10 +177,7 @@ async function readEvidenceFile(path) {
   }
 }
 
-async function writeEvidence(value) {
-  const configured = process.env.AGENT_CAPACITY_EVIDENCE_PATH?.trim();
-  if (!configured) return;
-  const path = resolve(configured);
+async function writeEvidence(value, path) {
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 }
@@ -156,4 +194,35 @@ function boundedInteger(name, fallback, minimum, maximum) {
 
 function safeError(error) {
   return (error instanceof Error ? error.message : String(error)).replaceAll(/[\r\n\t]+/gu, " ").slice(0, 500);
+}
+
+async function readDiskCapacity() {
+  const stats = await statfs(root);
+  const availableBytes = Number(stats.bavail) * Number(stats.bsize);
+  const totalBytes = Number(stats.blocks) * Number(stats.bsize);
+  if (!Number.isSafeInteger(availableBytes) || !Number.isSafeInteger(totalBytes) || availableBytes < 0 || totalBytes <= 0) {
+    throw new Error("Unable to read a safe filesystem capacity snapshot.");
+  }
+  return { availableBytes, totalBytes, usedBytes: totalBytes - availableBytes };
+}
+
+function boundedBytes(name, fallback, minimum, maximum) {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
+  const match = /^(\d+)(?:\s*(KiB|MiB|GiB|TiB))?$/iu.exec(raw);
+  if (!match) throw new Error(`${name} must be a byte count with an optional KiB, MiB, GiB, or TiB suffix.`);
+  const multiplier = match[2]?.toLowerCase() === "kib"
+    ? 1024
+    : match[2]?.toLowerCase() === "mib"
+      ? 1024 ** 2
+      : match[2]?.toLowerCase() === "gib"
+        ? 1024 ** 3
+        : match[2]?.toLowerCase() === "tib"
+          ? 1024 ** 4
+          : 1;
+  const value = Number(match[1]) * multiplier;
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`${name} must be between ${minimum} and ${maximum} bytes.`);
+  }
+  return value;
 }
