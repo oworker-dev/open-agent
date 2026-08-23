@@ -19,8 +19,14 @@ simultaneous Agent execution.
 | Workload | Result | Measured values |
 | --- | --- | --- |
 | 100 idle SSE streams | Pass | 0 errors, 0 unexpected disconnects, handshake p95 185ms |
+| 500 idle SSE streams across 32 durable sessions | Pass | 500/500 HTTP 200, all handshakes established in 30.7s, held 10s |
+| 257 idle SSE streams on one durable session | Fail by test design | 256 established; the 257th timed out. This is a per-session fan-out boundary, not a server-wide user limit |
 | 2 simple live AgentRuns, concurrency 1 | Pass for host admission/error gate | 0 errors, admission p95 102ms, Provider completion p95 57.4s; this is an upstream/route latency observation, not a host saturation result |
 | 4 simple live AgentRuns, concurrency 2 | Host gate pass; Provider latency observation | 0 errors, admission p95 192ms, completion p95 28.9s in the earlier 20s budget run; the capacity runner now uses a 60s observation budget and records resource/event-loop metrics separately |
+| 4 live AgentRuns, concurrency 4 | Pass | 0 errors, admission p95 198ms, completion p95 165.0s, event-loop p95 20.5ms |
+| 8 live AgentRuns, concurrency 8 | Pass | 0 errors, admission p95 319ms, completion p95 104.7s, event-loop p95 20.6ms |
+| 16 live AgentRuns, concurrency 16 | Pass | 0 errors, admission p95 665ms, completion p95 132.0s, event-loop p95 20.7ms |
+| 32 live AgentRuns, concurrency 32 | Fail | 16/32 failed during inspection/settlement (502 or timeout), error rate 50%; event-loop p95 20.6ms |
 | 100 MiB multipart upload | Pass | 1 upload, 38.72 MiB/s, ownership isolation passed |
 
 The AgentRun result is not classified as a server saturation limit: the run
@@ -30,13 +36,23 @@ at this tiny active workload.
 
 ## Current capacity conclusion
 
-The only measured stable level currently suitable for an external capacity
-claim is **100 idle SSE connections**. Two real Provider AgentRuns at
-concurrency 1 completed without errors, but their p95 was 57.4 seconds; that
-is an upstream latency signal, not proof of a server concurrency limit. The
-maximum stable level for active Agent turns or sandboxes is therefore **not
-yet established**. Ten thousand or one hundred thousand users cannot be
-claimed from this evidence.
+The current single-server evidence supports these **verified operating levels**:
+
+- **500 concurrently connected online sessions** (one SSE stream per user),
+  with all connections established and held for 10 seconds. This is a lower
+  bound for this topology, not a proven maximum; a 1,000-connection attempt
+  did not produce complete, trustworthy evidence and is not claimed.
+- **16 concurrently executing AgentRuns**, with 0% measured errors in the
+  controlled run. At 32, the error rate was 50%, so the production admission
+  ceiling should remain below 32 until the database, sandbox, and Provider
+  pools are isolated and retested.
+
+These figures are measured separately. They do **not** mean that 500 users can
+all run Agent tasks at once. A user with an idle open session consumes an SSE
+connection; an executing task additionally consumes workflow/database capacity,
+Provider quota/latency, and usually a sandbox. The maximum stable mixed workload
+has not yet been established. Ten thousand or one hundred thousand users cannot
+be claimed from this evidence.
 
 The capacity runner now starts AgentRun levels at 1 and records RSS, heap, and
 event-loop delay. It treats admission latency, error rate, throughput, and
@@ -54,7 +70,9 @@ The next capacity run must use a disk-safe isolated database and report at
 least 1k/5k/10k idle streams plus controlled 10/25/50/100 active turns. Real
 Provider latency, Provider quota, Workflow queue age, database pool wait,
 sandbox allocation, CPU, RSS, event-loop lag, and reconnect rate must be
-recorded separately.
+recorded separately. Until that run is completed, use 500 online connections
+and 16 active turns as conservative deployment planning numbers, not marketing
+capacity.
 
 ## Storage finding
 
