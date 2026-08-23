@@ -320,6 +320,29 @@ part retry counts, throughput, upload latency, and isolation status, never file
 bytes or credentials. This is a bounded capacity/regression gate, not evidence
 that a deployment meets the full 1k/5k/10k stream or tenant SLO matrix.
 
+### Workflow history retention
+
+`@workflow/world-postgres` does not perform general workflow-run cleanup. Run
+`npm run reap:workflow` with `WORKFLOW_POSTGRES_URL` to produce a read-only
+retention report. It protects active roots and unexpired Hooks, and only selects
+completed, failed, or cancelled runs older than the configured age. Deletion is
+disabled unless both `WORKFLOW_RETENTION_APPLY=1` and
+`WORKFLOW_RETENTION_CONFIRM=delete-workflow-runs` are supplied. Review the JSON
+report and take a database backup before applying cleanup. This worker never
+cleans the Agent UI event projection; that projection and Eve's authoritative
+stream remain separate lifecycles.
+
+### Single-server capacity matrix
+
+Run `npm run verify:capacity` against an isolated deployment. It sequentially
+raises idle stream and simple AgentRun levels using the existing bounded gates,
+stops at the first failed level, and writes one redacted report plus per-level
+evidence. Configure `AGENT_CAPACITY_STREAM_LEVELS` and
+`AGENT_CAPACITY_RUN_LEVELS` for the target machine. The result reports the
+highest passing test level only; it is not a claim that the same number of
+users can run long sandbox tasks or that ten thousand/one hundred thousand
+users are supported.
+
 Host JWTs for the interactive control plane use separate least-privilege
 scopes. Grant only the operations that the embedding surface exposes:
 

@@ -130,6 +130,14 @@ the repair endpoint reads Eve's finite transcript once, compacts it, verifies
 the tail did not move, and then marks the thread covered. Subsequent opens do
 not inspect or follow the settled Eve stream.
 
+The Postgres World does not provide general run retention. Open Agent therefore
+ships `reap:workflow` as a separate, default-dry-run operator boundary. It only
+selects terminal runs whose root is inactive and whose Hook retention has ended;
+the apply path requires an explicit confirmation token and deletes child rows in
+one transaction. It is intentionally independent from UI transcript compaction:
+no retention task may delete or rewrite the authoritative event projection used
+for session recovery without a verified root/session mapping.
+
 ### Transcript ordering invariant
 
 The UI transcript is a compact projection, not a second event source. Eve's
