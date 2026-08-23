@@ -6,6 +6,66 @@ const FALLBACK_PREFERENCES = {
     modelId: "default",
     reasoning: "medium",
 };
+export function mergeThreadCollectionsForConflict(local, remote) {
+    const byId = new Map(remote.threads.map((thread) => [thread.id, thread]));
+    for (const thread of local.threads) {
+        const existing = byId.get(thread.id);
+        if (!existing) {
+            byId.set(thread.id, thread);
+            continue;
+        }
+        const selected = thread.updatedAt >= existing.updatedAt ? thread : existing;
+        const editInProgress = thread.pendingTurn?.state === "clearing" ||
+            thread.pendingTurn?.state === "resubmitting";
+        const events = editInProgress
+            ? thread.events
+            : mergeConflictEvents(thread, existing);
+        byId.set(thread.id, {
+            ...selected,
+            events,
+            ...(events.length > 0 ? { hydration: undefined } : {}),
+            session: {
+                ...selected.session,
+                streamIndex: Math.max(thread.session.streamIndex, existing.session.streamIndex),
+            },
+        });
+    }
+    const threads = [...byId.values()].sort((left, right) => right.updatedAt - left.updatedAt);
+    const activeThreadId = local.activeThreadId && threads.some((thread) => thread.id === local.activeThreadId)
+        ? local.activeThreadId
+        : remote.activeThreadId;
+    return {
+        ...(activeThreadId ? { activeThreadId } : {}),
+        threads,
+        version: AGENT_THREAD_STORAGE_VERSION,
+    };
+}
+function mergeConflictEvents(local, remote) {
+    const localEvents = local.events;
+    const remoteEvents = remote.events;
+    if (remoteEvents.length === 0)
+        return localEvents;
+    if (localEvents.length === 0)
+        return remoteEvents;
+    const localIds = new Set(localEvents.map(eventIdentity));
+    const remoteIds = new Set(remoteEvents.map(eventIdentity));
+    const localSubsetOfRemote = [...localIds].every((id) => remoteIds.has(id));
+    const remoteSubsetOfLocal = [...remoteIds].every((id) => localIds.has(id));
+    if (localSubsetOfRemote)
+        return remoteEvents;
+    if (remoteSubsetOfLocal)
+        return localEvents;
+    const merged = [...remoteEvents];
+    const mergedIds = new Set(remoteIds);
+    for (const event of localEvents) {
+        const id = eventIdentity(event);
+        if (mergedIds.has(id))
+            continue;
+        merged.push(event);
+        mergedIds.add(id);
+    }
+    return compactThreadEvents(merged);
+}
 export const browserThreadStorage = {
     load: loadThreadCollection,
     save(storageKey, collection) {
@@ -100,6 +160,7 @@ function parseThread(value) {
             .slice(0, 5)
         : [];
     const retainedContext = sanitizeRetainedContext(value.retainedContext) ?? [];
+    const transcriptCoverage = parseTranscriptCoverage(value.transcriptCoverage);
     const rawEvents = Array.isArray(value.events)
         ? value.events
         : [];
@@ -132,8 +193,23 @@ function parseThread(value) {
             streamIndex: Math.max(storedStreamIndex, rawEvents.length),
         },
         status,
+        ...(transcriptCoverage ? { transcriptCoverage } : {}),
         title: value.title,
         updatedAt,
+    };
+}
+function parseTranscriptCoverage(value) {
+    if (!isRecord(value) || value.version !== 1 ||
+        typeof value.startIndex !== "number" || !Number.isSafeInteger(value.startIndex) || value.startIndex < 0 ||
+        typeof value.endIndex !== "number" || !Number.isSafeInteger(value.endIndex) || value.endIndex < value.startIndex ||
+        typeof value.complete !== "boolean")
+        return undefined;
+    return {
+        ...(value.authoritative === true ? { authoritative: true } : {}),
+        complete: value.complete,
+        endIndex: value.endIndex,
+        startIndex: value.startIndex,
+        version: 1,
     };
 }
 function parseDraftRestore(value) {
@@ -157,6 +233,7 @@ function parseInterruptedTurns(value) {
             continue;
         turns.set(candidate.turnId, {
             eventCount: candidate.eventCount,
+            ...(typeof candidate.settled === "boolean" ? { settled: candidate.settled } : {}),
             streamIndex: candidate.streamIndex,
             turnId: candidate.turnId,
         });
@@ -241,57 +318,120 @@ function parsePromptFiles(value) {
 }
 const MAX_PENDING_FILES = 20;
 export function appendThreadEvent(events, event) {
-    if (event.meta.id && events.some((candidate) => candidate.meta.id === event.meta.id)) {
+    if (hasEventIdentity(events, event)) {
         return events;
     }
-    if (event.type === "message.appended" || event.type === "reasoning.appended") {
-        const last = events.at(-1);
-        return last?.type === event.type &&
-            last.data.turnId === event.data.turnId &&
-            last.data.stepIndex === event.data.stepIndex
-            ? [...events.slice(0, -1), event]
-            : [...events, event];
+    const cumulativeKey = cumulativeEventKey(event);
+    if (cumulativeKey) {
+        const existingIndex = findLastCumulativeEventIndex(events, cumulativeKey);
+        if (existingIndex !== undefined) {
+            return [...events.slice(0, existingIndex), event, ...events.slice(existingIndex + 1)];
+        }
+        return [...events, event];
     }
     if (event.type === "message.completed" || event.type === "reasoning.completed") {
-        const incrementalType = event.type === "message.completed"
-            ? "message.appended"
-            : "reasoning.appended";
-        const last = events.at(-1);
-        return last?.type === incrementalType &&
-            last.data.turnId === event.data.turnId &&
-            last.data.stepIndex === event.data.stepIndex
-            ? [...events.slice(0, -1), event]
-            : [...events, event];
+        return [...events, event];
     }
     return [...events, event];
 }
+export function appendThreadEventIndexed(events, eventIds, event) {
+    const identity = eventIdentity(event);
+    if (eventIds.has(identity))
+        return false;
+    eventIds.add(identity);
+    const cumulativeKey = cumulativeEventKey(event);
+    if (cumulativeKey) {
+        const existingIndex = findLastCumulativeEventIndex(events, cumulativeKey);
+        if (existingIndex !== undefined) {
+            events[existingIndex] = event;
+            return true;
+        }
+    }
+    events.push(event);
+    return true;
+}
+export function eventIdentity(event) {
+    if (typeof event.meta?.id === "string" && event.meta.id.length > 0) {
+        return `id:${event.meta.id}`;
+    }
+    return `event:${JSON.stringify(event)}`;
+}
+function hasEventIdentity(events, event) {
+    const identity = eventIdentity(event);
+    return events.some((candidate) => eventIdentity(candidate) === identity);
+}
 export function compactThreadEvents(events) {
     const compacted = [];
+    const identities = new Set();
+    const cumulativeIndexes = new Map();
     for (const event of events) {
-        if (event.type === "message.appended" || event.type === "reasoning.appended") {
-            const last = compacted.at(-1);
-            if (last?.type === event.type &&
-                last.data.turnId === event.data.turnId &&
-                last.data.stepIndex === event.data.stepIndex) {
-                compacted[compacted.length - 1] = event;
+        const identity = eventIdentity(event);
+        if (identities.has(identity))
+            continue;
+        identities.add(identity);
+        const cumulativeKey = cumulativeEventKey(event);
+        if (cumulativeKey) {
+            const existingIndex = cumulativeIndexes.get(cumulativeKey);
+            if (existingIndex !== undefined) {
+                compacted[existingIndex] = event;
                 continue;
             }
-        }
-        if (event.type === "message.completed" || event.type === "reasoning.completed") {
-            const incrementalType = event.type === "message.completed"
-                ? "message.appended"
-                : "reasoning.appended";
-            const last = compacted.at(-1);
-            if (last?.type === incrementalType &&
-                last.data.turnId === event.data.turnId &&
-                last.data.stepIndex === event.data.stepIndex) {
-                compacted[compacted.length - 1] = event;
-                continue;
-            }
+            cumulativeIndexes.set(cumulativeKey, compacted.length);
         }
         compacted.push(event);
     }
     return compacted;
+}
+function cumulativeEventKey(event) {
+    if (event.type === "message.appended" || event.type === "reasoning.appended") {
+        return `${event.type}:${event.data.turnId}:${event.data.stepIndex}`;
+    }
+    if (event.type === "action.input.partial") {
+        return `${event.type}:${event.data.turnId}:${event.data.stepIndex}:${event.data.callId}`;
+    }
+    return undefined;
+}
+function findLastCumulativeEventIndex(events, key) {
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+        if (cumulativeEventKey(events[index]) === key)
+            return index;
+    }
+    return undefined;
+}
+export function reconcilePendingTurnWithEvents(pendingTurn, events) {
+    if (!pendingTurn)
+        return undefined;
+    const latestReceived = [...events].reverse().find((event) => event.type === "message.received");
+    const eventAt = latestReceived?.meta.at ? Date.parse(latestReceived.meta.at) : Number.NaN;
+    const submittedAt = pendingTurn.submittedAt;
+    const eventCanAcknowledge = !Number.isFinite(eventAt) || eventAt >= submittedAt - 5_000;
+    const hasAuthoritativeClientId = latestReceived?.type === "message.received" &&
+        typeof latestReceived.data.clientMessageId === "string" &&
+        latestReceived.data.clientMessageId.trim().length > 0;
+    const accepted = latestReceived?.type === "message.received" && (latestReceived.data.clientMessageId === pendingTurn.id ||
+        (!hasAuthoritativeClientId && eventCanAcknowledge && pendingTurn.text.trim().length > 0 &&
+            latestReceived.data.message.trim() === pendingTurn.text.trim()));
+    return accepted ? undefined : pendingTurn;
+}
+export function reconcileHydratedPendingTurn(pendingTurn, events) {
+    const reconciled = reconcilePendingTurnWithEvents(pendingTurn, events);
+    if (!reconciled)
+        return undefined;
+    if (reconciled.state !== "clearing" && reconciled.state !== "resubmitting" && reconciled.state !== "submitting")
+        return reconciled;
+    return { ...reconciled, state: "delivery-failed" };
+}
+export function dedupeThreadEvents(events) {
+    const seen = new Set();
+    const deduped = [];
+    for (const event of events) {
+        const identity = eventIdentity(event);
+        if (seen.has(identity))
+            continue;
+        seen.add(identity);
+        deduped.push(event);
+    }
+    return deduped;
 }
 function isExecutionMode(value) {
     return value === "automation" || value === "cautious" || value === "standard";

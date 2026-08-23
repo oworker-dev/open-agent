@@ -45,6 +45,19 @@ test("apply_patch parses and applies multiple hunks without collapsing contexts"
   assert.equal(result.deletedLines, 2);
 });
 
+test("apply_patch accepts Codex bare hunk headers when context locates the edit", () => {
+  const [operation] = parsePatch(`*** Begin Patch
+*** Update File: src/example.txt
+@@
+ beta
+-gamma
++gamma changed
+*** End Patch`);
+  assert.equal(operation?.kind, "update");
+  if (!operation || operation.kind !== "update") throw new Error("expected update");
+  assert.equal(applyUpdateText("alpha\nbeta\ngamma\n", operation.hunks).content, "alpha\nbeta\ngamma changed\n");
+});
+
 test("apply_patch rejects stale and ambiguous contexts", () => {
   assert.throws(
     () => applyUpdateText("same\nsame\n", [{ lines: [" same", "+changed"] }]),
@@ -58,7 +71,10 @@ test("apply_patch rejects stale and ambiguous contexts", () => {
 
 test("apply_patch enforces envelope, hunk counts, and workspace-only paths", () => {
   assert.throws(() => workspacePath("../escape"), /workspace|traversal/);
-  assert.throws(() => parsePatch("*** Begin Patch\n*** Update File: file\n@@ -1,2 +1,1 @@\n old\n+new\n*** End Patch"), /old-line count/);
+  const countMismatch = parsePatch("*** Begin Patch\n*** Update File: file\n@@ -1,2 +1,1 @@\n-old\n+new\n*** End Patch");
+  assert.equal(countMismatch[0]?.kind, "update");
+  if (!countMismatch[0] || countMismatch[0].kind !== "update") throw new Error("expected update");
+  assert.equal(applyUpdateText("old\nkeep\n", countMismatch[0].hunks).content, "new\nkeep\n");
   assert.throws(() => parsePatch("garbage\n*** Begin Patch\n*** Add File: file\n+x\n*** End Patch"), /outside/);
   assert.throws(() => normalizeWorkspacePath("/workspace/../secret"), /workspace|traversal/);
 });

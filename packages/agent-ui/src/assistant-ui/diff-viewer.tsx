@@ -1,6 +1,6 @@
 "use client";
 
-import { type ComponentProps, useMemo } from "react";
+import { type ComponentProps, useMemo, useRef } from "react";
 import type { SyntaxHighlighterProps } from "@assistant-ui/react-markdown";
 import { cva, type VariantProps } from "class-variance-authority";
 import { diffLines } from "diff";
@@ -31,7 +31,15 @@ interface SplitLinePair {
 }
 
 function parsePatch(patch: string): ParsedFile[] {
-  const files = parseDiff(patch);
+  let files: ReturnType<typeof parseDiff>;
+  try {
+    files = parseDiff(patch);
+  } catch {
+    // Provider tool arguments are cumulative and may end halfway through a
+    // hunk. Keep the previous render alive instead of throwing from React's
+    // render path while the next durable partial arrives.
+    return [];
+  }
   return files.map((file) => {
     const lines: ParsedLine[] = [];
     let additions = 0;
@@ -465,17 +473,20 @@ function DiffViewer({
   const oldName = oldFile?.name;
   const newContent = newFile?.content;
   const newName = newFile?.name;
+  const lastValidFilesRef = useRef<ParsedFile[]>([]);
 
   const parsedFiles = useMemo<ParsedFile[]>(() => {
     if (diffPatch) {
-      return parsePatch(diffPatch);
+      const next = parsePatch(diffPatch);
+      if (next.length > 0) lastValidFilesRef.current = next;
+      return next.length > 0 ? next : lastValidFilesRef.current;
     }
     if (oldContent !== undefined && newContent !== undefined) {
       const { lines, additions, deletions } = computeDiff(
         oldContent,
         newContent,
       );
-      return [
+      const next = [
         {
           oldName,
           newName,
@@ -484,6 +495,8 @@ function DiffViewer({
           deletions,
         },
       ];
+      lastValidFilesRef.current = next;
+      return next;
     }
     return [];
   }, [diffPatch, oldContent, oldName, newContent, newName]);

@@ -1,12 +1,18 @@
 "use client";
 import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-runtime";
-import { useMemo } from "react";
+import { useMemo, useRef } from "react";
 import { cva } from "class-variance-authority";
 import { diffLines } from "diff";
 import parseDiff from "parse-diff";
 import { cn } from "../utils.js";
 function parsePatch(patch) {
-    const files = parseDiff(patch);
+    let files;
+    try {
+        files = parseDiff(patch);
+    }
+    catch {
+        return [];
+    }
     return files.map((file) => {
         const lines = [];
         let additions = 0;
@@ -204,13 +210,17 @@ function DiffViewer({ code, patch, oldFile, newFile, viewMode = "unified", showL
     const oldName = oldFile?.name;
     const newContent = newFile?.content;
     const newName = newFile?.name;
+    const lastValidFilesRef = useRef([]);
     const parsedFiles = useMemo(() => {
         if (diffPatch) {
-            return parsePatch(diffPatch);
+            const next = parsePatch(diffPatch);
+            if (next.length > 0)
+                lastValidFilesRef.current = next;
+            return next.length > 0 ? next : lastValidFilesRef.current;
         }
         if (oldContent !== undefined && newContent !== undefined) {
             const { lines, additions, deletions } = computeDiff(oldContent, newContent);
-            return [
+            const next = [
                 {
                     oldName,
                     newName,
@@ -219,6 +229,8 @@ function DiffViewer({ code, patch, oldFile, newFile, viewMode = "unified", showL
                     deletions,
                 },
             ];
+            lastValidFilesRef.current = next;
+            return next;
         }
         return [];
     }, [diffPatch, oldContent, oldName, newContent, newName]);

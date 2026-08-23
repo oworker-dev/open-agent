@@ -11,6 +11,7 @@ import {
   type AgentModelOption,
   type AgentPromptMenuItem,
   type AgentRuntimeStatus,
+  type AgentSessionBoundary,
   type AgentSubagentSummary,
   type AgentThreadPreferences,
 } from "@oworker/open-agent-ui";
@@ -66,6 +67,27 @@ export function StandaloneAgentWorkspace({
     const body = await response.json() as { children?: unknown };
     return Array.isArray(body.children) ? body.children.filter(isSubagentSummary) : [];
   }, [storageMode]);
+  const inspectSession = useCallback(async (sessionId: string): Promise<AgentSessionBoundary> => {
+    if (storageMode !== "server") return { state: "running" };
+    const response = await fetch(`/api/standalone/sessions/${encodeURIComponent(sessionId)}`, {
+      credentials: "same-origin",
+      headers: { accept: "application/json" },
+      cache: "no-store",
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (!response.ok) throw new Error(`Session boundary request failed (${response.status}).`);
+    const body = await response.json() as Partial<AgentSessionBoundary>;
+    if (body.state !== "running" && body.state !== "waiting" && body.state !== "terminal") {
+      throw new Error("The Agent runtime returned an invalid session boundary.");
+    }
+    return {
+      state: body.state,
+      ...(typeof body.lastEventAt === "string" ? { lastEventAt: body.lastEventAt } : {}),
+      ...(typeof body.tailIndex === "number" && Number.isSafeInteger(body.tailIndex) && body.tailIndex >= 0 ? { tailIndex: body.tailIndex } : {}),
+      ...(typeof body.turnId === "string" ? { turnId: body.turnId } : {}),
+      ...(body.terminalStatus === "completed" || body.terminalStatus === "failed" ? { terminalStatus: body.terminalStatus } : {}),
+    };
+  }, [storageMode]);
   const controlSubagent = useCallback(async (input: { readonly action: "close" | "interrupt" | "wait"; readonly sessionId: string }): Promise<AgentSubagentSummary | undefined> => {
     if (storageMode !== "server") return undefined;
     const response = await fetch(`/api/standalone/subagents/${encodeURIComponent(input.sessionId)}`, {
@@ -99,6 +121,7 @@ export function StandaloneAgentWorkspace({
       extensions={extensions}
       initialSubagentSessionId={initialSubagentSessionId}
       initialThreadId={initialThreadId}
+      inspectSession={inspectSession}
       mentions={mentions}
       models={models}
       mailbox={mailbox}

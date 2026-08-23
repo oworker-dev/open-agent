@@ -57,6 +57,8 @@ function durableStatus(status: AgentSubagentSummary["status"]): SubagentSessionP
 export type AgentTurnPresentation = {
   readonly endedAt?: number;
   readonly finalPart?: Extract<EveMessagePart, { type: "text" }>;
+  /** A terminal step failure is rendered by the step's own activity row. */
+  readonly failureAnchored?: boolean;
   readonly proxiedInputParts: readonly EveDynamicToolPart[];
   readonly processParts: readonly EveMessagePart[];
   readonly startedAt?: number;
@@ -68,6 +70,22 @@ export type AgentTurnFailure = {
   readonly code: string;
   readonly message: string;
 };
+
+export type AgentFailureCategory = "network" | "provider" | "timeout" | "unknown";
+
+/** Classify transport/provider failures for a stable user-facing status. */
+export function classifyAgentFailure(failure: AgentTurnFailure): AgentFailureCategory {
+  const code = failure.code.toLocaleLowerCase();
+  const message = failure.message.toLocaleLowerCase();
+  const value = `${code} ${message}`;
+  if (/timeout|timed out|deadline|\b408\b|\b504\b/u.test(value)) return "timeout";
+  // A provider stream ending is normally an upstream retry/failure. Only call
+  // it a network error when the diagnostic actually names a transport fault;
+  // this avoids turning every exhausted model retry into a vague network flash.
+  if (/network|fetch|socket|connection reset|connection refused|econn|dns|chunked encoding/u.test(value)) return "network";
+  if (/provider|model|rate.?limit|\b429\b|overload|upstream|quota|\b5(?:00|02|03)\b|stream.?interrupted|stream.?ended/u.test(value)) return "provider";
+  return "unknown";
+}
 
 export type AgentStepPresentation = {
   readonly endedAt?: number;
@@ -85,6 +103,403 @@ export type AgentDisplayProjection = {
   readonly events: readonly MessageStreamEvent[];
   readonly messages: readonly EveMessage[];
 };
+
+/** Marker used only in the UI projection for a tool that was interrupted
+ * before Eve produced an action.result. It is never written into Eve's stream.
+ */
+export const INTERRUPTED_TOOL_ERROR = "Open Agent: tool call cancelled before completion.";
+export const CANCELLING_TOOL_ERROR = "Open Agent: tool call cancellation is pending.";
+export const INCOMPLETE_TOOL_ERROR = "Open Agent: tool call did not complete.";
+
+export function isInterruptedToolPart(part: EveDynamicToolPart): boolean {
+  return part.state === "output-error" && part.errorText === INTERRUPTED_TOOL_ERROR;
+}
+
+export function isCancellationPendingToolPart(part: EveDynamicToolPart): boolean {
+  return part.state === "output-error" && part.errorText === CANCELLING_TOOL_ERROR;
+}
+
+function isLocalInterruptedBoundary(event: MessageStreamEvent): boolean {
+  return event.type === "turn.cancelled" && event.meta?.id?.startsWith("local-interrupt-") === true;
+}
+
+/**
+ * Remove failed tool-input snapshots from the user-visible event projection
+ * once a turn has reached a terminal boundary. Eve's own stream remains
+ * append-only; this projection is the compact transcript used by the UI and
+ * must not make an incomplete provider call look like a successful action.
+ */
+export function sanitizeSettledThreadEvents(
+  events: readonly MessageStreamEvent[],
+): readonly MessageStreamEvent[] {
+  // A durable turn must have an inbound message anchor. When a browser or
+  // event-log checkpoint is interrupted between admission and
+  // `message.received`, Eve can still leave later tool/output events behind.
+  // Those events are execution residue, not a second user request. Keep HITL
+  // continuations (which intentionally have no new message) anchored by the
+  // preceding input request, and discard every other orphan turn.
+  const anchoredTurns = new Set(
+    events.flatMap((event) => event.type === "message.received" ? [event.data.turnId] : []),
+  );
+  const startedTurns = new Set(
+    events.flatMap((event) => event.type === "turn.started" ? [event.data.turnId] : []),
+  );
+  const continuationTurns = continuationTurnIds(events, anchoredTurns);
+  const orphanTurns = new Set<string>();
+  // A stream fragment without any message anchor at all is common in unit
+  // fixtures and can also be the first bytes observed during live admission.
+  // Only classify residue once the same transcript contains at least one
+  // authoritative user turn.
+  if (anchoredTurns.size > 0) {
+    for (const event of events) {
+      const turnId = eventTurnId(event);
+      // A transport checkpoint can lose `message.received` while retaining
+      // the real turn boundary and all of its tool/result events. Such a turn
+      // is valid history, not a duplicate admission. Only remove a turn that
+      // lacks both authoritative user admission and Eve's turn boundary.
+      if (turnId && !anchoredTurns.has(turnId) && !startedTurns.has(turnId) && !continuationTurns.has(turnId)) {
+        orphanTurns.add(turnId);
+      }
+    }
+  }
+  const terminalTurns = new Set<string>();
+  const cancelledTurns = new Set<string>();
+  const completedCalls = new Set<string>();
+  const lastPartialIndex = new Map<string, number>();
+  for (const [index, event] of events.entries()) {
+    if (event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled") {
+      terminalTurns.add(event.data.turnId);
+      if (event.type === "turn.cancelled") cancelledTurns.add(event.data.turnId);
+    }
+    if (event.type === "action.input.partial") {
+      lastPartialIndex.set(`${event.data.turnId}:${event.data.callId}`, index);
+    }
+    if (event.type === "action.result" && event.data.status === "completed" && event.data.result.kind === "tool-result") {
+      completedCalls.add(`${event.data.turnId}:${event.data.result.callId}`);
+    }
+  }
+
+  const filtered = events.filter((event, index) => {
+    const turnId = eventTurnId(event);
+    if (turnId && orphanTurns.has(turnId)) return false;
+    if (event.type !== "action.input.partial" || !terminalTurns.has(event.data.turnId) || cancelledTurns.has(event.data.turnId)) return true;
+    // A settled action has an authoritative `actions.requested` snapshot and
+    // `action.result`; retaining every cumulative input snapshot is the main
+    // source of multi-megabyte transcripts. Cancellation is the one case
+    // where the last partial remains useful as an audit marker.
+    const key = `${event.data.turnId}:${event.data.callId}`;
+    return completedCalls.has(key) && lastPartialIndex.get(key) === index;
+  });
+
+  // Also discard a step marker when its only event was the abandoned tool
+  // argument stream. Keeping it would render a phantom "Thinking" row.
+  const stepEvidence = new Set<string>();
+  for (const event of filtered) {
+    const turnId = eventTurnId(event);
+    const stepIndex = eventStepIndex(event);
+    if (!turnId || stepIndex === undefined) continue;
+    if (
+      event.type !== "step.started" &&
+      event.type !== "turn.completed" &&
+      event.type !== "turn.failed" &&
+      event.type !== "turn.cancelled"
+    ) stepEvidence.add(`${turnId}:${stepIndex}`);
+  }
+  const normalized = filtered.filter((event) => {
+    if (event.type !== "step.started" || !terminalTurns.has(event.data.turnId)) return true;
+    return stepEvidence.has(`${event.data.turnId}:${event.data.stepIndex}`);
+  });
+  const compacted: MessageStreamEvent[] = [];
+  for (const event of normalized) {
+    // Keep one cumulative incremental event as the visual anchor for each
+    // message/reasoning run. A completion boundary is intentionally retained
+    // as a separate event because Eve may emit it after tool results.
+    if (event.type === "message.appended" || event.type === "reasoning.appended") {
+      const last = compacted.at(-1);
+      if (
+        last?.type === event.type &&
+        last.data.turnId === event.data.turnId &&
+        last.data.stepIndex === event.data.stepIndex
+      ) {
+        compacted[compacted.length - 1] = event;
+        continue;
+      }
+    }
+    if (event.type === "session.waiting" && compacted.at(-1)?.type === "session.waiting") {
+      compacted[compacted.length - 1] = event;
+      continue;
+    }
+    compacted.push(event);
+  }
+  return compacted;
+}
+
+function continuationTurnIds(
+  events: readonly MessageStreamEvent[],
+  anchoredTurns: ReadonlySet<string>,
+): ReadonlySet<string> {
+  const continuation = new Set<string>();
+  let inputContinuationPending = false;
+  for (const event of events) {
+    if (event.type === "input.requested" || event.type === "authorization.required") {
+      inputContinuationPending = true;
+      continue;
+    }
+    if (event.type === "message.received") {
+      inputContinuationPending = false;
+      continue;
+    }
+    if (event.type === "turn.started") {
+      if (inputContinuationPending && !anchoredTurns.has(event.data.turnId)) {
+        continuation.add(event.data.turnId);
+      }
+      inputContinuationPending = false;
+    }
+  }
+  return continuation;
+}
+
+/**
+ * Repair the browser projection after a reconnect without inventing success.
+ *
+ * Eve's reducer can retain a tool-input snapshot when the browser persisted the
+ * snapshot before the transport failed. A terminal turn is authoritative, but
+ * it does not make that tool call successful: only an `action.result` event
+ * does. Keep the durable event log append-only. Provider failures retain the
+ * last tool input as an explicit failed boundary, while user cancellation
+ * preserves the last snapshot as an interrupted tool boundary.
+ */
+export function normalizeSettledAgentMessages(
+  messages: readonly EveMessage[],
+  events: readonly MessageStreamEvent[],
+): readonly EveMessage[] {
+  const terminalTurns = new Map<string, "completed" | "failed" | "cancelled" | "cancelling">();
+  for (const event of events) {
+    if (event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled") {
+      terminalTurns.set(
+        event.data.turnId,
+        event.type === "turn.completed"
+          ? "completed"
+          : event.type === "turn.failed"
+            ? "failed"
+            : isLocalInterruptedBoundary(event) ? "cancelling" : "cancelled",
+      );
+    }
+  }
+
+  return messages.map((message) => {
+    if (message.role !== "assistant" || !message.metadata?.turnId) return message;
+    const messageTurnId = message.metadata.turnId;
+    const terminal = terminalTurns.get(messageTurnId);
+    if (!terminal) return message;
+    // Eve can accept a steering/follow-up message inside the same durable
+    // turn. The default reducer then creates one assistant message per
+    // `message.received` segment, while the terminal boundary remains shared
+    // by the whole turn. Scope action results and partial tool inputs to the
+    // segment that produced the message; using the entire turn here causes a
+    // successful tool in one segment to be attached to every other segment
+    // and falsely synthesized as `tool call did not complete`.
+    const segmentEvents = eventsForAssistantSegment(message, events).events;
+    const segmentCompletedResults = new Map<string, { readonly output: unknown; readonly toolName: string }>();
+    const segmentPartialToolInputs = new Map<string, Extract<MessageStreamEvent, { type: "action.input.partial" }>>();
+    for (const event of segmentEvents) {
+      if (event.type === "action.result" && event.data.status === "completed" && event.data.result.kind === "tool-result") {
+        segmentCompletedResults.set(event.data.result.callId, {
+          output: event.data.result.output,
+          toolName: event.data.result.toolName,
+        });
+      }
+      if (event.type === "action.input.partial") {
+        segmentPartialToolInputs.set(event.data.callId, event);
+      }
+    }
+    let changed = false;
+    const parts = message.parts.flatMap((part): EveMessagePart[] => {
+      if (part.type !== "dynamic-tool" || !isOpenToolPart(part)) return [part];
+      const completed = segmentCompletedResults.get(part.toolCallId);
+      changed = true;
+      if (!completed) {
+        // A user cancellation is a visible lifecycle outcome, not a failed
+        // provider fragment. Keep the last input snapshot so the tool card and
+        // file diff remain auditable, but use a terminal error state so it can
+        // never be mistaken for a successful action.
+        if (terminal === "cancelled" || terminal === "cancelling") {
+          const toolMetadata = part.toolMetadata?.eve
+            ? {
+                ...part.toolMetadata,
+                eve: {
+                  kind: part.toolMetadata.eve.kind,
+                  name: part.toolMetadata.eve.name,
+                },
+              }
+            : part.toolMetadata;
+          return [{
+            errorText: terminal === "cancelled" ? INTERRUPTED_TOOL_ERROR : CANCELLING_TOOL_ERROR,
+            input: part.input,
+            ...(part.inputText !== undefined ? { inputText: part.inputText } : {}),
+            ...(part.stepIndex !== undefined ? { stepIndex: part.stepIndex } : {}),
+            state: "output-error",
+            toolCallId: part.toolCallId,
+            ...(toolMetadata ? { toolMetadata } : {}),
+            toolName: part.toolName,
+            type: "dynamic-tool",
+          } satisfies EveDynamicToolPart];
+        }
+        // Provider failures and completed turns without a result are still
+        // visible attempts. Keep them as terminal error cards so the user can
+        // see what failed instead of seeing a mysteriously missing tool.
+        return [{
+          errorText: incompleteToolError(segmentEvents, messageTurnId, part),
+          input: part.input,
+          ...(part.inputText !== undefined ? { inputText: part.inputText } : {}),
+          ...(part.stepIndex !== undefined ? { stepIndex: part.stepIndex } : {}),
+          state: "output-error",
+          toolCallId: part.toolCallId,
+          ...(part.toolMetadata ? { toolMetadata: part.toolMetadata } : {}),
+          toolName: part.toolName,
+          type: "dynamic-tool",
+        } satisfies EveDynamicToolPart];
+      }
+      return [{
+        input: part.input,
+        ...(part.inputText !== undefined ? { inputText: part.inputText } : {}),
+        ...(part.stepIndex !== undefined ? { stepIndex: part.stepIndex } : {}),
+        output: completed.output,
+        state: "output-available",
+        toolCallId: part.toolCallId,
+        ...(part.toolMetadata ? { toolMetadata: part.toolMetadata } : {}),
+        toolName: completed.toolName || part.toolName,
+        type: "dynamic-tool",
+      } satisfies EveDynamicToolPart];
+    });
+
+    // The default reducer leaves a step-start marker even when its only child
+    // was the orphaned tool input removed above. Remove those empty markers so
+    // a settled turn cannot render a phantom "正在思考" activity.
+    const cleanedParts: EveMessagePart[] = [];
+    const markerIndexByStep = new Map<number, number>();
+    const partialsForMessage = [...segmentPartialToolInputs.values()];
+    let markerStepIndex = 0;
+    for (let index = 0; index < parts.length; index += 1) {
+      const part = parts[index]!;
+      if (part.type !== "step-start") {
+        // A terminal Eve boundary closes any text delta that was left in a
+        // streaming state when the provider connection failed. Do not let a
+        // settled turn keep the composer or reasoning UI looking live.
+        if ((part.type === "text" || part.type === "reasoning") && part.state === "streaming") {
+          changed = true;
+          cleanedParts.push({ ...part, state: "done" });
+        } else {
+          cleanedParts.push(part);
+        }
+        continue;
+      }
+      const nextStep = parts.findIndex((candidate, candidateIndex) =>
+        candidateIndex > index && candidate.type === "step-start",
+      );
+      const end = nextStep < 0 ? parts.length : nextStep;
+      const hasContent = parts.slice(index + 1, end).some((candidate) => candidate.type !== "step-start");
+      const hasPartialInput = partialsForMessage.some((partial) => partial.data.stepIndex === markerStepIndex);
+      if (hasContent || hasPartialInput) {
+        markerIndexByStep.set(markerStepIndex, cleanedParts.length);
+        cleanedParts.push(part);
+      }
+      else changed = true;
+      markerStepIndex += 1;
+    }
+    const visibleToolCallIds = new Set(
+      cleanedParts.flatMap((part) => part.type === "dynamic-tool" ? [part.toolCallId] : []),
+    );
+    const syntheticByStep = new Map<number, EveDynamicToolPart[]>();
+    for (const partial of partialsForMessage) {
+      if (visibleToolCallIds.has(partial.data.callId)) continue;
+      changed = true;
+      visibleToolCallIds.add(partial.data.callId);
+      const synthetic: EveDynamicToolPart = {
+        errorText: terminal === "cancelled" || terminal === "cancelling"
+          ? terminal === "cancelled" ? INTERRUPTED_TOOL_ERROR : CANCELLING_TOOL_ERROR
+          : incompleteToolError(segmentEvents, messageTurnId, {
+              input: partial.data.input ?? {},
+              stepIndex: partial.data.stepIndex,
+              toolCallId: partial.data.callId,
+              toolName: partial.data.toolName,
+              type: "dynamic-tool",
+              state: "input-streaming",
+            }),
+        input: partial.data.input ?? {},
+        inputText: partial.data.inputTextSoFar,
+        state: "output-error",
+        stepIndex: partial.data.stepIndex,
+        toolCallId: partial.data.callId,
+        toolName: partial.data.toolName,
+        type: "dynamic-tool",
+      };
+      const stepParts = syntheticByStep.get(partial.data.stepIndex) ?? [];
+      stepParts.push(synthetic);
+      syntheticByStep.set(partial.data.stepIndex, stepParts);
+    }
+    // Keep a recovered failed tool next to its original step marker. This
+    // preserves the event order users saw during the live run.
+    const insertions = [...syntheticByStep.entries()]
+      .map(([stepIndex, stepParts]) => ({
+        index: markerIndexByStep.get(stepIndex) ?? cleanedParts.length - 1,
+        stepParts,
+      }))
+      .sort((left, right) => right.index - left.index);
+    for (const insertion of insertions) {
+      cleanedParts.splice(insertion.index + 1, 0, ...insertion.stepParts);
+    }
+    if (message.metadata?.status === "streaming") {
+      changed = true;
+    }
+    return changed
+      ? {
+          ...message,
+          metadata: message.metadata?.status === "streaming"
+            ? { ...message.metadata, status: "complete" }
+            : message.metadata,
+          parts: cleanedParts,
+        }
+      : message;
+  });
+}
+
+function incompleteToolError(
+  events: readonly MessageStreamEvent[],
+  turnId: string,
+  part: EveDynamicToolPart,
+): string {
+  const result = [...events].reverse().find((event) =>
+    event.type === "action.result" &&
+    event.data.turnId === turnId &&
+    event.data.result.callId === part.toolCallId &&
+    event.data.status !== "completed",
+  );
+  if (result?.type === "action.result" && result.data.error?.message) {
+    return result.data.error.message;
+  }
+  const stepFailure = [...events].reverse().find((event) =>
+    event.type === "step.failed" &&
+    event.data.turnId === turnId &&
+    (part.stepIndex === undefined || event.data.stepIndex === part.stepIndex),
+  );
+  if (stepFailure?.type === "step.failed") return stepFailure.data.message;
+  const turnFailure = [...events].reverse().find((event) =>
+    event.type === "turn.failed" && event.data.turnId === turnId,
+  );
+  if (turnFailure?.type === "turn.failed") return turnFailure.data.message;
+  return INCOMPLETE_TOOL_ERROR;
+}
+
+function isOpenToolPart(part: EveDynamicToolPart): part is OpenToolPart {
+  return part.state === "input-streaming" ||
+    part.state === "input-available" ||
+    (part.state === "output-available" && part.partial === true);
+}
+
+type OpenToolPart =
+  | Extract<EveDynamicToolPart, { readonly state: "input-streaming" | "input-available" }>
+  | (Extract<EveDynamicToolPart, { readonly state: "output-available" }> & { readonly partial: true });
 
 const MAX_DURABLE_STEP_RETRIES = 3;
 
@@ -121,7 +536,11 @@ function shouldSuppressInterruptedTurnEvent(
   const turnId = eventTurnId(event);
   if (!turnId) return false;
   const interrupted = turns.find((turn) => turn.turnId === turnId);
-  return Boolean(interrupted && isAfterCancellation(interrupted));
+  // A local cancellation marker is only a UI intent. Keep accepting durable
+  // events until Eve confirms `turn.cancelled`; otherwise a tool result that
+  // wins the cancellation race would be hidden and the refresh projection
+  // would disagree with the live view.
+  return Boolean(interrupted && interrupted.settled !== false && isAfterCancellation(interrupted));
 }
 
 /**
@@ -216,10 +635,18 @@ export function presentAgentStep(
       ? Math.max(maximum, eventStepIndex(event) ?? -1)
       : maximum,
   -1);
-  const terminalFailure = stepIndex === maximumTurnStepIndex
-    ? [...events].reverse().find((event) =>
+  const terminalFailureEvent = stepIndex === maximumTurnStepIndex
+    ? [...events].reverse().find((event): event is Extract<MessageStreamEvent, { type: "turn.failed" }> =>
         event.type === "turn.failed" && event.data.turnId === turnId
+      ) ?? [...events].reverse().find((event): event is Extract<MessageStreamEvent, { type: "session.failed" }> =>
+        event.type === "session.failed"
       )
+    : undefined;
+  const terminalFailure = terminalFailureEvent
+    ? {
+        code: terminalFailureEvent.data.code,
+        message: terminalFailureEvent.data.message,
+      }
     : undefined;
   const latestFailure = failures.at(-1);
   const retryAttempt = terminalFailure || completed
@@ -233,12 +660,10 @@ export function presentAgentStep(
   const latestAttemptFailed = latestAttemptEvents.some((event) => event.type === "step.failed");
   const endedAt = latestAttemptFailed && !completed && !terminalFailure
     ? undefined
-    : modelOutputBoundaryTime(latestAttemptEvents) ?? eventTimestamp(completed ?? terminalFailure);
+    : modelOutputBoundaryTime(latestAttemptEvents) ?? eventTimestamp(completed ?? terminalFailureEvent);
   return {
     ...(endedAt ? { endedAt } : {}),
-    ...(terminalFailure?.type === "turn.failed"
-      ? { failure: { code: terminalFailure.data.code, message: terminalFailure.data.message } }
-      : {}),
+    ...(terminalFailure ? { failure: terminalFailure } : {}),
     ...(retryAttempt > 0
       ? {
           retry: {
@@ -257,6 +682,32 @@ export function presentAgentStep(
         ? "completed"
         : "running",
   };
+}
+
+/** Return the actual provider reasoning text for one durable model step. */
+export function reasoningContentForStep(
+  events: readonly MessageStreamEvent[],
+  turnId: string | undefined,
+  stepIndex: number | undefined,
+): string {
+  let content = "";
+  for (const event of events) {
+    if (
+      (event.type !== "reasoning.appended" && event.type !== "reasoning.completed") ||
+      (turnId !== undefined && event.data.turnId !== turnId) ||
+      (stepIndex !== undefined && event.data.stepIndex !== stepIndex)
+    ) continue;
+    if (event.type === "reasoning.completed") {
+      if (event.data.reasoning.trim()) content = event.data.reasoning;
+      continue;
+    }
+    if (event.data.reasoningSoFar.trim()) {
+      content = event.data.reasoningSoFar;
+    } else if (event.data.reasoningDelta.trim()) {
+      content += event.data.reasoningDelta;
+    }
+  }
+  return content.trim();
 }
 
 export function presentAgentTurn(
@@ -280,13 +731,14 @@ export function presentAgentTurn(
   if (!hasTools) return undefined;
 
   const terminal = [...turnEvents].reverse().find((event) =>
-    event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled",
+    (event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled" || event.type === "session.failed") &&
+    !isLocalInterruptedBoundary(event),
   );
   const status = pendingRequests.length > 0
     ? "waiting"
     : terminal?.type === "turn.completed"
     ? "completed"
-    : terminal?.type === "turn.failed"
+    : terminal?.type === "turn.failed" || terminal?.type === "session.failed"
       ? "failed"
     : terminal?.type === "turn.cancelled"
         ? "cancelled"
@@ -297,7 +749,12 @@ export function presentAgentTurn(
   let finalPart: Extract<EveMessagePart, { type: "text" }> | undefined;
   const processParts: EveMessagePart[] = [];
 
-  for (const part of message.parts) {
+  // The Eve reducer normally preserves event order, but a reconnect can
+  // briefly expose its message snapshot and event snapshot at different
+  // render ticks. Re-anchor parts to the durable event sequence before
+  // splitting the final delivery from the execution process. This prevents a
+  // narration that happened before a tool call from jumping below that tool.
+  for (const part of orderAssistantMessageParts(message.parts, turnEvents, turnId)) {
     if (part.type === "text" && part.stepIndex === finalStepIndex) {
       finalPart = part;
       continue;
@@ -305,19 +762,243 @@ export function presentAgentTurn(
     processParts.push(part);
   }
 
+  const failedStep = status === "failed" && turnEvents.some((event) =>
+    event.type === "step.failed" && event.data.turnId === turnId,
+  );
+  const failedStepEvent = failedStep
+    ? [...turnEvents].reverse().find((event): event is Extract<MessageStreamEvent, { type: "step.failed" }> =>
+        event.type === "step.failed" && event.data.turnId === turnId,
+      )
+    : undefined;
+  // Eve normally emits step.failed before turn.failed, but a reconnect can
+  // expose only the terminal boundary. The last event-bearing step is still
+  // the exact place where that failure belongs.
+  const failedStepIndex = failedStepEvent?.data.stepIndex ?? (
+    status === "failed" ? latestStepIndex(turnEvents, turnId) : undefined
+  );
+  const failedStepHasPart = failedStepIndex !== undefined && processParts.some((part) =>
+    "stepIndex" in part && part.stepIndex === failedStepIndex,
+  );
+  const markerAnchored = status === "failed" && failedStepIndex !== undefined && hasStepMarkerForIndex(
+    processParts,
+    events,
+    turnId,
+    failedStepIndex,
+  );
+  const shouldAddFailureMarker = status === "failed" && failedStepIndex !== undefined && !failedStepHasPart && !markerAnchored;
+  const displayProcessParts = shouldAddFailureMarker
+    ? [...processParts, { type: "step-start" as const }]
+    : processParts;
+  const failureAnchored = status === "failed" && (
+    failedStepHasPart || markerAnchored || shouldAddFailureMarker
+  );
+
   return {
     endedAt: eventTimestamp(terminal) ?? segment.settledAt,
     finalPart,
+    ...(failureAnchored ? { failureAnchored: true } : {}),
     proxiedInputParts: pendingRequests
       .filter((request) => !message.parts.some((part) =>
         part.type === "dynamic-tool" && part.approval?.id === request.requestId,
       ))
       .map(toProxiedInputPart),
-    processParts,
+    // Settled failed provider calls may have no message part left after the
+    // orphaned tool snapshot is normalized. Keep one display-only marker so
+    // the failure card remains anchored to its actual failed step. A marker
+    // from an earlier step is not sufficient: without this tail marker the
+    // failure is silently hidden by AgentMessage's duplicate suppression.
+    processParts: displayProcessParts,
     startedAt: eventTimestamp(firstAction),
     status,
     ...(pendingRequests[0]?.kind ? { waitingFor: pendingRequests[0].kind } : {}),
   };
+}
+
+/**
+ * Reconcile a reducer message with its event segment without rebuilding the
+ * whole message state. The position of each part is derived from the first
+ * event that could have produced it; parts with no matching event keep their
+ * original position. This is intentionally stable so a live partial tool
+ * snapshot never jumps around while its input grows.
+ */
+function orderAssistantMessageParts(
+  parts: readonly EveMessagePart[],
+  events: readonly MessageStreamEvent[],
+  turnId: string,
+): readonly EveMessagePart[] {
+  if (parts.length < 2 || events.length < 2) return parts;
+
+  const markerSteps = new Map<number, number>();
+  let previousStep = -1;
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index]!;
+    if (part.type !== "step-start") continue;
+    const nextMarker = parts.findIndex((candidate, candidateIndex) =>
+      candidateIndex > index && candidate.type === "step-start",
+    );
+    const group = parts.slice(index + 1, nextMarker < 0 ? parts.length : nextMarker);
+    const explicitStep = group
+      .flatMap((candidate) =>
+        "stepIndex" in candidate && typeof candidate.stepIndex === "number"
+          ? [candidate.stepIndex]
+          : [],
+      )
+      .sort((left, right) => left - right)[0];
+    const nextStep = explicitStep !== undefined
+      ? explicitStep
+      : events.map(eventStepIndex).find((step): step is number => step !== undefined && step > previousStep);
+    if (nextStep !== undefined) {
+      markerSteps.set(index, nextStep);
+      previousStep = nextStep;
+    }
+  }
+
+  let activeStep: number | undefined;
+  const indexed = parts.map((part, index) => {
+    if (part.type === "step-start") activeStep = markerSteps.get(index);
+    else if ("stepIndex" in part && typeof part.stepIndex === "number") activeStep = part.stepIndex;
+    return {
+      eventIndex: partEventIndex(part, events, turnId, activeStep),
+      index,
+      isMarker: part.type === "step-start",
+      part,
+      stepIndex: activeStep,
+    };
+  });
+  const groups = new Map<number, typeof indexed>();
+  for (const entry of indexed) {
+    if (entry.stepIndex === undefined) continue;
+    const group = groups.get(entry.stepIndex) ?? [];
+    group.push(entry);
+    groups.set(entry.stepIndex, group);
+  }
+  // Older persisted snapshots can omit `step.started`. Assign a local order
+  // within each step so an unmatched narration remains beside the tool it
+  // precedes instead of being sorted to the end of the entire message.
+  const localOrder = new Map<number, number>();
+  for (const group of groups.values()) {
+    const known = group
+      .map((entry) => entry.eventIndex)
+      .filter((position): position is number => position !== undefined)
+      .sort((left, right) => left - right);
+    const firstKnown = known[0];
+    const lastKnown = known.at(-1);
+    let unknownAfter = 0;
+    for (const entry of group) {
+      if (entry.eventIndex !== undefined) {
+        localOrder.set(entry.index, entry.eventIndex);
+        continue;
+      }
+      const nextKnown = group
+        .filter((candidate) => candidate.index > entry.index && candidate.eventIndex !== undefined)
+        .map((candidate) => candidate.eventIndex!)
+        .sort((left, right) => left - right)[0];
+      if (entry.isMarker && firstKnown !== undefined) {
+        localOrder.set(entry.index, firstKnown - 1);
+      } else if (nextKnown !== undefined) {
+        localOrder.set(entry.index, nextKnown - 0.25);
+      } else if (lastKnown !== undefined) {
+        localOrder.set(entry.index, lastKnown + 0.25 + unknownAfter++ / 100);
+      } else {
+        localOrder.set(entry.index, entry.index);
+      }
+    }
+  }
+  const hasComparablePosition = indexed.some((entry) => entry.eventIndex !== undefined);
+  if (!hasComparablePosition) return parts;
+  return indexed
+    .toSorted((left, right) =>
+      (left.stepIndex ?? Number.MAX_SAFE_INTEGER) - (right.stepIndex ?? Number.MAX_SAFE_INTEGER) ||
+      (localOrder.get(left.index) ?? Number.MAX_SAFE_INTEGER) - (localOrder.get(right.index) ?? Number.MAX_SAFE_INTEGER) ||
+      left.index - right.index,
+    )
+    .map((entry) => entry.part);
+}
+
+function partEventIndex(
+  part: EveMessagePart,
+  events: readonly MessageStreamEvent[],
+  turnId: string,
+  stepIndex: number | undefined,
+): number | undefined {
+  const matchesStep = (event: MessageStreamEvent): boolean =>
+    eventTurnId(event) === turnId && (stepIndex === undefined || eventStepIndex(event) === stepIndex);
+  if (part.type === "step-start") {
+    return firstEventIndex(events, (event) => event.type === "step.started" && matchesStep(event));
+  }
+  if (part.type === "reasoning") {
+    const appended = firstEventIndex(events, (event) =>
+      matchesStep(event) && event.type === "reasoning.appended");
+    if (appended !== undefined) return appended;
+
+    // Older compact checkpoints may contain only reasoning.completed. That
+    // boundary is emitted after action results by Eve and is not the visual
+    // start of the thought. Anchor the fallback to step.started (or just
+    // before the first step event) so tools cannot jump above the reasoning.
+    const stepStarted = firstEventIndex(events, (event) =>
+      event.type === "step.started" && matchesStep(event));
+    if (stepStarted !== undefined) return stepStarted + 0.1;
+    const firstStepEvent = firstEventIndex(events, matchesStep);
+    return firstStepEvent === undefined ? undefined : firstStepEvent - 0.1;
+  }
+  if (part.type === "text") {
+    return firstEventIndex(events, (event) =>
+      matchesStep(event) && (event.type === "message.appended" || event.type === "message.completed"));
+  }
+  if (part.type === "dynamic-tool") {
+    return firstEventIndex(events, (event) =>
+      matchesStep(event) && (
+        (event.type === "action.input.partial" && event.data.callId === part.toolCallId) ||
+        (event.type === "actions.requested" && event.data.actions.some((action) => action.callId === part.toolCallId)) ||
+        (event.type === "action.result" && event.data.result.callId === part.toolCallId)
+      ));
+  }
+  return firstEventIndex(events, matchesStep);
+}
+
+function firstEventIndex(
+  events: readonly MessageStreamEvent[],
+  predicate: (event: MessageStreamEvent) => boolean,
+): number | undefined {
+  const index = events.findIndex(predicate);
+  return index >= 0 ? index : undefined;
+}
+
+function latestStepIndex(events: readonly MessageStreamEvent[], turnId: string): number | undefined {
+  return events.reduce<number | undefined>((latest, event) => {
+    if (eventTurnId(event) !== turnId) return latest;
+    const stepIndex = eventStepIndex(event);
+    return stepIndex === undefined ? latest : Math.max(latest ?? stepIndex, stepIndex);
+  }, undefined);
+}
+
+function hasStepMarkerForIndex(
+  parts: readonly EveMessagePart[],
+  events: readonly MessageStreamEvent[],
+  turnId: string,
+  targetStepIndex: number,
+): boolean {
+  let previousStepIndex = -1;
+  for (let index = 0; index < parts.length; index += 1) {
+    if (parts[index]?.type !== "step-start") continue;
+    const nextStep = parts.findIndex((candidate, candidateIndex) =>
+      candidateIndex > index && candidate.type === "step-start",
+    );
+    const stepParts = parts.slice(index + 1, nextStep < 0 ? parts.length : nextStep);
+    const explicit = stepParts.find((part) =>
+      "stepIndex" in part && typeof part.stepIndex === "number",
+    );
+    const stepIndex = explicit && "stepIndex" in explicit && typeof explicit.stepIndex === "number"
+      ? explicit.stepIndex
+      : events
+        .map(eventStepIndex)
+        .filter((candidate): candidate is number => candidate !== undefined && candidate > previousStepIndex)
+        .find((candidate) => events.some((event) => eventTurnId(event) === turnId && eventStepIndex(event) === candidate));
+    if (stepIndex === undefined) continue;
+    previousStepIndex = stepIndex;
+    if (stepIndex === targetStepIndex) return true;
+  }
+  return false;
 }
 
 /**
@@ -366,7 +1047,7 @@ export function unresolvedInputRequests(
       hasRequestedInput = false;
       continue;
     }
-    if (event.type === "session.completed" || event.type === "session.failed") {
+    if (event.type === "turn.cancelled" || event.type === "session.completed" || event.type === "session.failed") {
       pending = new Map();
       hasRequestedInput = false;
     }
@@ -389,8 +1070,10 @@ export function hasSettledLatestTurn(events: readonly MessageStreamEvent[]): boo
   const started = events[startedIndex];
   if (started?.type !== "turn.started") return false;
   return events.slice(startedIndex + 1).some((event) =>
-    (event.type === "turn.completed" || event.type === "turn.cancelled") &&
+    (event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled") &&
     event.data.turnId === started.data.turnId
+  ) || events.slice(startedIndex + 1).some((event) =>
+    event.type === "session.failed"
   );
 }
 
@@ -399,12 +1082,22 @@ export function failureForTurn(
   turnId: string | undefined,
 ): AgentTurnFailure | undefined {
   if (!turnId) return undefined;
+  // A step failure is an intermediate retry signal. Only a durable terminal
+  // boundary belongs in the message-level failure slot; otherwise a transient
+  // provider retry flashes a second error card at the bottom of the thread.
   const event = [...events].reverse().find((candidate) =>
-    (candidate.type === "turn.failed" || candidate.type === "step.failed") &&
-    candidate.data.turnId === turnId,
+    candidate.type === "turn.failed" && candidate.data.turnId === turnId,
   );
-  return event?.type === "turn.failed" || event?.type === "step.failed"
-    ? { code: event.data.code, message: event.data.message }
+  if (event?.type === "turn.failed") {
+    return { code: event.data.code, message: event.data.message };
+  }
+  const startedIndex = events.findLastIndex((candidate) =>
+    candidate.type === "turn.started" && candidate.data.turnId === turnId,
+  );
+  const sessionFailureIndex = events.findLastIndex((candidate) => candidate.type === "session.failed");
+  const sessionFailure = sessionFailureIndex > startedIndex ? events[sessionFailureIndex] : undefined;
+  return sessionFailure?.type === "session.failed"
+    ? { code: sessionFailure.data.code, message: sessionFailure.data.message }
     : undefined;
 }
 
@@ -470,10 +1163,12 @@ export function presentSubagentCall(
   if (parentCancellation?.type === "turn.cancelled") {
     return {
       childSessionId: started?.type === "subagent.called" ? started.data.childSessionId : undefined,
-      endedAt: eventTimestamp(parentCancellation),
       name: started?.type === "subagent.called" ? started.data.name : undefined,
       startedAt: eventTimestamp(started),
-      status: "cancelled",
+      // The parent boundary means cancellation was requested recursively, not
+      // that this child has emitted its own turn.cancelled/session.waiting.
+      // Keep the card open until the child lifecycle projection confirms it.
+      status: "waiting",
     };
   }
   if (terminalSession) {
@@ -593,20 +1288,43 @@ function finalDeliveryStepIndex(
   message: EveMessage,
   status: AgentTurnStatus,
 ): number | undefined {
-  const completedDelivery = [...events].reverse().find((event) =>
-    event.type === "message.completed" &&
-    event.data.message !== null &&
-    event.data.finishReason !== "tool-calls",
-  );
-  if (completedDelivery?.type === "message.completed") return completedDelivery.data.stepIndex;
+  const completedDeliveries = events
+    .map((event, index) => ({ event, index }))
+    .filter(({ event }) =>
+      event.type === "message.completed" &&
+      event.data.message !== null &&
+      event.data.finishReason !== "tool-calls",
+    )
+    .reverse();
+  for (const candidate of completedDeliveries) {
+    if (candidate.event.type !== "message.completed") continue;
+    const candidateStep = candidate.event.data.stepIndex;
+    // A model can narrate before moving to a later tool step. Until the
+    // terminal delivery arrives, that narration belongs in the execution
+    // process; treating it as final makes the tool card jump ahead of it.
+    const hasLaterExecution = events.slice(candidate.index + 1).some((event) =>
+      (event.type === "step.started" && event.data.stepIndex > candidateStep) ||
+      event.type === "actions.requested" ||
+      event.type === "action.input.partial" ||
+      event.type === "action.result" ||
+      event.type === "input.requested",
+    );
+    if (!hasLaterExecution) return candidateStep;
+  }
   if (status !== "running") return undefined;
 
-  const latestActionStep = events.reduce(
-    (latest, event) => event.type === "actions.requested" ? Math.max(latest, event.data.stepIndex) : latest,
-    -1,
-  );
+  const latestExecutionStep = events.reduce((latest, event) => {
+    if (
+      event.type === "step.started" ||
+      event.type === "actions.requested" ||
+      event.type === "action.input.partial" ||
+      event.type === "action.result" ||
+      event.type === "input.requested"
+    ) return Math.max(latest, event.data.stepIndex);
+    return latest;
+  }, -1);
   const latestText = [...message.parts].reverse().find((part) => part.type === "text");
-  return latestText?.type === "text" && (latestText.stepIndex ?? 0) > latestActionStep
+  return latestText?.type === "text" && (latestText.stepIndex ?? 0) > latestExecutionStep
     ? latestText.stepIndex
     : undefined;
 }
@@ -636,11 +1354,16 @@ function turnDisplayCoordinates(
 ): ReadonlyMap<string, TurnDisplayCoordinates> {
   const turnIds = events.flatMap((event) => event.type === "turn.started" ? [event.data.turnId] : []);
   const userTurns = new Set(events.flatMap((event) => event.type === "message.received" ? [event.data.turnId] : []));
+  // A turn without `message.received` is only a visual continuation when Eve
+  // explicitly parked for HITL input immediately before it. Treating every
+  // unanchored turn as a continuation merges independent turns after a partial
+  // checkpoint and makes their steps/reasoning appear to disappear.
+  const continuations = continuationTurnIds(events, userTurns);
   const preliminary = new Map<string, Omit<TurnDisplayCoordinates, "finalTurn">>();
   let rootTurnId: string | undefined;
   let nextStepOffset = 0;
   for (const turnId of turnIds) {
-    if (!rootTurnId || userTurns.has(turnId)) {
+    if (!rootTurnId || userTurns.has(turnId) || !continuations.has(turnId)) {
       rootTurnId = turnId;
       nextStepOffset = 0;
     }

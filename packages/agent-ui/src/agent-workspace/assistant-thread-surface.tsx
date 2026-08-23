@@ -56,6 +56,7 @@ import {
   DropdownMenuTrigger,
 } from "../ui/dropdown-menu.js";
 import { AgentMessage, type AgentInputResponse } from "./agent-message.js";
+import { presentAgentTurn } from "./turn-presentation.js";
 import type { AgentComposerDraftRestore, AgentExecutionMode, AgentModelOption, AgentPromptMenuItem, AgentSessionDeliverable, AgentThreadPreferences } from "./contracts.js";
 import type { AgentLocale, AgentMessages } from "./i18n.js";
 import type { AgentUsageSummary } from "./usage.js";
@@ -193,7 +194,7 @@ export function AssistantThreadSurface({
           {!isBusy ? <AssistantEmptyState messages={messages} /> : null}
         </ThreadPrimitive.Empty>
 
-        <ThreadPrimitive.ViewportFooter className="sticky bottom-0 z-20 mx-auto mt-auto flex w-full max-w-(--thread-max-width) flex-col bg-background pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-2 sm:pb-4 md:pb-5">
+        <ThreadPrimitive.ViewportFooter className="sticky bottom-0 z-20 mx-auto mt-auto flex w-full max-w-(--thread-max-width) flex-col bg-background pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-0 sm:pb-4 md:pb-5">
           <ThreadPrimitive.ScrollToBottom asChild>
             <TooltipIconButton
               tooltip={locale === "zh-CN" ? "滚动到底部" : "Scroll to bottom"}
@@ -268,7 +269,7 @@ function UserMessage({ messages }: { readonly messages: AgentMessages }) {
     return lastUser?.id === state.message.id;
   });
   return (
-    <MessagePrimitive.Root className="group mx-auto flex w-full max-w-(--thread-max-width) flex-col items-end">
+    <MessagePrimitive.Root className="group mx-auto flex w-full max-w-(--thread-max-width) scroll-mt-5 flex-col items-end">
       <AttachmentGroup className="mb-2 max-w-[88%] justify-end py-0 empty:hidden">
         <MessagePrimitive.Attachments>
           {({ attachment }) => <UserAttachment attachment={attachment} messages={messages} />}
@@ -284,9 +285,7 @@ function UserMessage({ messages }: { readonly messages: AgentMessages }) {
       </div>
       <div className={cn("mt-0.5 flex min-h-7 items-center transition-opacity", actionsVisible ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100")}>
         <ActionBarPrimitive.Root className="flex min-h-7 items-center gap-0.5">
-          <ActionBarPrimitive.Copy aria-label={messages.copyResponse} className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground">
-            <CopyIcon className="size-3.5" />
-          </ActionBarPrimitive.Copy>
+          <ReliableCopyButton label={messages.copyResponse} />
           {isLastUserMessage ? (
             <ActionBarPrimitive.Edit
               aria-label={messages.editMessage}
@@ -375,7 +374,7 @@ function AssistantMessage({
 }) {
   const hasCopyableText = message?.parts.some((part) => part.type === "text" && part.text.trim().length > 0) ?? false;
   return (
-    <MessagePrimitive.Root className="group mx-auto flex w-full max-w-(--thread-max-width) flex-col">
+    <MessagePrimitive.Root className="group mx-auto flex w-full max-w-(--thread-max-width) scroll-mt-5 flex-col">
       <div className="min-w-0 px-1 text-[15px] leading-7 text-foreground">
         {message ? (
           <AgentMessage
@@ -397,14 +396,42 @@ function AssistantMessage({
           <MessagePrimitive.Parts components={{ Text: MarkdownText, tools: { Fallback: ToolFallback } }} />
         )}
       </div>
-      {!isStreaming && hasCopyableText ? (
+      {!isStreaming && hasCopyableText && (!message?.metadata?.turnId || (message !== undefined && presentTurnCompleted(message, events, closedInputRequestIds))) ? (
         <ActionBarPrimitive.Root className="mt-1 flex min-h-7 items-center opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
-          <ActionBarPrimitive.Copy aria-label={messages.copyResponse} className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground">
-            <CopyIcon className="size-3.5" />
-          </ActionBarPrimitive.Copy>
+          <ReliableCopyButton label={messages.copyResponse} />
         </ActionBarPrimitive.Root>
       ) : null}
     </MessagePrimitive.Root>
+  );
+}
+
+function presentTurnCompleted(message: EveMessage, events: readonly MessageStreamEvent[], closedInputRequestIds: ReadonlySet<string>): boolean {
+  return presentAgentTurn(message, events, closedInputRequestIds)?.status === "completed";
+}
+
+function ReliableCopyButton({ label }: { readonly label: string }) {
+  const aui = useAui();
+  const [copied, setCopied] = useState(false);
+  const timer = useRef<number | undefined>(undefined);
+  useEffect(() => () => window.clearTimeout(timer.current), []);
+  return (
+    <Button
+      aria-label={label}
+      className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
+      onClick={() => {
+        void copyText(aui.message.getCopyText()).then(() => {
+          setCopied(true);
+          window.clearTimeout(timer.current);
+          timer.current = window.setTimeout(() => setCopied(false), 1_500);
+        }).catch(() => setCopied(false));
+      }}
+      size="icon-sm"
+      title={copied ? "Copied" : label}
+      type="button"
+      variant="ghost"
+    >
+      {copied ? <CheckIcon className="size-3.5" /> : <CopyIcon className="size-3.5" />}
+    </Button>
   );
 }
 
@@ -579,6 +606,7 @@ export function AssistantComposer({
     reasoningTokens: 0,
     totalTokens: usage.inputTokens + usage.outputTokens,
   };
+  const touchInput = typeof window !== "undefined" && window.matchMedia("(pointer: coarse) and (not (any-pointer: fine))").matches;
 
   return (
     <ComposerPrimitive.Unstable_TriggerPopoverRoot>
@@ -610,8 +638,9 @@ export function AssistantComposer({
             directiveChip={DirectiveChip}
             placeholder={messages.inputPlaceholder}
             ref={composerInputRef}
+            submitMode={touchInput ? "ctrlEnter" : "enter"}
             onKeyDownCapture={(event) => {
-              if (!isRunning || event.key !== "Enter" || event.shiftKey || composerDisabled || composerIsEmpty) return;
+              if (touchInput || !isRunning || event.key !== "Enter" || event.shiftKey || composerDisabled || composerIsEmpty) return;
               const input = event.target instanceof HTMLElement
                 ? event.target.closest<HTMLElement>('[role="textbox"]')
                 : null;
@@ -634,7 +663,7 @@ export function AssistantComposer({
                 <ModelSelector
               align="start"
               className="h-9 min-w-0 max-w-48 rounded-full px-2 text-muted-foreground sm:h-8 sm:max-w-64"
-              contentClassName="w-72 max-w-[calc(100vw-1.5rem)]"
+              contentClassName="w-72 max-w-[calc(100vw-1.5rem)] text-xs"
               effort={preferences.reasoning}
               effortLabel={messages.reasoning}
               models={selectorModels}
@@ -648,7 +677,7 @@ export function AssistantComposer({
               triggerLabel={messages.model}
                 />
                 <span className="ml-auto flex min-w-0 items-center gap-0.5 sm:gap-1">
-              {model && usage.contextInputTokens > 0 ? (
+              {model ? (
                 <ContextDisplay.Ring
                   className="h-9 shrink-0 rounded-full px-1.5 sm:h-8"
                   label={messages.context}
@@ -893,13 +922,13 @@ function ExecutionModeMenu({
           <span className="hidden truncate text-xs sm:inline">{selected.label}</span>
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="start" className="w-80 max-w-[calc(100vw-1.5rem)]" side="top">
-        <DropdownMenuLabel>{messages.executionMode}</DropdownMenuLabel>
+      <DropdownMenuContent align="start" className="w-80 max-w-[calc(100vw-1.5rem)] text-xs" side="top">
+        <DropdownMenuLabel className="text-xs">{messages.executionMode}</DropdownMenuLabel>
         <DropdownMenuRadioGroup onValueChange={(next) => onChange(next as AgentExecutionMode)} value={value}>
           {options.map((option) => {
             const Icon = option.icon;
             return (
-              <DropdownMenuRadioItem className="items-start py-2" key={option.value} value={option.value}>
+              <DropdownMenuRadioItem className="items-start py-2 text-xs" key={option.value} value={option.value}>
                 <Icon className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
                 <span className="min-w-0">
                   <span className="block text-xs font-medium text-foreground">{option.label}</span>

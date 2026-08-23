@@ -45,10 +45,57 @@ export function createHttpAgentThreadStorage(options) {
             }
             if (body.thread == null)
                 return undefined;
-            return parseThreadCollection({
+            const parsedThread = parseThreadCollection({
                 threads: [body.thread],
                 version: AGENT_THREAD_STORAGE_VERSION,
             }).threads[0];
+            const hydrated = parsedThread ? withoutSummaryHydration(parsedThread) : undefined;
+            if (hydrated) {
+                const baseline = baselines.get(storageKey);
+                baselines.set(storageKey, {
+                    ...(baseline?.activeThreadId ? { activeThreadId: baseline.activeThreadId } : {}),
+                    threads: [
+                        ...(baseline?.threads ?? []).filter((thread) => thread.id !== hydrated.id),
+                        hydrated,
+                    ],
+                    version: AGENT_THREAD_STORAGE_VERSION,
+                });
+            }
+            return hydrated;
+        },
+        async repairThread(storageKey, threadId) {
+            preferredThreadId = threadId;
+            const response = await request(fetchImplementation, options, collectionUrl(`${endpoint}/repair`, storageKey, { threadId }), {
+                headers: { "content-type": "application/json" },
+                method: "POST",
+            });
+            if (response.status === 404)
+                return undefined;
+            await requireOk(response);
+            const body = await response.json();
+            if (!Number.isSafeInteger(body.revision) || body.revision < 0) {
+                throw new Error("Agent thread storage returned an invalid revision.");
+            }
+            if (body.thread == null)
+                return undefined;
+            const parsedThread = parseThreadCollection({
+                threads: [body.thread],
+                version: AGENT_THREAD_STORAGE_VERSION,
+            }).threads[0];
+            const hydrated = parsedThread ? withoutSummaryHydration(parsedThread) : undefined;
+            if (hydrated) {
+                revisions.set(storageKey, body.revision);
+                const baseline = baselines.get(storageKey);
+                baselines.set(storageKey, {
+                    ...(baseline?.activeThreadId ? { activeThreadId: baseline.activeThreadId } : {}),
+                    threads: [
+                        ...(baseline?.threads ?? []).filter((thread) => thread.id !== hydrated.id),
+                        hydrated,
+                    ],
+                    version: AGENT_THREAD_STORAGE_VERSION,
+                });
+            }
+            return hydrated;
         },
         async save(storageKey, collection) {
             preferredThreadId = collection.activeThreadId;
@@ -75,18 +122,60 @@ export function createHttpAgentThreadStorage(options) {
         },
     };
 }
+function withoutSummaryHydration(thread) {
+    const { hydration: _summaryMarker, ...hydrated } = thread;
+    return hydrated;
+}
 function createCollectionPatch(baseline, collection) {
     const previousThreads = new Map(baseline.threads.map((thread) => [thread.id, thread]));
     const nextIds = new Set(collection.threads.map((thread) => thread.id));
+    const eventAppends = [];
+    const upsertThreads = collection.threads.flatMap((thread) => {
+        const previous = previousThreads.get(thread.id);
+        if (!previous)
+            return [thread];
+        const delta = appendOnlyEventDelta(previous.events, thread.events);
+        if (delta) {
+            if (delta.events.length > 0)
+                eventAppends.push({
+                    events: delta.events,
+                    ...(delta.replaceFrom === previous.events.length ? {} : { replaceFrom: delta.replaceFrom }),
+                    threadId: thread.id,
+                });
+            return [{ ...thread, events: [], hydration: "summary" }];
+        }
+        if (sameEventIds(previous.events, thread.events)) {
+            return [{ ...thread, events: [], hydration: "summary" }];
+        }
+        return [thread];
+    });
     return {
         activeThreadId: collection.activeThreadId ?? null,
         deletedThreadIds: baseline.threads.flatMap((thread) => nextIds.has(thread.id) ? [] : [thread.id]),
-        upsertThreads: collection.threads.filter((thread) => {
+        eventAppends,
+        upsertThreads: upsertThreads.filter((thread) => {
             const previous = previousThreads.get(thread.id);
-            return !previous || previous !== thread;
+            return !previous || previous !== thread || eventAppends.some((append) => append.threadId === thread.id);
         }),
         version: collection.version,
     };
+}
+function appendOnlyEventDelta(previous, next) {
+    if (next.length < previous.length)
+        return undefined;
+    let firstDifference = -1;
+    for (let index = 0; index < previous.length; index += 1) {
+        if (previous[index]?.meta.id !== next[index]?.meta.id) {
+            firstDifference = index;
+            break;
+        }
+    }
+    if (firstDifference < 0)
+        firstDifference = previous.length;
+    return { events: next.slice(firstDifference), replaceFrom: firstDifference };
+}
+function sameEventIds(left, right) {
+    return left.length === right.length && left.every((event, index) => event.meta.id === right[index]?.meta.id);
 }
 async function request(fetchImplementation, options, url, init) {
     const accessToken = await options.getAccessToken?.();

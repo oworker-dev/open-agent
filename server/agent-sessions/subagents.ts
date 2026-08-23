@@ -229,13 +229,36 @@ export async function syncAgentSubagentsFromEvents(options: AgentSubagentSupervi
     }
   }
   if (parentCancelled || parentTerminal) {
-    const status: AgentSubagentStatus = parentCancelled ? "interrupted" : "failed";
     for (const child of children.values()) {
       if (child.status !== "starting" && child.status !== "running" && child.status !== "waiting") continue;
       // A detached child is deliberately allowed to outlive normal parent
       // completion. Explicit parent cancellation still interrupts every child.
       if (parentTerminal && child.waitPolicy === "no-wait") continue;
-      const updated = await options.store.updateOwned(options.identity, child.childSessionId, { status });
+      let status: AgentSubagentStatus | undefined;
+      if (parentCancelled) {
+        // Eve cancels adopted children recursively, but the parent boundary
+        // does not prove that every child has reached its own boundary yet.
+        // Reconcile each child session instead of stamping `interrupted` on
+        // an accepted cancellation request.
+        try {
+          const inspected = await (options.runtime ?? eveAgentSubagentRuntime).inspect({
+            owner: options.identity,
+            sessionId: child.childSessionId,
+          });
+          const mapped = mapRuntimeStatus(inspected.status);
+          // A child that was active when the parent cancellation arrived can
+          // expose the final Eve boundary as `waiting`; in this context that
+          // waiting state is the completed cancellation handshake.
+          status = mapped === "waiting" ? "interrupted" : mapped;
+        } catch {
+          continue;
+        }
+      } else {
+        status = "failed";
+      }
+      const updated = status
+        ? await options.store.updateOwned(options.identity, child.childSessionId, { status })
+        : undefined;
       if (updated) children.set(updated.childSessionId, updated);
     }
   }
@@ -415,7 +438,18 @@ export async function interruptAgentSubagent(options: AgentSubagentSupervisorOpt
   const runtime = options.runtime ?? eveAgentSubagentRuntime;
   const result = await runtime.cancel({ accessToken: options.accessToken, sessionId: child.childSessionId });
   if (result === "accepted") {
-    return await options.store.updateOwned(options.identity, child.childSessionId, { status: "interrupted" });
+    // `accepted` only means Eve queued the cancellation. Inspect once for a
+    // fast terminal result, but never persist `interrupted` before the child
+    // session has actually reached its own cancellation boundary.
+    try {
+      const inspected = await runtime.inspect({ owner: options.identity, sessionId: child.childSessionId });
+      const mapped = mapRuntimeStatus(inspected.status);
+      return await options.store.updateOwned(options.identity, child.childSessionId, {
+        status: mapped === "waiting" ? "interrupted" : mapped,
+      }) ?? child;
+    } catch {
+      return child;
+    }
   }
   try {
     const inspected = await runtime.inspect({ owner: options.identity, sessionId: child.childSessionId });

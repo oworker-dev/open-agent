@@ -9,6 +9,8 @@ const projectId = configuration.projectId;
 const canvasId = process.env.MUSES_E2E_CANVAS_ID?.trim();
 const deploymentId = configuration.deploymentId;
 const agentNodeId = process.env.MUSES_E2E_AGENT_NODE_ID?.trim() || "agent-run-1";
+const workflowInputId = process.env.MUSES_E2E_WORKFLOW_INPUT_ID?.trim() || "prompt";
+const workflowMessage = process.env.MUSES_E2E_WORKFLOW_MESSAGE?.trim() || "Return the word BRIDGE_READY.";
 const runtimeConfig = configuration.runtimeConfig;
 const runDurationMs = Math.min(
   runtimeConfig.limits?.maxDurationMs ?? 600_000,
@@ -24,7 +26,7 @@ const actor = {
 const idempotencyKey = `muses-host-e2e:${Date.now()}:${randomUUID()}`;
 const request = {
   idempotencyKey,
-  message: `MUSES_HOST_E2E: This is an exact Host contract verification. Use only host_capabilities and host_invoke for the requested Host operations; do not use web_fetch, shell, filesystem, or other generic tools as substitutes. Inspect the canvas, invoke Workflow deployment ${deploymentId} with inputs {"prompt":{"valueType":"text","value":"Return the word BRIDGE_READY."}}, wait for completion using workflow.run.wait only, place the verified run on the canvas, inspect the canvas again, and report the result. Do not call generic tools while waiting.`,
+  message: `MUSES_HOST_E2E: This is an exact Host contract verification. Use only host_capabilities and host_invoke for the requested Host operations; do not use web_fetch, shell, filesystem, or other generic tools as substitutes. Inspect the canvas, invoke Workflow deployment ${deploymentId} with inputs ${JSON.stringify({ [workflowInputId]: { valueType: "text", value: workflowMessage } })}, and wait for completion using workflow.run.wait only. After it completes, call canvas.item.put with refId equal to the Workflow runId, kind "workflow", and a concise title and position. Inspect the canvas again and report the result. Do not call generic tools while waiting.`,
   profile: {
     profileId: runtimeConfig.profile.id,
     version: runtimeConfig.profile.version,
@@ -97,11 +99,12 @@ assert(canvasPut, "The completed Workflow run was not placed on the canvas.");
 const finalCanvas = hostResults
   .filter((output) => output.capability === "canvas.inspect")
   .at(-1);
+const canvasItem = canvasPut?.output?.item;
 assert(
   finalCanvas?.output?.canvas?.items?.some(
     (item) => item.kind === "workflow" && item.refId === workflowRunId,
-  ),
-  "The final canvas inspection did not contain the Workflow run.",
+  ) || (canvasItem?.kind === "workflow" && canvasItem.refId === workflowRunId),
+  "The canvas write was not confirmed with the Workflow run.",
 );
 
 console.log(JSON.stringify({

@@ -51,6 +51,28 @@ test("Eve mailbox runtime reads waiting boundaries and admits messages", async (
   });
 });
 
+test("Eve mailbox runtime reads a finite authoritative transcript", async () => {
+  let requestBody: unknown;
+  const events = [
+    { type: "session.started", data: {}, meta: { at: "2026-01-01T00:00:00.000Z", id: "evt-1" } },
+    { type: "session.waiting", data: {}, meta: { at: "2026-01-01T00:00:01.000Z", id: "evt-2" } },
+  ];
+  const runtime = createEveAgentMailboxRuntime(environment, async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body));
+    return new Response(events.map((event) => `${JSON.stringify(event)}\n`).join(""), {
+      headers: { "content-type": "application/x-ndjson" },
+    });
+  });
+
+  const received = [];
+  for await (const event of runtime.readTranscript!({ sessionId: "session-1", startIndex: 0 })) {
+    received.push(event);
+  }
+  assert.deepEqual(requestBody, { action: "transcript", sessionId: "session-1", startIndex: 0 });
+  assert.equal(received.length, 2);
+  assert.equal(received[1]?.type, "session.waiting");
+});
+
 
 test("Eve mailbox runtime retains the active turn identity", async () => {
   const runtime = createEveAgentMailboxRuntime(environment, async () =>

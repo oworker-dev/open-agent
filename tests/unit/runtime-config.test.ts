@@ -8,6 +8,7 @@ import {
 import {
   DEFAULT_AGENT_RUNTIME_CONFIG,
   readDeploymentAgentRuntimeConfig,
+  runtimeDefinitionLimits,
 } from "../../lib/agent-runtime-config.ts";
 import { createAgentUiConfig } from "../../lib/agent-ui-config.ts";
 
@@ -15,6 +16,13 @@ test("standalone defaults match the Codex GPT-5.6 context policy", () => {
   assert.equal(DEFAULT_AGENT_RUNTIME_CONFIG.models[0]?.contextWindowTokens, 272_000);
   assert.equal(DEFAULT_AGENT_RUNTIME_CONFIG.models[1]?.contextWindowTokens, 272_000);
   assert.equal(DEFAULT_AGENT_RUNTIME_CONFIG.compaction.thresholdPercent, 0.9);
+});
+
+test("standalone session budgets are independent from the model context window", () => {
+  assert.deepEqual(runtimeDefinitionLimits(DEFAULT_AGENT_RUNTIME_CONFIG), {
+    maxInputTokensPerSession: 40_000_000,
+    maxOutputTokensPerSession: 10_000_000,
+  });
 });
 
 test("accepts a credential-free host runtime snapshot and projects its UI catalog", () => {

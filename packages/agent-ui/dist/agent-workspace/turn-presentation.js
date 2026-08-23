@@ -32,6 +32,315 @@ function durableStatus(status) {
         return "cancelled";
     return status;
 }
+export function classifyAgentFailure(failure) {
+    const code = failure.code.toLocaleLowerCase();
+    const message = failure.message.toLocaleLowerCase();
+    const value = `${code} ${message}`;
+    if (/timeout|timed out|deadline|\b408\b|\b504\b/u.test(value))
+        return "timeout";
+    if (/network|fetch|socket|connection reset|connection refused|econn|dns|chunked encoding/u.test(value))
+        return "network";
+    if (/provider|model|rate.?limit|\b429\b|overload|upstream|quota|\b5(?:00|02|03)\b|stream.?interrupted|stream.?ended/u.test(value))
+        return "provider";
+    return "unknown";
+}
+export const INTERRUPTED_TOOL_ERROR = "Open Agent: tool call cancelled before completion.";
+export const CANCELLING_TOOL_ERROR = "Open Agent: tool call cancellation is pending.";
+export const INCOMPLETE_TOOL_ERROR = "Open Agent: tool call did not complete.";
+export function isInterruptedToolPart(part) {
+    return part.state === "output-error" && part.errorText === INTERRUPTED_TOOL_ERROR;
+}
+export function isCancellationPendingToolPart(part) {
+    return part.state === "output-error" && part.errorText === CANCELLING_TOOL_ERROR;
+}
+function isLocalInterruptedBoundary(event) {
+    return event.type === "turn.cancelled" && event.meta?.id?.startsWith("local-interrupt-") === true;
+}
+export function sanitizeSettledThreadEvents(events) {
+    const anchoredTurns = new Set(events.flatMap((event) => event.type === "message.received" ? [event.data.turnId] : []));
+    const startedTurns = new Set(events.flatMap((event) => event.type === "turn.started" ? [event.data.turnId] : []));
+    const continuationTurns = continuationTurnIds(events, anchoredTurns);
+    const orphanTurns = new Set();
+    if (anchoredTurns.size > 0) {
+        for (const event of events) {
+            const turnId = eventTurnId(event);
+            if (turnId && !anchoredTurns.has(turnId) && !startedTurns.has(turnId) && !continuationTurns.has(turnId)) {
+                orphanTurns.add(turnId);
+            }
+        }
+    }
+    const terminalTurns = new Set();
+    const cancelledTurns = new Set();
+    const completedCalls = new Set();
+    const lastPartialIndex = new Map();
+    for (const [index, event] of events.entries()) {
+        if (event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled") {
+            terminalTurns.add(event.data.turnId);
+            if (event.type === "turn.cancelled")
+                cancelledTurns.add(event.data.turnId);
+        }
+        if (event.type === "action.input.partial") {
+            lastPartialIndex.set(`${event.data.turnId}:${event.data.callId}`, index);
+        }
+        if (event.type === "action.result" && event.data.status === "completed" && event.data.result.kind === "tool-result") {
+            completedCalls.add(`${event.data.turnId}:${event.data.result.callId}`);
+        }
+    }
+    const filtered = events.filter((event, index) => {
+        const turnId = eventTurnId(event);
+        if (turnId && orphanTurns.has(turnId))
+            return false;
+        if (event.type !== "action.input.partial" || !terminalTurns.has(event.data.turnId) || cancelledTurns.has(event.data.turnId))
+            return true;
+        const key = `${event.data.turnId}:${event.data.callId}`;
+        return completedCalls.has(key) && lastPartialIndex.get(key) === index;
+    });
+    const stepEvidence = new Set();
+    for (const event of filtered) {
+        const turnId = eventTurnId(event);
+        const stepIndex = eventStepIndex(event);
+        if (!turnId || stepIndex === undefined)
+            continue;
+        if (event.type !== "step.started" &&
+            event.type !== "turn.completed" &&
+            event.type !== "turn.failed" &&
+            event.type !== "turn.cancelled")
+            stepEvidence.add(`${turnId}:${stepIndex}`);
+    }
+    const normalized = filtered.filter((event) => {
+        if (event.type !== "step.started" || !terminalTurns.has(event.data.turnId))
+            return true;
+        return stepEvidence.has(`${event.data.turnId}:${event.data.stepIndex}`);
+    });
+    const compacted = [];
+    for (const event of normalized) {
+        if (event.type === "message.appended" || event.type === "reasoning.appended") {
+            const last = compacted.at(-1);
+            if (last?.type === event.type &&
+                last.data.turnId === event.data.turnId &&
+                last.data.stepIndex === event.data.stepIndex) {
+                compacted[compacted.length - 1] = event;
+                continue;
+            }
+        }
+        if (event.type === "session.waiting" && compacted.at(-1)?.type === "session.waiting") {
+            compacted[compacted.length - 1] = event;
+            continue;
+        }
+        compacted.push(event);
+    }
+    return compacted;
+}
+function continuationTurnIds(events, anchoredTurns) {
+    const continuation = new Set();
+    let inputContinuationPending = false;
+    for (const event of events) {
+        if (event.type === "input.requested" || event.type === "authorization.required") {
+            inputContinuationPending = true;
+            continue;
+        }
+        if (event.type === "message.received") {
+            inputContinuationPending = false;
+            continue;
+        }
+        if (event.type === "turn.started") {
+            if (inputContinuationPending && !anchoredTurns.has(event.data.turnId)) {
+                continuation.add(event.data.turnId);
+            }
+            inputContinuationPending = false;
+        }
+    }
+    return continuation;
+}
+export function normalizeSettledAgentMessages(messages, events) {
+    const terminalTurns = new Map();
+    for (const event of events) {
+        if (event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled") {
+            terminalTurns.set(event.data.turnId, event.type === "turn.completed"
+                ? "completed"
+                : event.type === "turn.failed"
+                    ? "failed"
+                    : isLocalInterruptedBoundary(event) ? "cancelling" : "cancelled");
+        }
+    }
+    return messages.map((message) => {
+        if (message.role !== "assistant" || !message.metadata?.turnId)
+            return message;
+        const messageTurnId = message.metadata.turnId;
+        const terminal = terminalTurns.get(messageTurnId);
+        if (!terminal)
+            return message;
+        const segmentEvents = eventsForAssistantSegment(message, events).events;
+        const segmentCompletedResults = new Map();
+        const segmentPartialToolInputs = new Map();
+        for (const event of segmentEvents) {
+            if (event.type === "action.result" && event.data.status === "completed" && event.data.result.kind === "tool-result") {
+                segmentCompletedResults.set(event.data.result.callId, {
+                    output: event.data.result.output,
+                    toolName: event.data.result.toolName,
+                });
+            }
+            if (event.type === "action.input.partial") {
+                segmentPartialToolInputs.set(event.data.callId, event);
+            }
+        }
+        let changed = false;
+        const parts = message.parts.flatMap((part) => {
+            if (part.type !== "dynamic-tool" || !isOpenToolPart(part))
+                return [part];
+            const completed = segmentCompletedResults.get(part.toolCallId);
+            changed = true;
+            if (!completed) {
+                if (terminal === "cancelled" || terminal === "cancelling") {
+                    const toolMetadata = part.toolMetadata?.eve
+                        ? {
+                            ...part.toolMetadata,
+                            eve: {
+                                kind: part.toolMetadata.eve.kind,
+                                name: part.toolMetadata.eve.name,
+                            },
+                        }
+                        : part.toolMetadata;
+                    return [{
+                            errorText: terminal === "cancelled" ? INTERRUPTED_TOOL_ERROR : CANCELLING_TOOL_ERROR,
+                            input: part.input,
+                            ...(part.inputText !== undefined ? { inputText: part.inputText } : {}),
+                            ...(part.stepIndex !== undefined ? { stepIndex: part.stepIndex } : {}),
+                            state: "output-error",
+                            toolCallId: part.toolCallId,
+                            ...(toolMetadata ? { toolMetadata } : {}),
+                            toolName: part.toolName,
+                            type: "dynamic-tool",
+                        }];
+                }
+                return [{
+                        errorText: incompleteToolError(segmentEvents, messageTurnId, part),
+                        input: part.input,
+                        ...(part.inputText !== undefined ? { inputText: part.inputText } : {}),
+                        ...(part.stepIndex !== undefined ? { stepIndex: part.stepIndex } : {}),
+                        state: "output-error",
+                        toolCallId: part.toolCallId,
+                        ...(part.toolMetadata ? { toolMetadata: part.toolMetadata } : {}),
+                        toolName: part.toolName,
+                        type: "dynamic-tool",
+                    }];
+            }
+            return [{
+                    input: part.input,
+                    ...(part.inputText !== undefined ? { inputText: part.inputText } : {}),
+                    ...(part.stepIndex !== undefined ? { stepIndex: part.stepIndex } : {}),
+                    output: completed.output,
+                    state: "output-available",
+                    toolCallId: part.toolCallId,
+                    ...(part.toolMetadata ? { toolMetadata: part.toolMetadata } : {}),
+                    toolName: completed.toolName || part.toolName,
+                    type: "dynamic-tool",
+                }];
+        });
+        const cleanedParts = [];
+        const markerIndexByStep = new Map();
+        const partialsForMessage = [...segmentPartialToolInputs.values()];
+        let markerStepIndex = 0;
+        for (let index = 0; index < parts.length; index += 1) {
+            const part = parts[index];
+            if (part.type !== "step-start") {
+                if ((part.type === "text" || part.type === "reasoning") && part.state === "streaming") {
+                    changed = true;
+                    cleanedParts.push({ ...part, state: "done" });
+                }
+                else {
+                    cleanedParts.push(part);
+                }
+                continue;
+            }
+            const nextStep = parts.findIndex((candidate, candidateIndex) => candidateIndex > index && candidate.type === "step-start");
+            const end = nextStep < 0 ? parts.length : nextStep;
+            const hasContent = parts.slice(index + 1, end).some((candidate) => candidate.type !== "step-start");
+            const hasPartialInput = partialsForMessage.some((partial) => partial.data.stepIndex === markerStepIndex);
+            if (hasContent || hasPartialInput) {
+                markerIndexByStep.set(markerStepIndex, cleanedParts.length);
+                cleanedParts.push(part);
+            }
+            else
+                changed = true;
+            markerStepIndex += 1;
+        }
+        const visibleToolCallIds = new Set(cleanedParts.flatMap((part) => part.type === "dynamic-tool" ? [part.toolCallId] : []));
+        const syntheticByStep = new Map();
+        for (const partial of partialsForMessage) {
+            if (visibleToolCallIds.has(partial.data.callId))
+                continue;
+            changed = true;
+            visibleToolCallIds.add(partial.data.callId);
+            const synthetic = {
+                errorText: terminal === "cancelled" || terminal === "cancelling"
+                    ? terminal === "cancelled" ? INTERRUPTED_TOOL_ERROR : CANCELLING_TOOL_ERROR
+                    : incompleteToolError(segmentEvents, messageTurnId, {
+                        input: partial.data.input ?? {},
+                        stepIndex: partial.data.stepIndex,
+                        toolCallId: partial.data.callId,
+                        toolName: partial.data.toolName,
+                        type: "dynamic-tool",
+                        state: "input-streaming",
+                    }),
+                input: partial.data.input ?? {},
+                inputText: partial.data.inputTextSoFar,
+                state: "output-error",
+                stepIndex: partial.data.stepIndex,
+                toolCallId: partial.data.callId,
+                toolName: partial.data.toolName,
+                type: "dynamic-tool",
+            };
+            const stepParts = syntheticByStep.get(partial.data.stepIndex) ?? [];
+            stepParts.push(synthetic);
+            syntheticByStep.set(partial.data.stepIndex, stepParts);
+        }
+        const insertions = [...syntheticByStep.entries()]
+            .map(([stepIndex, stepParts]) => ({
+            index: markerIndexByStep.get(stepIndex) ?? cleanedParts.length - 1,
+            stepParts,
+        }))
+            .sort((left, right) => right.index - left.index);
+        for (const insertion of insertions) {
+            cleanedParts.splice(insertion.index + 1, 0, ...insertion.stepParts);
+        }
+        if (message.metadata?.status === "streaming") {
+            changed = true;
+        }
+        return changed
+            ? {
+                ...message,
+                metadata: message.metadata?.status === "streaming"
+                    ? { ...message.metadata, status: "complete" }
+                    : message.metadata,
+                parts: cleanedParts,
+            }
+            : message;
+    });
+}
+function incompleteToolError(events, turnId, part) {
+    const result = [...events].reverse().find((event) => event.type === "action.result" &&
+        event.data.turnId === turnId &&
+        event.data.result.callId === part.toolCallId &&
+        event.data.status !== "completed");
+    if (result?.type === "action.result" && result.data.error?.message) {
+        return result.data.error.message;
+    }
+    const stepFailure = [...events].reverse().find((event) => event.type === "step.failed" &&
+        event.data.turnId === turnId &&
+        (part.stepIndex === undefined || event.data.stepIndex === part.stepIndex));
+    if (stepFailure?.type === "step.failed")
+        return stepFailure.data.message;
+    const turnFailure = [...events].reverse().find((event) => event.type === "turn.failed" && event.data.turnId === turnId);
+    if (turnFailure?.type === "turn.failed")
+        return turnFailure.data.message;
+    return INCOMPLETE_TOOL_ERROR;
+}
+function isOpenToolPart(part) {
+    return part.state === "input-streaming" ||
+        part.state === "input-available" ||
+        (part.state === "output-available" && part.partial === true);
+}
 const MAX_DURABLE_STEP_RETRIES = 3;
 export function shouldSuppressInterruptedTurnDisplayEvent(event, eventIndex, turns) {
     return shouldSuppressInterruptedTurnEvent(event, turns, (turn) => eventIndex >= turn.eventCount);
@@ -48,7 +357,7 @@ function shouldSuppressInterruptedTurnEvent(event, turns, isAfterCancellation) {
     if (!turnId)
         return false;
     const interrupted = turns.find((turn) => turn.turnId === turnId);
-    return Boolean(interrupted && isAfterCancellation(interrupted));
+    return Boolean(interrupted && interrupted.settled !== false && isAfterCancellation(interrupted));
 }
 export function projectAgentDisplayTimeline(messages, events) {
     const turns = turnDisplayCoordinates(events);
@@ -122,8 +431,14 @@ export function presentAgentStep(events, turnId, stepIndex) {
     const maximumTurnStepIndex = events.reduce((maximum, event) => eventTurnId(event) === turnId
         ? Math.max(maximum, eventStepIndex(event) ?? -1)
         : maximum, -1);
-    const terminalFailure = stepIndex === maximumTurnStepIndex
-        ? [...events].reverse().find((event) => event.type === "turn.failed" && event.data.turnId === turnId)
+    const terminalFailureEvent = stepIndex === maximumTurnStepIndex
+        ? [...events].reverse().find((event) => event.type === "turn.failed" && event.data.turnId === turnId) ?? [...events].reverse().find((event) => event.type === "session.failed")
+        : undefined;
+    const terminalFailure = terminalFailureEvent
+        ? {
+            code: terminalFailureEvent.data.code,
+            message: terminalFailureEvent.data.message,
+        }
         : undefined;
     const latestFailure = failures.at(-1);
     const retryAttempt = terminalFailure || completed
@@ -134,12 +449,10 @@ export function presentAgentStep(events, turnId, stepIndex) {
     const latestAttemptFailed = latestAttemptEvents.some((event) => event.type === "step.failed");
     const endedAt = latestAttemptFailed && !completed && !terminalFailure
         ? undefined
-        : modelOutputBoundaryTime(latestAttemptEvents) ?? eventTimestamp(completed ?? terminalFailure);
+        : modelOutputBoundaryTime(latestAttemptEvents) ?? eventTimestamp(completed ?? terminalFailureEvent);
     return {
         ...(endedAt ? { endedAt } : {}),
-        ...(terminalFailure?.type === "turn.failed"
-            ? { failure: { code: terminalFailure.data.code, message: terminalFailure.data.message } }
-            : {}),
+        ...(terminalFailure ? { failure: terminalFailure } : {}),
         ...(retryAttempt > 0
             ? {
                 retry: {
@@ -159,6 +472,27 @@ export function presentAgentStep(events, turnId, stepIndex) {
                 : "running",
     };
 }
+export function reasoningContentForStep(events, turnId, stepIndex) {
+    let content = "";
+    for (const event of events) {
+        if ((event.type !== "reasoning.appended" && event.type !== "reasoning.completed") ||
+            (turnId !== undefined && event.data.turnId !== turnId) ||
+            (stepIndex !== undefined && event.data.stepIndex !== stepIndex))
+            continue;
+        if (event.type === "reasoning.completed") {
+            if (event.data.reasoning.trim())
+                content = event.data.reasoning;
+            continue;
+        }
+        if (event.data.reasoningSoFar.trim()) {
+            content = event.data.reasoningSoFar;
+        }
+        else if (event.data.reasoningDelta.trim()) {
+            content += event.data.reasoningDelta;
+        }
+    }
+    return content.trim();
+}
 export function presentAgentTurn(message, events, closedInputRequestIds = new Set()) {
     if (message.role !== "assistant" || !message.metadata?.turnId)
         return undefined;
@@ -173,12 +507,13 @@ export function presentAgentTurn(message, events, closedInputRequestIds = new Se
     const hasTools = firstAction !== undefined || pendingRequests.length > 0 || message.parts.some((part) => part.type === "dynamic-tool");
     if (!hasTools)
         return undefined;
-    const terminal = [...turnEvents].reverse().find((event) => event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled");
+    const terminal = [...turnEvents].reverse().find((event) => (event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled" || event.type === "session.failed") &&
+        !isLocalInterruptedBoundary(event));
     const status = pendingRequests.length > 0
         ? "waiting"
         : terminal?.type === "turn.completed"
             ? "completed"
-            : terminal?.type === "turn.failed"
+            : terminal?.type === "turn.failed" || terminal?.type === "session.failed"
                 ? "failed"
                 : terminal?.type === "turn.cancelled"
                     ? "cancelled"
@@ -188,24 +523,183 @@ export function presentAgentTurn(message, events, closedInputRequestIds = new Se
     const finalStepIndex = finalDeliveryStepIndex(turnEvents, message, status);
     let finalPart;
     const processParts = [];
-    for (const part of message.parts) {
+    for (const part of orderAssistantMessageParts(message.parts, turnEvents, turnId)) {
         if (part.type === "text" && part.stepIndex === finalStepIndex) {
             finalPart = part;
             continue;
         }
         processParts.push(part);
     }
+    const failedStep = status === "failed" && turnEvents.some((event) => event.type === "step.failed" && event.data.turnId === turnId);
+    const failedStepEvent = failedStep
+        ? [...turnEvents].reverse().find((event) => event.type === "step.failed" && event.data.turnId === turnId)
+        : undefined;
+    const failedStepIndex = failedStepEvent?.data.stepIndex ?? (status === "failed" ? latestStepIndex(turnEvents, turnId) : undefined);
+    const failedStepHasPart = failedStepIndex !== undefined && processParts.some((part) => "stepIndex" in part && part.stepIndex === failedStepIndex);
+    const markerAnchored = status === "failed" && failedStepIndex !== undefined && hasStepMarkerForIndex(processParts, events, turnId, failedStepIndex);
+    const shouldAddFailureMarker = status === "failed" && failedStepIndex !== undefined && !failedStepHasPart && !markerAnchored;
+    const displayProcessParts = shouldAddFailureMarker
+        ? [...processParts, { type: "step-start" }]
+        : processParts;
+    const failureAnchored = status === "failed" && (failedStepHasPart || markerAnchored || shouldAddFailureMarker);
     return {
         endedAt: eventTimestamp(terminal) ?? segment.settledAt,
         finalPart,
+        ...(failureAnchored ? { failureAnchored: true } : {}),
         proxiedInputParts: pendingRequests
             .filter((request) => !message.parts.some((part) => part.type === "dynamic-tool" && part.approval?.id === request.requestId))
             .map(toProxiedInputPart),
-        processParts,
+        processParts: displayProcessParts,
         startedAt: eventTimestamp(firstAction),
         status,
         ...(pendingRequests[0]?.kind ? { waitingFor: pendingRequests[0].kind } : {}),
     };
+}
+function orderAssistantMessageParts(parts, events, turnId) {
+    if (parts.length < 2 || events.length < 2)
+        return parts;
+    const markerSteps = new Map();
+    let previousStep = -1;
+    for (let index = 0; index < parts.length; index += 1) {
+        const part = parts[index];
+        if (part.type !== "step-start")
+            continue;
+        const nextMarker = parts.findIndex((candidate, candidateIndex) => candidateIndex > index && candidate.type === "step-start");
+        const group = parts.slice(index + 1, nextMarker < 0 ? parts.length : nextMarker);
+        const explicitStep = group
+            .flatMap((candidate) => "stepIndex" in candidate && typeof candidate.stepIndex === "number"
+            ? [candidate.stepIndex]
+            : [])
+            .sort((left, right) => left - right)[0];
+        const nextStep = explicitStep !== undefined
+            ? explicitStep
+            : events.map(eventStepIndex).find((step) => step !== undefined && step > previousStep);
+        if (nextStep !== undefined) {
+            markerSteps.set(index, nextStep);
+            previousStep = nextStep;
+        }
+    }
+    let activeStep;
+    const indexed = parts.map((part, index) => {
+        if (part.type === "step-start")
+            activeStep = markerSteps.get(index);
+        else if ("stepIndex" in part && typeof part.stepIndex === "number")
+            activeStep = part.stepIndex;
+        return {
+            eventIndex: partEventIndex(part, events, turnId, activeStep),
+            index,
+            isMarker: part.type === "step-start",
+            part,
+            stepIndex: activeStep,
+        };
+    });
+    const groups = new Map();
+    for (const entry of indexed) {
+        if (entry.stepIndex === undefined)
+            continue;
+        const group = groups.get(entry.stepIndex) ?? [];
+        group.push(entry);
+        groups.set(entry.stepIndex, group);
+    }
+    const localOrder = new Map();
+    for (const group of groups.values()) {
+        const known = group
+            .map((entry) => entry.eventIndex)
+            .filter((position) => position !== undefined)
+            .sort((left, right) => left - right);
+        const firstKnown = known[0];
+        const lastKnown = known.at(-1);
+        let unknownAfter = 0;
+        for (const entry of group) {
+            if (entry.eventIndex !== undefined) {
+                localOrder.set(entry.index, entry.eventIndex);
+                continue;
+            }
+            const nextKnown = group
+                .filter((candidate) => candidate.index > entry.index && candidate.eventIndex !== undefined)
+                .map((candidate) => candidate.eventIndex)
+                .sort((left, right) => left - right)[0];
+            if (entry.isMarker && firstKnown !== undefined) {
+                localOrder.set(entry.index, firstKnown - 1);
+            }
+            else if (nextKnown !== undefined) {
+                localOrder.set(entry.index, nextKnown - 0.25);
+            }
+            else if (lastKnown !== undefined) {
+                localOrder.set(entry.index, lastKnown + 0.25 + unknownAfter++ / 100);
+            }
+            else {
+                localOrder.set(entry.index, entry.index);
+            }
+        }
+    }
+    const hasComparablePosition = indexed.some((entry) => entry.eventIndex !== undefined);
+    if (!hasComparablePosition)
+        return parts;
+    return indexed
+        .toSorted((left, right) => (left.stepIndex ?? Number.MAX_SAFE_INTEGER) - (right.stepIndex ?? Number.MAX_SAFE_INTEGER) ||
+        (localOrder.get(left.index) ?? Number.MAX_SAFE_INTEGER) - (localOrder.get(right.index) ?? Number.MAX_SAFE_INTEGER) ||
+        left.index - right.index)
+        .map((entry) => entry.part);
+}
+function partEventIndex(part, events, turnId, stepIndex) {
+    const matchesStep = (event) => eventTurnId(event) === turnId && (stepIndex === undefined || eventStepIndex(event) === stepIndex);
+    if (part.type === "step-start") {
+        return firstEventIndex(events, (event) => event.type === "step.started" && matchesStep(event));
+    }
+    if (part.type === "reasoning") {
+        const appended = firstEventIndex(events, (event) => matchesStep(event) && event.type === "reasoning.appended");
+        if (appended !== undefined)
+            return appended;
+        const stepStarted = firstEventIndex(events, (event) => event.type === "step.started" && matchesStep(event));
+        if (stepStarted !== undefined)
+            return stepStarted + 0.1;
+        const firstStepEvent = firstEventIndex(events, matchesStep);
+        return firstStepEvent === undefined ? undefined : firstStepEvent - 0.1;
+    }
+    if (part.type === "text") {
+        return firstEventIndex(events, (event) => matchesStep(event) && (event.type === "message.appended" || event.type === "message.completed"));
+    }
+    if (part.type === "dynamic-tool") {
+        return firstEventIndex(events, (event) => matchesStep(event) && ((event.type === "action.input.partial" && event.data.callId === part.toolCallId) ||
+            (event.type === "actions.requested" && event.data.actions.some((action) => action.callId === part.toolCallId)) ||
+            (event.type === "action.result" && event.data.result.callId === part.toolCallId)));
+    }
+    return firstEventIndex(events, matchesStep);
+}
+function firstEventIndex(events, predicate) {
+    const index = events.findIndex(predicate);
+    return index >= 0 ? index : undefined;
+}
+function latestStepIndex(events, turnId) {
+    return events.reduce((latest, event) => {
+        if (eventTurnId(event) !== turnId)
+            return latest;
+        const stepIndex = eventStepIndex(event);
+        return stepIndex === undefined ? latest : Math.max(latest ?? stepIndex, stepIndex);
+    }, undefined);
+}
+function hasStepMarkerForIndex(parts, events, turnId, targetStepIndex) {
+    let previousStepIndex = -1;
+    for (let index = 0; index < parts.length; index += 1) {
+        if (parts[index]?.type !== "step-start")
+            continue;
+        const nextStep = parts.findIndex((candidate, candidateIndex) => candidateIndex > index && candidate.type === "step-start");
+        const stepParts = parts.slice(index + 1, nextStep < 0 ? parts.length : nextStep);
+        const explicit = stepParts.find((part) => "stepIndex" in part && typeof part.stepIndex === "number");
+        const stepIndex = explicit && "stepIndex" in explicit && typeof explicit.stepIndex === "number"
+            ? explicit.stepIndex
+            : events
+                .map(eventStepIndex)
+                .filter((candidate) => candidate !== undefined && candidate > previousStepIndex)
+                .find((candidate) => events.some((event) => eventTurnId(event) === turnId && eventStepIndex(event) === candidate));
+        if (stepIndex === undefined)
+            continue;
+        previousStepIndex = stepIndex;
+        if (stepIndex === targetStepIndex)
+            return true;
+    }
+    return false;
 }
 export function isProxiedInputOnlyMessage(message, events) {
     if (message.role !== "assistant" || !message.metadata?.turnId)
@@ -238,7 +732,7 @@ export function unresolvedInputRequests(events, closedInputRequestIds = new Set(
             hasRequestedInput = false;
             continue;
         }
-        if (event.type === "session.completed" || event.type === "session.failed") {
+        if (event.type === "turn.cancelled" || event.type === "session.completed" || event.type === "session.failed") {
             pending = new Map();
             hasRequestedInput = false;
         }
@@ -257,16 +751,21 @@ export function hasSettledLatestTurn(events) {
     const started = events[startedIndex];
     if (started?.type !== "turn.started")
         return false;
-    return events.slice(startedIndex + 1).some((event) => (event.type === "turn.completed" || event.type === "turn.cancelled") &&
-        event.data.turnId === started.data.turnId);
+    return events.slice(startedIndex + 1).some((event) => (event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled") &&
+        event.data.turnId === started.data.turnId) || events.slice(startedIndex + 1).some((event) => event.type === "session.failed");
 }
 export function failureForTurn(events, turnId) {
     if (!turnId)
         return undefined;
-    const event = [...events].reverse().find((candidate) => (candidate.type === "turn.failed" || candidate.type === "step.failed") &&
-        candidate.data.turnId === turnId);
-    return event?.type === "turn.failed" || event?.type === "step.failed"
-        ? { code: event.data.code, message: event.data.message }
+    const event = [...events].reverse().find((candidate) => candidate.type === "turn.failed" && candidate.data.turnId === turnId);
+    if (event?.type === "turn.failed") {
+        return { code: event.data.code, message: event.data.message };
+    }
+    const startedIndex = events.findLastIndex((candidate) => candidate.type === "turn.started" && candidate.data.turnId === turnId);
+    const sessionFailureIndex = events.findLastIndex((candidate) => candidate.type === "session.failed");
+    const sessionFailure = sessionFailureIndex > startedIndex ? events[sessionFailureIndex] : undefined;
+    return sessionFailure?.type === "session.failed"
+        ? { code: sessionFailure.data.code, message: sessionFailure.data.message }
         : undefined;
 }
 export function eventsBeforeLastUserTurn(events) {
@@ -311,10 +810,9 @@ export function presentSubagentCall(events, callId) {
     if (parentCancellation?.type === "turn.cancelled") {
         return {
             childSessionId: started?.type === "subagent.called" ? started.data.childSessionId : undefined,
-            endedAt: eventTimestamp(parentCancellation),
             name: started?.type === "subagent.called" ? started.data.name : undefined,
             startedAt: eventTimestamp(started),
-            status: "cancelled",
+            status: "waiting",
         };
     }
     if (terminalSession) {
@@ -406,16 +904,37 @@ function toProxiedInputPart(request) {
     };
 }
 function finalDeliveryStepIndex(events, message, status) {
-    const completedDelivery = [...events].reverse().find((event) => event.type === "message.completed" &&
+    const completedDeliveries = events
+        .map((event, index) => ({ event, index }))
+        .filter(({ event }) => event.type === "message.completed" &&
         event.data.message !== null &&
-        event.data.finishReason !== "tool-calls");
-    if (completedDelivery?.type === "message.completed")
-        return completedDelivery.data.stepIndex;
+        event.data.finishReason !== "tool-calls")
+        .reverse();
+    for (const candidate of completedDeliveries) {
+        if (candidate.event.type !== "message.completed")
+            continue;
+        const candidateStep = candidate.event.data.stepIndex;
+        const hasLaterExecution = events.slice(candidate.index + 1).some((event) => (event.type === "step.started" && event.data.stepIndex > candidateStep) ||
+            event.type === "actions.requested" ||
+            event.type === "action.input.partial" ||
+            event.type === "action.result" ||
+            event.type === "input.requested");
+        if (!hasLaterExecution)
+            return candidateStep;
+    }
     if (status !== "running")
         return undefined;
-    const latestActionStep = events.reduce((latest, event) => event.type === "actions.requested" ? Math.max(latest, event.data.stepIndex) : latest, -1);
+    const latestExecutionStep = events.reduce((latest, event) => {
+        if (event.type === "step.started" ||
+            event.type === "actions.requested" ||
+            event.type === "action.input.partial" ||
+            event.type === "action.result" ||
+            event.type === "input.requested")
+            return Math.max(latest, event.data.stepIndex);
+        return latest;
+    }, -1);
     const latestText = [...message.parts].reverse().find((part) => part.type === "text");
-    return latestText?.type === "text" && (latestText.stepIndex ?? 0) > latestActionStep
+    return latestText?.type === "text" && (latestText.stepIndex ?? 0) > latestExecutionStep
         ? latestText.stepIndex
         : undefined;
 }
@@ -436,11 +955,12 @@ function eventTimestamp(event) {
 function turnDisplayCoordinates(events) {
     const turnIds = events.flatMap((event) => event.type === "turn.started" ? [event.data.turnId] : []);
     const userTurns = new Set(events.flatMap((event) => event.type === "message.received" ? [event.data.turnId] : []));
+    const continuations = continuationTurnIds(events, userTurns);
     const preliminary = new Map();
     let rootTurnId;
     let nextStepOffset = 0;
     for (const turnId of turnIds) {
-        if (!rootTurnId || userTurns.has(turnId)) {
+        if (!rootTurnId || userTurns.has(turnId) || !continuations.has(turnId)) {
             rootTurnId = turnId;
             nextStepOffset = 0;
         }

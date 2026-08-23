@@ -1,6 +1,6 @@
 import type { AgentThreadCollection } from "@oworker/open-agent-ui/agent-workspace";
 import { AGENT_THREAD_STORAGE_VERSION } from "@oworker/open-agent-ui/agent-workspace";
-import { createPostgresThreadCollectionStoreFromEnvironment } from "@/server/data/thread-collection-store";
+import { createPostgresThreadCollectionStoreFromEnvironment, type ThreadCollectionPatchRecord } from "@/server/data/thread-collection-store";
 import { authenticateHostRequest } from "@/server/http/host-request-auth";
 import {
   applyThreadCollectionPatch,
@@ -11,7 +11,10 @@ import {
 
 export const runtime = "nodejs";
 
-const MAX_COLLECTION_BYTES = 5 * 1024 * 1024;
+// PUT is retained only for legacy full-snapshot clients. Normal Agent
+// checkpoints use PATCH event deltas and never scale with transcript size.
+const MAX_LEGACY_SNAPSHOT_BYTES = 64 * 1024 * 1024;
+const MAX_PATCH_BYTES = 64 * 1024 * 1024;
 const store = createPostgresThreadCollectionStoreFromEnvironment<AgentThreadCollection>();
 
 type RouteContext = { readonly params: Promise<{ readonly storageKey: string }> };
@@ -22,22 +25,35 @@ export async function GET(request: Request, context: RouteContext): Promise<Resp
   if (!store) return databaseUnavailable();
 
   const { storageKey } = await context.params;
-  const record = await store.load(
-    authenticated.identity.tenantId,
-    authenticated.identity.principalId,
-    storageKey,
-  );
-  const collection = record?.collection ?? { threads: [], version: 2 };
-  const revision = record?.revision ?? 0;
   const url = new URL(request.url);
   const threadId = url.searchParams.get("threadId");
-  if (threadId && url.searchParams.get("view") !== "index") {
+  const indexView = url.searchParams.get("view") === "index";
+  if (threadId && !indexView && store.loadThread) {
+    const record = await store.loadThread(
+      authenticated.identity.tenantId,
+      authenticated.identity.principalId,
+      storageKey,
+      threadId,
+    );
     return Response.json(
-      { thread: collection.threads.find((thread) => thread.id === threadId) ?? null, revision },
-      { headers: responseHeaders(revision) },
+      { thread: record?.thread ?? null, revision: record?.revision ?? 0 },
+      { headers: responseHeaders(record?.revision ?? 0) },
     );
   }
-  const responseCollection = url.searchParams.get("view") === "index"
+  const record = indexView && store.loadIndex
+    ? await store.loadIndex(
+        authenticated.identity.tenantId,
+        authenticated.identity.principalId,
+        storageKey,
+      )
+    : await store.load(
+        authenticated.identity.tenantId,
+        authenticated.identity.principalId,
+        storageKey,
+      );
+  const collection = record?.collection ?? { threads: [], version: 2 };
+  const revision = record?.revision ?? 0;
+  const responseCollection = indexView
     ? summarizeThreadCollection(collection, threadId ?? undefined)
     : collection;
   return Response.json(
@@ -57,8 +73,8 @@ export async function PUT(request: Request, context: RouteContext): Promise<Resp
   }
 
   const contentLength = Number(request.headers.get("content-length") ?? "0");
-  if (Number.isFinite(contentLength) && contentLength > MAX_COLLECTION_BYTES) {
-    return problem(413, "collection_too_large", "The thread collection exceeds 5 MiB.");
+  if (Number.isFinite(contentLength) && contentLength > MAX_LEGACY_SNAPSHOT_BYTES) {
+    return problem(413, "collection_too_large", "The legacy thread snapshot exceeds 64 MiB.");
   }
 
   let input: unknown;
@@ -71,8 +87,8 @@ export async function PUT(request: Request, context: RouteContext): Promise<Resp
     return problem(400, "invalid_collection", "The request must contain a thread collection.");
   }
   const serialized = JSON.stringify(input.collection);
-  if (Buffer.byteLength(serialized) > MAX_COLLECTION_BYTES) {
-    return problem(413, "collection_too_large", "The thread collection exceeds 5 MiB.");
+  if (Buffer.byteLength(serialized) > MAX_LEGACY_SNAPSHOT_BYTES) {
+    return problem(413, "collection_too_large", "The legacy thread snapshot exceeds 64 MiB.");
   }
   const collection = parseStrictThreadCollection(input.collection);
   if (!collection) {
@@ -110,7 +126,7 @@ export async function PATCH(request: Request, context: RouteContext): Promise<Re
   if (expectedRevision === undefined) {
     return problem(428, "revision_required", "If-Match must contain the loaded collection revision.");
   }
-  const input = await readJsonWithinLimit(request);
+  const input = await readJsonWithinLimit(request, MAX_PATCH_BYTES);
   if (input instanceof Response) return input;
   const patch = parseThreadCollectionPatch(input);
   if (!patch) {
@@ -118,22 +134,15 @@ export async function PATCH(request: Request, context: RouteContext): Promise<Re
   }
 
   const { storageKey } = await context.params;
-  const current = await store.load(
-    authenticated.identity.tenantId,
-    authenticated.identity.principalId,
-    storageKey,
-  );
-  const collection = applyThreadCollectionPatch(
-    current?.collection ?? { threads: [], version: AGENT_THREAD_STORAGE_VERSION },
-    patch,
-  );
-  const result = await store.save(
-    authenticated.identity.tenantId,
-    authenticated.identity.principalId,
-    storageKey,
-    expectedRevision,
-    collection,
-  );
+  const result = store.patch
+    ? await store.patch(
+        authenticated.identity.tenantId,
+        authenticated.identity.principalId,
+        storageKey,
+        expectedRevision,
+        patch as ThreadCollectionPatchRecord,
+      )
+    : await saveMetadataPatch(store, authenticated.identity.tenantId, authenticated.identity.principalId, storageKey, expectedRevision, patch);
   if (result.status === "conflict") {
     return problem(
       409,
@@ -148,15 +157,31 @@ export async function PATCH(request: Request, context: RouteContext): Promise<Re
   );
 }
 
-async function readJsonWithinLimit(request: Request): Promise<unknown | Response> {
+async function saveMetadataPatch(
+  threadStore: NonNullable<typeof store>,
+  tenantId: string,
+  principalId: string,
+  storageKey: string,
+  expectedRevision: number,
+  patch: Parameters<typeof applyThreadCollectionPatch>[1],
+) {
+  const current = await threadStore.load(tenantId, principalId, storageKey);
+  const collection = applyThreadCollectionPatch(
+    current?.collection ?? { threads: [], version: AGENT_THREAD_STORAGE_VERSION },
+    patch,
+  );
+  return await threadStore.save(tenantId, principalId, storageKey, expectedRevision, collection);
+}
+
+async function readJsonWithinLimit(request: Request, limit = MAX_PATCH_BYTES): Promise<unknown | Response> {
   const contentLength = Number(request.headers.get("content-length") ?? "0");
-  if (Number.isFinite(contentLength) && contentLength > MAX_COLLECTION_BYTES) {
-    return problem(413, "collection_too_large", "The thread collection patch exceeds 5 MiB.");
+  if (Number.isFinite(contentLength) && contentLength > limit) {
+    return problem(413, "collection_too_large", `The thread collection patch exceeds ${Math.round(limit / 1024 / 1024)} MiB.`);
   }
   try {
     const text = await request.text();
-    if (Buffer.byteLength(text) > MAX_COLLECTION_BYTES) {
-      return problem(413, "collection_too_large", "The thread collection patch exceeds 5 MiB.");
+    if (Buffer.byteLength(text) > limit) {
+      return problem(413, "collection_too_large", `The thread collection patch exceeds ${Math.round(limit / 1024 / 1024)} MiB.`);
     }
     return JSON.parse(text) as unknown;
   } catch {

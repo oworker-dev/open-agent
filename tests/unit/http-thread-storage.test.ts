@@ -82,7 +82,7 @@ test("loads a lightweight thread index before fetching one transcript", async ()
           revision: 4,
         });
       }
-      return Response.json({ revision: 4, thread });
+      return Response.json({ revision: 4, thread: { ...thread, hydration: "summary" } });
     }) as typeof fetch,
   });
 
@@ -90,8 +90,56 @@ test("loads a lightweight thread index before fetching one transcript", async ()
   assert.equal(index.threads[0]?.hydration, "summary");
   const hydrated = await storage.loadThread?.("workspace-lazy", thread.id);
   assert.equal(hydrated?.title, "Lazy thread");
+  assert.equal(hydrated?.hydration, undefined);
   assert.match(requestedUrls[0] ?? "", /view=index/);
   assert.match(requestedUrls[1] ?? "", new RegExp(`threadId=${thread.id}`));
+});
+
+test("a server transcript repair advances the revision used by the next metadata save", async () => {
+  const thread = {
+    ...createAgentThread(100, "Repair me"),
+    events: [],
+    hydration: "summary" as const,
+    session: { sessionId: "session-repair", streamIndex: 12_803 },
+  };
+  const repaired = {
+    ...thread,
+    events: [{
+      data: { wait: "next-user-message" },
+      meta: { at: new Date(0).toISOString(), id: "evt-repaired" },
+      type: "session.waiting" as const,
+    }],
+    hydration: undefined,
+    transcriptCoverage: { complete: true, endIndex: 12_803, startIndex: 0, version: 1 as const },
+  };
+  let savedIfMatch: string | null = null;
+  const storage = createHttpAgentThreadStorage({
+    fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (init?.method === "POST" && url.includes("/repair/")) {
+        return Response.json({ revision: 5, thread: repaired }, { headers: { etag: '"5"' } });
+      }
+      if (init?.method === "PATCH") {
+        savedIfMatch = new Headers(init.headers).get("if-match");
+        return Response.json({ revision: 6 }, { headers: { etag: '"6"' } });
+      }
+      return Response.json({
+        collection: { activeThreadId: thread.id, threads: [thread], version: 2 },
+        revision: 4,
+      }, { headers: { etag: '"4"' } });
+    }) as typeof fetch,
+  });
+
+  await storage.load("workspace-repair");
+  const hydrated = await storage.repairThread?.("workspace-repair", thread.id);
+  assert.equal(hydrated?.transcriptCoverage?.complete, true);
+  await storage.save("workspace-repair", {
+    activeThreadId: thread.id,
+    threads: [{ ...hydrated!, title: "Repaired" }],
+    version: 2,
+  });
+
+  assert.equal(savedIfMatch, '"5"');
 });
 
 function fakeThreadServer() {

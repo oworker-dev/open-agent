@@ -565,7 +565,10 @@ function cancellationGraceRemaining(
 
 function cancellationGraceMs(): number {
   const value = process.env.AGENT_RUN_CANCELLATION_GRACE_MS?.trim();
-  if (!value) return 100;
+  // Give Eve enough time to reach its durable cooperative-cancellation
+  // boundary before the exclusive headless session fallback resets it. The
+  // deployment can still tune this through AGENT_RUN_CANCELLATION_GRACE_MS.
+  if (!value) return 1_000;
   const milliseconds = Number(value);
   if (!Number.isInteger(milliseconds) || milliseconds < 100 || milliseconds > 10_000) {
     throw new Error("AGENT_RUN_CANCELLATION_GRACE_MS must be an integer from 100 to 10000.");

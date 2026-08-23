@@ -450,7 +450,7 @@ function ModelSelectorContent({
       side={renderedSide ?? side ?? "bottom"}
       sideOffset={sideOffset}
       className={cn(
-        "bg-popover/95 w-72 min-w-(--radix-popover-trigger-width) overflow-hidden rounded-xl p-0 shadow-lg backdrop-blur-sm",
+        "bg-popover/95 w-72 min-w-(--radix-popover-trigger-width) overflow-hidden rounded-xl p-0 text-xs shadow-lg backdrop-blur-sm",
         className,
       )}
       {...props}
@@ -592,7 +592,7 @@ function ModelSelectorItem({
             <ModelIcon className="mt-[3px]">{model.icon}</ModelIcon>
           )}
           <span className="flex min-w-0 flex-col">
-            <span className="truncate text-[13px] leading-5 font-medium" data-slot="model-selector-item-name">{model.name}</span>
+            <span className="truncate text-xs leading-5 font-medium" data-slot="model-selector-item-name">{model.name}</span>
             {model.description && (
               <span className="text-muted-foreground truncate text-xs">
                 {model.description}
@@ -663,7 +663,7 @@ function ModelSelectorEffort({
             key={option.id}
             value={option.id}
             className={cn(
-              "focus-visible:ring-ring/50 text-muted-foreground hover:text-foreground min-w-0 truncate rounded-md px-1 py-0.5 text-center text-[13px] leading-5 font-medium transition-colors outline-none focus-visible:ring-2",
+              "focus-visible:ring-ring/50 text-muted-foreground hover:text-foreground min-w-0 truncate rounded-md px-1 py-0.5 text-center text-xs leading-5 font-medium transition-colors outline-none focus-visible:ring-2",
               "data-[state=checked]:bg-accent data-[state=checked]:text-accent-foreground data-[state=checked]:font-medium",
             )}
           >

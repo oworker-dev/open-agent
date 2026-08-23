@@ -41,6 +41,9 @@ export type {
   AgentSubagentController,
   AgentSubagentControlAction,
   AgentSubagentSummary,
+  AgentSessionBoundary,
+  AgentSessionInspector,
+  AgentTranscriptCoverage,
 } from "./contracts.js";
 export {
   filterPromptMenuItems,
@@ -48,13 +51,20 @@ export {
   replacePromptTrigger,
   type PromptTrigger,
 } from "./prompt-menu.js";
+export { sanitizeSettledThreadEvents } from "./turn-presentation.js";
 export {
   AGENT_THREAD_STORAGE_VERSION,
   appendThreadEvent,
+  appendThreadEventIndexed,
   browserThreadStorage,
   compactThreadEvents,
   createAgentThread,
+  dedupeThreadEvents,
+  eventIdentity,
+  mergeThreadCollectionsForConflict,
   parseThreadCollection,
+  reconcileHydratedPendingTurn,
+  reconcilePendingTurnWithEvents,
 } from "./thread-storage.js";
 export type {
   AgentThreadCollection,

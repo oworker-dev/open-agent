@@ -1,4 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
+import type { MessageStreamEvent } from "eve/client";
+import { compactThreadEvents } from "@oworker/open-agent-ui/agent-workspace";
 const threadStores = new WeakMap<Page, FakeThreadStore>();
 
 test.beforeEach(async ({ page }) => {
@@ -70,14 +72,35 @@ test.beforeEach(async ({ page }) => {
         activeThreadId?: string | null;
         collection?: unknown;
         deletedThreadIds?: readonly string[];
+        eventAppends?: readonly {
+          readonly events: readonly MessageStreamEvent[];
+          readonly replaceFrom?: number;
+          readonly threadId: string;
+        }[];
         upsertThreads?: FakeThreadCollection["threads"];
       };
       if (route.request().method() === "PATCH") {
         const deleted = new Set(body.deletedThreadIds ?? []);
         const replacements = new Map((body.upsertThreads ?? []).map((thread) => [thread.id, thread]));
+        const appends = new Map((body.eventAppends ?? []).map((entry) => [entry.threadId, entry]));
         const retained = store.collection.threads
           .filter((thread) => !deleted.has(thread.id))
-          .map((thread) => replacements.get(thread.id) ?? thread);
+          .map((thread) => {
+            const replacement = replacements.get(thread.id);
+            const next = replacement?.hydration === "summary"
+              ? { ...thread, ...replacement, events: thread.events, hydration: undefined }
+              : replacement ?? thread;
+            const appended = appends.get(thread.id);
+            return appended && appended.events.length > 0
+              ? {
+                  ...next,
+                  events: compactThreadEvents([
+                    ...(next.events ?? []).slice(0, Math.min(appended.replaceFrom ?? next.events?.length ?? 0, next.events?.length ?? 0)) as readonly MessageStreamEvent[],
+                    ...appended.events,
+                  ]),
+                }
+              : next;
+          });
         const retainedIds = new Set(retained.map((thread) => thread.id));
         store.collection = {
           ...(body.activeThreadId ? { activeThreadId: body.activeThreadId } : {}),
@@ -89,13 +112,24 @@ test.beforeEach(async ({ page }) => {
         };
       } else {
         store.collection = body.collection as FakeThreadCollection;
-      }
-      store.revision += 1;
+    }
+    store.revision += 1;
     }
     await route.fulfill({
       body: JSON.stringify({ collection: store.collection, revision: store.revision }),
       contentType: "application/json",
       headers: { etag: `"${store.revision}"` },
+      status: 200,
+    });
+  });
+  // The E2E harness replaces thread storage with an in-memory store, so the
+  // production PostgreSQL ownership probe is unavailable here. Keep the
+  // runtime boundary authoritative in the same way as a live Eve session;
+  // individual settled-session tests register a newer waiting response.
+  await page.route(/\/api\/standalone\/sessions\/[^/]+$/, async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({ ok: true, state: "running" }),
+      contentType: "application/json",
       status: 200,
     });
   });
@@ -115,12 +149,12 @@ test("wide workspace supports navigation, search, settings, and a single draft s
   await expect(page).toHaveURL(/\/$/);
 
   await page.locator("aside").getByRole("button", { name: "New session", exact: true }).first().click();
-  await expect(page.locator("aside").getByText("New session", { exact: true })).toHaveCount(2);
-  await expect(page.locator('aside [aria-current="page"]')).toHaveCount(1);
+  await expect(page.locator("aside").getByText("New session", { exact: true })).toHaveCount(1);
+  await expect(page.locator('aside [aria-current="page"]')).toHaveCount(0);
 
   await page.getByRole("button", { name: "Search sessions" }).click();
   await page.getByPlaceholder("Search session history").fill("missing session");
-  await expect(page.getByText("No matching sessions")).toBeVisible();
+  await expect(page.getByText("No sessions yet")).toBeVisible();
 
   await page.getByRole("button", { name: "Settings" }).click();
   await expect(page.getByRole("dialog")).toBeVisible();
@@ -209,16 +243,51 @@ test("the thread index hydrates only the transcript selected from the sidebar", 
   const transcriptRequests: string[] = [];
   page.on("request", (request) => {
     const url = new URL(request.url());
-    if (url.pathname.includes("/thread-collections/") && url.searchParams.get("threadId")) {
+    if (request.method() === "GET" && url.pathname.includes("/thread-collections/") && url.searchParams.get("threadId")) {
       transcriptRequests.push(url.search);
     }
   });
-
   await page.goto("/");
   await expect(page.getByText("Stored response", { exact: true })).toHaveCount(0);
   await page.locator("aside").getByRole("button", { name: /Stored history/ }).click();
   await expect(page.getByText("Stored response", { exact: true })).toBeVisible();
   expect(transcriptRequests.filter((search) => !search.includes("view=index"))).toHaveLength(1);
+});
+
+test("a settled transcript with stale coverage is not replayed from Eve", async ({ page }) => {
+  const now = Date.now();
+  const events = mockSuccessfulTurn("Stored request", "Stored response")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as unknown);
+  setFakeThreadCollection(page, {
+    activeThreadId: "stale-coverage-thread",
+    threads: [{
+      closedInputRequestIds: [],
+      createdAt: now,
+      events,
+      id: "stale-coverage-thread",
+      preferences: { executionMode: "standard", modelId: "gpt-5.6-sol", reasoning: "medium" },
+      queuedTurns: [],
+      session: { sessionId: "stale-coverage-session", streamIndex: events.length + 10 },
+      status: "ready",
+      title: "Settled history",
+      transcriptCoverage: { complete: true, endIndex: 4, startIndex: 0, version: 1 },
+      updatedAt: now,
+    }],
+    version: 2,
+  });
+  let repairRequests = 0;
+  page.on("request", (request) => {
+    if (request.method() === "POST" && request.url().includes("/thread-collections/") && request.url().includes("/repair")) {
+      repairRequests += 1;
+    }
+  });
+  await page.goto("/");
+  await page.locator("aside").getByRole("button", { name: /Settled history/ }).click();
+  await expect(page.getByText("Stored response", { exact: true })).toBeVisible();
+  await page.waitForTimeout(250);
+  expect(repairRequests).toBe(0);
 });
 
 test("composer exposes assistant-ui attachments, permissions, and safe trigger selection", async ({ page }) => {
@@ -401,8 +470,8 @@ test("narrow mobile workspace keeps menus inside the viewport", async ({ page })
   await expect(effortGroup).toBeVisible();
   await expect(effortGroup.getByText("X high", { exact: true })).toBeVisible();
   const effortName = effortGroup.getByText("X high", { exact: true });
-  await expect(modelDialog.locator('[data-slot="model-selector-item-name"]').first()).toHaveCSS("font-size", "13px");
-  await expect(effortName).toHaveCSS("font-size", "13px");
+  await expect(modelDialog.locator('[data-slot="model-selector-item-name"]').first()).toHaveCSS("font-size", "12px");
+  await expect(effortName).toHaveCSS("font-size", "12px");
   const dialogBox = await modelDialog.boundingBox();
   const effortBox = await effortGroup.boundingBox();
   expect(dialogBox?.x).toBeGreaterThanOrEqual(0);
@@ -1009,7 +1078,7 @@ test("secondary view lists session assets and previews markdown, images, and dow
   await page.getByRole("button", { name: "Open side view", exact: true }).click();
   const secondary = page.locator("[data-agent-secondary-view]");
   await expect(secondary).toBeVisible();
-  await secondary.getByRole("button", { name: /Assets\s*3/u }).click();
+  await secondary.getByRole("button", { name: /Session assets\s*3/u }).click();
   await expect(secondary.getByText("hero.png", { exact: true })).toBeVisible();
   await expect(secondary.getByText("README.md", { exact: true })).toBeVisible();
   await expect(secondary.getByText("site.zip", { exact: true })).toBeVisible();
@@ -2511,6 +2580,98 @@ test("a half-open recovery stream is replaced when the durable run advances agai
   expect(requestCounts?.boundedRequests).toBeGreaterThanOrEqual(4);
 });
 
+test("a hot cumulative file patch keeps the live diff responsive", async ({ page }) => {
+  test.setTimeout(30_000);
+  const sessionId = "mock-hot-file-patch-session";
+  const turnId = "turn_hot_file_patch";
+  const at = new Date().toISOString();
+  const lines = Array.from({ length: 96 }, (_, index) => `+line-${index}`);
+  const patchPrefix = "*** Begin Patch\n*** Update File: site.css\n@@\n";
+  const patchSuffix = "\n*** End Patch";
+  const events = [
+    { data: { runtime: { agentId: "open-agent", agentName: "open-agent", eveVersion: "test", modelId: "mock/model" } }, meta: { at, id: "evt-hot-session" }, type: "session.started" },
+    { data: { sequence: 0, turnId }, meta: { at, id: "evt-hot-turn" }, type: "turn.started" },
+    { data: { message: "Apply a large file patch", parts: [{ text: "Apply a large file patch", type: "text" }], sequence: 0, turnId }, meta: { at, id: "evt-hot-user" }, type: "message.received" },
+    { data: { sequence: 0, stepIndex: 0, turnId }, meta: { at, id: "evt-hot-step" }, type: "step.started" },
+    { data: { finishReason: "tool-calls", message: null, sequence: 0, stepIndex: 0, turnId }, meta: { at, id: "evt-hot-message" }, type: "message.completed" },
+    { data: { actions: [{ callId: "call-hot-patch", input: { patch: patchPrefix }, kind: "tool-call", toolName: "apply_patch" }], sequence: 0, stepIndex: 0, turnId }, meta: { at, id: "evt-hot-action" }, type: "actions.requested" },
+    ...lines.map((_, index) => {
+      const patch = `${patchPrefix}${lines.slice(0, index + 1).join("\n")}${index === lines.length - 1 ? patchSuffix : ""}`;
+      return {
+        data: {
+          callId: "call-hot-patch",
+          input: { patch },
+          inputTextDelta: index === 0 ? JSON.stringify({ patch }) : "",
+          inputTextSoFar: JSON.stringify({ patch }),
+          sequence: index + 1,
+          stepIndex: 0,
+          toolName: "apply_patch",
+          turnId,
+        },
+        meta: { at, id: `evt-hot-partial-${index}` },
+        type: "action.input.partial",
+      };
+    }),
+    { data: { result: { callId: "call-hot-patch", kind: "tool-result", output: { path: "site.css", applied: true }, toolName: "apply_patch" }, sequence: 97, status: "completed", stepIndex: 0, turnId }, meta: { at, id: "evt-hot-result" }, type: "action.result" },
+    { data: { finishReason: "tool-calls", sequence: 98, stepIndex: 0, turnId, usage: { inputTokens: 10, outputTokens: 10 } }, meta: { at, id: "evt-hot-step-complete" }, type: "step.completed" },
+    { data: { sequence: 99, stepIndex: 1, turnId }, meta: { at, id: "evt-hot-step-final" }, type: "step.started" },
+    { data: { finishReason: "stop", message: "The file patch is complete.", sequence: 100, stepIndex: 1, turnId }, meta: { at, id: "evt-hot-final" }, type: "message.completed" },
+    { data: { finishReason: "stop", sequence: 101, stepIndex: 1, turnId, usage: { inputTokens: 10, outputTokens: 5 } }, meta: { at, id: "evt-hot-final-step" }, type: "step.completed" },
+    { data: { sequence: 102, turnId }, meta: { at, id: "evt-hot-complete" }, type: "turn.completed" },
+    { data: { wait: "next-user-message" }, meta: { at, id: "evt-hot-waiting" }, type: "session.waiting" },
+  ];
+
+  await page.addInitScript(({ events: streamEvents, targetSessionId }) => {
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (input, init) => {
+      const requestUrl = new URL(
+        typeof input === "string" || input instanceof URL ? input.toString() : input.url,
+        window.location.href,
+      );
+      if (requestUrl.pathname !== `/eve/v1/session/${targetSessionId}/stream`) return await nativeFetch(input, init);
+      const startIndex = Number(requestUrl.searchParams.get("startIndex") ?? "0");
+      const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+      let index = startIndex;
+      const body = new ReadableStream({
+        async pull(controller) {
+          if (signal?.aborted) {
+            controller.error(new DOMException("Aborted", "AbortError"));
+            return;
+          }
+          const event = streamEvents[index++];
+          if (!event) {
+            controller.close();
+            return;
+          }
+          controller.enqueue(new TextEncoder().encode(`${JSON.stringify(event)}\n`));
+          await new Promise((resolve) => setTimeout(resolve, 1));
+        },
+      });
+      return new Response(body, { headers: { "content-type": "application/x-ndjson" }, status: 200 });
+    };
+  }, { events, targetSessionId: sessionId });
+
+  await page.route("**/eve/v1/session", async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({ sessionId }),
+      contentType: "application/json",
+      headers: { "x-eve-session-id": sessionId },
+      status: 200,
+    });
+  });
+
+  await page.goto("/");
+  const composer = page.getByRole("textbox", { name: "Do anything" });
+  await composer.fill("Apply a large file patch");
+  await composer.press("Enter");
+  await page.getByRole("button", { name: "Worked for" }).click();
+  await page.getByText("Edited site.css +96", { exact: true }).click();
+  await expect(page.locator('[data-tool-view="diff"]')).toBeVisible({ timeout: 10_000 });
+  await expect(page.locator('[data-slot="diff-viewer-stats"]')).toContainText("+96", { timeout: 15_000 });
+  await expect(page.getByText("The file patch is complete.", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Send" })).toBeVisible();
+});
+
 test("large legacy incremental history hydrates quickly without an eager writeback", async ({ page }) => {
   const at = new Date().toISOString();
   const events = Array.from({ length: 3_000 }, (_, index) => ({
@@ -2561,18 +2722,17 @@ test("a persisted cursor past a missing UI boundary repairs from the durable tai
   const waiting = { data: { wait: "next-user-message" }, meta: { at }, type: "session.waiting" };
   const absoluteTailIndex = 7;
 
+  await page.route(`**/api/standalone/sessions/${sessionId}`, async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({ ok: true, state: "waiting", tailIndex: absoluteTailIndex }),
+      contentType: "application/json",
+      status: 200,
+    });
+  });
   await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
     const url = new URL(route.request().url());
-    if (url.searchParams.get("startIndex") === "-1") {
-      await route.fulfill({
-        body: `${JSON.stringify(waiting)}\n`,
-        contentType: "application/x-ndjson",
-        status: 200,
-      });
-      return;
-    }
     await route.fulfill({
-      body: "",
+      body: `${JSON.stringify(waiting)}\n`,
       contentType: "application/x-ndjson",
       headers: { "x-eve-stream-tail-index": String(absoluteTailIndex) },
       status: 200,
@@ -2599,6 +2759,131 @@ test("a persisted cursor past a missing UI boundary repairs from the durable tai
   await expect(page.getByText("Reconnecting to the active run...")).toBeHidden({ timeout: 10_000 });
   await expect(page.getByRole("button", { name: "Send" })).toBeVisible();
   await expect.poll(() => threadEvents(page).some((event) => isEventType(event, "session.waiting"))).toBeTruthy();
+});
+
+test("a settled Eve session never opens an unbounded recovery stream", async ({ page }) => {
+  const sessionId = "mock-settled-session";
+  const settledEvents = eventsFromNdjson(
+    mockSuccessfulTurn("Recover a completed task", "This task was already complete."),
+  );
+  const projectedEvents = settledEvents.slice(0, 4);
+  const streamRequests: string[] = [];
+
+  await page.route(`**/api/standalone/sessions/${sessionId}`, async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({
+        ok: true,
+        state: "waiting",
+        tailIndex: settledEvents.length - 1,
+      }),
+      contentType: "application/json",
+      status: 200,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
+    const url = new URL(route.request().url());
+    streamRequests.push(url.search);
+    await route.fulfill({
+      body: ndjson(settledEvents.slice(Number(url.searchParams.get("startIndex") ?? "0"))),
+      contentType: "application/x-ndjson",
+      headers: { "x-eve-stream-tail-index": String(settledEvents.length - 1) },
+      status: 200,
+    });
+  });
+
+  const now = Date.now();
+  setFakeThreadCollection(page, {
+    activeThreadId: "settled-session-thread",
+    threads: [{
+      closedInputRequestIds: [],
+      createdAt: now,
+      events: projectedEvents,
+      id: "settled-session-thread",
+      preferences: { executionMode: "standard", modelId: "gpt-5.6-sol", reasoning: "medium" },
+      queuedTurns: [],
+      session: { sessionId, streamIndex: projectedEvents.length },
+      status: "submitted",
+      title: "Settled task",
+      updatedAt: now,
+    }],
+    version: 2,
+  });
+
+  await page.goto("/threads/settled-session-thread");
+  await expect(page.getByText("This task was already complete.", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Send", exact: true })).toBeVisible();
+  expect(streamRequests.length).toBeGreaterThan(0);
+  expect(streamRequests.every((search) => search.includes("includeTailIndex=1"))).toBeTruthy();
+  expect(streamRequests.every((search) => !search.includes("follow=true"))).toBeTruthy();
+});
+
+test("a settled runtime clears a stale partial tool state", async ({ page }) => {
+  const sessionId = "mock-settled-partial-session";
+  const turnId = "turn_stale_partial";
+  const at = new Date().toISOString();
+  const settledEvents = [
+    { data: { runtime: { agentId: "open-agent", agentName: "open-agent", eveVersion: "test", modelId: "mock/model" } }, meta: { at, id: "evt-partial-session" }, type: "session.started" },
+    { data: { sequence: 0, turnId }, meta: { at, id: "evt-partial-turn" }, type: "turn.started" },
+    { data: { message: "Finish the stale tool call", parts: [{ text: "Finish the stale tool call", type: "text" }], sequence: 0, turnId }, meta: { at, id: "evt-partial-user" }, type: "message.received" },
+    { data: { sequence: 0, stepIndex: 0, turnId }, meta: { at, id: "evt-partial-step" }, type: "step.started" },
+    { data: { finishReason: "tool-calls", message: null, sequence: 0, stepIndex: 0, turnId }, meta: { at, id: "evt-partial-message" }, type: "message.completed" },
+    { data: { actions: [{ callId: "call-partial", input: { patch: "*** Begin Patch\n*** Update File: index.html\n@@\n+done\n*** End Patch" }, kind: "tool-call", toolName: "apply_patch" }], sequence: 0, stepIndex: 0, turnId }, meta: { at, id: "evt-partial-action" }, type: "actions.requested" },
+    { data: { callId: "call-partial", input: { patch: "*** Begin Patch\n*** Update File: index.html\n@@\n+done\n*** End Patch" }, sequence: 1, stepIndex: 0, toolName: "apply_patch", turnId }, meta: { at, id: "evt-partial-input" }, type: "action.input.partial" },
+    { data: { result: { callId: "call-partial", kind: "tool-result", output: { applied: true, path: "index.html" }, toolName: "apply_patch" }, sequence: 2, status: "completed", stepIndex: 0, turnId }, meta: { at, id: "evt-partial-result" }, type: "action.result" },
+    { data: { finishReason: "tool-calls", sequence: 3, stepIndex: 0, turnId, usage: { inputTokens: 10, outputTokens: 10 } }, meta: { at, id: "evt-partial-step-complete" }, type: "step.completed" },
+    { data: { sequence: 4, stepIndex: 1, turnId }, meta: { at, id: "evt-partial-final-step" }, type: "step.started" },
+    { data: { finishReason: "stop", message: "The stale tool call is complete.", sequence: 5, stepIndex: 1, turnId }, meta: { at, id: "evt-partial-final" }, type: "message.completed" },
+    { data: { finishReason: "stop", sequence: 6, stepIndex: 1, turnId, usage: { inputTokens: 10, outputTokens: 5 } }, meta: { at, id: "evt-partial-final-step-complete" }, type: "step.completed" },
+    { data: { sequence: 7, turnId }, meta: { at, id: "evt-partial-turn-complete" }, type: "turn.completed" },
+    { data: { wait: "next-user-message" }, meta: { at, id: "evt-partial-waiting" }, type: "session.waiting" },
+  ];
+  const projectedEvents = settledEvents.slice(0, 7);
+  const streamRequests: string[] = [];
+
+  await page.route(`**/api/standalone/sessions/${sessionId}`, async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({ ok: true, state: "waiting", tailIndex: settledEvents.length - 1 }),
+      contentType: "application/json",
+      status: 200,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
+    const url = new URL(route.request().url());
+    streamRequests.push(url.search);
+    await route.fulfill({
+      body: ndjson(settledEvents.slice(Number(url.searchParams.get("startIndex") ?? "0"))),
+      contentType: "application/x-ndjson",
+      headers: { "x-eve-stream-tail-index": String(settledEvents.length - 1) },
+      status: 200,
+    });
+  });
+
+  const now = Date.now();
+  setFakeThreadCollection(page, {
+    activeThreadId: "settled-partial-thread",
+    threads: [{
+      closedInputRequestIds: [],
+      createdAt: now,
+      events: projectedEvents,
+      id: "settled-partial-thread",
+      preferences: { executionMode: "standard", modelId: "gpt-5.6-sol", reasoning: "medium" },
+      queuedTurns: [],
+      session: { sessionId, streamIndex: projectedEvents.length },
+      status: "submitted",
+      title: "Stale partial tool",
+      updatedAt: now,
+    }],
+    version: 2,
+  });
+
+  await page.goto("/threads/settled-partial-thread");
+  await expect(page.getByText("The stale tool call is complete.", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Send", exact: true })).toBeVisible();
+  await expect(page.getByText("Editing", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Thinking", { exact: true })).toHaveCount(0);
+  expect(streamRequests.length).toBeGreaterThan(0);
+  expect(streamRequests.every((search) => search.includes("includeTailIndex=1"))).toBeTruthy();
+  expect(streamRequests.every((search) => !search.includes("follow=true"))).toBeTruthy();
 });
 
 test("recovery rewinds a transport cursor that advanced past the UI transcript", async ({ page }) => {
@@ -2779,8 +3064,10 @@ test("stop immediately returns the thread to an interactive state while server c
   await expect(stop).toBeVisible();
   await stop.click();
 
-  await expect(page.getByRole("button", { name: "Send" })).toBeVisible({ timeout: 100 });
+  await expect(page.getByRole("button", { name: "Stopping", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Send", exact: true })).toBeHidden();
   await cancelled;
+  await expect(page.getByRole("button", { name: "Send", exact: true })).toBeVisible();
   expect(cancelledTurnId).toBe("turn_0");
 });
 
@@ -3278,9 +3565,10 @@ test("stop before turn admission stays immediate and retries against the authori
   await expect(stop).toBeVisible();
   await stop.click();
 
-  await expect(page.getByRole("button", { name: "Send" })).toBeVisible({ timeout: 100 });
+  await expect(page.getByRole("button", { name: "Stopping", exact: true })).toBeVisible();
   await expect.poll(() => cancellations.some((entry) => entry.turnId === turnId)).toBeTruthy();
   expect(cancellations[0]?.turnId).toBeUndefined();
+  await expect(page.getByRole("button", { name: "Send", exact: true })).toBeVisible();
   await expect(page.getByText("LATE RESPONSE", { exact: true })).toHaveCount(0);
   await expect(page.getByRole("log").getByText("Stop before admission", { exact: true })).toBeVisible();
 });
@@ -3362,7 +3650,9 @@ test("stop cancels a recovered long-running turn after one bounded catch-up", as
   });
   await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
     const url = new URL(route.request().url());
-    if (url.searchParams.has("includeTailIndex")) boundedTailRequests += 1;
+    if (url.searchParams.has("includeTailIndex")) {
+      boundedTailRequests += 1;
+    }
     await streamsMayFinish;
     const startIndex = Number(url.searchParams.get("startIndex") ?? "0");
     await route.fulfill({

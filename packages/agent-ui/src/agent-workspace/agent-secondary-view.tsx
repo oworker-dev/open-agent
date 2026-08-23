@@ -12,7 +12,7 @@ import {
   UsersRoundIcon,
   XIcon,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent, type ReactNode } from "react";
 import { StaticMarkdownText } from "../assistant-ui/markdown-text.js";
 import { WebPreview } from "../assistant-ui/web-preview.js";
 import {
@@ -102,6 +102,7 @@ export function AgentSecondaryView({
   const [overviewRoute, setOverviewRoute] = useState<AgentSecondaryTab>(normalizeOverviewRoute(tab));
   const [openTabs, setOpenTabs] = useState<readonly AgentSecondaryContentTab[]>([]);
   const [activeTabId, setActiveTabId] = useState("home");
+  const consumedDeliverableRequestId = useRef<number | undefined>(undefined);
   const activeTab = openTabs.find((candidate) => candidate.id === activeTabId);
 
   const selectOverviewRoute = useCallback((route: AgentSecondaryTab) => {
@@ -143,7 +144,10 @@ export function AgentSecondaryView({
   }, [assets, onOpenAsset, onOpenDeliverable]);
 
   useEffect(() => {
-    if (requestedDeliverable) openDeliverable(requestedDeliverable);
+    if (!requestedDeliverable || requestedDeliverableRequestId === undefined) return;
+    if (consumedDeliverableRequestId.current === requestedDeliverableRequestId) return;
+    consumedDeliverableRequestId.current = requestedDeliverableRequestId;
+    openDeliverable(requestedDeliverable);
   }, [openDeliverable, requestedDeliverable, requestedDeliverableRequestId]);
 
   const activateContentTab = (contentTab: AgentSecondaryContentTab) => {
@@ -177,31 +181,30 @@ export function AgentSecondaryView({
             <ChevronLeftIcon className="size-4" />
           </Button>
         ) : null}
-        <h2 className="min-w-0 flex-1 truncate text-sm font-medium">{headerTitle}</h2>
+        {openTabs.length > 0 ? (
+          <h2 className="sr-only">{headerTitle}</h2>
+        ) : null}
+        {openTabs.length > 0 ? (
+          <SecondaryTabBar aria-label={isZh ? "已打开内容" : "Open content"}>
+            {openTabs.map((contentTab) => (
+              <div className={cn("group/tab flex w-40 shrink-0 items-center rounded-md", activeTabId === contentTab.id && "bg-accent")} key={contentTab.id}>
+                <TabButton active={activeTabId === contentTab.id} label={contentTab.title} onClick={() => activateContentTab(contentTab)} />
+                <button aria-label={`${isZh ? "关闭" : "Close"} ${contentTab.title}`} className="mr-1 flex size-5 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-background/80 hover:text-foreground" onClick={() => closeContentTab(contentTab)} type="button">
+                  <XIcon className="size-3" />
+                </button>
+              </div>
+            ))}
+          </SecondaryTabBar>
+        ) : (
+          <h2 className="min-w-0 flex-1 truncate text-sm font-medium">{headerTitle}</h2>
+        )}
         <Button aria-label={isZh ? "关闭副视图" : "Close side view"} onClick={onClose} size="icon-sm" variant="ghost">
           <PanelRightCloseIcon className="size-4" />
         </Button>
       </header>
 
-      <nav aria-label={isZh ? "工作区标签" : "Workspace tabs"} className="flex shrink-0 items-center gap-1 overflow-x-auto border-b border-border/60 px-2 py-1.5">
-        <TabButton active={activeTabId === "home"} label={isZh ? "概览" : "Overview"} onClick={() => setActiveTabId("home")} />
-        {openTabs.map((contentTab) => (
-          <div className={cn("group/tab flex max-w-44 items-center rounded-md", activeTabId === contentTab.id && "bg-accent")} key={contentTab.id}>
-            <TabButton active={activeTabId === contentTab.id} label={contentTab.title} onClick={() => activateContentTab(contentTab)} />
-            <button aria-label={`${isZh ? "关闭" : "Close"} ${contentTab.title}`} className="mr-1 flex size-5 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-background/80 hover:text-foreground" onClick={() => closeContentTab(contentTab)} type="button">
-              <XIcon className="size-3" />
-            </button>
-          </div>
-        ))}
-      </nav>
-
       {activeTabId === "home" ? (
         <>
-          <nav aria-label={isZh ? "工作区导航" : "Workspace navigation"} className="flex shrink-0 gap-1 border-b border-border/50 px-2 py-1.5">
-            <TabButton active={overviewRoute === "home"} label={isZh ? "首页" : "Home"} onClick={() => selectOverviewRoute("home")} />
-            <TabButton active={overviewRoute === "children"} count={children.length} label={isZh ? "子代理" : "Sub-agents"} onClick={() => selectOverviewRoute("children")} />
-            <TabButton active={overviewRoute === "deliverables"} count={mergedDeliverables.length} label={isZh ? "资产" : "Assets"} onClick={() => selectOverviewRoute("deliverables")} />
-          </nav>
           <div className="min-h-0 flex-1 overflow-y-auto p-3">
             {overviewRoute === "home" ? <Overview
               childCount={children.length}
@@ -292,7 +295,7 @@ function WebsitePreview({ title, url }: { readonly title: string; readonly url: 
       className="size-full min-h-[20rem] border-0 bg-white"
       key={generation}
       onLoad={() => setLoading(false)}
-      sandbox="allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-scripts"
+      sandbox="allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-scripts allow-same-origin"
       src={url}
       title={title}
     />
@@ -319,7 +322,33 @@ function FilePreview({ deliverable, locale, url }: { readonly deliverable: Agent
 }
 
 function TabButton({ active, count, label, onClick }: { readonly active: boolean; readonly count?: number; readonly label: string; readonly onClick: () => void }) {
-  return <button aria-current={active ? "page" : undefined} className={cn("min-w-0 truncate rounded-md px-2.5 py-1.5 text-xs text-muted-foreground hover:bg-accent hover:text-foreground", active && "font-medium text-foreground")} onClick={onClick} title={label} type="button">{label}{count ? <span className="ml-1 tabular-nums">{count}</span> : null}</button>;
+  return <button aria-current={active ? "page" : undefined} className={cn("min-w-0 flex-1 truncate rounded-md px-2.5 py-1.5 text-xs text-muted-foreground hover:bg-accent hover:text-foreground", active && "font-medium text-foreground")} onClick={onClick} title={label} type="button">{label}{count ? <span className="ml-1 tabular-nums">{count}</span> : null}</button>;
+}
+
+function SecondaryTabBar({ children, ...props }: { readonly children: ReactNode; readonly "aria-label": string }) {
+  const drag = useRef<{ readonly startX: number; readonly scrollLeft: number } | undefined>(undefined);
+  const onPointerDown = (event: PointerEvent<HTMLElement>) => {
+    if (event.pointerType === "touch" || event.button !== 0) return;
+    // Do not capture the pointer here. Capturing on pointerdown retargets the
+    // browser's subsequent click to the nav and can swallow an ordinary tab
+    // activation after returning from a preview. Native touch scrolling still
+    // handles mobile; mouse dragging remains available while over the tab bar.
+    drag.current = { startX: event.clientX, scrollLeft: event.currentTarget.scrollLeft };
+  };
+  const onPointerMove = (event: PointerEvent<HTMLElement>) => {
+    const state = drag.current;
+    if (!state) return;
+    event.currentTarget.scrollLeft = state.scrollLeft - (event.clientX - state.startX);
+  };
+  const stopDragging = () => { drag.current = undefined; };
+  return <nav
+    {...props}
+    className="flex min-w-0 flex-1 cursor-grab touch-pan-x select-none items-center gap-1 overflow-x-auto overscroll-x-contain active:cursor-grabbing"
+    onPointerCancel={stopDragging}
+    onPointerDown={onPointerDown}
+    onPointerMove={onPointerMove}
+    onPointerUp={stopDragging}
+  >{children}</nav>;
 }
 
 function OverviewCard({ count, icon, label, onClick }: { readonly count: number; readonly icon: ReactNode; readonly label: string; readonly onClick: () => void }) {

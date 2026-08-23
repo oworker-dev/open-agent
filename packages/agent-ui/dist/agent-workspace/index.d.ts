@@ -5,8 +5,9 @@ export { AgentThreadStorageConflictError, AgentThreadStorageHttpError, createHtt
 export { AgentMessage } from "./agent-message.js";
 export type { AgentInputResponse } from "./agent-message.js";
 export { createHttpAgentAssetUploadAdapter } from "./browser-asset-upload.js";
-export type { AgentAssetUpload, AgentAssetUploadAdapter, AgentExtensionInfo, AgentAssetEndpoint, AgentDeliverableEndpoint, AgentSessionAsset, AgentSessionDeliverable, AgentThread, AgentPendingTurn, AgentQueuedTurn, AgentThreadPatch, AgentThreadPreferences, AgentModelOption, AgentPromptMenuItem, PromptInputMessage, AgentRuntimeStatus, AgentWorkspaceClientConfig, AgentWorkspaceConfig, AgentWorkspaceHostSlots, AgentWorkspaceMailbox, AgentMailboxItemStatus, AgentMailboxReceipt, AgentSubagentLoader, AgentSubagentController, AgentSubagentControlAction, AgentSubagentSummary, } from "./contracts.js";
+export type { AgentAssetUpload, AgentAssetUploadAdapter, AgentExtensionInfo, AgentAssetEndpoint, AgentDeliverableEndpoint, AgentSessionAsset, AgentSessionDeliverable, AgentThread, AgentPendingTurn, AgentQueuedTurn, AgentThreadPatch, AgentThreadPreferences, AgentModelOption, AgentPromptMenuItem, PromptInputMessage, AgentRuntimeStatus, AgentWorkspaceClientConfig, AgentWorkspaceConfig, AgentWorkspaceHostSlots, AgentWorkspaceMailbox, AgentMailboxItemStatus, AgentMailboxReceipt, AgentSubagentLoader, AgentSubagentController, AgentSubagentControlAction, AgentSubagentSummary, AgentSessionBoundary, AgentSessionInspector, AgentTranscriptCoverage, } from "./contracts.js";
 export { filterPromptMenuItems, findPromptTrigger, replacePromptTrigger, type PromptTrigger, } from "./prompt-menu.js";
-export { AGENT_THREAD_STORAGE_VERSION, appendThreadEvent, browserThreadStorage, compactThreadEvents, createAgentThread, parseThreadCollection, } from "./thread-storage.js";
+export { sanitizeSettledThreadEvents } from "./turn-presentation.js";
+export { AGENT_THREAD_STORAGE_VERSION, appendThreadEvent, appendThreadEventIndexed, browserThreadStorage, compactThreadEvents, createAgentThread, dedupeThreadEvents, eventIdentity, mergeThreadCollectionsForConflict, parseThreadCollection, reconcileHydratedPendingTurn, reconcilePendingTurnWithEvents, } from "./thread-storage.js";
 export type { AgentThreadCollection, AgentThreadStorage, } from "./thread-storage.js";
 //# sourceMappingURL=index.d.ts.map

@@ -163,6 +163,7 @@ MUSES_E2E_WORKSPACE_ID=... \
 MUSES_E2E_PROJECT_ID=... \
 MUSES_E2E_CANVAS_ID=... \
 MUSES_E2E_DEPLOYMENT_ID=... \
+MUSES_E2E_WORKFLOW_INPUT_ID=prompt \
 MUSES_E2E_RUNTIME_CONFIG_JSON='{"contractVersion":"0.1.0",...full snapshot...}' \
 MUSES_AGENT_HOST_JWT_SECRET=... \
 MUSES_AGENT_HOST_JWT_ISSUER=... \
@@ -487,10 +488,19 @@ sandbox tombstone for asynchronous reaping. A failed retirement leaves the
 thread and sandbox visible.
 
 The bundled HTTP adapter uses `If-Match` revisions and sends only changed thread
-documents. A competing client receives `409`; the workspace reloads the current
-index, merges by thread update time, and retries at most three times. Persistent
-conflicts remain visible through `onStorageError` and never become unbounded
-write loops.
+metadata plus append-only event deltas for normal streaming. Existing transcript
+events are never copied into every checkpoint request; an edit/resend uses an
+explicit replacement snapshot. A competing client receives `409`; the workspace
+reloads the current index, merges by thread update time, and retries at most three
+times. Persistent conflicts remain visible through `onStorageError` and never
+become unbounded write loops. Normal checkpoints use only event deltas; the
+legacy `PUT` full snapshot route has a separate 64 MiB compatibility guard and
+is not a session or context-window limit. Large assets remain object-storage
+references and large transcripts are hydrated by thread rather than collection.
+Production PostgreSQL deployments must apply migration `0010_thread_event_log.sql`;
+it backfills legacy JSONB events and moves subsequent append checkpoints to the
+bounded event log. The JSONB collection remains a metadata/compatibility snapshot,
+while `loadThread` rehydrates the selected transcript from the event log.
 
 The server remains authoritative for identity, model entitlement, tool access,
 and billing. Browser headers and `clientContext` are untrusted input.

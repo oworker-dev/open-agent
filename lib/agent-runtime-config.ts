@@ -47,8 +47,11 @@ export const DEFAULT_AGENT_RUNTIME_CONFIG: AgentRuntimeConfigSnapshot = {
   },
   compaction: { thresholdPercent: 0.9 },
   limits: {
-    maxInputTokens: 2_000_000,
-    maxOutputTokens: 200_000,
+    // Match Eve's root-session defaults. Context-window compaction remains
+    // the mechanism that keeps a long conversation usable; these are lifetime
+    // safety budgets, not the model context window.
+    maxInputTokens: 40_000_000,
+    maxOutputTokens: 10_000_000,
   },
 };
 
@@ -61,8 +64,8 @@ export function runtimeDefinitionLimits(
   config: AgentRuntimeConfigSnapshot,
 ): AgentRuntimeDefinitionLimits {
   return {
-    maxInputTokensPerSession: config.limits.maxInputTokens ?? 2_000_000,
-    maxOutputTokensPerSession: config.limits.maxOutputTokens ?? 200_000,
+    maxInputTokensPerSession: config.limits.maxInputTokens ?? 40_000_000,
+    maxOutputTokensPerSession: config.limits.maxOutputTokens ?? 10_000_000,
   };
 }
 

@@ -37,6 +37,11 @@ export type AgentInterruptedTurn = {
   /** Absolute Eve stream cursor observed at cancellation. */
   readonly streamIndex: number;
   readonly turnId: string;
+  /**
+   * Whether Eve has emitted the authoritative cancellation boundary.
+   * Legacy snapshots omit this field and are treated as settled.
+   */
+  readonly settled?: boolean;
 };
 
 export type AgentQueuedTurn = {
@@ -148,6 +153,33 @@ export type AgentSubagentController = (input: {
 /** Host-provided durable loader. Event streams remain the optimistic fast path. */
 export type AgentSubagentLoader = (parentSessionId: string) => Promise<readonly AgentSubagentSummary[]>;
 
+/** A lightweight, server-authoritative Eve lifecycle probe. */
+export type AgentSessionBoundary = {
+  readonly lastEventAt?: string;
+  readonly tailIndex?: number;
+  readonly state: "running" | "waiting" | "terminal";
+  readonly terminalStatus?: "completed" | "failed";
+  readonly turnId?: string;
+};
+
+export type AgentSessionInspector = (sessionId: string) => Promise<AgentSessionBoundary>;
+
+/**
+ * Coverage of the compact UI transcript against Eve's absolute stream.
+ *
+ * `endIndex` is the next unread Eve cursor, so a repaired or live transcript
+ * that started at zero covers `[startIndex, endIndex)`. Legacy checkpoints do
+ * not carry this marker and must never be treated as complete history.
+ */
+export type AgentTranscriptCoverage = {
+  /** True only after the server has read Eve's finite transcript to its tail. */
+  readonly authoritative?: boolean;
+  readonly complete: boolean;
+  readonly endIndex: number;
+  readonly startIndex: number;
+  readonly version: 1;
+};
+
 export type AgentRuntimeStatus = {
   readonly provider: "mock" | "ready" | "unconfigured";
 };
@@ -174,6 +206,7 @@ export type AgentThread = {
   readonly revision?: number;
   readonly session: AgentThreadSessionState;
   readonly status: AgentThreadStatus;
+  readonly transcriptCoverage?: AgentTranscriptCoverage;
   readonly title: string;
   readonly updatedAt: number;
 };

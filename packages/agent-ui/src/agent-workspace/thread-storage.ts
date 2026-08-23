@@ -1,5 +1,5 @@
 import type { MessageStreamEvent } from "eve/client";
-import type { AgentPendingTurn, AgentQueuedTurn, AgentThread, AgentThreadPreferences, AgentThreadSessionState, AgentThreadStatus, PromptInputMessage } from "./contracts.js";
+import type { AgentPendingTurn, AgentQueuedTurn, AgentThread, AgentThreadPreferences, AgentThreadSessionState, AgentThreadStatus, AgentTranscriptCoverage, PromptInputMessage } from "./contracts.js";
 import { sanitizeRetainedContext } from "./retained-context.js";
 
 export const AGENT_THREAD_STORAGE_VERSION = 2;
@@ -19,8 +19,81 @@ export type AgentThreadCollection = {
 export type AgentThreadStorage = {
   load(storageKey: string): AgentThreadCollection | Promise<AgentThreadCollection>;
   loadThread?(storageKey: string, threadId: string): AgentThread | undefined | Promise<AgentThread | undefined>;
+  /** Rebuilds an unverified settled Eve transcript on the host/server. */
+  repairThread?(storageKey: string, threadId: string): AgentThread | undefined | Promise<AgentThread | undefined>;
   save(storageKey: string, collection: AgentThreadCollection): void | Promise<void>;
 };
+
+/**
+ * Merge a local checkpoint with a collection loaded after a storage revision
+ * conflict. Remote event history is authoritative for normal append races;
+ * an explicit edit/resubmit is the only operation allowed to replace it.
+ */
+export function mergeThreadCollectionsForConflict(
+  local: AgentThreadCollection,
+  remote: AgentThreadCollection,
+): AgentThreadCollection {
+  const byId = new Map(remote.threads.map((thread) => [thread.id, thread]));
+  for (const thread of local.threads) {
+    const existing = byId.get(thread.id);
+    if (!existing) {
+      byId.set(thread.id, thread);
+      continue;
+    }
+    const selected = thread.updatedAt >= existing.updatedAt ? thread : existing;
+    const editInProgress = thread.pendingTurn?.state === "clearing" ||
+      thread.pendingTurn?.state === "resubmitting";
+    const events = editInProgress
+      ? thread.events
+      : mergeConflictEvents(thread, existing);
+    byId.set(thread.id, {
+      ...selected,
+      events,
+      ...(events.length > 0 ? { hydration: undefined } : {}),
+      session: {
+        ...selected.session,
+        streamIndex: Math.max(thread.session.streamIndex, existing.session.streamIndex),
+      },
+    });
+  }
+  const threads = [...byId.values()].sort((left, right) => right.updatedAt - left.updatedAt);
+  const activeThreadId = local.activeThreadId && threads.some((thread) => thread.id === local.activeThreadId)
+    ? local.activeThreadId
+    : remote.activeThreadId;
+  return {
+    ...(activeThreadId ? { activeThreadId } : {}),
+    threads,
+    version: AGENT_THREAD_STORAGE_VERSION,
+  };
+}
+
+function mergeConflictEvents(
+  local: AgentThread,
+  remote: AgentThread,
+): AgentThread["events"] {
+  const localEvents = local.events;
+  const remoteEvents = remote.events;
+  if (remoteEvents.length === 0) return localEvents;
+  if (localEvents.length === 0) return remoteEvents;
+  const localIds = new Set(localEvents.map(eventIdentity));
+  const remoteIds = new Set(remoteEvents.map(eventIdentity));
+  const localSubsetOfRemote = [...localIds].every((id) => remoteIds.has(id));
+  const remoteSubsetOfLocal = [...remoteIds].every((id) => localIds.has(id));
+  if (localSubsetOfRemote) return remoteEvents;
+  if (remoteSubsetOfLocal) return localEvents;
+
+  // Preserve the remote order and append only genuinely new local events.
+  // This avoids replacing an authoritative range with an old compact prefix.
+  const merged = [...remoteEvents];
+  const mergedIds = new Set(remoteIds);
+  for (const event of localEvents) {
+    const id = eventIdentity(event);
+    if (mergedIds.has(id)) continue;
+    merged.push(event);
+    mergedIds.add(id);
+  }
+  return compactThreadEvents(merged);
+}
 
 export const browserThreadStorage: AgentThreadStorage = {
   load: loadThreadCollection,
@@ -134,6 +207,7 @@ function parseThread(value: unknown): AgentThread | undefined {
         .slice(0, 5)
     : [];
   const retainedContext = sanitizeRetainedContext(value.retainedContext) ?? [];
+  const transcriptCoverage = parseTranscriptCoverage(value.transcriptCoverage);
   const rawEvents = Array.isArray(value.events)
     ? (value.events as readonly MessageStreamEvent[])
     : [];
@@ -168,8 +242,23 @@ function parseThread(value: unknown): AgentThread | undefined {
       streamIndex: Math.max(storedStreamIndex, rawEvents.length),
     },
     status,
+    ...(transcriptCoverage ? { transcriptCoverage } : {}),
     title: value.title,
     updatedAt,
+  };
+}
+
+function parseTranscriptCoverage(value: unknown): AgentTranscriptCoverage | undefined {
+  if (!isRecord(value) || value.version !== 1 ||
+      typeof value.startIndex !== "number" || !Number.isSafeInteger(value.startIndex) || value.startIndex < 0 ||
+      typeof value.endIndex !== "number" || !Number.isSafeInteger(value.endIndex) || value.endIndex < value.startIndex ||
+      typeof value.complete !== "boolean") return undefined;
+  return {
+    ...(value.authoritative === true ? { authoritative: true } : {}),
+    complete: value.complete,
+    endIndex: value.endIndex,
+    startIndex: value.startIndex,
+    version: 1,
   };
 }
 
@@ -184,7 +273,7 @@ function parseDraftRestore(value: unknown): AgentThread["draftRestore"] {
 
 function parseInterruptedTurns(value: unknown): NonNullable<AgentThread["interruptedTurns"]> {
   if (!Array.isArray(value)) return [];
-  const turns = new Map<string, { eventCount: number; streamIndex: number; turnId: string }>();
+  const turns = new Map<string, { eventCount: number; settled?: boolean; streamIndex: number; turnId: string }>();
   for (const candidate of value) {
     if (
       !isRecord(candidate) ||
@@ -196,6 +285,7 @@ function parseInterruptedTurns(value: unknown): NonNullable<AgentThread["interru
     ) continue;
     turns.set(candidate.turnId, {
       eventCount: candidate.eventCount,
+      ...(typeof candidate.settled === "boolean" ? { settled: candidate.settled } : {}),
       streamIndex: candidate.streamIndex,
       turnId: candidate.turnId,
     });
@@ -294,64 +384,179 @@ export function appendThreadEvent(
   events: readonly MessageStreamEvent[],
   event: MessageStreamEvent,
 ): readonly MessageStreamEvent[] {
-  if (event.meta.id && events.some((candidate) => candidate.meta.id === event.meta.id)) {
+  if (hasEventIdentity(events, event)) {
     return events;
   }
-  if (event.type === "message.appended" || event.type === "reasoning.appended") {
-    const last = events.at(-1);
-    return last?.type === event.type &&
-      last.data.turnId === event.data.turnId &&
-      last.data.stepIndex === event.data.stepIndex
-      ? [...events.slice(0, -1), event]
-      : [...events, event];
+  const cumulativeKey = cumulativeEventKey(event);
+  if (cumulativeKey) {
+    const existingIndex = findLastCumulativeEventIndex(events, cumulativeKey);
+    if (existingIndex !== undefined) {
+      return [...events.slice(0, existingIndex), event, ...events.slice(existingIndex + 1)];
+    }
+    return [...events, event];
   }
   if (event.type === "message.completed" || event.type === "reasoning.completed") {
-    const incrementalType = event.type === "message.completed"
-      ? "message.appended"
-      : "reasoning.appended";
-    const last = events.at(-1);
-    return last?.type === incrementalType &&
-      last.data.turnId === event.data.turnId &&
-      last.data.stepIndex === event.data.stepIndex
-      ? [...events.slice(0, -1), event]
-      : [...events, event];
+    // Keep the incremental event as the visual anchor. Eve may emit the
+    // completed boundary after tool events have already been flushed; replacing
+    // the anchor with that boundary makes a later replay render reasoning or
+    // narration below the tools.
+    return [...events, event];
   }
   return [...events, event];
+}
+
+/**
+ * Append a recovery event without repeatedly scanning the whole transcript.
+ * The array is intentionally mutable and owned by one recovery loop; callers
+ * publish a shallow copy only at their render/checkpoint boundary.
+ */
+export function appendThreadEventIndexed(
+  events: MessageStreamEvent[],
+  eventIds: Set<string>,
+  event: MessageStreamEvent,
+): boolean {
+  const identity = eventIdentity(event);
+  if (eventIds.has(identity)) return false;
+  eventIds.add(identity);
+
+  const cumulativeKey = cumulativeEventKey(event);
+  if (cumulativeKey) {
+    const existingIndex = findLastCumulativeEventIndex(events, cumulativeKey);
+    if (existingIndex !== undefined) {
+      events[existingIndex] = event;
+      return true;
+    }
+  }
+  // Completion is a separate lifecycle boundary. Retain it after the
+  // cumulative incremental anchor so the reducer can render the final state
+  // while the presenter can still recover the original visual position.
+  events.push(event);
+  return true;
+}
+
+/**
+ * Eve streams can replay the same event through more than one client
+ * subscription, especially while a React tree is being remounted. Events
+ * without `meta.id` still need a stable identity; otherwise the transcript
+ * and its absolute cursor advance twice for one durable event. Keep the
+ * identity deliberately exact: two events with different timestamps, IDs, or
+ * payloads remain distinct, while an exact replay is ignored.
+ */
+export function eventIdentity(event: MessageStreamEvent): string {
+  // Eve guarantees that meta.id is stable across reconnects, rewinds, and
+  // finished-session replays. Prefer it over the full payload so a transport
+  // adapter that normalizes timestamps or fields cannot duplicate one event.
+  if (typeof event.meta?.id === "string" && event.meta.id.length > 0) {
+    return `id:${event.meta.id}`;
+  }
+  return `event:${JSON.stringify(event)}`;
+}
+
+function hasEventIdentity(events: readonly MessageStreamEvent[], event: MessageStreamEvent): boolean {
+  const identity = eventIdentity(event);
+  return events.some((candidate) => eventIdentity(candidate) === identity);
 }
 
 export function compactThreadEvents(
   events: readonly MessageStreamEvent[],
 ): readonly MessageStreamEvent[] {
   const compacted: MessageStreamEvent[] = [];
+  const identities = new Set<string>();
+  const cumulativeIndexes = new Map<string, number>();
   for (const event of events) {
-    if (event.type === "message.appended" || event.type === "reasoning.appended") {
-      const last = compacted.at(-1);
-      if (
-        last?.type === event.type &&
-        last.data.turnId === event.data.turnId &&
-        last.data.stepIndex === event.data.stepIndex
-      ) {
-        compacted[compacted.length - 1] = event;
+    const identity = eventIdentity(event);
+    if (identities.has(identity)) continue;
+    identities.add(identity);
+    const cumulativeKey = cumulativeEventKey(event);
+    if (cumulativeKey) {
+      const existingIndex = cumulativeIndexes.get(cumulativeKey);
+      if (existingIndex !== undefined) {
+        compacted[existingIndex] = event;
         continue;
       }
+      cumulativeIndexes.set(cumulativeKey, compacted.length);
     }
-    if (event.type === "message.completed" || event.type === "reasoning.completed") {
-      const incrementalType = event.type === "message.completed"
-        ? "message.appended"
-        : "reasoning.appended";
-      const last = compacted.at(-1);
-      if (
-        last?.type === incrementalType &&
-        last.data.turnId === event.data.turnId &&
-        last.data.stepIndex === event.data.stepIndex
-      ) {
-        compacted[compacted.length - 1] = event;
-        continue;
-      }
-    }
+    // Completion is a separate lifecycle boundary. Keep it after the
+    // cumulative incremental anchor instead of moving the visual anchor.
     compacted.push(event);
   }
   return compacted;
+}
+
+type CumulativeEventKey = string;
+
+function cumulativeEventKey(event: MessageStreamEvent): CumulativeEventKey | undefined {
+  if (event.type === "message.appended" || event.type === "reasoning.appended") {
+    return `${event.type}:${event.data.turnId}:${event.data.stepIndex}`;
+  }
+  if (event.type === "action.input.partial") {
+    return `${event.type}:${event.data.turnId}:${event.data.stepIndex}:${event.data.callId}`;
+  }
+  return undefined;
+}
+
+function findLastCumulativeEventIndex(
+  events: readonly MessageStreamEvent[],
+  key: CumulativeEventKey,
+): number | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    if (cumulativeEventKey(events[index]!) === key) return index;
+  }
+  return undefined;
+}
+
+/** Return a pending browser turn only while the authoritative transcript has
+ * not accepted its latest message. Matching is anchored to the latest
+ * `message.received` event so an older identical prompt cannot acknowledge a
+ * newer retry. */
+export function reconcilePendingTurnWithEvents(
+  pendingTurn: AgentPendingTurn | undefined,
+  events: readonly MessageStreamEvent[],
+): AgentPendingTurn | undefined {
+  if (!pendingTurn) return undefined;
+  const latestReceived = [...events].reverse().find((event) => event.type === "message.received");
+  const eventAt = latestReceived?.meta.at ? Date.parse(latestReceived.meta.at) : Number.NaN;
+  const submittedAt = pendingTurn.submittedAt;
+  const eventCanAcknowledge = !Number.isFinite(eventAt) || eventAt >= submittedAt - 5_000;
+  const hasAuthoritativeClientId = latestReceived?.type === "message.received" &&
+    typeof latestReceived.data.clientMessageId === "string" &&
+    latestReceived.data.clientMessageId.trim().length > 0;
+  const accepted = latestReceived?.type === "message.received" && (
+    latestReceived.data.clientMessageId === pendingTurn.id ||
+    (!hasAuthoritativeClientId && eventCanAcknowledge && pendingTurn.text.trim().length > 0 &&
+      latestReceived.data.message.trim() === pendingTurn.text.trim())
+  );
+  return accepted ? undefined : pendingTurn;
+}
+
+/** Hydration must never replay a persisted clear/resubmit operation. */
+export function reconcileHydratedPendingTurn(
+  pendingTurn: AgentPendingTurn | undefined,
+  events: readonly MessageStreamEvent[],
+): AgentPendingTurn | undefined {
+  const reconciled = reconcilePendingTurnWithEvents(pendingTurn, events);
+  if (!reconciled) return undefined;
+  // Hydration is read-only. A stale browser admission must never become a
+  // fresh model request merely because the page was refreshed. If Eve did not
+  // durably acknowledge it with message.received, expose a retryable failure;
+  // the user can explicitly resend after inspecting the state.
+  if (reconciled.state !== "clearing" && reconciled.state !== "resubmitting" && reconciled.state !== "submitting") return reconciled;
+  return { ...reconciled, state: "delivery-failed" };
+}
+
+/** Remove exact stream replays while preserving incremental/completed pairs. */
+export function dedupeThreadEvents(
+  events: readonly MessageStreamEvent[],
+): readonly MessageStreamEvent[] {
+  const seen = new Set<string>();
+  const deduped: MessageStreamEvent[] = [];
+  for (const event of events) {
+    const identity = eventIdentity(event);
+    if (seen.has(identity)) continue;
+    seen.add(identity);
+    deduped.push(event);
+  }
+  return deduped;
 }
 
 function isExecutionMode(value: unknown): value is AgentThreadPreferences["executionMode"] {

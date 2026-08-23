@@ -1,0 +1,73 @@
+diff --git a/node_modules/@workflow/world-postgres/dist/streamer.js b/node_modules/@workflow/world-postgres/dist/streamer.js
+index adb21a0..c612b0f 100644
+--- a/node_modules/@workflow/world-postgres/dist/streamer.js
++++ b/node_modules/@workflow/world-postgres/dist/streamer.js
+@@ -249,6 +249,11 @@ export function createStreamer(pool, drizzle) {
+                 };
+             },
+             async get(_runId, name, startIndex) {
++                // Do not materialize the complete stream before the first
++                // byte is delivered. Long Eve sessions can contain hundreds
++                // of megabytes of chunks; a paged reader keeps recovery
++                // memory bounded while preserving the live-listener path.
++                const PAGE_SIZE = 256;
+                 const cleanups = [];
+                 return new ReadableStream({
+                     async start(controller) {
+@@ -285,26 +290,42 @@ export function createStreamer(pool, drizzle) {
+                         cleanups.push(() => {
+                             events.off(`strm:${name}`, onData);
+                         });
+-                        const chunks = await drizzle
+-                            .select({
+-                            id: streams.chunkId,
+-                            eof: streams.eof,
+-                            data: streams.chunkData,
+-                        })
+-                            .from(streams)
+-                            .where(and(eq(streams.streamId, name)))
+-                            .orderBy(streams.chunkId);
+                         // Resolve negative offset relative to the data chunk count
+                         // (excluding the trailing EOF marker, if present)
+                         if (typeof offset === 'number' && offset < 0) {
+-                            const dataCount = chunks.length > 0 && chunks[chunks.length - 1].eof
+-                                ? chunks.length - 1
+-                                : chunks.length;
++                            const [{ count }] = await drizzle
++                                .select({ count: sql `count(*)` })
++                                .from(streams)
++                                .where(and(eq(streams.streamId, name), eq(streams.eof, false)));
++                            const dataCount = Number(count ?? 0);
+                             offset = Math.max(0, dataCount + offset);
+                         }
+-                        for (const chunk of [...chunks, ...(buffer ?? [])]) {
+-                            enqueue(chunk);
++                        // The SQL offset already removes the historical
++                        // prefix, so the in-memory enqueue cursor must start
++                        // at zero for the returned page.
++                        let queryOffset = offset;
++                        offset = 0;
++                        for (;;) {
++                            const chunks = await drizzle
++                                .select({
++                                id: streams.chunkId,
++                                eof: streams.eof,
++                                data: streams.chunkData,
++                            })
++                                .from(streams)
++                                .where(and(eq(streams.streamId, name)))
++                                .orderBy(streams.chunkId)
++                                .offset(queryOffset)
++                                .limit(PAGE_SIZE);
++                            if (chunks.length === 0) break;
++                            for (const chunk of chunks) enqueue(chunk);
++                            queryOffset += chunks.length;
++                            // An EOF row closes the controller. Do not query
++                            // or enqueue another page after the stream ended.
++                            if (chunks.some((chunk) => chunk.eof)) break;
++                            if (chunks.length < PAGE_SIZE) break;
+                         }
++                        for (const chunk of buffer ?? []) enqueue(chunk);
+                         buffer = null;
+                     },
+                     cancel() {

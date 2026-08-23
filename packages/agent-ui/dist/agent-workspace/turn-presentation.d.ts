@@ -19,6 +19,7 @@ export type AgentTurnPresentation = {
     readonly finalPart?: Extract<EveMessagePart, {
         type: "text";
     }>;
+    readonly failureAnchored?: boolean;
     readonly proxiedInputParts: readonly EveDynamicToolPart[];
     readonly processParts: readonly EveMessagePart[];
     readonly startedAt?: number;
@@ -29,6 +30,8 @@ export type AgentTurnFailure = {
     readonly code: string;
     readonly message: string;
 };
+export type AgentFailureCategory = "network" | "provider" | "timeout" | "unknown";
+export declare function classifyAgentFailure(failure: AgentTurnFailure): AgentFailureCategory;
 export type AgentStepPresentation = {
     readonly endedAt?: number;
     readonly failure?: AgentTurnFailure;
@@ -44,10 +47,18 @@ export type AgentDisplayProjection = {
     readonly events: readonly MessageStreamEvent[];
     readonly messages: readonly EveMessage[];
 };
+export declare const INTERRUPTED_TOOL_ERROR = "Open Agent: tool call cancelled before completion.";
+export declare const CANCELLING_TOOL_ERROR = "Open Agent: tool call cancellation is pending.";
+export declare const INCOMPLETE_TOOL_ERROR = "Open Agent: tool call did not complete.";
+export declare function isInterruptedToolPart(part: EveDynamicToolPart): boolean;
+export declare function isCancellationPendingToolPart(part: EveDynamicToolPart): boolean;
+export declare function sanitizeSettledThreadEvents(events: readonly MessageStreamEvent[]): readonly MessageStreamEvent[];
+export declare function normalizeSettledAgentMessages(messages: readonly EveMessage[], events: readonly MessageStreamEvent[]): readonly EveMessage[];
 export declare function shouldSuppressInterruptedTurnDisplayEvent(event: MessageStreamEvent, eventIndex: number, turns: readonly AgentInterruptedTurn[]): boolean;
 export declare function shouldSuppressInterruptedTurnStreamEvent(event: MessageStreamEvent, streamIndex: number, turns: readonly AgentInterruptedTurn[]): boolean;
 export declare function projectAgentDisplayTimeline(messages: readonly EveMessage[], events: readonly MessageStreamEvent[]): AgentDisplayProjection;
 export declare function presentAgentStep(events: readonly MessageStreamEvent[], turnId: string | undefined, stepIndex: number): AgentStepPresentation;
+export declare function reasoningContentForStep(events: readonly MessageStreamEvent[], turnId: string | undefined, stepIndex: number | undefined): string;
 export declare function presentAgentTurn(message: EveMessage, events: readonly MessageStreamEvent[], closedInputRequestIds?: ReadonlySet<string>): AgentTurnPresentation | undefined;
 export declare function isProxiedInputOnlyMessage(message: EveMessage, events: readonly MessageStreamEvent[]): boolean;
 export declare function unresolvedInputRequests(events: readonly MessageStreamEvent[], closedInputRequestIds?: ReadonlySet<string>): readonly InputRequest[];

@@ -69,9 +69,13 @@ import type { AgentLocale } from "./i18n.js";
 import type { AgentSessionDeliverable } from "./contracts.js";
 import {
   failureForTurn,
+  classifyAgentFailure,
+  isCancellationPendingToolPart,
+  isInterruptedToolPart,
   presentAgentTurn,
   presentAgentStep,
   presentSubagentCall,
+  reasoningContentForStep,
   type AgentTurnPresentation,
   type AgentTurnStatus,
 } from "./turn-presentation.js";
@@ -94,6 +98,27 @@ function MessageAction({ children, label, onClick, tooltip }: { readonly childre
 
 function safeStringify(value: unknown): string {
   try { return JSON.stringify(value ?? {}, null, 2); } catch { return String(value); }
+}
+
+function useThrottledValue<T>(value: T, delayMs: number): T {
+  const latestRef = useRef(value);
+  const timerRef = useRef<number | undefined>(undefined);
+  const [snapshot, setSnapshot] = useState(value);
+  latestRef.current = value;
+
+  useEffect(() => {
+    if (Object.is(snapshot, value) || timerRef.current !== undefined) return;
+    timerRef.current = window.setTimeout(() => {
+      timerRef.current = undefined;
+      setSnapshot(latestRef.current);
+    }, delayMs);
+  }, [delayMs, snapshot, value]);
+
+  useEffect(() => () => {
+    if (timerRef.current !== undefined) window.clearTimeout(timerRef.current);
+  }, []);
+
+  return snapshot;
 }
 
 export type AgentInputResponse = {
@@ -146,6 +171,7 @@ export function AgentMessage({
   const task = presentAgentTurn(displayMessage, events, closedInputRequestIds);
   const responseText = task?.finalPart?.text ?? (task ? undefined : lastText(displayMessage.parts));
   const failure = failureForTurn(events, displayMessage.metadata?.turnId);
+  const hasFailureStepAnchor = task?.failureAnchored === true;
   const hasVisiblePart = displayMessage.parts.some((part) => part.type !== "step-start");
   const publishedDeliverables = task?.status === "completed"
     ? deliverablesForTurn(events, displayMessage.metadata?.turnId)
@@ -245,9 +271,7 @@ export function AgentMessage({
             turnId={message.metadata?.turnId}
           />
         ))}
-        {failure && !(task?.status === "failed" && events.some((event) =>
-          event.type === "step.failed" && event.data.turnId === message.metadata?.turnId
-        )) ? <TurnFailure failure={failure} locale={locale} /> : null}
+        {failure && !hasFailureStepAnchor ? <TurnFailure failure={failure} locale={locale} /> : null}
       </MessageContent>
       {showCopyAction && message.role === "assistant" && responseText && !isStreaming ? (
         <CopyResponseAction locale={locale} text={responseText} />
@@ -331,30 +355,59 @@ function ProcessParts({
   readonly turnId?: string;
 }) {
   const rendered: React.ReactNode[] = [];
-  let visualStepIndex = -1;
+  let previousStepIndex = -1;
+  const lastReasoningPartByStep = new Map<number, number>();
+  for (let partIndex = 0; partIndex < parts.length; partIndex += 1) {
+    const candidate = parts[partIndex];
+    if (candidate?.type === "reasoning" && typeof candidate.stepIndex === "number") {
+      // Eve retries a model step with the same stepIndex but a new message
+      // part. Render the latest attempt once; otherwise one logical thought
+      // appears as several consecutive "Reasoning complete" rows.
+      lastReasoningPartByStep.set(candidate.stepIndex, partIndex);
+    }
+  }
 
   for (let index = 0; index < parts.length;) {
     const part = parts[index]!;
     if (part.type === "step-start") {
-      visualStepIndex += 1;
       const nextStep = parts.findIndex((candidate, candidateIndex) =>
         candidateIndex > index && candidate.type === "step-start"
       );
       const stepEnd = nextStep < 0 ? parts.length : nextStep;
-      const hasReasoning = parts.slice(index + 1, stepEnd).some((candidate) =>
-        candidate.type === "reasoning" && candidate.stepIndex === visualStepIndex
+      const stepParts = parts.slice(index + 1, stepEnd);
+      const stepIndex = stepIndexForParts(stepParts, events, turnId, previousStepIndex);
+      if (stepIndex !== undefined) previousStepIndex = stepIndex;
+      const hasReasoning = stepIndex !== undefined && (
+        stepParts.some((candidate) =>
+          candidate.type === "reasoning" && candidate.stepIndex === stepIndex && candidate.text.trim().length > 0
+        ) || Boolean(reasoningContentForStep(events, turnId, stepIndex))
       );
       if (!hasReasoning) {
+        const hasStepEvidence = stepIndex !== undefined && events.some((event) =>
+          eventStepMatches(event, turnId, stepIndex),
+        );
+        if (!hasStepEvidence) {
+          index += 1;
+          continue;
+        }
         rendered.push(
           <StepActivity
             events={events}
-            key={`step-activity:${turnId}:${visualStepIndex}`}
+            key={`step-activity:${turnId}:${stepIndex ?? index}`}
             locale={locale}
-            stepIndex={visualStepIndex}
+            stepIndex={stepIndex ?? previousStepIndex}
             turnId={turnId}
           />,
         );
       }
+      index += 1;
+      continue;
+    }
+    if (
+      part.type === "reasoning" &&
+      typeof part.stepIndex === "number" &&
+      lastReasoningPartByStep.get(part.stepIndex) !== index
+    ) {
       index += 1;
       continue;
     }
@@ -455,6 +508,49 @@ function ProcessParts({
   return <>{rendered}</>;
 }
 
+/**
+ * A settled transcript may remove empty step markers (for example a tool
+ * argument stream that failed before actions.requested). The remaining
+ * markers must still use Eve's absolute step index; numbering visible markers
+ * from zero makes a later completed step look like an earlier "thinking"
+ * step. Live markers without parts are matched to the next durable step.
+ */
+function stepIndexForParts(
+  parts: readonly EveMessagePart[],
+  events: readonly MessageStreamEvent[],
+  turnId: string | undefined,
+  previousStepIndex: number,
+): number | undefined {
+  const explicit = parts.find((part) =>
+    "stepIndex" in part && typeof part.stepIndex === "number"
+  );
+  if (explicit && "stepIndex" in explicit && typeof explicit.stepIndex === "number") {
+    return explicit.stepIndex;
+  }
+  if (!turnId) return undefined;
+  return events
+    .map(eventStep)
+    .filter((step): step is number => step !== undefined && step > previousStepIndex)
+    .find((step) => events.some((event) => eventStepMatches(event, turnId, step)));
+}
+
+function eventStep(event: MessageStreamEvent): number | undefined {
+  if (!("data" in event) || !event.data || typeof event.data !== "object") return undefined;
+  return "stepIndex" in event.data && typeof event.data.stepIndex === "number"
+    ? event.data.stepIndex
+    : undefined;
+}
+
+function eventStepMatches(
+  event: MessageStreamEvent,
+  turnId: string | undefined,
+  stepIndex: number,
+): boolean {
+  if (!turnId || !("data" in event) || !event.data || typeof event.data !== "object") return false;
+  const data = event.data as { readonly stepIndex?: unknown; readonly turnId?: unknown };
+  return data.turnId === turnId && data.stepIndex === stepIndex;
+}
+
 function ProcessToolGroup({
   active,
   assetUrl,
@@ -552,6 +648,8 @@ function ToolPart({
   const running = !isToolTerminal(part);
   const defaultOpen = isTodoTool(part) || part.state === "approval-requested";
   const Icon = toolIcon(part);
+  const interrupted = isInterruptedToolPart(part);
+  const cancellationPending = isCancellationPendingToolPart(part);
   const statusLabel = isFileMutationTool(part) ? undefined : toolStatusLabel(locale, part);
 
   return (
@@ -561,12 +659,20 @@ function ToolPart({
       >
         {running ? (
           <LoaderCircleIcon className="size-4 shrink-0 animate-spin [animation-duration:0.65s]" />
+        ) : interrupted ? (
+          <CircleStopIcon className="size-4 shrink-0 text-muted-foreground" />
+        ) : cancellationPending ? (
+          <LoaderCircleIcon className="size-4 shrink-0 animate-spin text-muted-foreground [animation-duration:0.9s]" />
         ) : part.state === "output-error" || part.state === "output-denied" ? (
           <XCircleIcon className="size-4 shrink-0 text-destructive" />
         ) : (
           <Icon className="size-4 shrink-0" />
         )}
-        <span className="truncate">{toolTitle(locale, part, events)}</span>
+        {isFileMutationTool(part) ? (
+          <FileMutationToolTitle events={events} locale={locale} part={part} />
+        ) : (
+          <span className="truncate">{toolTitle(locale, part, events)}</span>
+        )}
         {statusLabel ? (
           <span className={cn("shrink-0 text-xs", part.state === "output-error" && "text-destructive")}>
             {statusLabel}
@@ -576,7 +682,15 @@ function ToolPart({
       </CollapsibleTrigger>
       <ToolFallbackContent>
         <KnownToolContent assetUrl={assetUrl} events={events} locale={locale} onOpenSubagent={onOpenSubagent} part={part} />
-        {part.errorText ? <p className="whitespace-pre-wrap text-xs text-destructive">{part.errorText}</p> : null}
+        {part.errorText ? (
+          <p className={cn("whitespace-pre-wrap text-xs", interrupted ? "text-muted-foreground" : "text-destructive")}>
+            {interrupted
+              ? localize(locale, "Tool call stopped before completion.", "工具调用在完成前已中断。")
+              : cancellationPending
+                ? localize(locale, "Stopping tool call…", "正在停止工具调用…")
+                : part.errorText}
+          </p>
+        ) : null}
       </ToolFallbackContent>
     </ToolFallbackRoot>
   );
@@ -598,8 +712,6 @@ function KnownToolContent({
   const normalized = normalizeToolName(part.toolName);
   const input = asRecord(part.input);
   const output = "output" in part ? part.output : undefined;
-  const patch = toolPatch(part);
-  const fileChange = toolFileChange(part, events);
   const openDeliverable = useContext(DeliverableOpenContext);
 
   if (part.toolMetadata?.eve?.kind === "subagent-call") {
@@ -607,24 +719,7 @@ function KnownToolContent({
   }
 
   if (["apply_patch", "patch_file", "write_file", "edit_file"].includes(normalized)) {
-    if (patch) {
-      return <div data-tool-view="diff"><DiffViewer contentClassName="max-h-72 overflow-auto" patch={patch} showIcon size="sm" variant="muted" /></div>;
-    }
-    if (fileChange) {
-      return (
-        <div data-tool-view="diff">
-          <DiffViewer
-            contentClassName="max-h-72 overflow-auto"
-            newFile={{ content: fileChange.newContent, name: fileChange.path }}
-            oldFile={{ content: fileChange.oldContent, name: fileChange.path }}
-            showIcon
-            size="sm"
-            variant="muted"
-          />
-        </div>
-      );
-    }
-    return <p className="text-xs text-muted-foreground">{localize(locale, "Receiving file changes...", "正在接收文件变更…")}</p>;
+    return <FileMutationToolContent events={events} locale={locale} part={part} />;
   }
 
   if (["bash", "shell", "terminal", "exec_command"].includes(normalized)) {
@@ -768,6 +863,71 @@ function KnownToolContent({
       ) : null}
     </div>
   );
+}
+
+function FileMutationToolContent({
+  events,
+  locale,
+  part,
+}: {
+  readonly events: readonly MessageStreamEvent[];
+  readonly locale: AgentLocale;
+  readonly part: EveDynamicToolPart;
+}) {
+  // A provider sends cumulative JSON snapshots for tool arguments. Parsing a
+  // large patch for every token is quadratic in the file size and can block
+  // the browser. Publish an in-progress snapshot at a bounded cadence, while
+  // showing terminal tool input immediately.
+  const previewPart = usePreviewFileMutationPart(part);
+  const patch = toolPatch(previewPart);
+  const fileChange = toolFileChange(previewPart, events);
+
+  if (patch) {
+    return <div data-tool-view="diff"><DiffViewer contentClassName="max-h-72 overflow-auto" patch={patch} showIcon size="sm" variant="muted" /></div>;
+  }
+  if (fileChange) {
+    return (
+      <div data-tool-view="diff">
+        <DiffViewer
+          contentClassName="max-h-72 overflow-auto"
+          newFile={{ content: fileChange.newContent, name: fileChange.path }}
+          oldFile={{ content: fileChange.oldContent, name: fileChange.path }}
+          showIcon
+          size="sm"
+          variant="muted"
+        />
+      </div>
+    );
+  }
+  return <p className="text-xs text-muted-foreground">{localize(locale, "Receiving file changes...", "正在接收文件变更…")}</p>;
+}
+
+function FileMutationToolTitle({
+  events,
+  locale,
+  part,
+}: {
+  readonly events: readonly MessageStreamEvent[];
+  readonly locale: AgentLocale;
+  readonly part: EveDynamicToolPart;
+}) {
+  const previewPart = usePreviewFileMutationPart(part);
+  const summary = fileMutationSummary(previewPart, events);
+  return (
+    <span className="flex min-w-0 items-center gap-1.5 truncate">
+      <span className="truncate">{fileMutationActionLabel(locale, previewPart, summary)}{summary.path ? ` ${summary.path}` : ""}</span>
+      {summary.additions > 0 ? <><span aria-hidden="true"> </span><span className="shrink-0 text-green-600 dark:text-green-400">+{summary.additions}</span></> : null}
+      {summary.deletions > 0 ? <span className="shrink-0 text-red-600 dark:text-red-400">-{summary.deletions}</span> : null}
+    </span>
+  );
+}
+
+function usePreviewFileMutationPart(part: EveDynamicToolPart): EveDynamicToolPart {
+  const liveInput = useThrottledValue(part.input, 75);
+  const liveInputText = useThrottledValue(part.inputText, 75);
+  return isToolTerminal(part)
+    ? part
+    : { ...part, input: liveInput, inputText: liveInputText };
 }
 
 const VIEW_IMAGE_MEDIA_TYPES = new Set([
@@ -936,18 +1096,45 @@ function fileMutationTitle(
   part: EveDynamicToolPart,
   events: readonly MessageStreamEvent[] = [],
 ): string {
+  if (isCancellationPendingToolPart(part)) {
+    const summary = fileMutationSummary(part, events);
+    const stats = [
+      summary.additions > 0 ? `+${summary.additions}` : undefined,
+      summary.deletions > 0 ? `-${summary.deletions}` : undefined,
+    ].filter(Boolean).join(" ");
+    return [localize(locale, "Stopping", "正在停止"), summary.path, stats].filter(Boolean).join(" ");
+  }
+  if (isInterruptedToolPart(part)) {
+    const summary = fileMutationSummary(part, events);
+    const stats = [
+      summary.additions > 0 ? `+${summary.additions}` : undefined,
+      summary.deletions > 0 ? `-${summary.deletions}` : undefined,
+    ].filter(Boolean).join(" ");
+    return [localize(locale, "Stopped", "已中断"), summary.path, stats].filter(Boolean).join(" ");
+  }
   const running = !isToolTerminal(part);
   const summary = fileMutationSummary(part, events);
-  const action = summary.operation === "create"
-    ? running ? localize(locale, "Creating", "正在创建") : localize(locale, "Created", "已创建")
-    : summary.operation === "delete"
-      ? running ? localize(locale, "Deleting", "正在删除") : localize(locale, "Deleted", "已删除")
-      : running ? localize(locale, "Editing", "正在编辑") : localize(locale, "Edited", "已编辑");
+  const action = fileMutationActionLabel(locale, part, summary);
   const stats = [
     summary.additions > 0 ? `+${summary.additions}` : undefined,
     summary.deletions > 0 ? `-${summary.deletions}` : undefined,
   ].filter(Boolean).join(" ");
   return [action, summary.path, stats].filter(Boolean).join(" ");
+}
+
+function fileMutationActionLabel(
+  locale: AgentLocale,
+  part: EveDynamicToolPart,
+  summary: FileMutationSummary,
+): string {
+  if (isCancellationPendingToolPart(part)) return localize(locale, "Stopping", "正在停止");
+  if (isInterruptedToolPart(part)) return localize(locale, "Stopped", "已中断");
+  const running = !isToolTerminal(part);
+  return summary.operation === "create"
+    ? running ? localize(locale, "Creating", "正在创建") : localize(locale, "Created", "已创建")
+    : summary.operation === "delete"
+      ? running ? localize(locale, "Deleting", "正在删除") : localize(locale, "Deleted", "已删除")
+      : running ? localize(locale, "Editing", "正在编辑") : localize(locale, "Edited", "已编辑");
 }
 
 function patchFilePath(patch: string): string | undefined {
@@ -983,6 +1170,19 @@ function StepActivity({
   readonly turnId?: string;
 }) {
   const step = presentAgentStep(events, turnId, stepIndex);
+  const hasReasoningContent = Boolean(reasoningContentForStep(events, turnId, stepIndex));
+  // A step can legitimately contain only a tool call. Do not label its
+  // terminal boundary as completed reasoning when the Provider emitted no
+  // reasoning text at all. While it is live, keep the neutral thinking state
+  // without implying that an expandable reasoning block exists.
+  if (!hasReasoningContent && step.status !== "running") {
+    return (
+      <>
+        {step.retry ? <RetryStatus locale={locale} retry={step.retry} /> : null}
+        {step.status === "failed" && step.failure ? <StepFailure failure={step.failure} locale={locale} /> : null}
+      </>
+    );
+  }
   return (
     <>
       {step.retry ? (
@@ -1013,7 +1213,7 @@ function StepFailure({
     <div className="mb-1 flex items-start gap-2 text-sm text-destructive" role="alert">
       <XCircleIcon className="mt-0.5 size-4 shrink-0" />
       <span className="min-w-0 break-words">
-        {localize(locale, "Execution failed", "执行失败")}: {sanitizeFailureMessage(failure.message)}
+        {failureTitle(locale, failure)}: {sanitizeFailureMessage(failure.message)}
       </span>
     </div>
   );
@@ -1030,7 +1230,7 @@ function RetryStatus({
     <Collapsible className="mb-1 text-sm text-muted-foreground">
       <CollapsibleTrigger className="group/retry flex max-w-full items-center gap-2 py-1.5 text-left hover:text-foreground">
         <WifiIcon className="size-4 shrink-0" />
-        <span>{localize(locale, "Reconnecting", "正在重新连接")} {retry.attempt}/{retry.maximum}</span>
+        <span>{retryTitle(locale, retry.error)} {retry.attempt}/{retry.maximum}</span>
         {retry.error ? <ChevronDownIcon className="size-3.5 -rotate-90 transition-transform group-data-[state=open]/retry:rotate-0" /> : null}
       </CollapsibleTrigger>
       {retry.error ? (
@@ -1060,6 +1260,11 @@ function ReasoningPart({
   const step = presentAgentStep(events, turnId, part.stepIndex ?? 0);
   const durationSeconds = useElapsedSeconds(timing.startedAt, timing.endedAt);
   const streaming = part.state === "streaming";
+  const text = part.text.trim() || reasoningContentForStep(events, turnId, part.stepIndex);
+  // Empty reasoning boundaries are protocol bookkeeping, not user-visible
+  // reasoning. Keep a live placeholder while the step is running, but remove
+  // it after completion instead of rendering an empty "Reasoning complete".
+  if (!text && !streaming) return null;
   return (
     <>
       {step.retry ? <RetryStatus locale={locale} retry={step.retry} /> : null}
@@ -1068,16 +1273,24 @@ function ReasoningPart({
         <ReasoningTrigger
           active={streaming}
           duration={timing.startedAt && durationSeconds > 0 ? durationSeconds : undefined}
-          label={streaming
-            ? reasoningSummary(part.text) ?? localize(locale, "Thinking", "正在思考")
-            : localize(locale, "Reasoning complete", "思考完成")}
+          hideChevron={!text}
+          label={reasoningTriggerLabel(locale, streaming, text)}
         />
         <ReasoningContent aria-busy={streaming}>
-          <ReasoningText><StaticMarkdownText text={part.text} /></ReasoningText>
+          <ReasoningText><StaticMarkdownText text={text} /></ReasoningText>
         </ReasoningContent>
       </ReasoningRoot>
     </>
   );
+}
+
+function reasoningTriggerLabel(
+  locale: AgentLocale,
+  streaming: boolean,
+  text: string,
+): string {
+  if (streaming) return reasoningSummary(text) ?? localize(locale, "Thinking", "正在思考");
+  return localize(locale, "Reasoning complete", "思考完成");
 }
 
 function reasoningSummary(text: string): string | undefined {
@@ -1095,16 +1308,42 @@ function reasoningTiming(
   turnId: string | undefined,
   stepIndex: number | undefined,
 ): { readonly endedAt?: number; readonly startedAt?: number } {
-  const matching = events.filter((event) =>
+  const matching = events
+    .map((event, index) => ({ event, index }))
+    .filter(({ event }) =>
     (event.type === "reasoning.appended" || event.type === "reasoning.completed") &&
     (turnId === undefined || event.data.turnId === turnId) &&
     (stepIndex === undefined || ("stepIndex" in event.data && event.data.stepIndex === stepIndex)),
   );
-  const startedAt = eventTime(matching.find((event) => event.type === "reasoning.appended") ?? matching[0]);
-  const completed = [...matching].reverse().find((event) => event.type === "reasoning.completed");
+  const latestReasoning = matching.at(-1);
+  if (!latestReasoning) return {};
+  // A retry can emit another reasoning block with the same stepIndex. Start
+  // the timer at the latest step boundary so tool/retry gaps are not counted
+  // as model thinking time.
+  const attemptStartIndex = events.findLastIndex((event, index) =>
+    index <= latestReasoning.index &&
+    event.type === "step.started" &&
+    (turnId === undefined || event.data.turnId === turnId) &&
+    (stepIndex === undefined || event.data.stepIndex === stepIndex),
+  );
+  const attemptReasoning = matching.filter(({ index }) => index >= attemptStartIndex);
+  const firstAppend = attemptReasoning.find(({ event }) => event.type === "reasoning.appended");
+  const completed = [...attemptReasoning].reverse().find(({ event }) => event.type === "reasoning.completed");
+  const startedAt = eventTime(firstAppend?.event) ?? eventTime(attemptStartIndex >= 0 ? events[attemptStartIndex] : latestReasoning.event);
+  const startedIndex = firstAppend?.index ?? attemptStartIndex;
+  // Some providers omit reasoning.completed when they immediately request a
+  // tool. End the visible reasoning timer at that model boundary; otherwise
+  // the elapsed time incorrectly includes the tool execution itself.
+  const boundary = startedIndex >= 0
+    ? events.slice(startedIndex + 1).find((event) =>
+      (event.type === "reasoning.completed" || event.type === "actions.requested" || event.type === "message.completed") &&
+      (turnId === undefined || event.data.turnId === turnId) &&
+      (stepIndex === undefined || ("stepIndex" in event.data && event.data.stepIndex === stepIndex)),
+    )
+    : undefined;
   return {
     ...(startedAt ? { startedAt } : {}),
-    ...(completed ? { endedAt: eventTime(completed) } : {}),
+    ...(completed ? { endedAt: eventTime(completed.event) } : boundary ? { endedAt: eventTime(boundary) } : {}),
   };
 }
 
@@ -1715,7 +1954,7 @@ function executionLabel(locale: AgentLocale, task: AgentTurnPresentation): strin
       ? localize(locale, "Waiting for approval", "等待批准")
       : localize(locale, "Waiting for confirmation", "等待确认");
   }
-  if (task.status === "completed") return localize(locale, "Worked for", "已处理");
+  if (task.status === "completed") return localize(locale, "Worked for", "已处理完成");
   if (task.status === "cancelled") return localize(locale, "Stopped after", "已停止");
   return localize(locale, "Failed after", "执行失败");
 }
@@ -2179,15 +2418,34 @@ function QuestionnaireResponseForm({
 
 function TurnFailure({ failure, locale }: { readonly failure: { readonly code: string; readonly message: string }; readonly locale: AgentLocale }) {
   return (
-    <div className="mt-2 flex items-start gap-3 rounded-xl border border-border/70 px-3.5 py-3 text-sm" role="alert">
+    <div className="mt-2 flex items-start gap-2 px-1 py-1.5 text-sm" role="alert">
       <XCircleIcon className="mt-0.5 size-4 shrink-0 text-destructive" />
       <div className="min-w-0 flex-1">
-        <p className="font-medium text-foreground">{localize(locale, "This turn failed", "本轮执行失败")}</p>
+        <p className="font-medium text-destructive">{failureTitle(locale, failure)}</p>
         <p className="mt-1 break-words text-muted-foreground">{sanitizeFailureMessage(failure.message)}</p>
         <code className="mt-1.5 block text-xs text-muted-foreground">{failure.code}</code>
       </div>
     </div>
   );
+}
+
+function failureTitle(locale: AgentLocale, failure: { readonly code: string; readonly message: string }): string {
+  switch (classifyAgentFailure(failure)) {
+    case "network": return localize(locale, "Network error", "网络错误");
+    case "timeout": return localize(locale, "Request timed out", "请求超时");
+    case "provider": return localize(locale, "Provider request failed", "上游模型请求失败");
+    default: return localize(locale, "This turn failed", "本轮执行失败");
+  }
+}
+
+function retryTitle(locale: AgentLocale, failure: { readonly code: string; readonly message: string } | undefined): string {
+  if (!failure) return localize(locale, "Retrying", "正在重试");
+  switch (classifyAgentFailure(failure)) {
+    case "network": return localize(locale, "Retrying connection", "正在重试连接");
+    case "timeout": return localize(locale, "Retrying after timeout", "超时后正在重试");
+    case "provider": return localize(locale, "Retrying provider request", "正在重试上游请求");
+    default: return localize(locale, "Retrying", "正在重试");
+  }
 }
 
 function sanitizeFailureMessage(message: string): string {
@@ -2201,6 +2459,8 @@ function localize(locale: AgentLocale, english: string, chinese: string): string
 }
 
 function toolStatusLabel(locale: AgentLocale, part: EveDynamicToolPart): string {
+  if (isCancellationPendingToolPart(part)) return localize(locale, "Stopping", "正在停止");
+  if (isInterruptedToolPart(part)) return localize(locale, "Stopped", "已中断");
   if (part.state === "output-available" && part.partial === true) {
     return localize(locale, "Running", "运行中");
   }

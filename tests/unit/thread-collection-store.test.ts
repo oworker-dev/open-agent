@@ -5,6 +5,7 @@ import type { Pool, QueryResult } from "pg";
 import {
   createPostgresThreadCollectionStore,
   normalizeJsonbValue,
+  type ThreadCollectionPatchRecord,
 } from "../../server/data/thread-collection-store.ts";
 
 const config = {
@@ -69,4 +70,78 @@ test("normalizes nested JSONB strings without changing normal Unicode or caller 
   assert.deepEqual(normalized.values[2], { content: "before\uFFFDafter" });
   assert.equal(original.values[1], "unpaired:\uD800");
   assert.deepEqual(original.values[2], { content: "before\u0000after" });
+});
+
+test("append-only thread patches do not load the existing transcript", async () => {
+  const calls: string[] = [];
+  let updatedCollection: Record<string, unknown> | undefined;
+  const client = {
+    async query(sql: string, parameters?: readonly unknown[]) {
+      calls.push(sql);
+      if (sql === "begin" || sql === "commit" || sql === "rollback") return { rows: [] };
+      if (sql.includes("for update")) {
+        return {
+          rows: [{
+            collection: {
+              activeThreadId: "thread-1",
+              threads: [{ id: "thread-1", events: [], status: "streaming", title: "Long task" }],
+              version: 2,
+            },
+            revision: "4",
+          }],
+        };
+      }
+      if (sql.includes("set collection = $4::jsonb")) {
+        updatedCollection = JSON.parse(String(parameters?.[3])) as Record<string, unknown>;
+      }
+      if (sql.includes("max(event_index)")) return { rows: [{ next_index: "2" }] };
+      return { rows: [] };
+    },
+    release() {},
+  };
+  const pool = {
+    async connect() { return client; },
+  } as unknown as Pool;
+  const store = createPostgresThreadCollectionStore(config, pool);
+  const patch: ThreadCollectionPatchRecord = {
+    deletedThreadIds: [],
+    eventAppends: [{
+      events: [{ data: { sequence: 2 }, meta: { at: new Date(0).toISOString(), id: "evt-3" }, type: "step.started" }],
+      threadId: "thread-1",
+    }],
+    upsertThreads: [{ events: [], id: "thread-1", status: "streaming", title: "Long task" }],
+  };
+
+  const result = await store.patch?.("tenant-1", "principal-1", "workspace-1", 4, patch);
+
+  assert.equal(result?.status, "saved");
+  assert.equal(calls.some((sql) => sql.includes("jsonb_array_elements")), false);
+  assert.equal(calls.some((sql) => sql.includes("insert into \"open_agent_test\".\"agent_thread_events\"")), true);
+  assert.equal(updatedCollection?.activeThreadId, "thread-1");
+});
+
+test("hydrating one thread removes the index-only summary marker", async () => {
+  let loadedSql = "";
+  const pool = {
+    async query(sql: string) {
+      loadedSql = sql;
+      return {
+        rows: [{
+          thread: {
+            id: "thread-1",
+            events: [{ type: "session.waiting", data: {}, meta: { id: "evt-1" } }],
+            status: "ready",
+          },
+          revision: "9",
+        }],
+      } as unknown as QueryResult;
+    },
+  } as unknown as Pool;
+  const store = createPostgresThreadCollectionStore(config, pool);
+
+  const result = await store.loadThread?.("tenant-1", "principal-1", "workspace-1", "thread-1");
+
+  assert.equal((result?.thread as { readonly id?: unknown } | undefined)?.id, "thread-1");
+  assert.equal(loadedSql.includes("thread - 'events' - 'hydration'"), true);
+  assert.equal(loadedSql.includes("jsonb_build_object(\n            'events'"), true);
 });

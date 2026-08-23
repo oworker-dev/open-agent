@@ -27,6 +27,7 @@ import { withSessionOwnership } from "../lib/session-ownership-auth";
 import { parseAgentRunPolicy } from "../lib/run-policy";
 import { parseRemoteTraceParent } from "../lib/observability";
 import { verifyMailboxDispatchRequest } from "../lib/mailbox-dispatch-auth.ts";
+import type { MessageStreamEvent } from "eve/client";
 
 const MODEL_HEADER = "x-agent-model";
 const REASONING_HEADER = "x-agent-reasoning";
@@ -193,6 +194,24 @@ const mailboxRoute = POST(MAILBOX_ROUTE, async (request, {
     return mailboxProblem(400, "mailbox_request_invalid", "The mailbox request is invalid.");
   }
   const session = attachSession(input.sessionId);
+  if (input.action === "transcript") {
+    try {
+      const tailIndex = await session.getStreamTailIndex();
+      return new Response(
+        boundedTranscriptStream(await session.getEventStream({ startIndex: input.startIndex }), input.startIndex, tailIndex),
+        {
+          headers: {
+            "cache-control": "no-store, no-transform",
+            "content-type": "application/x-ndjson; charset=utf-8",
+            "x-agent-stream-tail-index": String(tailIndex),
+            "x-accel-buffering": "no",
+          },
+        },
+      );
+    } catch {
+      return mailboxProblem(404, "mailbox_session_not_found", "The Agent session was not found.");
+    }
+  }
   if (input.action === "cancel") {
     const result = await session.cancel(
       input.turnId ? { turnId: input.turnId } : undefined,
@@ -285,13 +304,19 @@ export default {
 };
 
 type MailboxBoundary =
-  | { readonly state: "running"; readonly turnId?: string }
-  | { readonly state: "waiting" }
-  | { readonly state: "terminal"; readonly terminalStatus?: "completed" | "failed" };
+  | { readonly lastEventAt?: string; readonly state: "running"; readonly tailIndex?: number; readonly turnId?: string }
+  | { readonly state: "waiting"; readonly tailIndex?: number }
+  | { readonly state: "terminal"; readonly tailIndex?: number; readonly terminalStatus?: "completed" | "failed" };
 
 type MailboxInspectRequest = {
   readonly action: "inspect";
   readonly sessionId: string;
+};
+
+type MailboxTranscriptRequest = {
+  readonly action: "transcript";
+  readonly sessionId: string;
+  readonly startIndex: number;
 };
 
 type MailboxControlRequest =
@@ -325,7 +350,7 @@ type MailboxDeliverRequest = {
   readonly tenantId: string;
 };
 
-function parseMailboxRequest(body: string): MailboxInspectRequest | MailboxControlRequest | MailboxDeliverRequest | undefined {
+function parseMailboxRequest(body: string): MailboxInspectRequest | MailboxTranscriptRequest | MailboxControlRequest | MailboxDeliverRequest | undefined {
   let value: unknown;
   try {
     value = JSON.parse(body);
@@ -334,6 +359,14 @@ function parseMailboxRequest(body: string): MailboxInspectRequest | MailboxContr
   }
   if (!isRecord(value) || !validText(value.sessionId, 512)) return undefined;
   if (value.action === "inspect") return { action: "inspect", sessionId: value.sessionId };
+  if (
+    value.action === "transcript" &&
+    typeof value.startIndex === "number" &&
+    Number.isSafeInteger(value.startIndex) &&
+    value.startIndex >= 0
+  ) {
+    return { action: "transcript", sessionId: value.sessionId, startIndex: value.startIndex };
+  }
   if (value.action === "cancel") {
     if (value.turnId !== undefined && !validText(value.turnId, 512)) return undefined;
     return {
@@ -409,29 +442,80 @@ function validClientContext(value: unknown): value is readonly string[] {
   return isBoundedAgentClientContext(value);
 }
 
+/**
+ * The normal Eve stream endpoint is intentionally reconnectable. Transcript
+ * repair needs a different contract: snapshot the tail once, emit exactly the
+ * events that existed at that boundary, then close. This prevents a completed
+ * session from becoming an accidental infinite subscription.
+ */
+function boundedTranscriptStream(
+  source: ReadableStream<MessageStreamEvent>,
+  startIndex: number,
+  tailIndex: number,
+): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder();
+  let reader: ReadableStreamDefaultReader<MessageStreamEvent> | undefined;
+  let cancelled = false;
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      void (async () => {
+        reader = source.getReader();
+        let cursor = startIndex;
+        try {
+          while (!cancelled && cursor <= tailIndex) {
+            const next = await reader.read();
+            if (next.done) {
+              throw new Error("The Agent transcript ended before its declared durable tail.");
+            }
+            controller.enqueue(encoder.encode(`${JSON.stringify(next.value)}\n`));
+            cursor += 1;
+          }
+          if (!cancelled) controller.close();
+        } catch (error) {
+          if (!cancelled) controller.error(error);
+        } finally {
+          await reader.cancel().catch(() => undefined);
+          reader.releaseLock();
+        }
+      })();
+    },
+    cancel() {
+      cancelled = true;
+      void reader?.cancel().catch(() => undefined);
+    },
+  });
+}
+
 async function inspectMailboxBoundary(
   session: Session,
 ): Promise<MailboxBoundary> {
+  const tailIndex = await session.getStreamTailIndex();
   const stream = await session.getEventStream({ startIndex: -1 });
   const reader = stream.getReader();
   try {
     const latest = await reader.read();
     if (latest.done || !latest.value) return { state: "running" };
     if (latest.value.type === "session.waiting") {
-      return { state: "waiting" };
+      return { state: "waiting", tailIndex };
     }
     if (latest.value.type === "session.completed") {
-      return { state: "terminal", terminalStatus: "completed" };
+      return { state: "terminal", tailIndex, terminalStatus: "completed" };
     }
     if (latest.value.type === "session.failed") {
-      return { state: "terminal", terminalStatus: "failed" };
+      return { state: "terminal", tailIndex, terminalStatus: "failed" };
     }
     const data: unknown = latest.value.data;
     const record = isRecord(data) ? data : undefined;
     const turnId = record && validText(record["turnId"], 512)
       ? record["turnId"]
       : undefined;
-    return { state: "running", ...(turnId ? { turnId } : {}) };
+    const at = latest.value.meta?.at;
+    return {
+      state: "running",
+      ...(typeof at === "string" ? { lastEventAt: at } : {}),
+      tailIndex,
+      ...(turnId ? { turnId } : {}),
+    };
   } finally {
     void reader.cancel().catch(() => undefined);
     reader.releaseLock();

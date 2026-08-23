@@ -1,4 +1,4 @@
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 import {
   getAgentDatabasePool,
   quoteIdentifier,
@@ -11,9 +11,27 @@ export type StoredThreadCollection<TCollection> = {
   readonly revision: number;
 };
 
+export type StoredThread<TThread = unknown> = {
+  readonly thread: TThread;
+  readonly revision: number;
+};
+
 export type ThreadCollectionWriteResult<TCollection> =
   | { readonly record: StoredThreadCollection<TCollection>; readonly status: "saved" }
   | { readonly currentRevision: number; readonly status: "conflict" };
+
+/** The transport-neutral shape used by the HTTP thread PATCH contract. */
+export type ThreadCollectionPatchRecord = {
+  /** Undefined preserves the stored selection; null explicitly clears it. */
+  readonly activeThreadId?: string | null;
+  readonly deletedThreadIds: readonly string[];
+  readonly eventAppends: readonly {
+    readonly events: readonly unknown[];
+    readonly replaceFrom?: number;
+    readonly threadId: string;
+  }[];
+  readonly upsertThreads: readonly Record<string, unknown>[];
+};
 
 export interface AgentThreadCollectionStore<TCollection = unknown> {
   load(
@@ -21,6 +39,27 @@ export interface AgentThreadCollectionStore<TCollection = unknown> {
     principalId: string,
     storageKey: string,
   ): Promise<StoredThreadCollection<TCollection> | undefined>;
+  /** Reads only thread metadata for the sidebar; event payloads stay in Postgres. */
+  loadIndex?(
+    tenantId: string,
+    principalId: string,
+    storageKey: string,
+  ): Promise<StoredThreadCollection<TCollection> | undefined>;
+  /** Reads one thread JSON value without materializing the whole collection in Node. */
+  loadThread?(
+    tenantId: string,
+    principalId: string,
+    storageKey: string,
+    threadId: string,
+  ): Promise<StoredThread | undefined>;
+  /** Applies normal append-only stream checkpoints without loading history. */
+  patch?(
+    tenantId: string,
+    principalId: string,
+    storageKey: string,
+    expectedRevision: number,
+    patch: ThreadCollectionPatchRecord,
+  ): Promise<ThreadCollectionWriteResult<TCollection>>;
   save(
     tenantId: string,
     principalId: string,
@@ -35,7 +74,8 @@ export function createPostgresThreadCollectionStore<TCollection = unknown>(
   pool: Pool = getAgentDatabasePool(config),
 ): AgentThreadCollectionStore<TCollection> {
   const table = `${quoteIdentifier(config.schema)}."agent_thread_collections"`;
-  return postgresThreadCollectionStore<TCollection>(pool, table);
+  const eventTable = `${quoteIdentifier(config.schema)}."agent_thread_events"`;
+  return postgresThreadCollectionStore<TCollection>(pool, table, eventTable);
 }
 
 export function createPostgresThreadCollectionStoreFromEnvironment<TCollection = unknown>(
@@ -48,6 +88,7 @@ export function createPostgresThreadCollectionStoreFromEnvironment<TCollection =
 function postgresThreadCollectionStore<TCollection>(
   pool: Pool,
   table: string,
+  eventTable: string,
 ): AgentThreadCollectionStore<TCollection> {
   const load = async (
     tenantId: string,
@@ -67,8 +108,199 @@ function postgresThreadCollectionStore<TCollection>(
       : undefined;
   };
 
+  const loadIndex = async (
+    tenantId: string,
+    principalId: string,
+    storageKey: string,
+  ): Promise<StoredThreadCollection<TCollection> | undefined> => {
+    assertScope(tenantId, principalId, storageKey);
+    const result = await pool.query<{ collection: TCollection; revision: string }>(
+      `select jsonb_build_object(
+                'activeThreadId', collection->'activeThreadId',
+                'threads', coalesce((
+                  select jsonb_agg(jsonb_build_object(
+                    'closedInputRequestIds', '[]'::jsonb,
+                    'createdAt', thread->'createdAt',
+                    'events', '[]'::jsonb,
+                    'hydration', 'summary',
+                    'id', thread->'id',
+                    'preferences', thread->'preferences',
+                    'queuedTurns', '[]'::jsonb,
+                    'revision', thread->'revision',
+                    'session', thread->'session',
+                    'status', thread->'status',
+                    'transcriptCoverage', thread->'transcriptCoverage',
+                    'title', thread->'title',
+                    'updatedAt', thread->'updatedAt'
+                  ) order by coalesce((thread->>'updatedAt')::double precision, 0) desc)
+                  from jsonb_array_elements(coalesce(collection->'threads', '[]'::jsonb)) as thread
+                ), '[]'::jsonb),
+                'version', coalesce(collection->'version', '2'::jsonb)
+              ) as collection,
+              revision::text
+         from ${table}
+        where tenant_id = $1 and principal_id = $2 and storage_key = $3`,
+      [tenantId, principalId, storageKey],
+    );
+    const row = result.rows[0];
+    return row
+      ? { collection: row.collection, revision: parseRevision(row.revision) }
+      : undefined;
+  };
+
+  const loadThread = async (
+    tenantId: string,
+    principalId: string,
+    storageKey: string,
+    threadId: string,
+  ): Promise<StoredThread | undefined> => {
+    assertScope(tenantId, principalId, storageKey);
+    assertText(threadId, "threadId", 200);
+    const result = await pool.query<{ thread: unknown; revision: string }>(
+      `select
+          -- hydration=summary is an index-only transport marker. Once
+          -- this query joins the append-only event log, the returned thread
+          -- is complete and must not cause the browser to hydrate it again.
+          (thread - 'events' - 'hydration') || jsonb_build_object(
+            'events', coalesce((
+              select jsonb_agg(entry.event order by entry.event_index asc)
+                from ${eventTable} entry
+               where entry.tenant_id = $1
+                 and entry.principal_id = $2
+                 and entry.storage_key = $3
+                 and entry.thread_id = thread->>'id'
+            ), coalesce(thread->'events', '[]'::jsonb))
+          ) as thread,
+          collection_row.revision::text
+         from ${table} collection_row,
+              lateral jsonb_array_elements(coalesce(collection_row.collection->'threads', '[]'::jsonb)) as thread
+        where collection_row.tenant_id = $1 and collection_row.principal_id = $2 and collection_row.storage_key = $3
+          and thread->>'id' = $4
+        limit 1`,
+      [tenantId, principalId, storageKey, threadId],
+    );
+    const row = result.rows[0];
+    return row
+      ? { thread: row.thread, revision: parseRevision(row.revision) }
+      : undefined;
+  };
+
   return {
     load,
+    loadIndex,
+    loadThread,
+    async patch(tenantId, principalId, storageKey, expectedRevision, input) {
+      assertScope(tenantId, principalId, storageKey);
+      assertRevision(expectedRevision);
+      assertThreadPatch(input);
+
+      const connection = await pool.connect();
+      try {
+        await connection.query("begin");
+        const locked = await connection.query<{ collection: Record<string, unknown>; revision: string }>(
+          `select collection, revision::text
+             from ${table}
+            where tenant_id = $1 and principal_id = $2 and storage_key = $3
+            for update`,
+          [tenantId, principalId, storageKey],
+        );
+        const row = locked.rows[0];
+        if (expectedRevision !== (row ? parseRevision(row.revision) : 0)) {
+          await connection.query("rollback");
+          return {
+            currentRevision: row ? parseRevision(row.revision) : 0,
+            status: "conflict",
+          };
+        }
+
+        const current = isRecordValue(row?.collection)
+          ? row.collection
+          : { threads: [], version: 2 };
+        const currentThreads = Array.isArray(current.threads)
+          ? current.threads.filter(isRecordValue)
+          : [];
+        const currentById = new Map(
+          currentThreads.flatMap((thread) => typeof thread.id === "string" ? [[thread.id, thread] as const] : []),
+        );
+        const deleted = new Set(input.deletedThreadIds);
+        const replacements = new Map(input.upsertThreads.flatMap((thread) =>
+          typeof thread.id === "string" ? [[thread.id, thread] as const] : []));
+        const nextThreads: Record<string, unknown>[] = [];
+        for (const existing of currentThreads) {
+          const id = typeof existing.id === "string" ? existing.id : undefined;
+          if (!id || deleted.has(id)) continue;
+          const replacement = replacements.get(id);
+          const next = replacement
+            ? replacement.hydration === "summary"
+              ? mergeSummaryThread(existing, replacement)
+              : replacement
+            : existing;
+          nextThreads.push({ ...next, events: [] });
+        }
+        for (const [id, replacement] of replacements) {
+          if (!currentById.has(id) && !deleted.has(id)) nextThreads.push({ ...replacement, events: [] });
+        }
+        const requestedActiveThreadId = input.activeThreadId === undefined
+          ? typeof current.activeThreadId === "string" ? current.activeThreadId : undefined
+          : input.activeThreadId ?? undefined;
+        const nextCollection = normalizeJsonbValue({
+          ...(requestedActiveThreadId ? { activeThreadId: requestedActiveThreadId } : {}),
+          threads: nextThreads,
+          version: 2,
+        });
+        const serialized = JSON.stringify(nextCollection);
+        if (serialized === undefined) throw new Error("Thread patch must be JSON serializable.");
+
+        if (!row) {
+          await connection.query(
+            `insert into ${table}
+              (tenant_id, principal_id, storage_key, revision, collection)
+             values ($1, $2, $3, 1, $4::jsonb)`,
+            [tenantId, principalId, storageKey, serialized],
+          );
+        } else {
+          await connection.query(
+            `update ${table}
+                set collection = $4::jsonb,
+                    revision = revision + 1,
+                    updated_at = now()
+              where tenant_id = $1 and principal_id = $2 and storage_key = $3`,
+            [tenantId, principalId, storageKey, serialized],
+          );
+        }
+
+        for (const threadId of input.deletedThreadIds) {
+          await connection.query(
+            `delete from ${eventTable}
+              where tenant_id = $1 and principal_id = $2 and storage_key = $3 and thread_id = $4`,
+            [tenantId, principalId, storageKey, threadId],
+          );
+        }
+
+        // A full event array is only sent for a new or edited thread. Normal
+        // streaming checkpoints use eventAppends and never copy old history.
+        for (const thread of input.upsertThreads) {
+          if (typeof thread.id !== "string") continue;
+          const events = threadEvents(thread);
+          if (events.length === 0) continue;
+          await replaceThreadEvents(connection, eventTable, tenantId, principalId, storageKey, thread.id, events);
+        }
+        for (const append of input.eventAppends) {
+          await appendThreadEvents(connection, eventTable, tenantId, principalId, storageKey, append);
+        }
+
+        await connection.query("commit");
+        return {
+          record: { collection: nextCollection as TCollection, revision: expectedRevision + 1 },
+          status: "saved",
+        };
+      } catch (error) {
+        await connection.query("rollback").catch(() => undefined);
+        throw error;
+      } finally {
+        connection.release();
+      }
+    },
     async save(tenantId, principalId, storageKey, expectedRevision, collection) {
       assertScope(tenantId, principalId, storageKey);
       assertRevision(expectedRevision);
@@ -98,6 +330,29 @@ function postgresThreadCollectionStore<TCollection>(
 
       const saved = result.rows[0];
       if (saved) {
+        const persistedThreads = isRecordValue(normalized) && Array.isArray(normalized.threads)
+          ? normalized.threads.filter(isRecordValue)
+          : [];
+        // Full snapshots are reserved for edits/legacy callers. Keep the
+        // append-only log authoritative for any thread that carries an
+        // explicit transcript; summary-only metadata saves leave its history
+        // untouched.
+        if (typeof (pool as Pool & { connect?: unknown }).connect === "function") {
+          for (const thread of persistedThreads) {
+            const events = threadEvents(thread);
+            if (typeof thread.id === "string" && events.length > 0) {
+              await replaceThreadEvents(
+                pool,
+                eventTable,
+                tenantId,
+                principalId,
+                storageKey,
+                thread.id,
+                events,
+              );
+            }
+          }
+        }
         return {
           record: { collection: saved.collection, revision: parseRevision(saved.revision) },
           status: "saved",
@@ -155,4 +410,175 @@ function parseRevision(value: string): number {
     throw new Error("Stored thread collection revision exceeds the supported range.");
   }
   return revision;
+}
+
+function isRecordValue(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+type ThreadEventQueryExecutor = Pick<Pool, "query"> | Pick<PoolClient, "query">;
+
+function assertThreadPatch(input: ThreadCollectionPatchRecord): void {
+  if (!isRecordValue(input) || !Array.isArray(input.deletedThreadIds) ||
+      !Array.isArray(input.eventAppends) || !Array.isArray(input.upsertThreads)) {
+    throw new Error("Invalid thread collection patch.");
+  }
+  if (
+    input.activeThreadId !== undefined && input.activeThreadId !== null &&
+    (typeof input.activeThreadId !== "string" || !input.activeThreadId.trim() || input.activeThreadId.length > 200)
+  ) {
+    throw new Error("Invalid active thread id.");
+  }
+}
+
+function threadEvents(thread: Record<string, unknown>): readonly Record<string, unknown>[] {
+  return Array.isArray(thread.events) ? thread.events.filter(isRecordValue) : [];
+}
+
+/** Keep summary metadata authoritative, including explicit clearing of
+ * optional browser transaction state such as pendingTurn. */
+function mergeSummaryThread(
+  current: Record<string, unknown>,
+  replacement: Record<string, unknown>,
+): Record<string, unknown> {
+  const next: Record<string, unknown> = {
+    ...current,
+    closedInputRequestIds: replacement.closedInputRequestIds,
+    preferences: replacement.preferences,
+    queuedTurns: replacement.queuedTurns,
+    revision: replacement.revision,
+    session: replacement.session,
+    status: replacement.status,
+    title: replacement.title,
+    updatedAt: replacement.updatedAt,
+  };
+  for (const key of ["draftRestore", "interruptedTurns", "pendingTurn", "retainedContext"] as const) {
+    if (Object.prototype.hasOwnProperty.call(replacement, key)) next[key] = replacement[key];
+    else delete next[key];
+  }
+  const replacementCoverage = isRecordValue(replacement.transcriptCoverage)
+    ? replacement.transcriptCoverage
+    : undefined;
+  const currentCoverage = isRecordValue(current.transcriptCoverage)
+    ? current.transcriptCoverage
+    : undefined;
+  const replacingEditedTurn = isRecordValue(replacement.pendingTurn) &&
+    (replacement.pendingTurn.state === "clearing" || replacement.pendingTurn.state === "resubmitting");
+  if (replacementCoverage?.authoritative === true) {
+    next.transcriptCoverage = replacementCoverage;
+  } else if (Object.prototype.hasOwnProperty.call(replacement, "transcriptCoverage") && replacementCoverage) {
+    if (currentCoverage?.authoritative === true) {
+      next.transcriptCoverage = currentCoverage;
+    } else {
+      next.transcriptCoverage = replacementCoverage;
+    }
+  } else if (Object.prototype.hasOwnProperty.call(replacement, "transcriptCoverage") && !replacement.transcriptCoverage) {
+    if (replacingEditedTurn) delete next.transcriptCoverage;
+    else if (currentCoverage) next.transcriptCoverage = currentCoverage;
+    else delete next.transcriptCoverage;
+  } else if (replacingEditedTurn) {
+    delete next.transcriptCoverage;
+  } else if (currentCoverage) {
+    next.transcriptCoverage = currentCoverage;
+  } else {
+    delete next.transcriptCoverage;
+  }
+  return next;
+}
+
+async function replaceThreadEvents(
+  connection: ThreadEventQueryExecutor,
+  eventTable: string,
+  tenantId: string,
+  principalId: string,
+  storageKey: string,
+  threadId: string,
+  events: readonly Record<string, unknown>[],
+): Promise<void> {
+  await connection.query(
+    `delete from ${eventTable}
+      where tenant_id = $1 and principal_id = $2 and storage_key = $3 and thread_id = $4`,
+    [tenantId, principalId, storageKey, threadId],
+  );
+  await insertThreadEvents(connection, eventTable, tenantId, principalId, storageKey, threadId,
+    events.map((event, index) => ({ event, eventIndex: index })));
+}
+
+async function appendThreadEvents(
+  connection: ThreadEventQueryExecutor,
+  eventTable: string,
+  tenantId: string,
+  principalId: string,
+  storageKey: string,
+  append: ThreadCollectionPatchRecord["eventAppends"][number],
+): Promise<void> {
+  const replaceFrom = append.replaceFrom;
+  const countResult = await connection.query<{ next_index: string }>(
+    `select coalesce(max(event_index) + 1, 0)::text as next_index
+       from ${eventTable}
+      where tenant_id = $1 and principal_id = $2 and storage_key = $3 and thread_id = $4`,
+    [tenantId, principalId, storageKey, append.threadId],
+  );
+  const nextIndex = replaceFrom ?? parseRevision(countResult.rows[0]?.next_index ?? "0");
+  if (replaceFrom !== undefined) {
+    await connection.query(
+      `delete from ${eventTable}
+        where tenant_id = $1 and principal_id = $2 and storage_key = $3 and thread_id = $4 and event_index >= $5`,
+      [tenantId, principalId, storageKey, append.threadId, replaceFrom],
+    );
+  }
+  await insertThreadEvents(
+    connection,
+    eventTable,
+    tenantId,
+    principalId,
+    storageKey,
+    append.threadId,
+    append.events.flatMap((rawEvent, offset) =>
+      isRecordValue(rawEvent) ? [{ event: rawEvent, eventIndex: nextIndex + offset }] : []),
+  );
+}
+
+async function insertThreadEvents(
+  connection: ThreadEventQueryExecutor,
+  eventTable: string,
+  tenantId: string,
+  principalId: string,
+  storageKey: string,
+  threadId: string,
+  entries: readonly { readonly event: Record<string, unknown>; readonly eventIndex: number }[],
+): Promise<void> {
+  if (entries.length === 0) return;
+  const records = entries.map(({ event, eventIndex }) => {
+    const meta = isRecordValue(event.meta) ? event.meta : {};
+    const eventId = typeof meta.id === "string" && meta.id
+      ? meta.id
+      : `legacy:${threadId}:${eventIndex}`;
+    return {
+      event: normalizeJsonbValue(event),
+      eventId,
+      eventIndex,
+    };
+  });
+  await connection.query(
+    `insert into ${eventTable}
+      (tenant_id, principal_id, storage_key, thread_id, event_index, event_id, event)
+     select $1, $2, $3, $4, item.event_index, item.event_id, item.event
+       from jsonb_to_recordset($5::jsonb) as item(event_index bigint, event_id text, event jsonb)
+      where not exists (
+        select 1
+          from ${eventTable} existing
+         where existing.tenant_id = $1
+           and existing.principal_id = $2
+           and existing.storage_key = $3
+           and existing.thread_id = $4
+           and existing.event_id = item.event_id
+      )
+     on conflict do nothing`,
+    [tenantId, principalId, storageKey, threadId, JSON.stringify(records.map((record) => ({
+      event: record.event,
+      event_id: record.eventId,
+      event_index: record.eventIndex,
+    })))],
+  );
 }

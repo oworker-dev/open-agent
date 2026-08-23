@@ -23,6 +23,7 @@ export type AgentInterruptedTurn = {
     readonly eventCount: number;
     readonly streamIndex: number;
     readonly turnId: string;
+    readonly settled?: boolean;
 };
 export type AgentQueuedTurn = {
     readonly delivery?: "browser" | "server";
@@ -104,6 +105,21 @@ export type AgentSubagentController = (input: {
     readonly sessionId: string;
 }) => Promise<AgentSubagentSummary | undefined>;
 export type AgentSubagentLoader = (parentSessionId: string) => Promise<readonly AgentSubagentSummary[]>;
+export type AgentSessionBoundary = {
+    readonly lastEventAt?: string;
+    readonly tailIndex?: number;
+    readonly state: "running" | "waiting" | "terminal";
+    readonly terminalStatus?: "completed" | "failed";
+    readonly turnId?: string;
+};
+export type AgentSessionInspector = (sessionId: string) => Promise<AgentSessionBoundary>;
+export type AgentTranscriptCoverage = {
+    readonly authoritative?: boolean;
+    readonly complete: boolean;
+    readonly endIndex: number;
+    readonly startIndex: number;
+    readonly version: 1;
+};
 export type AgentRuntimeStatus = {
     readonly provider: "mock" | "ready" | "unconfigured";
 };
@@ -126,6 +142,7 @@ export type AgentThread = {
     readonly revision?: number;
     readonly session: AgentThreadSessionState;
     readonly status: AgentThreadStatus;
+    readonly transcriptCoverage?: AgentTranscriptCoverage;
     readonly title: string;
     readonly updatedAt: number;
 };

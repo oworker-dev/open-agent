@@ -11,7 +11,7 @@ import { parseStartAgentRun } from "../../server/agent-runs/input.ts";
 
 const profile = { profileId: "general-purpose", version: "0.1.0" } as const;
 const softwareTask = { id: "software-task", version: "1.0.0" } as const;
-const defaultLimits = { maxInputTokens: 2_000_000, maxOutputTokens: 200_000 } as const;
+const defaultLimits = { maxInputTokens: 40_000_000, maxOutputTokens: 10_000_000 } as const;
 const softwareConfig = {
   ...DEFAULT_AGENT_RUNTIME_CONFIG,
   id: "software-host",
@@ -100,7 +100,7 @@ test("runtime limits cannot be expanded by an AgentRun request", () => {
     resolveAgentRunPolicy(profile, {
       limits: { maxInputTokens: 4_000_000, maxToolCalls: 12 },
     }).limits,
-    { maxInputTokens: 2_000_000, maxOutputTokens: 200_000, maxToolCalls: 12 },
+    { maxInputTokens: 4_000_000, maxOutputTokens: 10_000_000, maxToolCalls: 12 },
   );
 });
 

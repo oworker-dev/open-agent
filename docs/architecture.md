@@ -97,6 +97,14 @@ Oversized observations preserve both head and tail with an omission marker.
 The full durable event remains stored separately and is never replaced by this
 model-facing checkpoint.
 
+The standalone runtime no longer uses the earlier 2M input / 200K output
+session budgets. Its default lifetime safety budgets are 40M input and 10M
+output provider-reported tokens, while the 272K model context window is kept
+usable by compaction. These budgets are independent of HTTP payload size and
+event-log size; a large or long-lived thread is handled through the compact
+append-only transcript rather than by sending the complete conversation on
+every checkpoint.
+
 The reference app stores thread data in `localStorage` through the default
 `AgentThreadStorage`. That is a UX cache, not production persistence. Hosts can
 inject an authenticated database adapter without forking the workspace. The
@@ -111,6 +119,35 @@ checkpoint because Eve can replay their absolute cursor after refresh. Every
 patch requires `If-Match`; a `409` reloads the current index, merges by thread
 revision/update time, and retries at most three times instead of overwriting a
 newer client indefinitely.
+
+The PostgreSQL Workflow World is read through bounded pages. Its stream reader
+never selects an entire `workflow_stream_chunks` history into Node memory; a
+settled transcript repair also stops at the inspected Eve tail and closes the
+response. A completed thread opens from the stored event log only after the
+server has written an `authoritative` transcript coverage marker. An older
+browser checkpoint is never allowed to claim completeness from its cursor alone;
+the repair endpoint reads Eve's finite transcript once, compacts it, verifies
+the tail did not move, and then marks the thread covered. Subsequent opens do
+not inspect or follow the settled Eve stream.
+
+### Transcript ordering invariant
+
+The UI transcript is a compact projection, not a second event source. Eve's
+cumulative `reasoning.appended`, `message.appended`, and
+`action.input.partial` events are replaced by their `(turn, step, call)` key at
+the position of the first event. They must never be moved to the array tail
+when a tool event is interleaved. `reasoning.completed` and
+`message.completed` are lifecycle boundaries and remain separate from their
+visual anchors; Eve is allowed to emit them after action results. The same
+keyed compactor is used by live checkpoints, recovery, settled repair, and
+hydration so a reconnect cannot create false consecutive thinking rows or
+reorder narration around tools.
+
+Storage conflicts are resolved against hydrated remote transcripts. An index
+summary with `events: []` is metadata only and can never replace a local or
+remote complete event log. Normal append races retain the remote order and
+merge only unseen event identities; only an explicit edit/resubmit may replace
+history. This prevents an older React snapshot from erasing persisted steps.
 
 ### Follow-up mailbox
 

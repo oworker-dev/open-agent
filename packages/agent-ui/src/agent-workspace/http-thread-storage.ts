@@ -4,6 +4,7 @@ import {
   type AgentThreadCollection,
   type AgentThreadStorage,
 } from "./thread-storage.js";
+import type { AgentThread } from "./contracts.js";
 
 export type HttpAgentThreadStorageOptions = {
   readonly endpoint?: string;
@@ -75,10 +76,63 @@ export function createHttpAgentThreadStorage(
         throw new Error("Agent thread storage returned an invalid revision.");
       }
       if (body.thread == null) return undefined;
-      return parseThreadCollection({
+      const parsedThread = parseThreadCollection({
         threads: [body.thread],
         version: AGENT_THREAD_STORAGE_VERSION,
       }).threads[0];
+      // `hydration: "summary"` belongs only to collection indexes. A host
+      // that accidentally echoes it from the single-thread endpoint must not
+      // make AgentWorkspace request the same transcript forever.
+      const hydrated = parsedThread ? withoutSummaryHydration(parsedThread) : undefined;
+      if (hydrated) {
+        const baseline = baselines.get(storageKey);
+        baselines.set(storageKey, {
+          ...(baseline?.activeThreadId ? { activeThreadId: baseline.activeThreadId } : {}),
+          threads: [
+            ...(baseline?.threads ?? []).filter((thread) => thread.id !== hydrated.id),
+            hydrated,
+          ],
+          version: AGENT_THREAD_STORAGE_VERSION,
+        });
+      }
+      return hydrated;
+    },
+    async repairThread(storageKey, threadId) {
+      preferredThreadId = threadId;
+      const response = await request(
+        fetchImplementation,
+        options,
+        collectionUrl(`${endpoint}/repair`, storageKey, { threadId }),
+        {
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        },
+      );
+      if (response.status === 404) return undefined;
+      await requireOk(response);
+      const body = await response.json() as { revision?: unknown; thread?: unknown };
+      if (!Number.isSafeInteger(body.revision) || (body.revision as number) < 0) {
+        throw new Error("Agent thread storage returned an invalid revision.");
+      }
+      if (body.thread == null) return undefined;
+      const parsedThread = parseThreadCollection({
+        threads: [body.thread],
+        version: AGENT_THREAD_STORAGE_VERSION,
+      }).threads[0];
+      const hydrated = parsedThread ? withoutSummaryHydration(parsedThread) : undefined;
+      if (hydrated) {
+        revisions.set(storageKey, body.revision as number);
+        const baseline = baselines.get(storageKey);
+        baselines.set(storageKey, {
+          ...(baseline?.activeThreadId ? { activeThreadId: baseline.activeThreadId } : {}),
+          threads: [
+            ...(baseline?.threads ?? []).filter((thread) => thread.id !== hydrated.id),
+            hydrated,
+          ],
+          version: AGENT_THREAD_STORAGE_VERSION,
+        });
+      }
+      return hydrated;
     },
     async save(storageKey, collection) {
       preferredThreadId = collection.activeThreadId;
@@ -114,26 +168,83 @@ export function createHttpAgentThreadStorage(
   };
 }
 
+function withoutSummaryHydration(thread: AgentThread): AgentThread {
+  const { hydration: _summaryMarker, ...hydrated } = thread;
+  return hydrated;
+}
+
 function createCollectionPatch(
   baseline: AgentThreadCollection,
   collection: AgentThreadCollection,
 ): {
   readonly activeThreadId: string | null;
   readonly deletedThreadIds: readonly string[];
+  readonly eventAppends: readonly {
+    readonly events: AgentThreadCollection["threads"][number]["events"];
+    readonly threadId: string;
+  }[];
   readonly upsertThreads: AgentThreadCollection["threads"];
   readonly version: number;
 } {
   const previousThreads = new Map(baseline.threads.map((thread) => [thread.id, thread]));
   const nextIds = new Set(collection.threads.map((thread) => thread.id));
+  const eventAppends: {
+    readonly events: AgentThreadCollection["threads"][number]["events"];
+    readonly replaceFrom?: number;
+    readonly threadId: string;
+  }[] = [];
+  const upsertThreads = collection.threads.flatMap((thread) => {
+    const previous = previousThreads.get(thread.id);
+    if (!previous) return [thread];
+    const delta = appendOnlyEventDelta(previous.events, thread.events);
+    if (delta) {
+      if (delta.events.length > 0) eventAppends.push({
+        events: delta.events,
+        ...(delta.replaceFrom === previous.events.length ? {} : { replaceFrom: delta.replaceFrom }),
+        threadId: thread.id,
+      });
+      return [{ ...thread, events: [], hydration: "summary" as const }];
+    }
+    if (sameEventIds(previous.events, thread.events)) {
+      return [{ ...thread, events: [], hydration: "summary" as const }];
+    }
+    // Edit/resend can truncate history. Keep the explicit replacement path;
+    // normal streaming never takes it, so long sessions use tiny event deltas.
+    return [thread];
+  });
   return {
     activeThreadId: collection.activeThreadId ?? null,
     deletedThreadIds: baseline.threads.flatMap((thread) => nextIds.has(thread.id) ? [] : [thread.id]),
-    upsertThreads: collection.threads.filter((thread) => {
+    eventAppends,
+    upsertThreads: upsertThreads.filter((thread) => {
       const previous = previousThreads.get(thread.id);
-      return !previous || previous !== thread;
+      return !previous || previous !== thread || eventAppends.some((append) => append.threadId === thread.id);
     }),
     version: collection.version,
   };
+}
+
+function appendOnlyEventDelta(
+  previous: AgentThreadCollection["threads"][number]["events"],
+  next: AgentThreadCollection["threads"][number]["events"],
+): { readonly events: AgentThreadCollection["threads"][number]["events"]; readonly replaceFrom: number } | undefined {
+  if (next.length < previous.length) return undefined;
+  let firstDifference = -1;
+  for (let index = 0; index < previous.length; index += 1) {
+    if (previous[index]?.meta.id !== next[index]?.meta.id) {
+      firstDifference = index;
+      break;
+    }
+  }
+  if (firstDifference < 0) firstDifference = previous.length;
+  return { events: next.slice(firstDifference), replaceFrom: firstDifference };
+}
+
+function sameEventIds(
+  left: AgentThread["events"],
+  right: AgentThread["events"],
+): boolean {
+  return left.length === right.length && left.every((event, index) => event.meta.id === right[index]?.meta.id);
 }
 
 async function request(

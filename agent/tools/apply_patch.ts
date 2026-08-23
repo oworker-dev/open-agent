@@ -31,7 +31,7 @@ type TextState = { readonly original: string | null; value: string | null };
  * stream. Every path is anchored to the current Eve workspace.
  */
 export default defineTool({
-  description: "Apply a Codex-style *** Begin Patch to files in /workspace. Supports Add File, Update File, Delete File, and Move to. Updates may contain multiple strict @@ hunks. Use this instead of inventing shell patch commands.",
+  description: "Apply a Codex-style *** Begin Patch to files in /workspace. Supports Add File, Update File, Delete File, and Move to. Updates may contain multiple @@ hunks matched by exact context. Use this instead of inventing shell patch commands.",
   inputSchema: z.object({ patch: z.string().min(1).max(512 * 1024) }).strict(),
   outputSchema: z.object({
     changes: z.array(z.object({
@@ -189,12 +189,11 @@ function parseHunks(lines: readonly string[], path: string): PatchHunk[] {
     if (currentLines.length === 0) throw new Error(`Update File ${path} contains an empty hunk.`);
     const oldCount = currentLines.filter((line) => line.startsWith(" ") || line.startsWith("-")).length;
     const newCount = currentLines.filter((line) => line.startsWith(" ") || line.startsWith("+")).length;
-    if (currentHeader.oldCount !== undefined && currentHeader.oldCount !== oldCount) {
-      throw new Error(`Update File ${path} hunk old-line count is ${oldCount}, expected ${currentHeader.oldCount}.`);
-    }
-    if (currentHeader.newCount !== undefined && currentHeader.newCount !== newCount) {
-      throw new Error(`Update File ${path} hunk new-line count is ${newCount}, expected ${currentHeader.newCount}.`);
-    }
+    // Models occasionally emit a unified-diff header copied from a wider
+    // context window while returning only the changed lines. The actual
+    // prefixed lines are authoritative: applyUpdateText locates them by exact
+    // context and still rejects stale or ambiguous patches. Header counts are
+    // therefore advisory rather than a second, conflicting source of truth.
     hunks.push({ ...currentHeader, lines: currentLines });
     currentLines = [];
   };
@@ -212,6 +211,10 @@ function parseHunks(lines: readonly string[], path: string): PatchHunk[] {
 }
 
 function parseHunkHeader(line: string, path: string): Omit<PatchHunk, "lines"> {
+  // Codex commonly emits a bare `@@` when the context itself is sufficient to
+  // locate the edit. Treat it as an unpositioned hunk instead of rejecting the
+  // otherwise valid patch with "invalid hunk header: @@".
+  if (line.trim() === "@@") return {};
   const match = /^@@(?: -(\d+)(?:,(\d+))?)?(?: \+(\d+)(?:,(\d+))?)? @@(?: .*)?$/u.exec(line);
   if (!match) throw new Error(`Update File ${path} contains an invalid hunk header: ${line}`);
   return {

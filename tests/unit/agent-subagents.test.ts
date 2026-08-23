@@ -276,6 +276,10 @@ test("parent cancellation closes active child projections instead of leaving the
     identity: owner,
     ownershipStore,
     parentSessionId: "parent",
+    runtime: {
+      async inspect() { return { status: "waiting" as const }; },
+      async cancel() { return "accepted" as const; },
+    },
     store,
   });
   assert.equal(result[0]?.status, "interrupted");

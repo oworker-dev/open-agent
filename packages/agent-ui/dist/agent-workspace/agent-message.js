@@ -15,7 +15,7 @@ import { Attachment, AttachmentAction, AttachmentContent, AttachmentDescription,
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "../ui/collapsible.js";
 import { Questionnaire, QuestionnaireChoice, QuestionnaireChoiceDescription, QuestionnaireChoices, QuestionnaireError, QuestionnaireItem, QuestionnaireSubmit, QuestionnaireTitle, } from "../ui/questionnaire.js";
 import { cn } from "../utils.js";
-import { failureForTurn, presentAgentTurn, presentAgentStep, presentSubagentCall, } from "./turn-presentation.js";
+import { failureForTurn, classifyAgentFailure, isCancellationPendingToolPart, isInterruptedToolPart, presentAgentTurn, presentAgentStep, presentSubagentCall, reasoningContentForStep, } from "./turn-presentation.js";
 function Message({ children, from, ...props }) {
     return _jsx("article", { className: cn("group flex w-full flex-col", from === "user" ? "items-end" : "items-start"), ...props, children: children });
 }
@@ -36,6 +36,25 @@ function safeStringify(value) {
         return String(value);
     }
 }
+function useThrottledValue(value, delayMs) {
+    const latestRef = useRef(value);
+    const timerRef = useRef(undefined);
+    const [snapshot, setSnapshot] = useState(value);
+    latestRef.current = value;
+    useEffect(() => {
+        if (Object.is(snapshot, value) || timerRef.current !== undefined)
+            return;
+        timerRef.current = window.setTimeout(() => {
+            timerRef.current = undefined;
+            setSnapshot(latestRef.current);
+        }, delayMs);
+    }, [delayMs, snapshot, value]);
+    useEffect(() => () => {
+        if (timerRef.current !== undefined)
+            window.clearTimeout(timerRef.current);
+    }, []);
+    return snapshot;
+}
 const EMPTY_CLOSED_INPUT_REQUEST_IDS = new Set();
 const DeliverableOpenContext = createContext(undefined);
 export function AgentMessage({ assetUrl, canRespond, closedInputRequestIds = EMPTY_CLOSED_INPUT_REQUEST_IDS, events, fallbackStartedAt, isStreaming, locale, message, onOpenDeliverable, onOpenSubagent, onInputResponses, onCloseInputRequest = () => undefined, showCopyAction = true, }) {
@@ -50,12 +69,13 @@ export function AgentMessage({ assetUrl, canRespond, closedInputRequestIds = EMP
     const task = presentAgentTurn(displayMessage, events, closedInputRequestIds);
     const responseText = task?.finalPart?.text ?? (task ? undefined : lastText(displayMessage.parts));
     const failure = failureForTurn(events, displayMessage.metadata?.turnId);
+    const hasFailureStepAnchor = task?.failureAnchored === true;
     const hasVisiblePart = displayMessage.parts.some((part) => part.type !== "step-start");
     const publishedDeliverables = task?.status === "completed"
         ? deliverablesForTurn(events, displayMessage.metadata?.turnId)
         : [];
     return (_jsx(DeliverableOpenContext.Provider, { value: onOpenDeliverable, children: _jsxs(Message, { "data-optimistic": message.metadata?.optimistic ? "true" : undefined, from: message.role, children: [_jsxs(MessageContent, { className: message.role === "assistant" ? "w-full" : undefined, children: [message.role === "assistant" && isStreaming && !hasVisiblePart ? (_jsx(ReasoningRoot, { className: "mb-1", role: "status", streaming: true, variant: "ghost", children: _jsx(ReasoningTrigger, { active: true, hideChevron: true, label: localize(locale, "Thinking", "正在思考") }) })) : null, task ? (_jsxs(_Fragment, { children: [_jsxs(ExecutionGroup, { collapseWhenSettled: task.status === "completed" && Boolean(task.finalPart?.text.trim() ||
-                                        hasLaterFinalDelivery(events, message.metadata?.turnId)), fallbackStartedAt: fallbackStartedAt, locale: locale, task: task, children: [_jsx(ProcessParts, { assetUrl: assetUrl, canRespond: canRespond, closedInputRequestIds: closedInputRequestIds, events: events, inActiveExecution: task.status === "running" || task.status === "waiting", locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, parts: task.processParts, turnId: message.metadata?.turnId }), task.proxiedInputParts.map((part) => (_jsxs("div", { className: "space-y-2", children: [_jsx("p", { className: "text-xs font-medium text-amber-700 dark:text-amber-300", children: localize(locale, "A delegated task needs your approval", "子代理任务需要你的批准") }), _jsx(AgentMessagePart, { assetUrl: assetUrl, canRespond: canRespond, closedInputRequestIds: closedInputRequestIds, events: events, inActiveExecution: true, locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, part: part, turnId: message.metadata?.turnId })] }, `proxied-input:${part.toolCallId}`)))] }), task.finalPart ? (_jsx("div", { className: "pt-3", children: _jsx(AgentMessagePart, { assetUrl: assetUrl, canRespond: canRespond, events: events, inActiveExecution: false, locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, part: task.finalPart, turnId: message.metadata?.turnId }) })) : null, publishedDeliverables.length > 0 ? (_jsx("div", { className: "space-y-2 pt-3", "data-turn-deliverables": true, children: publishedDeliverables.map((deliverable) => _jsx(PublishedDeliverableCard, { deliverable: deliverable, locale: locale }, `${deliverable.kind}:${deliverable.id}`)) })) : null] })) : displayMessage.parts.map((part, index) => (_jsx(AgentMessagePart, { assetUrl: assetUrl, canRespond: canRespond, events: events, inActiveExecution: false, locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, part: part, turnId: message.metadata?.turnId }, partKey(part, index)))), failure && !(task?.status === "failed" && events.some((event) => event.type === "step.failed" && event.data.turnId === message.metadata?.turnId)) ? _jsx(TurnFailure, { failure: failure, locale: locale }) : null] }), showCopyAction && message.role === "assistant" && responseText && !isStreaming ? (_jsx(CopyResponseAction, { locale: locale, text: responseText })) : null] }) }));
+                                        hasLaterFinalDelivery(events, message.metadata?.turnId)), fallbackStartedAt: fallbackStartedAt, locale: locale, task: task, children: [_jsx(ProcessParts, { assetUrl: assetUrl, canRespond: canRespond, closedInputRequestIds: closedInputRequestIds, events: events, inActiveExecution: task.status === "running" || task.status === "waiting", locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, parts: task.processParts, turnId: message.metadata?.turnId }), task.proxiedInputParts.map((part) => (_jsxs("div", { className: "space-y-2", children: [_jsx("p", { className: "text-xs font-medium text-amber-700 dark:text-amber-300", children: localize(locale, "A delegated task needs your approval", "子代理任务需要你的批准") }), _jsx(AgentMessagePart, { assetUrl: assetUrl, canRespond: canRespond, closedInputRequestIds: closedInputRequestIds, events: events, inActiveExecution: true, locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, part: part, turnId: message.metadata?.turnId })] }, `proxied-input:${part.toolCallId}`)))] }), task.finalPart ? (_jsx("div", { className: "pt-3", children: _jsx(AgentMessagePart, { assetUrl: assetUrl, canRespond: canRespond, events: events, inActiveExecution: false, locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, part: task.finalPart, turnId: message.metadata?.turnId }) })) : null, publishedDeliverables.length > 0 ? (_jsx("div", { className: "space-y-2 pt-3", "data-turn-deliverables": true, children: publishedDeliverables.map((deliverable) => _jsx(PublishedDeliverableCard, { deliverable: deliverable, locale: locale }, `${deliverable.kind}:${deliverable.id}`)) })) : null] })) : displayMessage.parts.map((part, index) => (_jsx(AgentMessagePart, { assetUrl: assetUrl, canRespond: canRespond, events: events, inActiveExecution: false, locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, part: part, turnId: message.metadata?.turnId }, partKey(part, index)))), failure && !hasFailureStepAnchor ? _jsx(TurnFailure, { failure: failure, locale: locale }) : null] }), showCopyAction && message.role === "assistant" && responseText && !isStreaming ? (_jsx(CopyResponseAction, { locale: locale, text: responseText })) : null] }) }));
 }
 function AgentMessagePart({ assetUrl, canRespond, closedInputRequestIds = EMPTY_CLOSED_INPUT_REQUEST_IDS, events, inActiveExecution, locale, onOpenSubagent, onInputResponses, onCloseInputRequest = () => undefined, part, turnId, }) {
     switch (part.type) {
@@ -79,17 +99,38 @@ function AgentMessagePart({ assetUrl, canRespond, closedInputRequestIds = EMPTY_
 }
 function ProcessParts({ assetUrl, canRespond, closedInputRequestIds = EMPTY_CLOSED_INPUT_REQUEST_IDS, events, inActiveExecution, locale, onInputResponses, onCloseInputRequest = () => undefined, onOpenSubagent, parts, turnId, }) {
     const rendered = [];
-    let visualStepIndex = -1;
+    let previousStepIndex = -1;
+    const lastReasoningPartByStep = new Map();
+    for (let partIndex = 0; partIndex < parts.length; partIndex += 1) {
+        const candidate = parts[partIndex];
+        if (candidate?.type === "reasoning" && typeof candidate.stepIndex === "number") {
+            lastReasoningPartByStep.set(candidate.stepIndex, partIndex);
+        }
+    }
     for (let index = 0; index < parts.length;) {
         const part = parts[index];
         if (part.type === "step-start") {
-            visualStepIndex += 1;
             const nextStep = parts.findIndex((candidate, candidateIndex) => candidateIndex > index && candidate.type === "step-start");
             const stepEnd = nextStep < 0 ? parts.length : nextStep;
-            const hasReasoning = parts.slice(index + 1, stepEnd).some((candidate) => candidate.type === "reasoning" && candidate.stepIndex === visualStepIndex);
+            const stepParts = parts.slice(index + 1, stepEnd);
+            const stepIndex = stepIndexForParts(stepParts, events, turnId, previousStepIndex);
+            if (stepIndex !== undefined)
+                previousStepIndex = stepIndex;
+            const hasReasoning = stepIndex !== undefined && (stepParts.some((candidate) => candidate.type === "reasoning" && candidate.stepIndex === stepIndex && candidate.text.trim().length > 0) || Boolean(reasoningContentForStep(events, turnId, stepIndex)));
             if (!hasReasoning) {
-                rendered.push(_jsx(StepActivity, { events: events, locale: locale, stepIndex: visualStepIndex, turnId: turnId }, `step-activity:${turnId}:${visualStepIndex}`));
+                const hasStepEvidence = stepIndex !== undefined && events.some((event) => eventStepMatches(event, turnId, stepIndex));
+                if (!hasStepEvidence) {
+                    index += 1;
+                    continue;
+                }
+                rendered.push(_jsx(StepActivity, { events: events, locale: locale, stepIndex: stepIndex ?? previousStepIndex, turnId: turnId }, `step-activity:${turnId}:${stepIndex ?? index}`));
             }
+            index += 1;
+            continue;
+        }
+        if (part.type === "reasoning" &&
+            typeof part.stepIndex === "number" &&
+            lastReasoningPartByStep.get(part.stepIndex) !== index) {
             index += 1;
             continue;
         }
@@ -122,6 +163,31 @@ function ProcessParts({ assetUrl, canRespond, closedInputRequestIds = EMPTY_CLOS
     }
     return _jsx(_Fragment, { children: rendered });
 }
+function stepIndexForParts(parts, events, turnId, previousStepIndex) {
+    const explicit = parts.find((part) => "stepIndex" in part && typeof part.stepIndex === "number");
+    if (explicit && "stepIndex" in explicit && typeof explicit.stepIndex === "number") {
+        return explicit.stepIndex;
+    }
+    if (!turnId)
+        return undefined;
+    return events
+        .map(eventStep)
+        .filter((step) => step !== undefined && step > previousStepIndex)
+        .find((step) => events.some((event) => eventStepMatches(event, turnId, step)));
+}
+function eventStep(event) {
+    if (!("data" in event) || !event.data || typeof event.data !== "object")
+        return undefined;
+    return "stepIndex" in event.data && typeof event.data.stepIndex === "number"
+        ? event.data.stepIndex
+        : undefined;
+}
+function eventStepMatches(event, turnId, stepIndex) {
+    if (!turnId || !("data" in event) || !event.data || typeof event.data !== "object")
+        return false;
+    const data = event.data;
+    return data.turnId === turnId && data.stepIndex === stepIndex;
+}
 function ProcessToolGroup({ active, assetUrl, canRespond, closedInputRequestIds, events, inActiveExecution, locale, needsInput, onCloseInputRequest, onInputResponses, onOpenSubagent, toolParts, turnId, }) {
     const [open, setOpen] = useState(active || inActiveExecution || needsInput);
     useEffect(() => {
@@ -140,27 +206,25 @@ function ToolPart({ assetUrl, canRespond, closedInputRequestIds = EMPTY_CLOSED_I
     const running = !isToolTerminal(part);
     const defaultOpen = isTodoTool(part) || part.state === "approval-requested";
     const Icon = toolIcon(part);
+    const interrupted = isInterruptedToolPart(part);
+    const cancellationPending = isCancellationPendingToolPart(part);
     const statusLabel = isFileMutationTool(part) ? undefined : toolStatusLabel(locale, part);
-    return (_jsxs(ToolFallbackRoot, { className: "my-0", defaultOpen: defaultOpen, children: [_jsxs(CollapsibleTrigger, { className: "group/trigger flex w-fit max-w-full origin-left items-center gap-2 py-1.5 text-left text-sm text-muted-foreground transition-[color,scale] hover:text-foreground active:scale-[0.98]", children: [running ? (_jsx(LoaderCircleIcon, { className: "size-4 shrink-0 animate-spin [animation-duration:0.65s]" })) : part.state === "output-error" || part.state === "output-denied" ? (_jsx(XCircleIcon, { className: "size-4 shrink-0 text-destructive" })) : (_jsx(Icon, { className: "size-4 shrink-0" })), _jsx("span", { className: "truncate", children: toolTitle(locale, part, events) }), statusLabel ? (_jsx("span", { className: cn("shrink-0 text-xs", part.state === "output-error" && "text-destructive"), children: statusLabel })) : null, _jsx(ChevronDownIcon, { className: "size-3.5 shrink-0 -rotate-90 transition-transform group-data-[state=open]/trigger:rotate-0" })] }), _jsxs(ToolFallbackContent, { children: [_jsx(KnownToolContent, { assetUrl: assetUrl, events: events, locale: locale, onOpenSubagent: onOpenSubagent, part: part }), part.errorText ? _jsx("p", { className: "whitespace-pre-wrap text-xs text-destructive", children: part.errorText }) : null] })] }));
+    return (_jsxs(ToolFallbackRoot, { className: "my-0", defaultOpen: defaultOpen, children: [_jsxs(CollapsibleTrigger, { className: "group/trigger flex w-fit max-w-full origin-left items-center gap-2 py-1.5 text-left text-sm text-muted-foreground transition-[color,scale] hover:text-foreground active:scale-[0.98]", children: [running ? (_jsx(LoaderCircleIcon, { className: "size-4 shrink-0 animate-spin [animation-duration:0.65s]" })) : interrupted ? (_jsx(CircleStopIcon, { className: "size-4 shrink-0 text-muted-foreground" })) : cancellationPending ? (_jsx(LoaderCircleIcon, { className: "size-4 shrink-0 animate-spin text-muted-foreground [animation-duration:0.9s]" })) : part.state === "output-error" || part.state === "output-denied" ? (_jsx(XCircleIcon, { className: "size-4 shrink-0 text-destructive" })) : (_jsx(Icon, { className: "size-4 shrink-0" })), isFileMutationTool(part) ? (_jsx(FileMutationToolTitle, { events: events, locale: locale, part: part })) : (_jsx("span", { className: "truncate", children: toolTitle(locale, part, events) })), statusLabel ? (_jsx("span", { className: cn("shrink-0 text-xs", part.state === "output-error" && "text-destructive"), children: statusLabel })) : null, _jsx(ChevronDownIcon, { className: "size-3.5 shrink-0 -rotate-90 transition-transform group-data-[state=open]/trigger:rotate-0" })] }), _jsxs(ToolFallbackContent, { children: [_jsx(KnownToolContent, { assetUrl: assetUrl, events: events, locale: locale, onOpenSubagent: onOpenSubagent, part: part }), part.errorText ? (_jsx("p", { className: cn("whitespace-pre-wrap text-xs", interrupted ? "text-muted-foreground" : "text-destructive"), children: interrupted
+                            ? localize(locale, "Tool call stopped before completion.", "工具调用在完成前已中断。")
+                            : cancellationPending
+                                ? localize(locale, "Stopping tool call…", "正在停止工具调用…")
+                                : part.errorText })) : null] })] }));
 }
 function KnownToolContent({ assetUrl, events, locale, onOpenSubagent, part, }) {
     const normalized = normalizeToolName(part.toolName);
     const input = asRecord(part.input);
     const output = "output" in part ? part.output : undefined;
-    const patch = toolPatch(part);
-    const fileChange = toolFileChange(part, events);
     const openDeliverable = useContext(DeliverableOpenContext);
     if (part.toolMetadata?.eve?.kind === "subagent-call") {
         return _jsx(SubagentProgress, { events: events, locale: locale, onOpenSubagent: onOpenSubagent, part: part });
     }
     if (["apply_patch", "patch_file", "write_file", "edit_file"].includes(normalized)) {
-        if (patch) {
-            return _jsx("div", { "data-tool-view": "diff", children: _jsx(DiffViewer, { contentClassName: "max-h-72 overflow-auto", patch: patch, showIcon: true, size: "sm", variant: "muted" }) });
-        }
-        if (fileChange) {
-            return (_jsx("div", { "data-tool-view": "diff", children: _jsx(DiffViewer, { contentClassName: "max-h-72 overflow-auto", newFile: { content: fileChange.newContent, name: fileChange.path }, oldFile: { content: fileChange.oldContent, name: fileChange.path }, showIcon: true, size: "sm", variant: "muted" }) }));
-        }
-        return _jsx("p", { className: "text-xs text-muted-foreground", children: localize(locale, "Receiving file changes...", "正在接收文件变更…") });
+        return _jsx(FileMutationToolContent, { events: events, locale: locale, part: part });
     }
     if (["bash", "shell", "terminal", "exec_command"].includes(normalized)) {
         const command = firstString(input, ["command", "cmd"]);
@@ -227,6 +291,30 @@ function KnownToolContent({ assetUrl, events, locale, onOpenSubagent, part, }) {
         return skill ? _jsx("p", { className: "text-xs text-muted-foreground", children: skill }) : null;
     }
     return (_jsxs("div", { className: "space-y-2 text-xs", "data-tool-view": "fallback", children: [part.input !== undefined ? (_jsxs("div", { children: [_jsx("p", { className: "mb-1 text-muted-foreground", children: localize(locale, "Parameters", "参数") }), _jsx("pre", { className: "max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-md bg-muted/50 p-2.5", children: safeStringify(part.input) })] })) : null, output !== undefined ? (_jsxs("div", { children: [_jsx("p", { className: "mb-1 text-muted-foreground", children: localize(locale, "Result", "结果") }), _jsx("pre", { className: "max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-md bg-muted/50 p-2.5", children: safeStringify(output) })] })) : null] }));
+}
+function FileMutationToolContent({ events, locale, part, }) {
+    const previewPart = usePreviewFileMutationPart(part);
+    const patch = toolPatch(previewPart);
+    const fileChange = toolFileChange(previewPart, events);
+    if (patch) {
+        return _jsx("div", { "data-tool-view": "diff", children: _jsx(DiffViewer, { contentClassName: "max-h-72 overflow-auto", patch: patch, showIcon: true, size: "sm", variant: "muted" }) });
+    }
+    if (fileChange) {
+        return (_jsx("div", { "data-tool-view": "diff", children: _jsx(DiffViewer, { contentClassName: "max-h-72 overflow-auto", newFile: { content: fileChange.newContent, name: fileChange.path }, oldFile: { content: fileChange.oldContent, name: fileChange.path }, showIcon: true, size: "sm", variant: "muted" }) }));
+    }
+    return _jsx("p", { className: "text-xs text-muted-foreground", children: localize(locale, "Receiving file changes...", "正在接收文件变更…") });
+}
+function FileMutationToolTitle({ events, locale, part, }) {
+    const previewPart = usePreviewFileMutationPart(part);
+    const summary = fileMutationSummary(previewPart, events);
+    return (_jsxs("span", { className: "flex min-w-0 items-center gap-1.5 truncate", children: [_jsxs("span", { className: "truncate", children: [fileMutationActionLabel(locale, previewPart, summary), summary.path ? ` ${summary.path}` : ""] }), summary.additions > 0 ? _jsxs(_Fragment, { children: [_jsx("span", { "aria-hidden": "true", children: " " }), _jsxs("span", { className: "shrink-0 text-green-600 dark:text-green-400", children: ["+", summary.additions] })] }) : null, summary.deletions > 0 ? _jsxs("span", { className: "shrink-0 text-red-600 dark:text-red-400", children: ["-", summary.deletions] }) : null] }));
+}
+function usePreviewFileMutationPart(part) {
+    const liveInput = useThrottledValue(part.input, 75);
+    const liveInputText = useThrottledValue(part.inputText, 75);
+    return isToolTerminal(part)
+        ? part
+        : { ...part, input: liveInput, inputText: liveInputText };
 }
 const VIEW_IMAGE_MEDIA_TYPES = new Set([
     "image/gif",
@@ -331,18 +419,42 @@ function fileMutationSummary(part, events = []) {
     return { additions, deletions, operation, ...(path ? { path } : {}) };
 }
 function fileMutationTitle(locale, part, events = []) {
+    if (isCancellationPendingToolPart(part)) {
+        const summary = fileMutationSummary(part, events);
+        const stats = [
+            summary.additions > 0 ? `+${summary.additions}` : undefined,
+            summary.deletions > 0 ? `-${summary.deletions}` : undefined,
+        ].filter(Boolean).join(" ");
+        return [localize(locale, "Stopping", "正在停止"), summary.path, stats].filter(Boolean).join(" ");
+    }
+    if (isInterruptedToolPart(part)) {
+        const summary = fileMutationSummary(part, events);
+        const stats = [
+            summary.additions > 0 ? `+${summary.additions}` : undefined,
+            summary.deletions > 0 ? `-${summary.deletions}` : undefined,
+        ].filter(Boolean).join(" ");
+        return [localize(locale, "Stopped", "已中断"), summary.path, stats].filter(Boolean).join(" ");
+    }
     const running = !isToolTerminal(part);
     const summary = fileMutationSummary(part, events);
-    const action = summary.operation === "create"
-        ? running ? localize(locale, "Creating", "正在创建") : localize(locale, "Created", "已创建")
-        : summary.operation === "delete"
-            ? running ? localize(locale, "Deleting", "正在删除") : localize(locale, "Deleted", "已删除")
-            : running ? localize(locale, "Editing", "正在编辑") : localize(locale, "Edited", "已编辑");
+    const action = fileMutationActionLabel(locale, part, summary);
     const stats = [
         summary.additions > 0 ? `+${summary.additions}` : undefined,
         summary.deletions > 0 ? `-${summary.deletions}` : undefined,
     ].filter(Boolean).join(" ");
     return [action, summary.path, stats].filter(Boolean).join(" ");
+}
+function fileMutationActionLabel(locale, part, summary) {
+    if (isCancellationPendingToolPart(part))
+        return localize(locale, "Stopping", "正在停止");
+    if (isInterruptedToolPart(part))
+        return localize(locale, "Stopped", "已中断");
+    const running = !isToolTerminal(part);
+    return summary.operation === "create"
+        ? running ? localize(locale, "Creating", "正在创建") : localize(locale, "Created", "已创建")
+        : summary.operation === "delete"
+            ? running ? localize(locale, "Deleting", "正在删除") : localize(locale, "Deleted", "已删除")
+            : running ? localize(locale, "Editing", "正在编辑") : localize(locale, "Edited", "已编辑");
 }
 function patchFilePath(patch) {
     const match = patch.match(/^\+\+\+\s+(?:b\/)?(.+)$/m) ?? patch.match(/^---\s+(?:a\/)?(.+)$/m);
@@ -367,24 +479,34 @@ function countContentLines(value) {
 }
 function StepActivity({ events, locale, stepIndex, turnId, }) {
     const step = presentAgentStep(events, turnId, stepIndex);
+    const hasReasoningContent = Boolean(reasoningContentForStep(events, turnId, stepIndex));
+    if (!hasReasoningContent && step.status !== "running") {
+        return (_jsxs(_Fragment, { children: [step.retry ? _jsx(RetryStatus, { locale: locale, retry: step.retry }) : null, step.status === "failed" && step.failure ? _jsx(StepFailure, { failure: step.failure, locale: locale }) : null] }));
+    }
     return (_jsxs(_Fragment, { children: [step.retry ? (_jsx(RetryStatus, { locale: locale, retry: step.retry })) : null, step.status === "failed" && step.failure ? _jsx(StepFailure, { failure: step.failure, locale: locale }) : null, _jsx(ReasoningRoot, { className: "mb-1", role: "status", streaming: step.status === "running", variant: "ghost", children: _jsx(ReasoningTrigger, { active: step.status === "running", hideChevron: true, label: step.status === "running"
                         ? localize(locale, "Thinking", "正在思考")
                         : localize(locale, "Reasoning complete", "思考完成") }) })] }));
 }
 function StepFailure({ failure, locale, }) {
-    return (_jsxs("div", { className: "mb-1 flex items-start gap-2 text-sm text-destructive", role: "alert", children: [_jsx(XCircleIcon, { className: "mt-0.5 size-4 shrink-0" }), _jsxs("span", { className: "min-w-0 break-words", children: [localize(locale, "Execution failed", "执行失败"), ": ", sanitizeFailureMessage(failure.message)] })] }));
+    return (_jsxs("div", { className: "mb-1 flex items-start gap-2 text-sm text-destructive", role: "alert", children: [_jsx(XCircleIcon, { className: "mt-0.5 size-4 shrink-0" }), _jsxs("span", { className: "min-w-0 break-words", children: [failureTitle(locale, failure), ": ", sanitizeFailureMessage(failure.message)] })] }));
 }
 function RetryStatus({ locale, retry, }) {
-    return (_jsxs(Collapsible, { className: "mb-1 text-sm text-muted-foreground", children: [_jsxs(CollapsibleTrigger, { className: "group/retry flex max-w-full items-center gap-2 py-1.5 text-left hover:text-foreground", children: [_jsx(WifiIcon, { className: "size-4 shrink-0" }), _jsxs("span", { children: [localize(locale, "Reconnecting", "正在重新连接"), " ", retry.attempt, "/", retry.maximum] }), retry.error ? _jsx(ChevronDownIcon, { className: "size-3.5 -rotate-90 transition-transform group-data-[state=open]/retry:rotate-0" }) : null] }), retry.error ? (_jsx(CollapsibleContent, { className: "overflow-hidden", children: _jsxs("div", { className: "ml-6 rounded-lg border border-border/60 px-3 py-2 text-xs", children: [_jsx("p", { className: "break-words text-foreground", children: sanitizeFailureMessage(retry.error.message) }), _jsx("code", { className: "mt-1 block text-muted-foreground", children: retry.error.code })] }) })) : null] }));
+    return (_jsxs(Collapsible, { className: "mb-1 text-sm text-muted-foreground", children: [_jsxs(CollapsibleTrigger, { className: "group/retry flex max-w-full items-center gap-2 py-1.5 text-left hover:text-foreground", children: [_jsx(WifiIcon, { className: "size-4 shrink-0" }), _jsxs("span", { children: [retryTitle(locale, retry.error), " ", retry.attempt, "/", retry.maximum] }), retry.error ? _jsx(ChevronDownIcon, { className: "size-3.5 -rotate-90 transition-transform group-data-[state=open]/retry:rotate-0" }) : null] }), retry.error ? (_jsx(CollapsibleContent, { className: "overflow-hidden", children: _jsxs("div", { className: "ml-6 rounded-lg border border-border/60 px-3 py-2 text-xs", children: [_jsx("p", { className: "break-words text-foreground", children: sanitizeFailureMessage(retry.error.message) }), _jsx("code", { className: "mt-1 block text-muted-foreground", children: retry.error.code })] }) })) : null] }));
 }
 function ReasoningPart({ events, locale, part, turnId, }) {
     const timing = reasoningTiming(events, turnId, part.stepIndex);
     const step = presentAgentStep(events, turnId, part.stepIndex ?? 0);
     const durationSeconds = useElapsedSeconds(timing.startedAt, timing.endedAt);
     const streaming = part.state === "streaming";
-    return (_jsxs(_Fragment, { children: [step.retry ? _jsx(RetryStatus, { locale: locale, retry: step.retry }) : null, step.status === "failed" && step.failure ? _jsx(StepFailure, { failure: step.failure, locale: locale }) : null, _jsxs(ReasoningRoot, { className: "mb-1", streaming: streaming, variant: "ghost", children: [_jsx(ReasoningTrigger, { active: streaming, duration: timing.startedAt && durationSeconds > 0 ? durationSeconds : undefined, label: streaming
-                            ? reasoningSummary(part.text) ?? localize(locale, "Thinking", "正在思考")
-                            : localize(locale, "Reasoning complete", "思考完成") }), _jsx(ReasoningContent, { "aria-busy": streaming, children: _jsx(ReasoningText, { children: _jsx(StaticMarkdownText, { text: part.text }) }) })] })] }));
+    const text = part.text.trim() || reasoningContentForStep(events, turnId, part.stepIndex);
+    if (!text && !streaming)
+        return null;
+    return (_jsxs(_Fragment, { children: [step.retry ? _jsx(RetryStatus, { locale: locale, retry: step.retry }) : null, step.status === "failed" && step.failure ? _jsx(StepFailure, { failure: step.failure, locale: locale }) : null, _jsxs(ReasoningRoot, { className: "mb-1", streaming: streaming, variant: "ghost", children: [_jsx(ReasoningTrigger, { active: streaming, duration: timing.startedAt && durationSeconds > 0 ? durationSeconds : undefined, hideChevron: !text, label: reasoningTriggerLabel(locale, streaming, text) }), _jsx(ReasoningContent, { "aria-busy": streaming, children: _jsx(ReasoningText, { children: _jsx(StaticMarkdownText, { text: text }) }) })] })] }));
+}
+function reasoningTriggerLabel(locale, streaming, text) {
+    if (streaming)
+        return reasoningSummary(text) ?? localize(locale, "Thinking", "正在思考");
+    return localize(locale, "Reasoning complete", "思考完成");
 }
 function reasoningSummary(text) {
     const firstLine = text
@@ -397,14 +519,31 @@ function reasoningSummary(text) {
     return firstLine.length > 64 ? `${firstLine.slice(0, 63)}…` : firstLine;
 }
 function reasoningTiming(events, turnId, stepIndex) {
-    const matching = events.filter((event) => (event.type === "reasoning.appended" || event.type === "reasoning.completed") &&
+    const matching = events
+        .map((event, index) => ({ event, index }))
+        .filter(({ event }) => (event.type === "reasoning.appended" || event.type === "reasoning.completed") &&
         (turnId === undefined || event.data.turnId === turnId) &&
         (stepIndex === undefined || ("stepIndex" in event.data && event.data.stepIndex === stepIndex)));
-    const startedAt = eventTime(matching.find((event) => event.type === "reasoning.appended") ?? matching[0]);
-    const completed = [...matching].reverse().find((event) => event.type === "reasoning.completed");
+    const latestReasoning = matching.at(-1);
+    if (!latestReasoning)
+        return {};
+    const attemptStartIndex = events.findLastIndex((event, index) => index <= latestReasoning.index &&
+        event.type === "step.started" &&
+        (turnId === undefined || event.data.turnId === turnId) &&
+        (stepIndex === undefined || event.data.stepIndex === stepIndex));
+    const attemptReasoning = matching.filter(({ index }) => index >= attemptStartIndex);
+    const firstAppend = attemptReasoning.find(({ event }) => event.type === "reasoning.appended");
+    const completed = [...attemptReasoning].reverse().find(({ event }) => event.type === "reasoning.completed");
+    const startedAt = eventTime(firstAppend?.event) ?? eventTime(attemptStartIndex >= 0 ? events[attemptStartIndex] : latestReasoning.event);
+    const startedIndex = firstAppend?.index ?? attemptStartIndex;
+    const boundary = startedIndex >= 0
+        ? events.slice(startedIndex + 1).find((event) => (event.type === "reasoning.completed" || event.type === "actions.requested" || event.type === "message.completed") &&
+            (turnId === undefined || event.data.turnId === turnId) &&
+            (stepIndex === undefined || ("stepIndex" in event.data && event.data.stepIndex === stepIndex)))
+        : undefined;
     return {
         ...(startedAt ? { startedAt } : {}),
-        ...(completed ? { endedAt: eventTime(completed) } : {}),
+        ...(completed ? { endedAt: eventTime(completed.event) } : boundary ? { endedAt: eventTime(boundary) } : {}),
     };
 }
 function eventTime(event) {
@@ -860,7 +999,7 @@ function executionLabel(locale, task) {
             : localize(locale, "Waiting for confirmation", "等待确认");
     }
     if (task.status === "completed")
-        return localize(locale, "Worked for", "已处理");
+        return localize(locale, "Worked for", "已处理完成");
     if (task.status === "cancelled")
         return localize(locale, "Stopped after", "已停止");
     return localize(locale, "Failed after", "执行失败");
@@ -1038,7 +1177,25 @@ function QuestionnaireResponseForm({ acceptsFreeform, canRespond, locale, onInpu
         }, children: [_jsxs(QuestionnaireItem, { name: "response", required: true, children: [_jsx(QuestionnaireTitle, { className: "sr-only", children: prompt }), _jsxs(QuestionnaireChoices, { children: [options.map((option) => (_jsxs(QuestionnaireChoice, { checked: selectedOptionId === option.id, className: option.style === "danger" ? "border-destructive/40 data-checked:bg-destructive/10" : option.style === "primary" ? "data-checked:border-primary/50" : undefined, disabled: !canRespond, onChange: (event) => setSelectedOptionId(event.currentTarget.checked ? option.id : ""), value: option.id, children: [_jsx("span", { className: cn("min-w-0 break-words font-medium", option.style === "danger" && "text-destructive"), children: option.label }), option.description ? _jsx(QuestionnaireChoiceDescription, { children: option.description }) : null] }, option.id))), acceptsFreeform ? (_jsxs(_Fragment, { children: [_jsx(QuestionnaireChoice, { checked: !selectedOptionId && hasFreeformAnswer, className: "hidden", value: FREEFORM_OPTION_ID, children: localize(locale, "Freeform answer", "补充回答") }), _jsx("textarea", { "aria-label": options.length > 0 ? localize(locale, "Additional information", "补充信息") : localize(locale, "Answer", "回答"), className: "min-h-20 w-full resize-y rounded-lg border border-border/70 bg-transparent px-3 py-2 text-sm leading-5 outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-50", disabled: !canRespond, onChange: (event) => setFreeformText(event.currentTarget.value), placeholder: options.length > 0 ? localize(locale, "Add context (optional)", "补充信息（可选）") : localize(locale, "Type your answer", "输入你的回答"), value: freeformText })] })) : null] }), _jsx(QuestionnaireError, { children: localize(locale, "Choose an option or add information to continue.", "请选择一个选项或补充信息后继续。") })] }), _jsx("div", { className: "flex justify-end pt-1", children: _jsx(QuestionnaireSubmit, { disabled: !canRespond, children: localize(locale, "Confirm", "确认") }) })] }));
 }
 function TurnFailure({ failure, locale }) {
-    return (_jsxs("div", { className: "mt-2 flex items-start gap-3 rounded-xl border border-border/70 px-3.5 py-3 text-sm", role: "alert", children: [_jsx(XCircleIcon, { className: "mt-0.5 size-4 shrink-0 text-destructive" }), _jsxs("div", { className: "min-w-0 flex-1", children: [_jsx("p", { className: "font-medium text-foreground", children: localize(locale, "This turn failed", "本轮执行失败") }), _jsx("p", { className: "mt-1 break-words text-muted-foreground", children: sanitizeFailureMessage(failure.message) }), _jsx("code", { className: "mt-1.5 block text-xs text-muted-foreground", children: failure.code })] })] }));
+    return (_jsxs("div", { className: "mt-2 flex items-start gap-2 px-1 py-1.5 text-sm", role: "alert", children: [_jsx(XCircleIcon, { className: "mt-0.5 size-4 shrink-0 text-destructive" }), _jsxs("div", { className: "min-w-0 flex-1", children: [_jsx("p", { className: "font-medium text-destructive", children: failureTitle(locale, failure) }), _jsx("p", { className: "mt-1 break-words text-muted-foreground", children: sanitizeFailureMessage(failure.message) }), _jsx("code", { className: "mt-1.5 block text-xs text-muted-foreground", children: failure.code })] })] }));
+}
+function failureTitle(locale, failure) {
+    switch (classifyAgentFailure(failure)) {
+        case "network": return localize(locale, "Network error", "网络错误");
+        case "timeout": return localize(locale, "Request timed out", "请求超时");
+        case "provider": return localize(locale, "Provider request failed", "上游模型请求失败");
+        default: return localize(locale, "This turn failed", "本轮执行失败");
+    }
+}
+function retryTitle(locale, failure) {
+    if (!failure)
+        return localize(locale, "Retrying", "正在重试");
+    switch (classifyAgentFailure(failure)) {
+        case "network": return localize(locale, "Retrying connection", "正在重试连接");
+        case "timeout": return localize(locale, "Retrying after timeout", "超时后正在重试");
+        case "provider": return localize(locale, "Retrying provider request", "正在重试上游请求");
+        default: return localize(locale, "Retrying", "正在重试");
+    }
 }
 function sanitizeFailureMessage(message) {
     return message
@@ -1049,6 +1206,10 @@ function localize(locale, english, chinese) {
     return locale === "zh-CN" ? chinese : english;
 }
 function toolStatusLabel(locale, part) {
+    if (isCancellationPendingToolPart(part))
+        return localize(locale, "Stopping", "正在停止");
+    if (isInterruptedToolPart(part))
+        return localize(locale, "Stopped", "已中断");
     if (part.state === "output-available" && part.partial === true) {
         return localize(locale, "Running", "运行中");
     }

@@ -1,7 +1,7 @@
 "use client";
 import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-runtime";
 import { ChevronLeftIcon, ChevronRightIcon, DownloadIcon, FileIcon, ImageIcon, MonitorIcon, PanelRightCloseIcon, RefreshCwIcon, UsersRoundIcon, XIcon, } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { StaticMarkdownText } from "../assistant-ui/markdown-text.js";
 import { WebPreview } from "../assistant-ui/web-preview.js";
 import { Attachment, AttachmentAction, AttachmentContent, AttachmentDescription, AttachmentMedia, AttachmentTitle, } from "../ui/attachment.js";
@@ -14,6 +14,7 @@ export function AgentSecondaryView({ assetUrl, assets = [], assetsError, assetsL
     const [overviewRoute, setOverviewRoute] = useState(normalizeOverviewRoute(tab));
     const [openTabs, setOpenTabs] = useState([]);
     const [activeTabId, setActiveTabId] = useState("home");
+    const consumedDeliverableRequestId = useRef(undefined);
     const activeTab = openTabs.find((candidate) => candidate.id === activeTabId);
     const selectOverviewRoute = useCallback((route) => {
         const normalized = normalizeOverviewRoute(route);
@@ -52,8 +53,12 @@ export function AgentSecondaryView({ assetUrl, assets = [], assetsError, assetsL
         }
     }, [assets, onOpenAsset, onOpenDeliverable]);
     useEffect(() => {
-        if (requestedDeliverable)
-            openDeliverable(requestedDeliverable);
+        if (!requestedDeliverable || requestedDeliverableRequestId === undefined)
+            return;
+        if (consumedDeliverableRequestId.current === requestedDeliverableRequestId)
+            return;
+        consumedDeliverableRequestId.current = requestedDeliverableRequestId;
+        openDeliverable(requestedDeliverable);
     }, [openDeliverable, requestedDeliverable, requestedDeliverableRequestId]);
     const activateContentTab = (contentTab) => {
         setActiveTabId(contentTab.id);
@@ -73,7 +78,7 @@ export function AgentSecondaryView({ assetUrl, assets = [], assetsError, assetsL
         : overviewRoute === "deliverables"
             ? (isZh ? "会话资产" : "Session assets")
             : (isZh ? "工作区" : "Workspace"));
-    return (_jsxs("aside", { className: "flex h-full min-h-0 min-w-0 flex-col bg-background", "data-agent-secondary-view": true, children: [_jsxs("header", { className: "flex h-12 shrink-0 items-center gap-2 border-b border-border/70 px-3", children: [activeTab || overviewRoute !== "home" ? (_jsx(Button, { "aria-label": activeTab ? (isZh ? "返回列表" : "Back to list") : (isZh ? "返回概览" : "Back to overview"), onClick: () => selectOverviewRoute(activeTab?.kind === "child" ? "children" : activeTab?.kind === "deliverable" ? "deliverables" : "home"), size: "icon-sm", variant: "ghost", children: _jsx(ChevronLeftIcon, { className: "size-4" }) })) : null, _jsx("h2", { className: "min-w-0 flex-1 truncate text-sm font-medium", children: headerTitle }), _jsx(Button, { "aria-label": isZh ? "关闭副视图" : "Close side view", onClick: onClose, size: "icon-sm", variant: "ghost", children: _jsx(PanelRightCloseIcon, { className: "size-4" }) })] }), _jsxs("nav", { "aria-label": isZh ? "工作区标签" : "Workspace tabs", className: "flex shrink-0 items-center gap-1 overflow-x-auto border-b border-border/60 px-2 py-1.5", children: [_jsx(TabButton, { active: activeTabId === "home", label: isZh ? "概览" : "Overview", onClick: () => setActiveTabId("home") }), openTabs.map((contentTab) => (_jsxs("div", { className: cn("group/tab flex max-w-44 items-center rounded-md", activeTabId === contentTab.id && "bg-accent"), children: [_jsx(TabButton, { active: activeTabId === contentTab.id, label: contentTab.title, onClick: () => activateContentTab(contentTab) }), _jsx("button", { "aria-label": `${isZh ? "关闭" : "Close"} ${contentTab.title}`, className: "mr-1 flex size-5 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-background/80 hover:text-foreground", onClick: () => closeContentTab(contentTab), type: "button", children: _jsx(XIcon, { className: "size-3" }) })] }, contentTab.id)))] }), activeTabId === "home" ? (_jsxs(_Fragment, { children: [_jsxs("nav", { "aria-label": isZh ? "工作区导航" : "Workspace navigation", className: "flex shrink-0 gap-1 border-b border-border/50 px-2 py-1.5", children: [_jsx(TabButton, { active: overviewRoute === "home", label: isZh ? "首页" : "Home", onClick: () => selectOverviewRoute("home") }), _jsx(TabButton, { active: overviewRoute === "children", count: children.length, label: isZh ? "子代理" : "Sub-agents", onClick: () => selectOverviewRoute("children") }), _jsx(TabButton, { active: overviewRoute === "deliverables", count: mergedDeliverables.length, label: isZh ? "资产" : "Assets", onClick: () => selectOverviewRoute("deliverables") })] }), _jsxs("div", { className: "min-h-0 flex-1 overflow-y-auto p-3", children: [overviewRoute === "home" ? _jsx(Overview, { childCount: children.length, deliverableCount: mergedDeliverables.length, isZh: isZh, onChildren: () => selectOverviewRoute("children"), onDeliverables: () => selectOverviewRoute("deliverables") }) : null, overviewRoute === "children" ? _jsx(ChildList, { children: children, isZh: isZh, onOpen: openChild }) : null, overviewRoute === "deliverables" ? _jsx(DeliverableList, { assetUrl: assetUrl, deliverables: mergedDeliverables, error: error, isZh: isZh, loading: loading, onOpen: openDeliverable, onRefresh: refresh }) : null] })] })) : activeTab?.kind === "child" ? (_jsx("div", { className: "flex min-h-0 flex-1 flex-col", children: childContent ?? _jsx(EmptyState, { label: isZh ? "子代理会话不可用" : "Sub-agent session unavailable" }) })) : activeTab?.kind === "deliverable" ? (_jsx(DeliverablePreview, { assetUrl: assetUrl, deliverable: activeTab.deliverable, locale: locale })) : null] }));
+    return (_jsxs("aside", { className: "flex h-full min-h-0 min-w-0 flex-col bg-background", "data-agent-secondary-view": true, children: [_jsxs("header", { className: "flex h-12 shrink-0 items-center gap-2 border-b border-border/70 px-3", children: [activeTab || overviewRoute !== "home" ? (_jsx(Button, { "aria-label": activeTab ? (isZh ? "返回列表" : "Back to list") : (isZh ? "返回概览" : "Back to overview"), onClick: () => selectOverviewRoute(activeTab?.kind === "child" ? "children" : activeTab?.kind === "deliverable" ? "deliverables" : "home"), size: "icon-sm", variant: "ghost", children: _jsx(ChevronLeftIcon, { className: "size-4" }) })) : null, openTabs.length > 0 ? (_jsx("h2", { className: "sr-only", children: headerTitle })) : null, openTabs.length > 0 ? (_jsx(SecondaryTabBar, { "aria-label": isZh ? "已打开内容" : "Open content", children: openTabs.map((contentTab) => (_jsxs("div", { className: cn("group/tab flex w-40 shrink-0 items-center rounded-md", activeTabId === contentTab.id && "bg-accent"), children: [_jsx(TabButton, { active: activeTabId === contentTab.id, label: contentTab.title, onClick: () => activateContentTab(contentTab) }), _jsx("button", { "aria-label": `${isZh ? "关闭" : "Close"} ${contentTab.title}`, className: "mr-1 flex size-5 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-background/80 hover:text-foreground", onClick: () => closeContentTab(contentTab), type: "button", children: _jsx(XIcon, { className: "size-3" }) })] }, contentTab.id))) })) : (_jsx("h2", { className: "min-w-0 flex-1 truncate text-sm font-medium", children: headerTitle })), _jsx(Button, { "aria-label": isZh ? "关闭副视图" : "Close side view", onClick: onClose, size: "icon-sm", variant: "ghost", children: _jsx(PanelRightCloseIcon, { className: "size-4" }) })] }), activeTabId === "home" ? (_jsx(_Fragment, { children: _jsxs("div", { className: "min-h-0 flex-1 overflow-y-auto p-3", children: [overviewRoute === "home" ? _jsx(Overview, { childCount: children.length, deliverableCount: mergedDeliverables.length, isZh: isZh, onChildren: () => selectOverviewRoute("children"), onDeliverables: () => selectOverviewRoute("deliverables") }) : null, overviewRoute === "children" ? _jsx(ChildList, { children: children, isZh: isZh, onOpen: openChild }) : null, overviewRoute === "deliverables" ? _jsx(DeliverableList, { assetUrl: assetUrl, deliverables: mergedDeliverables, error: error, isZh: isZh, loading: loading, onOpen: openDeliverable, onRefresh: refresh }) : null] }) })) : activeTab?.kind === "child" ? (_jsx("div", { className: "flex min-h-0 flex-1 flex-col", children: childContent ?? _jsx(EmptyState, { label: isZh ? "子代理会话不可用" : "Sub-agent session unavailable" }) })) : activeTab?.kind === "deliverable" ? (_jsx(DeliverablePreview, { assetUrl: assetUrl, deliverable: activeTab.deliverable, locale: locale })) : null] }));
 }
 function Overview({ childCount, deliverableCount, isZh, onChildren, onDeliverables }) {
     return _jsxs("div", { className: "grid gap-2", children: [_jsx(OverviewCard, { count: childCount, icon: _jsx(UsersRoundIcon, { className: "size-4" }), label: isZh ? "子代理" : "Sub-agents", onClick: onChildren }), _jsx(OverviewCard, { count: deliverableCount, icon: _jsx(FileIcon, { className: "size-4" }), label: isZh ? "会话资产" : "Session assets", onClick: onDeliverables }), _jsx("p", { className: "px-1 pt-2 text-xs leading-5 text-muted-foreground", children: isZh ? "子代理对话和 Agent 发布的文件、图片、网站会保留为会话级可访问引用。" : "Sub-agent conversations and Agent-published files, images, and websites remain accessible from this session." })] });
@@ -102,7 +107,7 @@ function WebsitePreview({ title, url }) {
     const [loading, setLoading] = useState(true);
     const [generation, setGeneration] = useState(0);
     const origin = safeDisplayOrigin(url);
-    return _jsx(WebPreview, { className: "min-h-0 flex-1", loading: loading, onOpenExternal: () => window.open(url, "_blank", "noopener,noreferrer"), onReload: () => { setLoading(true); setGeneration((value) => value + 1); }, origin: origin, children: _jsx("iframe", { className: "size-full min-h-[20rem] border-0 bg-white", onLoad: () => setLoading(false), sandbox: "allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-scripts", src: url, title: title }, generation) });
+    return _jsx(WebPreview, { className: "min-h-0 flex-1", loading: loading, onOpenExternal: () => window.open(url, "_blank", "noopener,noreferrer"), onReload: () => { setLoading(true); setGeneration((value) => value + 1); }, origin: origin, children: _jsx("iframe", { className: "size-full min-h-[20rem] border-0 bg-white", onLoad: () => setLoading(false), sandbox: "allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-scripts allow-same-origin", src: url, title: title }, generation) });
 }
 function FilePreview({ deliverable, locale, url }) {
     const [text, setText] = useState();
@@ -128,7 +133,23 @@ function FilePreview({ deliverable, locale, url }) {
     return _jsxs("div", { className: "flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-6 text-center", children: [_jsx(FileIcon, { className: "size-8 text-muted-foreground" }), _jsx("p", { className: "text-sm text-muted-foreground", children: locale === "zh-CN" ? "此文件类型不支持在线预览" : "This file type is not previewable online" }), _jsx(Button, { asChild: true, size: "sm", variant: "outline", children: _jsxs("a", { download: deliverable.title, href: url, rel: "noreferrer", target: "_blank", children: [_jsx(DownloadIcon, { className: "size-3.5" }), locale === "zh-CN" ? "下载文件" : "Download"] }) })] });
 }
 function TabButton({ active, count, label, onClick }) {
-    return _jsxs("button", { "aria-current": active ? "page" : undefined, className: cn("min-w-0 truncate rounded-md px-2.5 py-1.5 text-xs text-muted-foreground hover:bg-accent hover:text-foreground", active && "font-medium text-foreground"), onClick: onClick, title: label, type: "button", children: [label, count ? _jsx("span", { className: "ml-1 tabular-nums", children: count }) : null] });
+    return _jsxs("button", { "aria-current": active ? "page" : undefined, className: cn("min-w-0 flex-1 truncate rounded-md px-2.5 py-1.5 text-xs text-muted-foreground hover:bg-accent hover:text-foreground", active && "font-medium text-foreground"), onClick: onClick, title: label, type: "button", children: [label, count ? _jsx("span", { className: "ml-1 tabular-nums", children: count }) : null] });
+}
+function SecondaryTabBar({ children, ...props }) {
+    const drag = useRef(undefined);
+    const onPointerDown = (event) => {
+        if (event.pointerType === "touch" || event.button !== 0)
+            return;
+        drag.current = { startX: event.clientX, scrollLeft: event.currentTarget.scrollLeft };
+    };
+    const onPointerMove = (event) => {
+        const state = drag.current;
+        if (!state)
+            return;
+        event.currentTarget.scrollLeft = state.scrollLeft - (event.clientX - state.startX);
+    };
+    const stopDragging = () => { drag.current = undefined; };
+    return _jsx("nav", { ...props, className: "flex min-w-0 flex-1 cursor-grab touch-pan-x select-none items-center gap-1 overflow-x-auto overscroll-x-contain active:cursor-grabbing", onPointerCancel: stopDragging, onPointerDown: onPointerDown, onPointerMove: onPointerMove, onPointerUp: stopDragging, children: children });
 }
 function OverviewCard({ count, icon, label, onClick }) {
     return _jsxs("button", { className: "flex items-center gap-3 rounded-lg border border-border/70 bg-card px-3 py-3 text-left transition-colors hover:border-border hover:bg-accent/40", onClick: onClick, type: "button", children: [_jsx("span", { className: "text-muted-foreground", children: icon }), _jsx("span", { className: "min-w-0 flex-1 text-sm font-medium", children: label }), _jsx("span", { className: "text-xs tabular-nums text-muted-foreground", children: count }), _jsx(ChevronRightIcon, { className: "size-4 text-muted-foreground" })] });

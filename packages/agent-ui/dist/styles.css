@@ -801,6 +801,9 @@
   .w-24 {
     width: calc(var(--spacing) * 24);
   }
+  .w-40 {
+    width: calc(var(--spacing) * 40);
+  }
   .w-52 {
     width: calc(var(--spacing) * 52);
   }
@@ -863,9 +866,6 @@
   }
   .max-w-40 {
     max-width: calc(var(--spacing) * 40);
-  }
-  .max-w-44 {
-    max-width: calc(var(--spacing) * 44);
   }
   .max-w-48 {
     max-width: calc(var(--spacing) * 48);
@@ -1194,6 +1194,9 @@
   .cursor-default {
     cursor: default;
   }
+  .cursor-grab {
+    cursor: grab;
+  }
   .cursor-pointer {
     cursor: pointer;
   }
@@ -1202,6 +1205,10 @@
   }
   .cursor-zoom-out {
     cursor: zoom-out;
+  }
+  .touch-pan-x {
+    --tw-pan-x: pan-x;
+    touch-action: var(--tw-pan-x,) var(--tw-pan-y,) var(--tw-pinch-zoom,);
   }
   .touch-none {
     touch-action: none;
@@ -1223,6 +1230,9 @@
   }
   .scroll-my-1 {
     scroll-margin-block: calc(var(--spacing) * 1);
+  }
+  .scroll-mt-5 {
+    scroll-margin-top: calc(var(--spacing) * 5);
   }
   .scroll-px-1 {
     scroll-padding-inline: calc(var(--spacing) * 1);
@@ -1465,6 +1475,9 @@
   }
   .overflow-hidden {
     overflow: hidden;
+  }
+  .overflow-visible {
+    overflow: visible;
   }
   .overflow-x-auto {
     overflow-x: auto;
@@ -1721,12 +1734,6 @@
   }
   .border-sidebar-border {
     border-color: var(--sidebar-border);
-  }
-  .border-sidebar-ring\/40 {
-    border-color: var(--sidebar-ring);
-    @supports (color: color-mix(in lab, red, red)) {
-      border-color: color-mix(in oklab, var(--sidebar-ring) 40%, transparent);
-    }
   }
   .border-transparent {
     border-color: transparent;
@@ -2004,14 +2011,11 @@
   .bg-sidebar {
     background-color: var(--sidebar);
   }
+  .bg-sidebar-accent {
+    background-color: var(--sidebar-accent);
+  }
   .bg-sidebar-border {
     background-color: var(--sidebar-border);
-  }
-  .bg-sidebar-primary\/\[0\.08\] {
-    background-color: var(--sidebar-primary);
-    @supports (color: color-mix(in lab, red, red)) {
-      background-color: color-mix(in oklab, var(--sidebar-primary) 8%, transparent);
-    }
   }
   .bg-sidebar\/80 {
     background-color: var(--sidebar);
@@ -2662,6 +2666,12 @@
       --tw-ring-color: color-mix(in oklab, var(--ring, oklch(0.708 0 0)) 50%, transparent);
     }
   }
+  .ring-sidebar-border\/70 {
+    --tw-ring-color: var(--sidebar-border);
+    @supports (color: color-mix(in lab, red, red)) {
+      --tw-ring-color: color-mix(in oklab, var(--sidebar-border) 70%, transparent);
+    }
+  }
   .ring-sidebar-ring {
     --tw-ring-color: var(--sidebar-ring);
   }
@@ -2831,6 +2841,9 @@
   }
   .\[animation-duration\:0\.6s\] {
     animation-duration: 0.6s;
+  }
+  .\[animation-duration\:0\.9s\] {
+    animation-duration: 0.9s;
   }
   .\[animation-duration\:0\.65s\] {
     animation-duration: 0.65s;
@@ -3841,24 +3854,6 @@
       color: var(--muted-foreground, oklch(0.6 0 0));
     }
   }
-  .before\:absolute {
-    &::before {
-      content: var(--tw-content);
-      position: absolute;
-    }
-  }
-  .before\:inset-y-2 {
-    &::before {
-      content: var(--tw-content);
-      inset-block: calc(var(--spacing) * 2);
-    }
-  }
-  .before\:left-0 {
-    &::before {
-      content: var(--tw-content);
-      left: calc(var(--spacing) * 0);
-    }
-  }
   .before\:mr-1 {
     &::before {
       content: var(--tw-content);
@@ -3883,12 +3878,6 @@
       height: 1px;
     }
   }
-  .before\:w-0\.5 {
-    &::before {
-      content: var(--tw-content);
-      width: calc(var(--spacing) * 0.5);
-    }
-  }
   .before\:w-6 {
     &::before {
       content: var(--tw-content);
@@ -3907,22 +3896,10 @@
       flex: 1;
     }
   }
-  .before\:rounded-full {
-    &::before {
-      content: var(--tw-content);
-      border-radius: calc(infinity * 1px);
-    }
-  }
   .before\:bg-border {
     &::before {
       content: var(--tw-content);
       background-color: var(--border, oklch(0.916 0 0));
-    }
-  }
-  .before\:bg-sidebar-primary {
-    &::before {
-      content: var(--tw-content);
-      background-color: var(--sidebar-primary);
     }
   }
   .before\:text-right {
@@ -4674,6 +4651,11 @@
   .active\:scale-\[0\.98\] {
     &:active {
       scale: 0.98;
+    }
+  }
+  .active\:cursor-grabbing {
+    &:active {
+      cursor: grabbing;
     }
   }
   .active\:bg-muted {
@@ -8637,6 +8619,18 @@
   syntax: "*";
   inherits: false;
 }
+@property --tw-pan-x {
+  syntax: "*";
+  inherits: false;
+}
+@property --tw-pan-y {
+  syntax: "*";
+  inherits: false;
+}
+@property --tw-pinch-zoom {
+  syntax: "*";
+  inherits: false;
+}
 @property --tw-scroll-snap-strictness {
   syntax: "*";
   inherits: false;
@@ -8913,6 +8907,9 @@
       --tw-rotate-z: initial;
       --tw-skew-x: initial;
       --tw-skew-y: initial;
+      --tw-pan-x: initial;
+      --tw-pan-y: initial;
+      --tw-pinch-zoom: initial;
       --tw-scroll-snap-strictness: proximity;
       --tw-space-y-reverse: 0;
       --tw-space-x-reverse: 0;

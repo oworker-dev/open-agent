@@ -19,15 +19,19 @@ import { AgentSubagentMenu } from "./agent-subagent-menu.js";
 import { AgentSecondaryView, type AgentSecondaryChild, type AgentSecondaryTab } from "./agent-secondary-view.js";
 import { AgentThreadView } from "./agent-thread.js";
 import { cn } from "../utils.js";
-import type { AgentAssetEndpoint, AgentDeliverableEndpoint, AgentInterruptedTurn, AgentModelOption, AgentQueuedTurn, AgentSessionAsset, AgentSessionDeliverable, AgentSubagentController, AgentSubagentLoader, AgentSubagentSummary, AgentThread, AgentThreadPatch, AgentThreadPreferences, AgentWorkspaceClientConfig, AgentWorkspaceMailbox } from "./contracts.js";
-import { AgentThreadStorageConflictError } from "./http-thread-storage.js";
+import type { AgentAssetEndpoint, AgentDeliverableEndpoint, AgentInterruptedTurn, AgentModelOption, AgentPendingTurn, AgentQueuedTurn, AgentSessionAsset, AgentSessionBoundary, AgentSessionInspector, AgentSessionDeliverable, AgentSubagentController, AgentSubagentLoader, AgentSubagentSummary, AgentThread, AgentThreadPatch, AgentThreadPreferences, AgentWorkspaceClientConfig, AgentWorkspaceMailbox } from "./contracts.js";
+import { AgentThreadStorageConflictError, AgentThreadStorageHttpError } from "./http-thread-storage.js";
 import { messagesFor, resolveBrowserLocale, type AgentLocale, type AgentMessages } from "./i18n.js";
 import {
   AGENT_THREAD_STORAGE_VERSION,
   browserThreadStorage,
-  appendThreadEvent,
+  appendThreadEventIndexed,
   compactThreadEvents,
   createAgentThread,
+  eventIdentity,
+  mergeThreadCollectionsForConflict,
+  reconcileHydratedPendingTurn,
+  reconcilePendingTurnWithEvents,
   type AgentThreadCollection,
   type AgentThreadStorage,
 } from "./thread-storage.js";
@@ -60,6 +64,7 @@ export function AgentWorkspace({
   hostSlots,
   initialSubagentSessionId,
   initialThreadId,
+  inspectSession,
   loadSubagents,
   controlSubagent,
   mailbox,
@@ -88,6 +93,7 @@ export function AgentWorkspace({
   readonly hostSlots?: { readonly sidebarFooter?: React.ReactNode; readonly threadHeaderEnd?: React.ReactNode };
   readonly initialSubagentSessionId?: string;
   readonly initialThreadId?: string;
+  readonly inspectSession?: AgentSessionInspector;
   readonly mailbox?: AgentWorkspaceMailbox;
   readonly loadSubagents?: AgentSubagentLoader;
   readonly controlSubagent?: AgentSubagentController;
@@ -147,6 +153,9 @@ export function AgentWorkspace({
   const [locale, setLocale] = useState<AgentLocale>("en");
   const recoveryStarted = useRef(new Set<string>());
   const recoveryControllers = useRef(new Map<string, AbortController>());
+  const runtimeChecksStarted = useRef(new Set<string>());
+  const hydrationInFlight = useRef(new Set<string>());
+  const serverHydrationThreads = useRef(new Set<string>());
   const storageSaveQueue = useRef<Promise<void>>(Promise.resolve());
   const storageSaveTimer = useRef<number | undefined>(undefined);
   const storageSaveDueAt = useRef<number | undefined>(undefined);
@@ -157,6 +166,7 @@ export function AgentWorkspace({
   const pendingCollection = useRef<AgentThreadCollection | undefined>(undefined);
   const messages = messagesFor(locale);
   const sidebarPanelRef = usePanelRef();
+  const activeSessionScopeRef = useRef<string | undefined>(undefined);
 
   useEffect(() => {
     const media = window.matchMedia("(min-width: 1024px)");
@@ -232,10 +242,10 @@ export function AgentWorkspace({
           version: AGENT_THREAD_STORAGE_VERSION,
         };
 
-        const busyThreads = restoredThreads.filter(threadNeedsRecovery);
-        if (busyThreads.length > 0) {
-          setRecoveringIds(new Set(busyThreads.map((thread) => thread.id)));
-        }
+        // Do not infer runtime liveness from a browser checkpoint. A stale
+        // `submitted` status is common after a refresh, while Eve may already
+        // be parked at `session.waiting`. Runtime inspection below decides
+        // whether a live recovery stream is actually needed.
       })
       .catch((error: unknown) => {
         if (cancelled) return;
@@ -337,6 +347,159 @@ export function AgentWorkspace({
     });
   }, []);
 
+  const settleThreadHistory = useCallback(async (
+    thread: AgentThread,
+    boundary: AgentSessionBoundary,
+  ) => {
+    const failed = boundary.state === "terminal" && boundary.terminalStatus === "failed";
+    const settledStatus: AgentThread["status"] = failed ? "error" : "ready";
+    const settledCursor = boundary.tailIndex === undefined
+      ? thread.session.streamIndex
+      : Math.max(thread.session.streamIndex, boundary.tailIndex + 1);
+    const settledSession = {
+      ...thread.session,
+      streamIndex: settledCursor,
+    };
+    const settledEvents = compactThreadEvents(thread.events);
+    // A lifecycle boundary only proves that Eve is settled. It does not prove
+    // that this compact browser transcript contains every absolute stream
+    // event. Only a live checkpoint or the server repair route may publish a
+    // new complete coverage marker.
+    const settledCoverage = hasCompleteTranscriptCoverage(thread, settledCursor)
+      ? thread.transcriptCoverage
+      : undefined;
+
+    // Publish the authoritative lifecycle immediately. This prevents a
+    // stale partial tool event from keeping the composer in a running state
+    // while the small settled tail is being synchronized silently.
+    updateThread(thread.id, {
+      ...(settledEvents.length !== thread.events.length ? { events: settledEvents } : {}),
+      ...(settledCoverage
+        ? { transcriptCoverage: settledCoverage }
+        : { transcriptCoverage: undefined }),
+      revision: (thread.revision ?? 0) + 1,
+      session: settledSession,
+      status: settledStatus,
+      updatedAt: Date.now(),
+    });
+
+    // A settled runtime does not prove that the browser transcript is
+    // complete. Legacy checkpoints can contain only a small prefix while the
+    // Eve cursor is far ahead. Never append a tail window to that prefix: it
+    // creates a plausible-looking but permanently incomplete transcript and
+    // drops the middle of the task. The server repair path is the only place
+    // allowed to rebuild such history from index zero.
+    const transcriptComplete = hasCompleteTranscriptCoverage(thread, settledCursor) ||
+      settledCursor <= thread.events.length;
+    // A server-backed thread can have a stale compact prefix after a browser
+    // disconnect. Once Eve is settled, retry the finite server repair here as
+    // well as during initial hydration. This closes the race where hydration
+    // observed a running session (HTTP 409) and the later waiting boundary
+    // would otherwise leave the prefix permanently incomplete.
+    if (
+      !transcriptComplete &&
+      serverHydrationThreads.current.has(thread.id) &&
+      threadStorage.repairThread &&
+      thread.session.sessionId &&
+      shouldRepairServerTranscript(thread)
+    ) {
+      try {
+        const repaired = await threadStorage.repairThread(storageKey, thread.id);
+        if (repaired) {
+          const repairedPendingTurn = reconcileHydratedPendingTurn(
+            repaired.pendingTurn,
+            compactThreadEvents(repaired.events),
+          );
+          updateThread(thread.id, {
+            ...repaired,
+            events: compactThreadEvents(repaired.events),
+            ...(repairedPendingTurn ? { pendingTurn: repairedPendingTurn } : { pendingTurn: undefined }),
+            updatedAt: Date.now(),
+          });
+          return;
+        }
+      } catch (error) {
+        // A 409 means a new turn was admitted while this repair was racing the
+        // boundary. Keep the runtime lifecycle authoritative and let the next
+        // durable checkpoint retry; other errors should not reopen a stream.
+        if (!(error instanceof AgentThreadStorageHttpError) || error.status !== 409) {
+          onStorageError?.(error);
+        }
+      }
+    }
+    // Summary hydration is owned by the server event-log loader. For an
+    // inline legacy prefix, however, the bounded tail read is still the
+    // correct compatibility path and must not be skipped.
+    if (!transcriptComplete && thread.hydration === "summary") return;
+
+    if (
+      boundary.tailIndex === undefined ||
+      (thread.events.at(-1) && isRecoveryBoundary(thread.events.at(-1)!)) ||
+      !thread.session.sessionId
+    ) return;
+
+    const connection = createAgentSession(client, thread.preferences, settledSession);
+    const session = attachAgentSession(connection, connection.initialSession);
+    if (!session) return;
+
+    try {
+      const tailEvents = await readSettledTail(
+        session,
+        boundary.tailIndex,
+        AbortSignal.timeout(RECOVERY_TAIL_LOOKUP_TIMEOUT_MS * 2),
+      );
+      if (tailEvents.length === 0) return;
+      const events = [...settledEvents];
+      const eventIds = new Set(events.map(eventIdentity));
+      for (const event of tailEvents) appendThreadEventIndexed(events, eventIds, event);
+      const nextSettledEvents = compactThreadEvents(events);
+      updateThread(thread.id, {
+        events: nextSettledEvents,
+        ...(settledCoverage
+          ? { transcriptCoverage: settledCoverage }
+          : { transcriptCoverage: undefined }),
+        revision: (thread.revision ?? 0) + 2,
+        session: settledSession,
+        status: settledStatus,
+        updatedAt: Date.now(),
+      });
+    } catch {
+      // The runtime lifecycle is already settled. A transient tail read must
+      // not reopen a live stream or put the completed thread back in recovery.
+    }
+  }, [client, onStorageError, storageKey, threadStorage, updateThread]);
+
+  const inspectThreadRuntime = useCallback(async (thread: AgentThread) => {
+    if (
+      !thread.session.sessionId ||
+      !threadNeedsRuntimeInspection(thread) ||
+      runtimeChecksStarted.current.has(thread.id)
+    ) return;
+    runtimeChecksStarted.current.add(thread.id);
+    if (!inspectSession) {
+      setRecoveringIds((current) => new Set(current).add(thread.id));
+      return;
+    }
+    try {
+      const boundary = await inspectSession(thread.session.sessionId);
+      const hasQueuedAdmission = thread.queuedTurns.some((turn) =>
+        turn.delivery === "server" && Boolean(turn.mailboxItemId),
+      );
+      if (boundary.state === "running" || hasQueuedAdmission || thread.status === "cancelling") {
+        setRecoveringIds((current) => new Set(current).add(thread.id));
+        return;
+      }
+      await settleThreadHistory(thread, boundary);
+    } catch {
+      // A failed lifecycle probe is not evidence that a completed session is
+      // running, so recovery will start with bounded catch-up only. This also
+      // keeps hosts that do not expose an inspector usable during a transient
+      // control-plane outage without opening an unsafe live-follow stream.
+      runtimeChecksStarted.current.delete(thread.id);
+      setRecoveringIds((current) => new Set(current).add(thread.id));
+    }
+  }, [inspectSession, settleThreadHistory]);
+
   const createThread = useCallback(() => {
     const active = activeThreadId ? threadsRef.current.find((thread) => thread.id === activeThreadId) : undefined;
     // Keep one draft placeholder. A repeated click while the user is already
@@ -399,10 +562,8 @@ export function AgentWorkspace({
     setActiveSubagentSessionId(undefined);
     if (!window.matchMedia("(min-width: 1024px)").matches) setSidebarOpen(false);
     const selected = threads.find((thread) => thread.id === threadId);
-    if (selected && threadNeedsRecovery(selected)) {
-      setRecoveringIds((current) => new Set(current).add(threadId));
-    }
-  }, [threads]);
+    if (selected) void inspectThreadRuntime(selected);
+  }, [inspectThreadRuntime, threads]);
 
   const finishWorkbenchTransition = useCallback((transition: "collapsing" | "expanding", nextMode: "fullscreen" | "split") => {
     window.clearTimeout(workbenchTransitionTimer.current);
@@ -476,27 +637,54 @@ export function AgentWorkspace({
   }, []);
 
   const cancelThreadRecovery = useCallback((threadId: string) => {
-    recoveryControllers.current.get(threadId)?.abort();
-    setRecoveringIds((current) => withoutSetValue(current, threadId));
+    // Keep the existing recovery stream attached while a user cancellation is
+    // being delivered. Eve emits the authoritative `turn.cancelled` and
+    // `session.waiting` boundary on that stream; aborting it here forces a
+    // second recovery mount and can race a stale tail probe. The recovery
+    // loop already observes the durable cancellation and settles itself.
+    setRecoveryErrors((current) => withoutMapKey(current, threadId));
   }, []);
 
   const activeThread = threads.find((thread) => thread.id === activeThreadId) ?? threads[0];
+  activeSessionScopeRef.current = activeThread?.session.sessionId;
+  const visibleThreads = threads.filter((thread) => !ephemeralThreadIds.has(thread.id));
   const publicationRefreshKey = activeThread ? latestPublicationResultKey(activeThread.events) : undefined;
+  const projectedSubagentActivityKey = activeThread
+    ? mergeSubagentSessions(activeThread.events, [])
+        .map((child) => `${child.childSessionId ?? ""}:${child.status}`)
+        .sort()
+        .join("|")
+    : "";
+  const durableSubagentActivityKey = durableSubagents
+    .map((child) => `${child.childSessionId}:${child.status}`)
+    .sort()
+    .join("|");
 
   useEffect(() => {
     let cancelled = false;
     const sessionId = activeThread?.session.sessionId;
-    if (!loadSubagents || !sessionId) {
+    const projectedSubagents = activeThread
+      ? mergeSubagentSessions(activeThread.events, durableSubagents)
+      : [];
+    const hasActiveProjectedSubagent = projectedSubagents.some((child) =>
+      child.status === "starting" || child.status === "running" || child.status === "waiting",
+    );
+    if (!loadSubagents || !sessionId || !hasActiveProjectedSubagent) {
       setDurableSubagents([]);
       return;
     }
+    let inFlight = false;
     const refresh = async () => {
+      if (cancelled || inFlight || (typeof document !== "undefined" && document.visibilityState === "hidden")) return;
+      inFlight = true;
       try {
         const next = await loadSubagents(sessionId);
         if (!cancelled) setDurableSubagents(next);
       } catch {
         // Parent events remain useful while the control-plane endpoint is
         // unavailable; the next interval or navigation retries the read.
+      } finally {
+        inFlight = false;
       }
     };
     void refresh();
@@ -505,7 +693,7 @@ export function AgentWorkspace({
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [activeThread?.session.sessionId, loadSubagents]);
+  }, [activeThread?.session.sessionId, durableSubagentActivityKey, loadSubagents, projectedSubagentActivityKey]);
 
   const refreshAssets = useCallback(() => {
     const sessionId = activeThread?.session.sessionId;
@@ -537,7 +725,7 @@ export function AgentWorkspace({
         });
         if (!response.ok) throw new Error(`Asset list failed (${response.status}).`);
         const body: unknown = await response.json();
-        setSessionAssets(parseSessionAssets(body));
+        if (activeSessionScopeRef.current === sessionId) setSessionAssets(parseSessionAssets(body));
       } catch (error) {
         if (!controller.signal.aborted) setAssetsError(error instanceof Error ? error.message : "The session assets could not be loaded.");
       } finally {
@@ -558,7 +746,9 @@ export function AgentWorkspace({
     setDeliverablesLoading(true);
     setDeliverablesError(undefined);
     void loadSessionDeliverables({ client, endpoint: deliverableEndpoint, sessionId, signal: controller.signal })
-      .then((items) => setSessionDeliverables(items))
+      .then((items) => {
+        if (activeSessionScopeRef.current === sessionId) setSessionDeliverables(items);
+      })
       .catch((error: unknown) => {
         if (!controller.signal.aborted) setDeliverablesError(error instanceof Error ? error.message : "The session deliverables could not be loaded.");
       })
@@ -567,6 +757,17 @@ export function AgentWorkspace({
       });
     return () => controller.abort();
   }, [activeThread?.session.sessionId, client, deliverableEndpoint]);
+
+  useEffect(() => {
+    setActiveSubagentSessionId(undefined);
+    setSecondaryTab("home");
+    setSecondaryChildSessionId(undefined);
+    setRequestedDeliverable(undefined);
+    setSessionAssets([]);
+    setSessionDeliverables([]);
+    setAssetsError(undefined);
+    setDeliverablesError(undefined);
+  }, [activeThread?.id, activeThread?.session.sessionId]);
 
   useEffect(() => {
     if (!secondaryOpen || activeSubagentSessionId) return;
@@ -590,20 +791,68 @@ export function AgentWorkspace({
     setSecondaryOpen(true);
   }, [onOpenDeliverable]);
   const hydrateThread = useCallback((thread: AgentThread) => {
-    if (thread.hydration !== "summary" || !threadStorage.loadThread) return;
+    if (
+      thread.hydration !== "summary" ||
+      !threadStorage.loadThread ||
+      hydrationInFlight.current.has(thread.id)
+    ) return;
+    hydrationInFlight.current.add(thread.id);
+    serverHydrationThreads.current.add(thread.id);
     setThreadHydrationErrors((current) => withoutMapKey(current, thread.id));
     setHydratingThreadIds((current) => new Set(current).add(thread.id));
-    void Promise.resolve(threadStorage.loadThread(storageKey, thread.id))
+    const loadHydratedThread = async (): Promise<AgentThread | undefined> => {
+      // Load the durable UI transcript first. Older checkpoints can have a
+      // stale coverage marker even though their append-only event log is
+      // complete. Repairing before this read would replay a potentially
+      // hundreds-of-megabytes Eve stream on every page open.
+      const hydrated = await threadStorage.loadThread!(storageKey, thread.id);
+      if (!hydrated) return undefined;
+      if (
+        threadStorage.repairThread &&
+        hydrated.session.sessionId &&
+        shouldRepairServerTranscript(hydrated)
+      ) {
+        try {
+          const repaired = await threadStorage.repairThread(storageKey, thread.id);
+          if (repaired) return repaired;
+        } catch (error) {
+          if (!(error instanceof AgentThreadStorageHttpError) || error.status !== 409) throw error;
+        }
+      }
+      return hydrated;
+    };
+    void loadHydratedThread()
       .then((hydrated) => {
         if (!hydrated) throw new Error("The selected Agent session no longer exists.");
+        const sanitizedEvents = compactThreadEvents(hydrated.events);
+        const reconciledPendingTurn = reconcileHydratedPendingTurn(
+          hydrated.pendingTurn,
+          sanitizedEvents,
+        );
+        // A compact event array can be locally complete without proving that
+        // it covers Eve's authoritative stream. Do not mint a verified marker
+        // during hydration; only the finite server repair can do that.
+        const healedCoverage = hydrated.transcriptCoverage?.complete === true
+          ? hydrated.transcriptCoverage
+          : undefined;
+        const nextThread = sanitizedEvents.length === hydrated.events.length &&
+          healedCoverage === hydrated.transcriptCoverage &&
+          reconciledPendingTurn === hydrated.pendingTurn
+          ? hydrated
+          : {
+              ...hydrated,
+              events: sanitizedEvents,
+              ...(reconciledPendingTurn ? { pendingTurn: reconciledPendingTurn } : {}),
+              ...(!reconciledPendingTurn ? { pendingTurn: undefined } : {}),
+              ...(healedCoverage ? { transcriptCoverage: healedCoverage } : {}),
+              updatedAt: Date.now(),
+            };
         setThreads((current) => {
-          const next = current.map((candidate) => candidate.id === thread.id ? hydrated : candidate);
+          const next = current.map((candidate) => candidate.id === thread.id ? nextThread : candidate);
           threadsRef.current = next;
           return next;
         });
-        if (threadNeedsRecovery(hydrated)) {
-          setRecoveringIds((current) => new Set(current).add(thread.id));
-        }
+        void inspectThreadRuntime(nextThread);
       })
       .catch((error: unknown) => {
         onStorageError?.(error);
@@ -612,8 +861,11 @@ export function AgentWorkspace({
           error instanceof Error ? error.message : messages.recoveryFailed,
         ));
       })
-      .finally(() => setHydratingThreadIds((current) => withoutSetValue(current, thread.id)));
-  }, [messages.recoveryFailed, onStorageError, storageKey, threadStorage]);
+      .finally(() => {
+        hydrationInFlight.current.delete(thread.id);
+        setHydratingThreadIds((current) => withoutSetValue(current, thread.id));
+      });
+  }, [inspectThreadRuntime, messages.recoveryFailed, onStorageError, storageKey, threadStorage]);
 
   useEffect(() => {
     if (
@@ -624,6 +876,11 @@ export function AgentWorkspace({
     ) return;
     hydrateThread(activeThread);
   }, [activeThread, hydrateThread, hydratingThreadIds, threadHydrationErrors]);
+
+  useEffect(() => {
+    if (!isHydrated || !activeThread || activeThread.hydration === "summary") return;
+    void inspectThreadRuntime(activeThread);
+  }, [activeThread?.id, activeThread?.hydration, inspectThreadRuntime, isHydrated]);
 
   const activeSubagent = activeThread && activeSubagentSessionId
     ? findSubagentSession(activeThread.events, activeSubagentSessionId, locale, durableSubagents)
@@ -649,6 +906,7 @@ export function AgentWorkspace({
     setRecoveryErrors((current) => withoutMapKey(current, thread.id));
     const controller = new AbortController();
     recoveryControllers.current.set(thread.id, controller);
+    const events = [...thread.events];
 
     const recoveredCursor = thread.session.streamIndex;
     const connection = createAgentSession(client, thread.preferences, { ...thread.session, streamIndex: recoveredCursor });
@@ -659,12 +917,77 @@ export function AgentWorkspace({
       setRecoveringIds((current) => withoutSetValue(current, thread.id));
       return;
     }
-    let cursor = recoveredCursor;
-    let events = [...thread.events];
+    let knownRuntimeBoundary: { readonly state: "waiting" | "terminal"; readonly failed?: boolean } | undefined;
+    // A live follow stream is only safe after an authoritative Eve inspection
+    // says that this session is running. A stale browser checkpoint or a
+    // failed/unauthorized inspection must never be treated as proof of life:
+    // doing so turns a completed session into an unbounded replay subscription.
+    // Host integrations that do not expose a lifecycle inspector retain the
+    // original live-session behavior; standalone deployments always provide
+    // the inspector and therefore fail closed until it says "running".
+    let runtimeBoundaryState: "unknown" | "running" | "waiting" | "terminal" = inspectSession ? "unknown" : "running";
+    let runtimeTailIndex: number | undefined;
+    let followIdleTimeouts = 0;
+    // A browser checkpoint can remain "submitted" after Eve has already
+    // parked or retired the run. Probe the authoritative lifecycle before
+    // opening a live follow stream; completed runs must never be replayed.
+    if (inspectSession) {
+      try {
+        const boundary = await inspectSession(session.state.sessionId);
+        runtimeBoundaryState = boundary.state;
+        runtimeTailIndex = boundary.tailIndex;
+        if (boundary.state === "waiting" || boundary.state === "terminal") {
+          // A settled runtime is history, never a recovery stream. Publish
+          // the settled lifecycle first, then read only a small tail window to
+          // recover a missing turn boundary or final tool result.
+          await settleThreadHistory(thread, boundary);
+          setRecoveringIds((current) => withoutSetValue(current, thread.id));
+          return;
+        }
+      } catch {
+        // A transient probe failure must not discard a valid long-running turn.
+        // Continue with the bounded stream policy below.
+      }
+    }
+    const refreshRuntimeBoundary = async (): Promise<typeof runtimeBoundaryState | undefined> => {
+      if (!inspectSession) return undefined;
+      try {
+        const boundary = await inspectSession(session.state.sessionId);
+        runtimeBoundaryState = boundary.state;
+        runtimeTailIndex = boundary.tailIndex;
+        if (boundary.state === "waiting" || boundary.state === "terminal") {
+          knownRuntimeBoundary = {
+            state: boundary.state,
+            ...(boundary.terminalStatus === "failed" ? { failed: true } : {}),
+          };
+          runtimeBoundaryReady = false;
+        }
+        return runtimeBoundaryState;
+      } catch {
+        // Fail closed. The recovery loop can retry a bounded read, but it must
+        // not open a live follow stream without an explicit running boundary.
+        runtimeBoundaryState = "unknown";
+        return undefined;
+      }
+    };
+    const recoveryStartCursor = recoveredCursor;
+    let cursor = recoveryStartCursor;
+    let persistedCursor = recoveryStartCursor;
+    const eventIds = new Set(events.map(eventIdentity));
+    let recoverySnapshotDirty = false;
+    let recoveryEventsSinceFlush = 0;
+    let lastRecoveryFlushAt = Date.now();
     let checkedTailBoundary = false;
     let needsBoundedCatchUp = true;
     let reconnectAttempt = 0;
-    let pendingTurn = thread.pendingTurn;
+    let runtimeBoundaryReady = false;
+    // A refresh can happen after Eve has durably accepted the submitted turn,
+    // but before the browser checkpoint that clears `pendingTurn` is written.
+    // Reconcile that admission from the persisted message log before opening
+    // the recovery stream; otherwise the recovered session remains visually
+    // stuck on Stop even after `session.waiting` has arrived.
+    const originalPendingTurnId = thread.pendingTurn?.id;
+    let pendingTurn = reconcilePendingTurnWithEvents(thread.pendingTurn, events);
     let queuedTurns = thread.queuedTurns;
     let interruptedTurns = thread.interruptedTurns ?? [];
     let cancellationPending = thread.status === "cancelling";
@@ -678,8 +1001,13 @@ export function AgentWorkspace({
     );
     const recoveryOwnedQueuedTurnIds = new Set(queuedTurns.map((turn) => turn.id));
     const consumedQueuedTurnIds = new Set<string>();
-    const recoveryOwnedPendingTurnId = pendingTurn?.id;
-    const consumedPendingTurnIds = new Set<string>();
+    const recoveryOwnedPendingTurnId = originalPendingTurnId;
+    // If the acceptance is already present in the persisted event prefix,
+    // prevent the live browser snapshot (which may still contain the stale
+    // pending admission) from reintroducing it during recovery merges.
+    const consumedPendingTurnIds = new Set<string>(
+      !pendingTurn && originalPendingTurnId ? [originalPendingTurnId] : [],
+    );
     let settled = false;
     const currentClosedInputRequestIds = () => new Set(
       threadsRef.current.find((candidate) => candidate.id === thread.id)?.closedInputRequestIds ?? thread.closedInputRequestIds,
@@ -709,7 +1037,14 @@ export function AgentWorkspace({
         }
       }
 
-      const livePendingTurn = liveThread.pendingTurn;
+      const livePendingTurn = reconcilePendingTurnWithEvents(liveThread.pendingTurn, events);
+      if (liveThread.pendingTurn && !livePendingTurn) {
+        // The live React snapshot can lag the durable event prefix by one
+        // checkpoint. Do not resurrect an admission that Eve already
+        // acknowledged while this recovery loop was running.
+        consumedPendingTurnIds.add(liveThread.pendingTurn.id);
+        if (pendingTurn?.id === liveThread.pendingTurn.id) pendingTurn = undefined;
+      }
       if (
         livePendingTurn &&
         livePendingTurn.id !== recoveryOwnedPendingTurnId &&
@@ -758,16 +1093,47 @@ export function AgentWorkspace({
     );
     const currentBoundarySettles = () => {
       const last = events.at(-1);
+      if (knownRuntimeBoundary && runtimeBoundaryReady) {
+        if (committedCatchUpTurns.size > 0 || hasPendingServerQueue()) return false;
+        return true;
+      }
       if (!last || !isRecoveryBoundary(last)) return false;
-      return committedCatchUpTurns.size === 0 &&
-        (last.type !== "session.waiting" || !hasPendingServerQueue());
+      if (committedCatchUpTurns.size > 0 || hasPendingServerQueue()) return false;
+      // `turn.completed` closes one model turn, not necessarily the session.
+      // When Eve still reports the session as running, keep the recovery loop
+      // open for the following `session.waiting` or next turn boundary.
+      if (
+        runtimeBoundaryState === "running" &&
+        (last.type === "turn.completed" || last.type === "turn.failed" || last.type === "turn.cancelled")
+      ) return false;
+      // A turn boundary is enough for an idle session with no queued work.
+      // When a follow-up is persisted, keep reading until Eve parks the
+      // session so the mailbox dispatcher can admit it at the true boundary.
+      return true;
+    };
+    const flushRecoverySnapshot = (force = false) => {
+      if (!force && !recoverySnapshotDirty && cursor === persistedCursor) return;
+      persistedCursor = cursor;
+      recoverySnapshotDirty = false;
+      recoveryEventsSinceFlush = 0;
+      lastRecoveryFlushAt = Date.now();
+      updateThread(thread.id, {
+        events: [...events],
+        interruptedTurns,
+        pendingTurn,
+        queuedTurns,
+        session: { ...session.state, streamIndex: persistedCursor },
+        status: cancellationPending
+          ? "cancelling"
+          : statusFromEvents(events, currentClosedInputRequestIds()),
+      });
     };
 
     try {
       cursor = await reconcileRecoveryCursor(
         connection.client,
         session.state.sessionId,
-        recoveredCursor,
+        recoveryStartCursor,
         events,
         controller.signal,
       );
@@ -779,12 +1145,21 @@ export function AgentWorkspace({
             break;
           }
           let consumed = 0;
-          const follow = !needsBoundedCatchUp;
+          // `follow:true` is a live subscription. It is valid only when the
+          // runtime inspection explicitly observed a running session. When
+          // inspection is unavailable, keep every request bounded and retry
+          // the inspection instead of risking an infinite stream on a stale
+          // or already-completed session.
+          const follow = !needsBoundedCatchUp && runtimeBoundaryState === "running";
           needsBoundedCatchUp = false;
           let restartFollowFromDurableProgress = false;
+          let followIdleTimedOut = false;
           const followController = follow ? new AbortController() : undefined;
+          const catchUpController = follow ? undefined : new AbortController();
           const abortFollow = () => followController?.abort();
+          const abortCatchUp = () => catchUpController?.abort();
           if (followController) controller.signal.addEventListener("abort", abortFollow, { once: true });
+          if (catchUpController) controller.signal.addEventListener("abort", abortCatchUp, { once: true });
           const followWatchdog = followController
             ? watchRecoveryDurableProgress({
                 client: connection.client,
@@ -797,10 +1172,16 @@ export function AgentWorkspace({
                 signal: followController.signal,
               })
             : undefined;
+          const followIdleTimer = followController
+            ? window.setTimeout(() => {
+                followIdleTimedOut = true;
+                followController.abort();
+              }, RECOVERY_FOLLOW_IDLE_TIMEOUT_MS)
+            : undefined;
           try {
             for await (const event of session.stream({
               follow,
-              signal: followController?.signal ?? controller.signal,
+              signal: followController?.signal ?? catchUpController?.signal ?? controller.signal,
               startIndex: cursor,
               ...(follow ? { streamReconnectPolicy: RECOVERY_STREAM_RECONNECT_POLICY } : {}),
             })) {
@@ -819,8 +1200,12 @@ export function AgentWorkspace({
                 cursor,
                 interruptedTurns,
               );
-              if (!suppressEvent) events = [...appendThreadEvent(events, event)];
+              if (!suppressEvent) {
+                appendThreadEventIndexed(events, eventIds, event);
+                recoveryEventsSinceFlush += 1;
+              }
               cursor += 1;
+              recoverySnapshotDirty = true;
               consumed += 1;
               onEvent?.(event);
               if (event.type === "message.received") {
@@ -857,29 +1242,43 @@ export function AgentWorkspace({
                 cancellationPending &&
                 (event.type === "session.waiting" || event.type === "session.completed" || event.type === "session.failed")
               ) cancellationPending = false;
-              updateThread(thread.id, {
-                events: [...events],
-                interruptedTurns,
-                pendingTurn,
-                queuedTurns,
-                session: { ...session.state, streamIndex: cursor },
-                status: cancellationPending
-                  ? "cancelling"
-                  : statusFromEvents(events, currentClosedInputRequestIds()),
-              });
+              if (
+                recoveryEventsSinceFlush >= 32 ||
+                Date.now() - lastRecoveryFlushAt >= 75
+              ) flushRecoverySnapshot();
+              // Durable boundaries are user-visible state transitions. Publish
+              // them immediately even when the provider keeps the HTTP stream
+              // open between events (notably during cancellation recovery).
+              if (
+                event.type === "turn.cancelled" ||
+                event.type === "turn.completed" ||
+                event.type === "turn.failed" ||
+                event.type === "session.waiting" ||
+                event.type === "session.completed" ||
+                event.type === "session.failed"
+              ) flushRecoverySnapshot(true);
               if (isRecoveryBoundary(event)) {
+                flushRecoverySnapshot(true);
                 await refreshMailboxQueue();
                 settled = currentBoundarySettles();
-                break;
+                if (settled) break;
               }
             }
           } catch (error) {
             if (!restartFollowFromDurableProgress) throw error;
           } finally {
+            if (followIdleTimer !== undefined) window.clearTimeout(followIdleTimer);
             controller.signal.removeEventListener("abort", abortFollow);
+            controller.signal.removeEventListener("abort", abortCatchUp);
             followController?.abort();
+            catchUpController?.abort();
             await followWatchdog;
+            flushRecoverySnapshot();
           }
+          // Cancellation or teardown can abort the finite stream after the
+          // SDK has returned from the iterator. Do not run tail repair,
+          // runtime inspection, or another reconnect pass after that point.
+          if (controller.signal.aborted) return;
           if (restartFollowFromDurableProgress && !settled) {
             // The recovery connection itself stopped delivering while Eve's
             // durable log advanced. Catch up from the last UI-consumed cursor
@@ -888,6 +1287,56 @@ export function AgentWorkspace({
             reconnectAttempt = 0;
             continue;
           }
+          if (followIdleTimedOut && !settled && consumed === 0) {
+            // A provider may legitimately spend several minutes before its
+            // next durable event. Close this individual HTTP response, then
+            // reopen from the same cursor; this keeps the connection bounded
+            // without turning a slow but healthy task into a failed session.
+            followIdleTimeouts += 1;
+            if (followIdleTimeouts >= 3) {
+              throw new Error("The Agent recovery stream made no progress after repeated bounded reconnects.");
+            }
+            needsBoundedCatchUp = true;
+            reconnectAttempt = 0;
+            continue;
+          }
+          if (consumed > 0) followIdleTimeouts = 0;
+          // A finite catch-up page may end exactly at turn.completed while
+          // Eve is still deciding whether to park the session. Re-check the
+          // authoritative lifecycle before opening a live follow stream; this
+          // also lets the next bounded page deliver session.waiting when it is
+          // already present at the tail.
+          if (
+            !settled &&
+            !follow &&
+            runtimeBoundaryState === "running" &&
+            consumed > 0 &&
+            events.at(-1) &&
+            (events.at(-1)!.type === "turn.completed" ||
+              events.at(-1)!.type === "turn.failed" ||
+              events.at(-1)!.type === "turn.cancelled")
+          ) {
+            runtimeBoundaryState = "unknown";
+          }
+          if (!settled && !follow && runtimeBoundaryState === "unknown") {
+            const refreshedState = await refreshRuntimeBoundary();
+            if (refreshedState === "running") {
+              // The bounded page reached the current tail. The next loop may
+              // follow only because Eve just confirmed the session is live.
+              needsBoundedCatchUp = false;
+              reconnectAttempt = 0;
+              continue;
+            }
+            if (refreshedState === "waiting" || refreshedState === "terminal") {
+              // Re-read from the authoritative tail in bounded pages so the
+              // final boundary and delivery are projected before settling.
+              needsBoundedCatchUp = true;
+              reconnectAttempt = 0;
+              continue;
+            }
+          }
+          if (knownRuntimeBoundary) runtimeBoundaryReady = true;
+          flushRecoverySnapshot();
           await refreshMailboxQueue();
           // A tail lookup repairs a persisted cursor that already moved past a
           // boundary missing from the UI history. It must only run after the
@@ -900,24 +1349,16 @@ export function AgentWorkspace({
             !isRecoveryBoundary(events.at(-1)!)
           ) {
             checkedTailBoundary = true;
-            const missingBoundary = await readTailBoundary(session, controller.signal);
+            const missingBoundary = await readTailBoundary(session, cursor, controller.signal);
             if (missingBoundary) {
-              events = [...appendThreadEvent(events, missingBoundary)];
+              appendThreadEventIndexed(events, eventIds, missingBoundary);
+              recoverySnapshotDirty = true;
               if (
                 cancellationPending &&
                 (missingBoundary.type === "session.waiting" || missingBoundary.type === "session.completed" || missingBoundary.type === "session.failed")
               ) cancellationPending = false;
               await refreshMailboxQueue();
-              updateThread(thread.id, {
-                events: [...events],
-                interruptedTurns,
-                pendingTurn,
-                queuedTurns,
-                session: { ...session.state, streamIndex: cursor },
-                status: cancellationPending
-                  ? "cancelling"
-                  : statusFromEvents(events, currentClosedInputRequestIds()),
-              });
+              flushRecoverySnapshot(true);
               settled = currentBoundarySettles();
             }
           }
@@ -947,7 +1388,9 @@ export function AgentWorkspace({
         session: { ...session.state, streamIndex: cursor },
         status: cancellationPending
           ? "cancelling"
-          : statusFromEvents(events, currentClosedInputRequestIds()),
+          : knownRuntimeBoundary?.failed
+            ? "error"
+            : statusFromEvents(events, currentClosedInputRequestIds()),
       });
     } catch (error) {
       if (controller.signal.aborted || isAbortError(error)) return;
@@ -963,7 +1406,7 @@ export function AgentWorkspace({
         return next;
       });
     }
-  }, [client, mailbox, messages.recoveryFailed, onEvent, updateThread]);
+  }, [client, inspectSession, mailbox, messages.recoveryFailed, onEvent, updateThread]);
 
   useEffect(() => () => {
     for (const controller of recoveryControllers.current.values()) controller.abort();
@@ -992,7 +1435,7 @@ export function AgentWorkspace({
       data-workbench-fullscreen={workbenchFullscreen ? "true" : "false"}
       data-workbench-mode={desktopLayout ? workbenchMode : "mobile"}
     >
-      {!desktopLayout ? <AgentSidebar activeThreadId={activeThread.id} brand={productName} deletingThreadIds={deletingThreadIds} hostFooter={hostSlots?.sidebarFooter} locale={locale} messages={messages} onClose={() => setSidebarOpen(false)} onDelete={deleteThread} onNew={createThread} onRename={renameThread} onSelect={selectThread} onSettings={() => setSettingsOpen(true)} open={sidebarOpen} threads={threads} variant="mobile" /> : null}
+      {!desktopLayout ? <AgentSidebar activeThreadId={activeThread.id} brand={productName} deletingThreadIds={deletingThreadIds} hostFooter={hostSlots?.sidebarFooter} locale={locale} messages={messages} onClose={() => setSidebarOpen(false)} onDelete={deleteThread} onNew={createThread} onRename={renameThread} onSelect={selectThread} onSettings={() => setSettingsOpen(true)} open={sidebarOpen} threads={visibleThreads} variant="mobile" /> : null}
       <ResizablePanelGroup
         className="h-full"
         onLayoutChanged={handleDesktopLayoutChanged}
@@ -1000,7 +1443,7 @@ export function AgentWorkspace({
       >
         {desktopLayout ? (
           <ResizablePanel className="block" collapsedSize="0px" collapsible data-sidebar-panel defaultSize={`${SIDEBAR_DEFAULT_WIDTH}px`} id="agent-sidebar" maxSize={`${SIDEBAR_MAX_WIDTH}px`} minSize={`${SIDEBAR_MIN_WIDTH}px`} onResize={handleSidebarResize} panelRef={sidebarPanelRef}>
-            <AgentSidebar activeThreadId={activeThread.id} brand={productName} deletingThreadIds={deletingThreadIds} hostFooter={hostSlots?.sidebarFooter} locale={locale} messages={messages} onClose={() => setSidebarOpen(false)} onDelete={deleteThread} onNew={createThread} onRename={renameThread} onSelect={selectThread} onSettings={() => setSettingsOpen(true)} open={sidebarOpen} threads={threads} variant="desktop" />
+            <AgentSidebar activeThreadId={activeThread.id} brand={productName} deletingThreadIds={deletingThreadIds} hostFooter={hostSlots?.sidebarFooter} locale={locale} messages={messages} onClose={() => setSidebarOpen(false)} onDelete={deleteThread} onNew={createThread} onRename={renameThread} onSelect={selectThread} onSettings={() => setSettingsOpen(true)} open={sidebarOpen} threads={visibleThreads} variant="desktop" />
           </ResizablePanel>
         ) : null}
         {desktopLayout ? <ResizableHandle className="flex bg-transparent after:w-2" data-main-resize-handle disabled={workbenchMode !== "split"} onPointerDown={() => {
@@ -1125,6 +1568,7 @@ export function AgentWorkspace({
                 {desktopLayout ? <ResizableHandle className="flex bg-transparent after:w-2" data-secondary-resize-handle /> : null}
                 <ResizablePanel className="min-w-0 border-l border-border/70" defaultSize={desktopLayout ? "30%" : "100%"} id="agent-secondary" maxSize={desktopLayout ? "50%" : "100%"} minSize={desktopLayout ? "260px" : "0px"}>
                   <AgentSecondaryView
+                    key={`secondary:${activeThread?.id ?? "empty"}:${activeThread?.session.sessionId ?? "draft"}`}
                     assetUrl={client?.assetUrl}
                     assets={sessionAssets}
                     assetsError={assetsError}
@@ -1186,7 +1630,7 @@ export function AgentWorkspace({
           onRename={renameThread}
           onSelect={selectThread}
           onSettings={() => setSettingsOpen(true)}
-          threads={threads}
+          threads={visibleThreads}
         />
       ) : null}
       <AgentSettingsDialog extensions={extensions} locale={locale} messages={messages} onLocaleChange={setLocale} onOpenChange={setSettingsOpen} open={settingsOpen} />
@@ -1374,10 +1818,15 @@ function UnavailableSubagentView({
 }
 
 const RECOVERY_TAIL_LOOKUP_TIMEOUT_MS = 1_500;
+const SETTLED_TAIL_EVENTS = 64;
 const RECOVERY_CURSOR_OVERLAP_EVENTS = 256;
 const RECOVERY_PROGRESS_PROBE_DELAY_MS = 10_000;
 const RECOVERY_PROGRESS_PROBE_INTERVAL_MS = 10_000;
 const RECOVERY_PROGRESS_PROBE_TIMEOUT_MS = 2_500;
+// Recovery is a reconnect path, not a permanent browser subscription. A
+// healthy active run emits durable events before this window expires; if it
+// does not, release the HTTP connection and surface a retryable state.
+const RECOVERY_FOLLOW_IDLE_TIMEOUT_MS = 90_000;
 const MAX_RECOVERY_RECONNECT_ATTEMPTS = 6;
 const RECOVERY_RETRY_BASE_DELAY_MS = 750;
 const RECOVERY_RETRY_MAX_DELAY_MS = 15_000;
@@ -1415,20 +1864,34 @@ async function reconcileRecoveryCursor(
   const starts = nearbyStart === 0 ? [0] : [nearbyStart, 0];
   for (const startIndex of starts) {
     const probe = client.sessions.attach(sessionId, { streamIndex: startIndex });
+    const probeController = new AbortController();
+    const abortProbe = () => probeController.abort();
+    signal.addEventListener("abort", abortProbe, { once: true });
     let cursor = startIndex;
     try {
       for await (const event of probe.stream({
         follow: false,
-        signal,
+        signal: probeController.signal,
         startIndex,
       })) {
         cursor += 1;
         if (event.meta.id === lastObservedEventId) return cursor;
+        // This is only an event-id locator around a claimed cursor, never a
+        // transcript loader or retention limit. Settled incomplete histories
+        // are rebuilt server-side from the full authoritative stream.
+        if (cursor - startIndex >= RECOVERY_CURSOR_OVERLAP_EVENTS) {
+          probeController.abort();
+          break;
+        }
       }
     } catch (error) {
-      if (signal.aborted || isAbortError(error)) throw error;
+      if (signal.aborted) throw error;
+      if (probeController.signal.aborted || isAbortError(error)) continue;
       if (isRetryableRecoveryError(error)) return recoveredCursor;
       throw error;
+    } finally {
+      signal.removeEventListener("abort", abortProbe);
+      probeController.abort();
     }
   }
   return recoveredCursor;
@@ -1436,6 +1899,7 @@ async function reconcileRecoveryCursor(
 
 async function readTailBoundary(
   session: ClientSession,
+  startIndex: number,
   parentSignal: AbortSignal,
 ): Promise<MessageStreamEvent | undefined> {
   const controller = new AbortController();
@@ -1444,8 +1908,13 @@ async function readTailBoundary(
   const timeout = window.setTimeout(abort, RECOVERY_TAIL_LOOKUP_TIMEOUT_MS);
   try {
     for await (const event of session.stream({
+      // `startIndex: -1` without `follow:false` is a live-follow request and
+      // can remain open forever when the durable log has no new event. This
+      // repair probe is historical data lookup, so it must always have a
+      // finite tail and a non-negative cursor.
+      follow: false,
       signal: controller.signal,
-      startIndex: -1,
+      startIndex: Math.max(0, startIndex),
       streamReconnectPolicy: { reconnect: false },
     })) {
       return isRecoveryBoundary(event) ? event : undefined;
@@ -1459,6 +1928,34 @@ async function readTailBoundary(
   return undefined;
 }
 
+/**
+ * Read only the settled tail needed to repair a stale browser transcript.
+ * This is deliberately a bounded, non-following read. A completed session
+ * must never replay its entire history just because the UI missed its final
+ * boundary event.
+ */
+async function readSettledTail(
+  session: ClientSession,
+  tailIndex: number,
+  signal: AbortSignal,
+): Promise<readonly MessageStreamEvent[]> {
+  const startIndex = Math.max(0, tailIndex - SETTLED_TAIL_EVENTS + 1);
+  const expectedEvents = Math.max(0, tailIndex - startIndex + 1);
+  const events: MessageStreamEvent[] = [];
+  for await (const event of session.stream({
+    follow: false,
+    signal,
+    startIndex,
+    streamReconnectPolicy: { reconnect: false },
+  })) {
+    events.push(event);
+    // The SDK normally stops at Eve's declared tail. Keep this caller-side
+    // guard as a second boundary so a proxy/runtime that leaves a bounded
+    // response open cannot turn a settled-history read into a live stream.
+    if (events.length >= expectedEvents) break;
+  }
+  return events;
+}
 async function watchRecoveryDurableProgress({
   client,
   getCursor,
@@ -1552,7 +2049,12 @@ function waitForRecoveryRetry(signal: AbortSignal, attempt: number): Promise<voi
 }
 
 function isRecoveryBoundary(event: MessageStreamEvent): boolean {
-  return event.type === "session.waiting" || event.type === "session.completed" || event.type === "session.failed";
+  return event.type === "turn.completed" ||
+    event.type === "turn.failed" ||
+    event.type === "turn.cancelled" ||
+    event.type === "session.waiting" ||
+    event.type === "session.completed" ||
+    event.type === "session.failed";
 }
 
 function statusFromEvents(
@@ -1572,6 +2074,8 @@ function statusFromEvents(
     return hasUnresolvedInputRequests(events, closedInputRequestIds) ? "waiting" : "ready";
   }
   if (last.type === "session.completed") return "ready";
+  if (latestTurnBoundary?.type === "turn.cancelled") return "cancelling";
+  if (latestTurnBoundary?.type === "turn.completed") return "ready";
   if (last.type === "turn.started" || last.type === "step.started" || last.type === "message.appended" || last.type === "reasoning.appended") return "streaming";
   return "submitted";
 }
@@ -1656,6 +2160,47 @@ function threadNeedsRecovery(thread: AgentThread): boolean {
   return !lastEvent || !isRecoveryBoundary(lastEvent);
 }
 
+function threadNeedsRuntimeInspection(thread: AgentThread): boolean {
+  if (threadNeedsRecovery(thread)) return true;
+  if (!transcriptCoversSession(thread)) return true;
+  return thread.pendingTurn?.state === "clearing" ||
+    thread.pendingTurn?.state === "resubmitting" ||
+    thread.pendingTurn?.state === "submitting";
+}
+
+function transcriptCoversSession(thread: AgentThread): boolean {
+  return hasCompleteTranscriptCoverage(thread) || thread.session.streamIndex <= thread.events.length;
+}
+
+function shouldRepairServerTranscript(thread: AgentThread): boolean {
+  // A browser coverage marker is an observation, not proof that the complete
+  // Eve stream was read. Only the repair route writes `authoritative: true`.
+  // This distinction prevents a stale 195-event snapshot with a 3799-event
+  // cursor from being accepted as complete history.
+  if (hasCompleteTranscriptCoverage(thread)) return false;
+  if (thread.events.length === 0) return true;
+  // Current Eve events carry stable IDs. Legacy host snapshots without IDs
+  // cannot be mapped safely to an absolute cursor, so retain their settled
+  // transcript and use the bounded tail path instead.
+  return thread.events.some((event) =>
+    typeof event.meta?.id === "string" && event.meta.id.length > 0,
+  );
+}
+
+function hasCompleteTranscriptCoverage(thread: AgentThread, endIndex = thread.session.streamIndex): boolean {
+  const coverage = thread.transcriptCoverage;
+  // A browser checkpoint records the cursor it observed, but it may have
+  // dropped the middle of the stream while React was remounting. Only the
+  // server-side finite repair can prove that the compact transcript covers
+  // every event from index zero. Treating a browser marker as authoritative
+  // makes a completed session look healthy while silently hiding old tool
+  // calls and turns on the next page load.
+  return coverage?.authoritative === true &&
+    coverage.complete === true &&
+    coverage.startIndex === 0 &&
+    coverage.endIndex >= endIndex;
+}
+
 function isEmptyDraftThread(thread: AgentThread): boolean {
   return thread.events.length === 0 &&
     thread.queuedTurns.length === 0 &&
@@ -1681,12 +2226,13 @@ function sameInterruptedTurns(
   left: readonly AgentInterruptedTurn[],
   right: readonly AgentInterruptedTurn[],
 ): boolean {
-  return left.length === right.length && left.every((turn, index) => {
-    const candidate = right[index];
-    return candidate?.turnId === turn.turnId &&
+    return left.length === right.length && left.every((turn, index) => {
+      const candidate = right[index];
+      return candidate?.turnId === turn.turnId &&
       candidate.eventCount === turn.eventCount &&
-      candidate.streamIndex === turn.streamIndex;
-  });
+      candidate.streamIndex === turn.streamIndex &&
+      candidate.settled === turn.settled;
+    });
 }
 
 function retargetLatestInterruptedTurn(
@@ -1738,38 +2284,44 @@ async function saveThreadCollectionWithConflictRecovery(
       return candidate;
     } catch (error) {
       if (!(error instanceof AgentThreadStorageConflictError) || attempt === 2) throw error;
-      const remote = await storage.load(storageKey);
-      candidate = mergeThreadCollections(candidate, remote);
+      // The normal HTTP load is an index-only read. Merging that summary into
+      // a local checkpoint would replace a complete remote transcript with an
+      // empty `events` array on the next PATCH. Hydrate every remote summary
+      // before resolving a revision conflict; the extra reads occur only on a
+      // conflict and keep the append-only event log authoritative.
+      const remote = await loadConflictCollection(storageKey, storage);
+      candidate = mergeThreadCollectionsForConflict(candidate, remote);
     }
   }
   return candidate;
 }
 
-function mergeThreadCollections(
-  local: AgentThreadCollection,
-  remote: AgentThreadCollection,
-): AgentThreadCollection {
-  const threads = mergeThreads(local.threads, remote.threads);
-  const activeThreadId = local.activeThreadId && threads.some((thread) => thread.id === local.activeThreadId)
-    ? local.activeThreadId
-    : remote.activeThreadId;
-  return {
-    ...(activeThreadId ? { activeThreadId } : {}),
-    threads,
-    version: AGENT_THREAD_STORAGE_VERSION,
-  };
-}
-
-function mergeThreads(
-  preferred: readonly AgentThread[],
-  fallback: readonly AgentThread[],
-): AgentThread[] {
-  const byId = new Map(fallback.map((thread) => [thread.id, thread]));
-  for (const thread of preferred) {
-    const existing = byId.get(thread.id);
-    if (!existing || thread.updatedAt >= existing.updatedAt) byId.set(thread.id, thread);
+async function loadConflictCollection(
+  storageKey: string,
+  storage: AgentThreadStorage,
+): Promise<AgentThreadCollection> {
+  const index = await storage.load(storageKey);
+  if (!storage.loadThread) return index;
+  const threads: AgentThread[] = [];
+  // Keep hydration sequential. createHttpAgentThreadStorage updates its
+  // baseline after each single-thread read; parallel reads can race and leave
+  // the baseline containing only the last hydrated thread, which makes the
+  // next conflict PATCH look like a deletion of the others.
+  for (const thread of index.threads) {
+    if (thread.hydration !== "summary") {
+      threads.push(thread);
+      continue;
+    }
+    try {
+      threads.push(await storage.loadThread!(storageKey, thread.id) ?? thread);
+    } catch {
+      // Preserve the summary only when a single thread cannot be hydrated;
+      // the conflict merge will prefer any complete local transcript over
+      // this incomplete value instead of silently deleting history.
+      threads.push(thread);
+    }
   }
-  return [...byId.values()].sort((left, right) => right.updatedAt - left.updatedAt);
+  return { ...index, threads };
 }
 
 function mergeVisibleThreads(
@@ -1779,7 +2331,11 @@ function mergeVisibleThreads(
 ): AgentThread[] {
   const ephemeral = current.filter((thread) => ephemeralIds.has(thread.id));
   const localPersisted = current.filter((thread) => !ephemeralIds.has(thread.id));
-  return [...ephemeral, ...mergeThreads(localPersisted, persisted)];
+  const merged = mergeThreadCollectionsForConflict(
+    { threads: localPersisted, version: AGENT_THREAD_STORAGE_VERSION },
+    { threads: persisted, version: AGENT_THREAD_STORAGE_VERSION },
+  ).threads;
+  return [...ephemeral, ...merged];
 }
 
 function sameThreadCollection(
@@ -1826,7 +2382,7 @@ function isUrgentPersistenceChange(
     const lastEvent = thread.events.at(-1);
     const priorLastEvent = prior.events.at(-1);
     if (
-      lastEvent?.meta.id !== priorLastEvent?.meta.id &&
+      !samePersistenceEvent(lastEvent, priorLastEvent) &&
       lastEvent && isUrgentPersistenceEvent(lastEvent)
     ) return true;
   }
@@ -1847,6 +2403,38 @@ function samePendingTurn(
 
 function sameStringList(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function samePersistenceEvent(
+  left: MessageStreamEvent | undefined,
+  right: MessageStreamEvent | undefined,
+): boolean {
+  if (!left || !right) return left === right;
+  const leftId = left.meta.id;
+  const rightId = right.meta.id;
+  if (leftId || rightId) return leftId === rightId;
+  // Eve sessions created before stream ids were introduced can still be
+  // replayed. Compare the small lifecycle identity fields instead of treating
+  // two id-less events as the same event and delaying terminal persistence.
+  return JSON.stringify(persistenceEventKey(left)) === JSON.stringify(persistenceEventKey(right));
+}
+
+function persistenceEventKey(event: MessageStreamEvent): readonly unknown[] {
+  const data = "data" in event && event.data && typeof event.data === "object"
+    ? event.data as Record<string, unknown>
+    : {};
+  return [
+    event.type,
+    data.turnId,
+    data.sequence,
+    data.stepIndex,
+    data.callId,
+    data.requestId,
+    data.message,
+    data.wait,
+    data.finishReason,
+    data.status,
+  ];
 }
 
 function isUrgentPersistenceEvent(event: MessageStreamEvent): boolean {

@@ -5,14 +5,15 @@ import type {
   AgentMailboxStore,
   EnqueueAgentMailboxResult,
 } from "../data/agent-mailbox-store.ts";
+import type { MessageStreamEvent } from "eve/client";
 import type { AgentSessionOwner } from "../data/session-ownership-store.ts";
 
 const DEFAULT_BUSY_RETRY_MS = 2_000;
 
 export type AgentMailboxBoundary =
-  | { readonly state: "running"; readonly turnId?: string }
-  | { readonly state: "waiting" }
-  | { readonly state: "terminal"; readonly terminalStatus?: "completed" | "failed" };
+  | { readonly lastEventAt?: string; readonly state: "running"; readonly tailIndex?: number; readonly turnId?: string }
+  | { readonly state: "waiting"; readonly tailIndex?: number }
+  | { readonly state: "terminal"; readonly tailIndex?: number; readonly terminalStatus?: "completed" | "failed" };
 
 export interface AgentMailboxRuntime {
   deliver(input: {
@@ -26,6 +27,11 @@ export interface AgentMailboxRuntime {
     readonly owner: AgentSessionOwner;
     readonly sessionId: string;
   }): Promise<AgentMailboxBoundary>;
+  /** Reads one finite authoritative Eve transcript without opening a live stream. */
+  readTranscript?(input: {
+    readonly sessionId: string;
+    readonly startIndex: number;
+  }): AsyncIterable<MessageStreamEvent>;
   /** Server-authorized lifecycle controls use the same signed runtime bridge. */
   cancel?(input: {
     readonly owner: AgentSessionOwner;
