@@ -512,6 +512,9 @@ The HTTP adapter's `eventWindow=1` route returns a bounded tail (`eventLimit`,
 default 256) with `startIndex`, `endIndex`, `total`, and `hasMoreBefore`; the
 workspace uses that contract to load older history on demand instead of
 replaying a settled session from cursor zero.
+The same bounded hydration path is used for child-agent sessions when the host
+provides `loadThreadWindow`; child pages share the root thread UI and continue
+from the absolute window cursor without a second index-zero snapshot reader.
 Production PostgreSQL deployments must apply migration `0010_thread_event_log.sql`;
 it backfills legacy JSONB events and moves subsequent append checkpoints to the
 bounded event log. The JSONB collection remains a metadata/compatibility snapshot,
