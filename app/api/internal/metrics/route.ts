@@ -1,7 +1,11 @@
 import { timingSafeEqual } from "node:crypto";
+import { monitorEventLoopDelay } from "node:perf_hooks";
 import { getAgentDatabasePoolStats } from "@/server/data/agent-database";
 
 export const runtime = "nodejs";
+
+const eventLoop = monitorEventLoopDelay({ resolution: 20 });
+eventLoop.enable();
 
 /**
  * Protected, low-cardinality diagnostics for capacity verification. This is
@@ -18,6 +22,9 @@ export async function GET(request: Request): Promise<Response> {
   }
   const usage = process.memoryUsage();
   const cpu = process.cpuUsage();
+  const eventLoopP95Ms = Number((eventLoop.percentile(95) / 1e6).toFixed(2));
+  const eventLoopMaxMs = Number((eventLoop.max / 1e6).toFixed(2));
+  eventLoop.reset();
   return Response.json(
     {
       ok: true,
@@ -31,6 +38,8 @@ export async function GET(request: Request): Promise<Response> {
         externalBytes: usage.external,
         cpuUserMicros: cpu.user,
         cpuSystemMicros: cpu.system,
+        eventLoopP95Ms,
+        eventLoopMaxMs,
         activeResources: process.getActiveResourcesInfo?.() ?? [],
       },
       agentDatabasePools: getAgentDatabasePoolStats(),
