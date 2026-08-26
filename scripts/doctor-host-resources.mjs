@@ -17,6 +17,7 @@ const minFreeMemoryBytes = boundedBytes(
   0,
   100 * 1024 ** 4,
 );
+const requireDockerLimits = process.env.AGENT_HOST_REQUIRE_DOCKER_LIMITS === "1";
 
 const disk = await readDisk();
 const memory = await readMemory();
@@ -26,6 +27,10 @@ const docker = await readDocker();
 const checks = {
   freeDisk: { ok: disk.availableBytes >= minFreeDiskBytes, requiredBytes: minFreeDiskBytes },
   freeMemory: { ok: memory.availableBytes >= minFreeMemoryBytes, requiredBytes: minFreeMemoryBytes },
+  dockerLimits: {
+    ok: !requireDockerLimits || docker.sandbox?.unlimitedCount === 0,
+    required: requireDockerLimits,
+  },
 };
 const report = {
   schemaVersion: "open-agent.host-resource-diagnostics.v1",
@@ -37,7 +42,7 @@ const report = {
   disk,
   docker,
   checks,
-  ok: checks.freeDisk.ok && checks.freeMemory.ok,
+  ok: checks.freeDisk.ok && checks.freeMemory.ok && checks.dockerLimits.ok,
   note: "Read-only diagnostics. Values are host observations, not a capacity or user-count guarantee.",
 };
 console.log(JSON.stringify(report, null, 2));
@@ -105,12 +110,44 @@ async function readDocker() {
       serverVersion: info.ServerVersion ?? null,
       cpus: info.NCPU ?? null,
       memoryBytes: info.MemTotal ?? null,
+      sandbox: await readDockerSandboxLimits(),
     };
   } catch (error) {
     return {
       reachable: false,
       reason: (error instanceof Error ? error.message : String(error)).slice(0, 240),
     };
+  }
+}
+
+async function readDockerSandboxLimits() {
+  try {
+    const { stdout } = await execFileAsync(
+      process.env.EVE_DOCKER_PATH?.trim() || "docker",
+      ["ps", "--filter", "label=eve.sandbox", "--filter", "status=running", "--format", "{{.ID}}"],
+      { timeout: 5_000, maxBuffer: 2 * 1024 * 1024 },
+    );
+    const ids = stdout.trim().split(/\s+/u).filter(Boolean).slice(0, 100);
+    if (ids.length === 0) return { running: 0, inspected: 0, unlimitedCount: 0, sample: [] };
+    const { stdout: inspected } = await execFileAsync(
+      process.env.EVE_DOCKER_PATH?.trim() || "docker",
+      ["inspect", "--format", "{{json .HostConfig}}", ...ids],
+      { timeout: 5_000, maxBuffer: 4 * 1024 * 1024 },
+    );
+    const sample = inspected.trim().split("\n").filter(Boolean).map((line) => {
+      const hostConfig = JSON.parse(line);
+      return {
+        memoryBytes: Number(hostConfig.Memory ?? 0),
+        nanoCpus: Number(hostConfig.NanoCpus ?? 0),
+        pidsLimit: hostConfig.PidsLimit == null ? null : Number(hostConfig.PidsLimit),
+      };
+    });
+    const unlimitedCount = sample.filter((entry) =>
+      entry.memoryBytes <= 0 || entry.nanoCpus <= 0 || entry.pidsLimit == null || entry.pidsLimit <= 0,
+    ).length;
+    return { running: ids.length, inspected: sample.length, unlimitedCount, sample: sample.slice(0, 5) };
+  } catch (error) {
+    return { running: null, inspected: 0, unlimitedCount: null, sample: [], error: (error instanceof Error ? error.message : String(error)).slice(0, 240) };
   }
 }
 
