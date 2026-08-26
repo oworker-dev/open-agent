@@ -98,8 +98,10 @@ must stop load testing and be treated as an infrastructure issue, not fixed by
 shrinking event history or dropping durable records.
 Set `AGENT_HOST_REQUIRE_DOCKER_LIMITS=1` when the deployment contract requires
 every running Eve Docker sandbox to expose finite memory, CPU, and PID limits;
-the diagnostic inspects the actual `HostConfig` values and does not assume the
-Eve Docker backend applied limits that it cannot configure itself.
+the diagnostic inspects the actual `HostConfig` values and, when the three
+`AGENT_DOCKER_*` values are present, verifies they match the declared limits.
+It does not assume the Eve Docker backend applied limits that it cannot
+configure itself.
 
 The doctor must pass in the same environment used for the build. In particular,
 `AGENT_EMBED_ALLOWED_ORIGINS` and `EVE_NEXT_PRODUCTION_PORT` are build inputs.

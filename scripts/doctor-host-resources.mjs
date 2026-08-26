@@ -18,17 +18,19 @@ const minFreeMemoryBytes = boundedBytes(
   100 * 1024 ** 4,
 );
 const requireDockerLimits = process.env.AGENT_HOST_REQUIRE_DOCKER_LIMITS === "1";
+const configuredDockerLimits = requireDockerLimits ? readConfiguredDockerLimits() : null;
 
 const disk = await readDisk();
-const memory = await readMemory();
 const cgroup = await readCgroupLimits();
+const memory = await readMemory(cgroup);
 const swap = await readSwap();
 const docker = await readDocker();
 const checks = {
   freeDisk: { ok: disk.availableBytes >= minFreeDiskBytes, requiredBytes: minFreeDiskBytes },
   freeMemory: { ok: memory.availableBytes >= minFreeMemoryBytes, requiredBytes: minFreeMemoryBytes },
   dockerLimits: {
-    ok: !requireDockerLimits || docker.sandbox?.unlimitedCount === 0,
+    ok: !requireDockerLimits
+      || (docker.sandbox?.unlimitedCount === 0 && docker.sandbox?.mismatchCount === 0),
     required: requireDockerLimits,
   },
 };
@@ -55,36 +57,86 @@ async function readDisk() {
   return { availableBytes, totalBytes, usedBytes: Math.max(0, totalBytes - availableBytes) };
 }
 
-async function readMemory() {
+async function readMemory(cgroup = {}) {
   try {
     const source = await readFile("/proc/meminfo", "utf8");
     const values = new Map(
       [...source.matchAll(/^([A-Za-z_]+):\s+(\d+)\s+kB$/gmu)]
         .map((match) => [match[1], Number(match[2]) * 1024]),
     );
-    const totalBytes = values.get("MemTotal") ?? os.totalmem();
-    const availableBytes = values.get("MemAvailable") ?? os.freemem();
-    return { totalBytes, availableBytes, usedBytes: Math.max(0, totalBytes - availableBytes) };
+    const hostTotalBytes = values.get("MemTotal") ?? os.totalmem();
+    const hostAvailableBytes = values.get("MemAvailable") ?? os.freemem();
+    const cgroupLimit = Number.isSafeInteger(cgroup.memoryLimitBytes) ? cgroup.memoryLimitBytes : undefined;
+    const cgroupCurrent = Number.isSafeInteger(cgroup.memoryCurrentBytes) ? cgroup.memoryCurrentBytes : undefined;
+    const totalBytes = cgroupLimit && cgroupLimit > 0 ? Math.min(hostTotalBytes, cgroupLimit) : hostTotalBytes;
+    const availableBytes = cgroupLimit && cgroupCurrent !== undefined
+      ? Math.max(0, Math.min(hostAvailableBytes, cgroupLimit - cgroupCurrent))
+      : hostAvailableBytes;
+    return {
+      totalBytes,
+      availableBytes,
+      usedBytes: Math.max(0, totalBytes - availableBytes),
+      hostTotalBytes,
+      hostAvailableBytes,
+    };
   } catch {
-    const totalBytes = os.totalmem();
-    const availableBytes = os.freemem();
-    return { totalBytes, availableBytes, usedBytes: Math.max(0, totalBytes - availableBytes) };
+    const hostTotalBytes = os.totalmem();
+    const hostAvailableBytes = os.freemem();
+    const cgroupLimit = Number.isSafeInteger(cgroup.memoryLimitBytes) ? cgroup.memoryLimitBytes : undefined;
+    const cgroupCurrent = Number.isSafeInteger(cgroup.memoryCurrentBytes) ? cgroup.memoryCurrentBytes : undefined;
+    const totalBytes = cgroupLimit && cgroupLimit > 0 ? Math.min(hostTotalBytes, cgroupLimit) : hostTotalBytes;
+    const availableBytes = cgroupLimit && cgroupCurrent !== undefined
+      ? Math.max(0, Math.min(hostAvailableBytes, cgroupLimit - cgroupCurrent))
+      : hostAvailableBytes;
+    return { totalBytes, availableBytes, usedBytes: Math.max(0, totalBytes - availableBytes), hostTotalBytes, hostAvailableBytes };
   }
 }
 
 async function readCgroupLimits() {
-  const result = {};
-  for (const [name, path] of [
-    ["memoryMaxBytes", "/sys/fs/cgroup/memory.max"],
-    ["cpuMax", "/sys/fs/cgroup/cpu.max"],
-  ]) {
+  const memoryMaxRaw = await readFirstAvailable(["/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"]);
+  const memoryCurrentRaw = await readFirstAvailable(["/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"]);
+  const cpuMaxRaw = await readFirstAvailable(["/sys/fs/cgroup/cpu.max", "/sys/fs/cgroup/cpu/cpu.cfs_quota_us"]);
+  const memoryLimitBytes = parseCgroupBytes(memoryMaxRaw);
+  const memoryCurrentBytes = parseCgroupBytes(memoryCurrentRaw);
+  return {
+    memoryMax: memoryMaxRaw,
+    memoryCurrent: memoryCurrentRaw,
+    memoryLimitBytes,
+    memoryCurrentBytes,
+    cpuMax: cpuMaxRaw,
+    cpuQuota: parseCpuQuota(cpuMaxRaw),
+  };
+}
+
+async function readFirstAvailable(paths) {
+  for (const path of paths) {
     try {
-      result[name] = (await readFile(path, "utf8")).trim();
+      return (await readFile(path, "utf8")).trim();
     } catch {
-      result[name] = null;
+      // Try the next cgroup layout (v2 then v1).
     }
   }
-  return result;
+  return null;
+}
+
+function parseCgroupBytes(raw) {
+  if (!raw || raw === "max") return null;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+function parseCpuQuota(raw) {
+  if (!raw) return null;
+  const fields = raw.split(/\s+/u);
+  if (fields.length >= 2 && fields[0] !== "max") {
+    const quota = Number(fields[0]);
+    const period = Number(fields[1]);
+    return Number.isFinite(quota) && Number.isFinite(period) && quota > 0 && period > 0
+      ? quota / period
+      : null;
+  }
+  const quota = Number(fields[0]);
+  return Number.isFinite(quota) && quota > 0 ? quota : null;
 }
 
 async function readSwap() {
@@ -110,7 +162,7 @@ async function readDocker() {
       serverVersion: info.ServerVersion ?? null,
       cpus: info.NCPU ?? null,
       memoryBytes: info.MemTotal ?? null,
-      sandbox: await readDockerSandboxLimits(),
+      sandbox: await readDockerSandboxLimits(configuredDockerLimits),
     };
   } catch (error) {
     return {
@@ -120,19 +172,26 @@ async function readDocker() {
   }
 }
 
-async function readDockerSandboxLimits() {
+async function readDockerSandboxLimits(expected) {
   try {
     const { stdout } = await execFileAsync(
       process.env.EVE_DOCKER_PATH?.trim() || "docker",
       ["ps", "--filter", "label=eve.sandbox", "--filter", "status=running", "--format", "{{.ID}}"],
       { timeout: 5_000, maxBuffer: 2 * 1024 * 1024 },
     );
-    const ids = stdout.trim().split(/\s+/u).filter(Boolean).slice(0, 100);
-    if (ids.length === 0) return { running: 0, inspected: 0, unlimitedCount: 0, sample: [] };
+    const ids = stdout.trim().split(/\s+/u).filter(Boolean);
+    if (ids.length === 0) return {
+      running: 0,
+      inspected: 0,
+      unlimitedCount: 0,
+      mismatchCount: 0,
+      expected,
+      sample: [],
+    };
     const { stdout: inspected } = await execFileAsync(
       process.env.EVE_DOCKER_PATH?.trim() || "docker",
       ["inspect", "--format", "{{json .HostConfig}}", ...ids],
-      { timeout: 5_000, maxBuffer: 4 * 1024 * 1024 },
+      { timeout: 10_000, maxBuffer: 32 * 1024 * 1024 },
     );
     const sample = inspected.trim().split("\n").filter(Boolean).map((line) => {
       const hostConfig = JSON.parse(line);
@@ -145,10 +204,52 @@ async function readDockerSandboxLimits() {
     const unlimitedCount = sample.filter((entry) =>
       entry.memoryBytes <= 0 || entry.nanoCpus <= 0 || entry.pidsLimit == null || entry.pidsLimit <= 0,
     ).length;
-    return { running: ids.length, inspected: sample.length, unlimitedCount, sample: sample.slice(0, 5) };
+    const mismatchCount = expected === null ? 0 : sample.filter((entry) =>
+      entry.memoryBytes !== expected.memoryBytes
+      || entry.nanoCpus !== expected.nanoCpus
+      || entry.pidsLimit !== expected.pidsLimit,
+    ).length;
+    return {
+      running: ids.length,
+      inspected: sample.length,
+      unlimitedCount,
+      mismatchCount,
+      expected,
+      sample: sample.slice(0, 5),
+    };
   } catch (error) {
-    return { running: null, inspected: 0, unlimitedCount: null, sample: [], error: (error instanceof Error ? error.message : String(error)).slice(0, 240) };
+    return {
+      running: null,
+      inspected: 0,
+      unlimitedCount: null,
+      mismatchCount: null,
+      expected,
+      sample: [],
+      error: (error instanceof Error ? error.message : String(error)).slice(0, 240),
+    };
   }
+}
+
+function readConfiguredDockerLimits() {
+  const memoryBytes = boundedBytes(
+    process.env.AGENT_DOCKER_MEMORY_LIMIT_BYTES,
+    0,
+    64 * 1024 ** 3,
+  );
+  if (memoryBytes <= 0) {
+    throw new Error("AGENT_DOCKER_MEMORY_LIMIT_BYTES is required when AGENT_HOST_REQUIRE_DOCKER_LIMITS=1.");
+  }
+  const cpusRaw = process.env.AGENT_DOCKER_CPU_LIMIT?.trim();
+  const cpus = cpusRaw ? Number(cpusRaw) : NaN;
+  if (!Number.isFinite(cpus) || cpus < 0.1 || cpus > 64) {
+    throw new Error("AGENT_DOCKER_CPU_LIMIT must be a number from 0.1 to 64 when AGENT_HOST_REQUIRE_DOCKER_LIMITS=1.");
+  }
+  const pidsRaw = process.env.AGENT_DOCKER_PIDS_LIMIT?.trim();
+  const pidsLimit = pidsRaw ? Number(pidsRaw) : NaN;
+  if (!Number.isSafeInteger(pidsLimit) || pidsLimit < 64 || pidsLimit > 32_768) {
+    throw new Error("AGENT_DOCKER_PIDS_LIMIT must be an integer from 64 to 32768 when AGENT_HOST_REQUIRE_DOCKER_LIMITS=1.");
+  }
+  return { memoryBytes, nanoCpus: Math.round(cpus * 1_000_000_000), pidsLimit };
 }
 
 function boundedBytes(raw, fallback, minimum, maximum) {
