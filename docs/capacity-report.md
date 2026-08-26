@@ -102,15 +102,14 @@ sessions and Muses host sessions are never selected by that cleanup path.
 
 ## Storage finding
 
-The local Workflow database currently contains roughly 634 MiB. The
-`workflow_stream_chunks` table currently reports roughly 532 MiB of relation
-storage (about 979 MiB of uncompressed chunk payload across 56k chunks). The
-Workflow World has 276 scanned runs, including 132 `running` rows from the
-long-running local test history; the latest retention dry-run protected 81
-active roots and selected zero deletions. Those active rows must be reconciled
-through the Eve lifecycle and an archived-session policy before cleanup; direct
-SQL deletion is not a valid production fix. The Postgres World package
-documents no general workflow-run cleanup. `npm run reap:workflow` provides a
-default dry-run report and an explicitly confirmed terminal-run cleanup path,
-but it must be reviewed with a backup and a verified session/archive policy
-before deletion is enabled in production.
+The local Workflow database is storage-heavy: the post-cleanup snapshot is
+roughly 665 MiB, with `workflow_stream_chunks` at about 540 MiB of relation
+storage and 1.04 GiB of uncompressed chunk payload across 63k chunks. The
+snapshot contains 720 runs, of which 80 are still `running` (40 retained
+session roots and their 40 active child/turn records); these are historical
+user or Muses-host sessions and are not safe to infer as abandoned from age
+alone. Earlier capacity runs left additional synthetic roots; the verifier now
+retires those through Eve's reset lifecycle, and the cleanup was confirmed with
+zero `LOAD_READY` roots remaining. `npm run reap:workflow` remains a guarded,
+default-dry-run path for old terminal runs; it never rewrites active sessions
+and direct SQL deletion is not a production reconciliation strategy.
