@@ -189,7 +189,9 @@ function createCollectionPatch(baseline, collection) {
             if (delta.events.length > 0)
                 eventAppends.push({
                     events: delta.events,
-                    ...(delta.replaceFrom === previous.events.length ? {} : { replaceFrom: delta.replaceFrom }),
+                    ...(delta.replaceFrom === previous.events.length ? {} : {
+                        replaceFrom: (previous.transcriptWindow?.startIndex ?? 0) + delta.replaceFrom,
+                    }),
                     threadId: thread.id,
                 });
             return [{ ...thread, events: [], hydration: "summary" }];

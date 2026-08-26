@@ -267,7 +267,13 @@ function createCollectionPatch(
     if (delta) {
       if (delta.events.length > 0) eventAppends.push({
         events: delta.events,
-        ...(delta.replaceFrom === previous.events.length ? {} : { replaceFrom: delta.replaceFrom }),
+        // A bounded transcript starts at an absolute event-log offset. The
+        // local array index is only suitable for the in-memory diff; translate
+        // replacement checkpoints back to the server's absolute index so a
+        // cumulative tool-input update cannot overwrite older turns.
+        ...(delta.replaceFrom === previous.events.length ? {} : {
+          replaceFrom: (previous.transcriptWindow?.startIndex ?? 0) + delta.replaceFrom,
+        }),
         threadId: thread.id,
       });
       return [{ ...thread, events: [], hydration: "summary" as const }];

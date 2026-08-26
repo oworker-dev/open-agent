@@ -184,6 +184,53 @@ test("loads transcript windows with an absolute before cursor", async () => {
   assert.match(urls[0] ?? "", /eventLimit=4/u);
 });
 
+test("maps cumulative replacements from a bounded window to absolute event indexes", async () => {
+  const thread = {
+    ...createAgentThread(100, "Windowed replacement"),
+    events: [{
+      data: { callId: "call-1", stepIndex: 0, turnId: "turn-1", input: "old" },
+      meta: { at: new Date(0).toISOString(), id: "partial-1" },
+      type: "action.input.partial" as const,
+    }],
+    session: { sessionId: "session-1", streamIndex: 9 },
+    transcriptWindow: { endIndex: 9, hasMoreBefore: true, startIndex: 8, total: 20 },
+  };
+  let patch: { readonly eventAppends?: readonly { readonly replaceFrom?: number }[] } | undefined;
+  const storage = createHttpAgentThreadStorage({
+    fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("eventWindow=1")) {
+        return Response.json({
+          eventWindow: thread.transcriptWindow,
+          revision: 2,
+          thread,
+        }, { headers: { etag: '"2"' } });
+      }
+      if (init?.method === "PATCH") {
+        patch = JSON.parse(String(init.body)) as typeof patch;
+        return Response.json({ revision: 3 }, { headers: { etag: '"3"' } });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    }) as typeof fetch,
+  });
+
+  await storage.loadThreadWindow?.("workspace-window-replacement", thread.id);
+  await storage.save("workspace-window-replacement", {
+    activeThreadId: thread.id,
+    threads: [{
+      ...thread,
+      events: [{
+        ...thread.events[0]!,
+        data: { ...thread.events[0]!.data, input: "new" },
+        meta: { ...thread.events[0]!.meta, id: "partial-2" },
+      }],
+    }],
+    version: AGENT_THREAD_STORAGE_VERSION,
+  });
+
+  assert.equal(patch?.eventAppends?.[0]?.replaceFrom, 8);
+});
+
 test("a server transcript repair advances the revision used by the next metadata save", async () => {
   const thread = {
     ...createAgentThread(100, "Repair me"),
