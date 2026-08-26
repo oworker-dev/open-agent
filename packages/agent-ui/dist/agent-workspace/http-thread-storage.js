@@ -1,4 +1,4 @@
-import { AGENT_THREAD_STORAGE_VERSION, parseThreadCollection, } from "./thread-storage.js";
+import { AGENT_THREAD_STORAGE_VERSION, eventIdentity, parseThreadCollection, } from "./thread-storage.js";
 export class AgentThreadStorageConflictError extends Error {
     currentRevision;
     expectedRevision;
@@ -65,7 +65,7 @@ export function createHttpAgentThreadStorage(options) {
         },
         async repairThread(storageKey, threadId) {
             preferredThreadId = threadId;
-            const response = await request(fetchImplementation, options, collectionUrl(`${endpoint}/repair`, storageKey, { threadId }), {
+            const response = await request(fetchImplementation, options, repairCollectionUrl(endpoint, storageKey, { threadId }), {
                 headers: { "content-type": "application/json" },
                 method: "POST",
             });
@@ -104,7 +104,8 @@ export function createHttpAgentThreadStorage(options) {
             if (expectedRevision === undefined || baseline === undefined) {
                 throw new Error("Agent thread storage must be loaded before it can be saved.");
             }
-            const patch = createCollectionPatch(baseline, collection);
+            const savedCollection = snapshotCollection(collection);
+            const patch = createCollectionPatch(baseline, savedCollection);
             const response = await request(fetchImplementation, options, collectionUrl(endpoint, storageKey), {
                 body: JSON.stringify(patch),
                 headers: {
@@ -118,8 +119,18 @@ export function createHttpAgentThreadStorage(options) {
             }
             await requireOk(response);
             revisions.set(storageKey, await readRevisionResponse(response));
-            baselines.set(storageKey, collection);
+            baselines.set(storageKey, savedCollection);
         },
+    };
+}
+function snapshotCollection(collection) {
+    return {
+        ...(collection.activeThreadId ? { activeThreadId: collection.activeThreadId } : {}),
+        threads: collection.threads.map((thread) => ({
+            ...thread,
+            events: [...thread.events],
+        })),
+        version: collection.version,
     };
 }
 function withoutSummaryHydration(thread) {
@@ -147,6 +158,9 @@ function createCollectionPatch(baseline, collection) {
         if (sameEventIds(previous.events, thread.events)) {
             return [{ ...thread, events: [], hydration: "summary" }];
         }
+        if (!isExplicitTranscriptReplacement(thread)) {
+            return [{ ...thread, events: [], hydration: "summary" }];
+        }
         return [thread];
     });
     return {
@@ -160,22 +174,30 @@ function createCollectionPatch(baseline, collection) {
         version: collection.version,
     };
 }
+function isExplicitTranscriptReplacement(thread) {
+    return thread.pendingTurn?.state === "clearing" ||
+        thread.pendingTurn?.state === "resubmitting";
+}
 function appendOnlyEventDelta(previous, next) {
     if (next.length < previous.length)
         return undefined;
     let firstDifference = -1;
     for (let index = 0; index < previous.length; index += 1) {
-        if (previous[index]?.meta.id !== next[index]?.meta.id) {
+        if (eventIdentity(previous[index]) !== eventIdentity(next[index])) {
             firstDifference = index;
             break;
         }
     }
     if (firstDifference < 0)
         firstDifference = previous.length;
+    for (let index = firstDifference + 1; index < previous.length; index += 1) {
+        if (eventIdentity(previous[index]) !== eventIdentity(next[index]))
+            return undefined;
+    }
     return { events: next.slice(firstDifference), replaceFrom: firstDifference };
 }
 function sameEventIds(left, right) {
-    return left.length === right.length && left.every((event, index) => event.meta.id === right[index]?.meta.id);
+    return left.length === right.length && left.every((event, index) => right[index] !== undefined && eventIdentity(event) === eventIdentity(right[index]));
 }
 async function request(fetchImplementation, options, url, init) {
     const accessToken = await options.getAccessToken?.();
@@ -221,6 +243,13 @@ async function readCollectionResponse(response) {
 }
 function collectionUrl(endpoint, storageKey, query) {
     const url = `${endpoint}/${encodeURIComponent(storageKey)}`;
+    if (!query)
+        return url;
+    const search = new URLSearchParams(query);
+    return `${url}?${search.toString()}`;
+}
+function repairCollectionUrl(endpoint, storageKey, query) {
+    const url = `${endpoint}/${encodeURIComponent(storageKey)}/repair`;
     if (!query)
         return url;
     const search = new URLSearchParams(query);

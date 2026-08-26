@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import type { MessageStreamEvent } from "eve/client";
 import {
   AgentThreadStorageConflictError,
   createHttpAgentThreadStorage,
@@ -30,6 +31,67 @@ test("persists a loaded collection and advances its optimistic revision", async 
 
   assert.equal(server.revision(), 1);
   assert.equal(server.collection().threads[0]?.title, "Persist me");
+});
+
+test("an in-flight save snapshots its event baseline before the live buffer grows", async () => {
+  type PatchBody = {
+    readonly eventAppends?: readonly {
+      readonly events: readonly MessageStreamEvent[];
+      readonly threadId: string;
+    }[];
+    readonly upsertThreads?: readonly { readonly events: readonly MessageStreamEvent[] }[];
+  };
+  const patches: PatchBody[] = [];
+  let releaseFirstSave: (() => void) | undefined;
+  let markFirstSaveStarted: (() => void) | undefined;
+  const firstSaveStarted = new Promise<void>((resolve) => {
+    markFirstSaveStarted = resolve;
+  });
+  const firstSaveMayFinish = new Promise<void>((resolve) => {
+    releaseFirstSave = resolve;
+  });
+  let revision = 0;
+  const storage = createHttpAgentThreadStorage({
+    fetch: (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method !== "PATCH") {
+        return Response.json({
+          collection: { threads: [], version: AGENT_THREAD_STORAGE_VERSION },
+          revision,
+        }, { headers: { etag: `"${revision}"` } });
+      }
+      patches.push(JSON.parse(String(init.body)) as PatchBody);
+      if (patches.length === 1) {
+        markFirstSaveStarted?.();
+        await firstSaveMayFinish;
+      }
+      revision += 1;
+      return Response.json({ revision }, { headers: { etag: `"${revision}"` } });
+    }) as typeof fetch,
+  });
+
+  await storage.load("workspace-live-buffer");
+  const events: MessageStreamEvent[] = [];
+  const thread = { ...createAgentThread(100, "Live buffer"), events };
+  const collection = {
+    activeThreadId: thread.id,
+    threads: [thread],
+    version: AGENT_THREAD_STORAGE_VERSION,
+  };
+
+  const firstSave = storage.save("workspace-live-buffer", collection);
+  await firstSaveStarted;
+  events.push({
+    data: { sequence: 0, stepIndex: 0, turnId: "turn-live" },
+    meta: { at: new Date(0).toISOString() },
+    type: "step.started",
+  } as MessageStreamEvent);
+  releaseFirstSave?.();
+  await firstSave;
+  await storage.save("workspace-live-buffer", collection);
+
+  assert.deepEqual(patches[0]?.upsertThreads?.[0]?.events, []);
+  assert.equal(patches[1]?.eventAppends?.[0]?.events.length, 1);
+  assert.equal(patches[1]?.eventAppends?.[0]?.events[0]?.type, "step.started");
 });
 
 test("surfaces a conflict instead of overwriting another client", async () => {
@@ -113,10 +175,12 @@ test("a server transcript repair advances the revision used by the next metadata
     transcriptCoverage: { complete: true, endIndex: 12_803, startIndex: 0, version: 1 as const },
   };
   let savedIfMatch: string | null = null;
+  let repairUrl: string | undefined;
   const storage = createHttpAgentThreadStorage({
     fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
-      if (init?.method === "POST" && url.includes("/repair/")) {
+      if (init?.method === "POST" && url.includes("/workspace-repair/repair?")) {
+        repairUrl = url;
         return Response.json({ revision: 5, thread: repaired }, { headers: { etag: '"5"' } });
       }
       if (init?.method === "PATCH") {
@@ -133,6 +197,7 @@ test("a server transcript repair advances the revision used by the next metadata
   await storage.load("workspace-repair");
   const hydrated = await storage.repairThread?.("workspace-repair", thread.id);
   assert.equal(hydrated?.transcriptCoverage?.complete, true);
+  assert.equal(repairUrl, `/api/agent/thread-collections/workspace-repair/repair?threadId=${encodeURIComponent(thread.id)}`);
   await storage.save("workspace-repair", {
     activeThreadId: thread.id,
     threads: [{ ...hydrated!, title: "Repaired" }],
@@ -142,12 +207,92 @@ test("a server transcript repair advances the revision used by the next metadata
   assert.equal(savedIfMatch, '"5"');
 });
 
+test("does not replace durable events with a shorter reconnect snapshot", async () => {
+  const server = fakeThreadServer();
+  const storage = createHttpAgentThreadStorage({
+    fetch: server.fetch,
+    getAccessToken: () => "test-token",
+  });
+  const initial = await storage.load("workspace-stale-reconnect");
+  const firstEvent = {
+    data: { message: "request", parts: [{ text: "request", type: "text" }], sequence: 0, turnId: "turn-0" },
+    meta: { at: new Date(0).toISOString(), id: "event-request" },
+    type: "message.received" as const,
+  } satisfies MessageStreamEvent;
+  const secondEvent = {
+    data: { messageDelta: "answer", messageSoFar: "answer", sequence: 0, stepIndex: 0, turnId: "turn-0" },
+    meta: { at: new Date(1).toISOString(), id: "event-answer" },
+    type: "message.appended" as const,
+  } satisfies MessageStreamEvent;
+  const thread = {
+    ...createAgentThread(100, "Stale reconnect"),
+    events: [firstEvent, secondEvent],
+  };
+  await storage.save("workspace-stale-reconnect", {
+    ...initial,
+    activeThreadId: thread.id,
+    threads: [thread],
+  });
+
+  const staleSnapshot = { ...thread, events: [secondEvent], updatedAt: 200 };
+  await storage.save("workspace-stale-reconnect", {
+    activeThreadId: thread.id,
+    threads: [staleSnapshot],
+    version: AGENT_THREAD_STORAGE_VERSION,
+  });
+
+  const patch = server.lastPatch();
+  assert.equal(patch?.eventAppends?.length, 0);
+  assert.deepEqual(patch?.upsertThreads?.[0]?.events, []);
+});
+
+test("does not treat a reordered snapshot as an append or replacement delta", async () => {
+  const server = fakeThreadServer();
+  const storage = createHttpAgentThreadStorage({
+    fetch: server.fetch,
+    getAccessToken: () => "test-token",
+  });
+  const initial = await storage.load("workspace-reordered-reconnect");
+  const makeEvent = (id: string, message: string) => ({
+    data: { messageDelta: message, messageSoFar: message, sequence: 0, stepIndex: 0, turnId: "turn-0" },
+    meta: { at: new Date(0).toISOString(), id },
+    type: "message.appended" as const,
+  });
+  const first = makeEvent("event-first", "first");
+  const second = {
+    data: { sequence: 0, stepIndex: 1, turnId: "turn-0" },
+    meta: { at: new Date(1).toISOString(), id: "event-second" },
+    type: "step.started" as const,
+  };
+  const thread = { ...createAgentThread(100, "Reordered"), events: [first, second] };
+  await storage.save("workspace-reordered-reconnect", {
+    ...initial,
+    activeThreadId: thread.id,
+    threads: [thread],
+  });
+
+  await storage.save("workspace-reordered-reconnect", {
+    activeThreadId: thread.id,
+    threads: [{ ...thread, events: [second, first], updatedAt: 200 }],
+    version: AGENT_THREAD_STORAGE_VERSION,
+  });
+
+  const patch = server.lastPatch();
+  assert.equal(patch?.eventAppends?.length, 0);
+  assert.deepEqual(patch?.upsertThreads?.[0]?.events, []);
+});
+
 function fakeThreadServer() {
   let revision = 0;
   let collection: AgentThreadCollection = { threads: [], version: AGENT_THREAD_STORAGE_VERSION };
+  let lastPatch: {
+    readonly eventAppends?: readonly { readonly events: readonly MessageStreamEvent[]; readonly threadId: string }[];
+    readonly upsertThreads?: readonly ReturnType<typeof createAgentThread>[];
+  } | undefined;
 
   return {
     collection: () => collection as { readonly threads: readonly ReturnType<typeof createAgentThread>[] },
+    lastPatch: () => lastPatch,
     fetch: (async (_input: RequestInfo | URL, init?: RequestInit) => {
       assert.match(new Headers(init?.headers).get("authorization") ?? "", /^Bearer /);
       if (init?.method !== "PUT" && init?.method !== "PATCH") {
@@ -167,6 +312,7 @@ function fakeThreadServer() {
         upsertThreads?: readonly ReturnType<typeof createAgentThread>[];
       };
       if (init.method === "PATCH") {
+        lastPatch = body;
         const deleted = new Set(body.deletedThreadIds ?? []);
         const replacements = new Map((body.upsertThreads ?? []).map((thread) => [thread.id, thread]));
         const retained = collection.threads

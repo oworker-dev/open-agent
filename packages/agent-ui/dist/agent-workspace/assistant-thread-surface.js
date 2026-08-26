@@ -24,7 +24,21 @@ export function AssistantThreadSurface({ assetUrl, approvalTakeover, cancellatio
     const canRespondToInputRequest = eveMessages.some((message) => message.parts.some((part) => part.type === "dynamic-tool" &&
         Boolean(part.toolMetadata?.eve?.inputRequest) &&
         part.toolMetadata?.eve?.inputResponse === undefined));
-    return (_jsx(ThreadPrimitive.Root, { className: "aui-root flex h-full min-h-0 flex-col bg-background", style: { "--thread-max-width": "48rem" }, children: _jsxs(ThreadPrimitive.Viewport, { "aria-live": "polite", autoScroll: true, turnAnchor: "top", className: "relative flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-auto px-3 pt-3 sm:px-4 sm:pt-4", "data-slot": "thread-viewport", role: "log", children: [_jsxs("div", { className: "mx-auto flex w-full max-w-(--thread-max-width) flex-col gap-6 empty:hidden", children: [_jsx(ThreadPrimitive.Messages, { children: ({ message }) => message.composer.isEditing ? (_jsx(EditMessage, { messages: messages })) : message.role === "user" ? (_jsx(UserMessage, { messages: messages })) : (_jsx(AssistantMessage, { assetUrl: assetUrl, canRespond: !isBusy || canRespondToInputRequest, events: events, fallbackStartedAt: fallbackStartedAt, isStreaming: isBusy && message.id === lastMessageId, locale: locale, message: eveMessagesById.get(message.id), messages: messages, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, closedInputRequestIds: closedInputRequestIds })) }), runtimeError ? (_jsx(RuntimeErrorMessage, { locale: locale, message: runtimeError, messages: messages, onRetry: onRetryRuntimeError })) : null] }), _jsx(ThreadPrimitive.Empty, { children: !isBusy ? _jsx(AssistantEmptyState, { messages: messages }) : null }), _jsxs(ThreadPrimitive.ViewportFooter, { className: "sticky bottom-0 z-20 mx-auto mt-auto flex w-full max-w-(--thread-max-width) flex-col bg-background pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-0 sm:pb-4 md:pb-5", children: [_jsx(ThreadPrimitive.ScrollToBottom, { asChild: true, children: _jsx(TooltipIconButton, { tooltip: locale === "zh-CN" ? "滚动到底部" : "Scroll to bottom", className: "absolute -top-9 left-1/2 z-10 size-8 -translate-x-1/2 rounded-full disabled:invisible", variant: "outline", children: _jsx(ArrowDownIcon, { className: "size-4" }) }) }), _jsx(AssistantComposer, { approvalTakeover: approvalTakeover, cancellationState: cancellationState, commands: commands, composerTop: composerTop, draftStorageKey: draftStorageKey, draftRestore: draftRestore, inputDisabled: inputDisabled, locale: locale, mentions: mentions, messages: messages, models: models, onPreferencesChange: onPreferencesChange, onInputResponses: onInputResponses, onDraftRestoreConsumed: onDraftRestoreConsumed, preferences: preferences, reasoningLevels: reasoningLevels, usage: usage })] })] }) }));
+    return (_jsx(ThreadPrimitive.Root, { className: "aui-root flex h-full min-h-0 flex-col bg-background", style: { "--thread-max-width": "48rem" }, children: _jsxs(ThreadPrimitive.Viewport, { "aria-live": "polite", autoScroll: true, turnAnchor: "top", className: "relative flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-auto px-3 pt-3 sm:px-4 sm:pt-4", "data-slot": "thread-viewport", role: "log", children: [_jsxs("div", { className: "mx-auto flex w-full max-w-(--thread-max-width) flex-col gap-6 pb-3 empty:hidden", children: [_jsx(ThreadPrimitive.Messages, { children: ({ message }) => message.composer.isEditing ? (_jsx(EditMessage, { messages: messages })) : message.role === "user" ? (_jsx(UserMessage, { messages: messages })) : (_jsx(AssistantMessage, { assetUrl: assetUrl, canRespond: !isBusy || canRespondToInputRequest, events: events, fallbackStartedAt: fallbackStartedAt, isStreaming: isBusy && message.id === lastMessageId, isTurnContinuation: isSteeringContinuationMessage(message, events), locale: locale, message: eveMessagesById.get(message.id), messages: messages, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, closedInputRequestIds: closedInputRequestIds })) }), runtimeError ? (_jsx(RuntimeErrorMessage, { locale: locale, message: runtimeError, messages: messages, onRetry: onRetryRuntimeError })) : null] }), _jsx(ThreadPrimitive.Empty, { children: !isBusy ? _jsx(AssistantEmptyState, { messages: messages }) : null }), _jsxs(ThreadPrimitive.ViewportFooter, { className: "sticky bottom-0 z-20 mx-auto mt-auto flex w-full max-w-(--thread-max-width) flex-col bg-background pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-0 sm:pb-4 md:pb-5", children: [_jsx(ThreadPrimitive.ScrollToBottom, { asChild: true, children: _jsx(TooltipIconButton, { tooltip: locale === "zh-CN" ? "滚动到底部" : "Scroll to bottom", className: "absolute -top-9 left-1/2 z-10 size-8 -translate-x-1/2 rounded-full disabled:invisible", variant: "outline", children: _jsx(ArrowDownIcon, { className: "size-4" }) }) }), _jsx(AssistantComposer, { approvalTakeover: approvalTakeover, cancellationState: cancellationState, commands: commands, composerTop: composerTop, draftStorageKey: draftStorageKey, draftRestore: draftRestore, inputDisabled: inputDisabled, locale: locale, mentions: mentions, messages: messages, models: models, onPreferencesChange: onPreferencesChange, onInputResponses: onInputResponses, onDraftRestoreConsumed: onDraftRestoreConsumed, preferences: preferences, reasoningLevels: reasoningLevels, usage: usage })] })] }) }));
+}
+function isSteeringContinuationMessage(message, events) {
+    const metadata = typeof message.metadata === "object" && message.metadata !== null
+        ? message.metadata
+        : undefined;
+    const turnId = typeof metadata?.turnId === "string" ? metadata.turnId : undefined;
+    if (message.role !== "assistant" || !turnId || !message.id.startsWith(`${turnId}:assistant:`))
+        return false;
+    const clientMessageId = message.id.slice(`${turnId}:assistant:`.length);
+    if (!clientMessageId)
+        return false;
+    const receipts = events.filter((event) => event.type === "message.received" && event.data.turnId === turnId);
+    const segmentIndex = receipts.findIndex((event) => event.type === "message.received" && event.data.clientMessageId === clientMessageId);
+    return segmentIndex > 0 || (segmentIndex < 0 && receipts.length > 0);
 }
 function RuntimeErrorMessage({ locale, message, messages, onRetry, }) {
     return (_jsx("article", { className: "mx-auto flex w-full max-w-(--thread-max-width) flex-col", "data-agent-message-error": true, role: "alert", children: _jsxs("div", { className: "flex items-start gap-3 px-1 text-sm", children: [_jsx(CircleXIcon, { className: "mt-0.5 size-4 shrink-0 text-destructive" }), _jsxs("div", { className: "min-w-0 flex-1", children: [_jsx("p", { className: "font-medium text-foreground", children: locale === "zh-CN" ? "本轮执行失败" : messages.requestFailed }), _jsx("p", { className: "mt-1 break-words text-muted-foreground", children: message }), _jsx("p", { className: "mt-1 text-muted-foreground", children: messages.requestPreserved }), onRetry ? (_jsxs(Button, { className: "mt-2 h-7 px-2.5 text-xs", onClick: onRetry, size: "sm", variant: "outline", children: [_jsx(RotateCcwIcon, { className: "size-3.5" }), messages.retry] })) : null] })] }) }));
@@ -57,25 +71,36 @@ function attachmentContentUrl(attachment) {
     }
     return undefined;
 }
-function AssistantMessage({ assetUrl, canRespond, closedInputRequestIds, events, fallbackStartedAt, isStreaming, locale, message, messages, onInputResponses, onCloseInputRequest, onOpenDeliverable, onOpenSubagent, }) {
-    const hasCopyableText = message?.parts.some((part) => part.type === "text" && part.text.trim().length > 0) ?? false;
-    return (_jsxs(MessagePrimitive.Root, { className: "group mx-auto flex w-full max-w-(--thread-max-width) scroll-mt-5 flex-col", children: [_jsx("div", { className: "min-w-0 px-1 text-[15px] leading-7 text-foreground", children: message ? (_jsx(AgentMessage, { assetUrl: assetUrl, canRespond: canRespond, closedInputRequestIds: closedInputRequestIds, events: events, fallbackStartedAt: fallbackStartedAt, isStreaming: isStreaming, locale: locale, message: message, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, showCopyAction: false })) : (_jsx(MessagePrimitive.Parts, { components: { Text: MarkdownText, tools: { Fallback: ToolFallback } } })) }), !isStreaming && hasCopyableText && (!message?.metadata?.turnId || (message !== undefined && presentTurnCompleted(message, events, closedInputRequestIds))) ? (_jsx(ActionBarPrimitive.Root, { className: "mt-1 flex min-h-7 items-center opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100", children: _jsx(ReliableCopyButton, { label: messages.copyResponse }) })) : null] }));
+function AssistantMessage({ assetUrl, canRespond, closedInputRequestIds, events, fallbackStartedAt, isStreaming, isTurnContinuation, locale, message, messages, onInputResponses, onCloseInputRequest, onOpenDeliverable, onOpenSubagent, }) {
+    const task = message
+        ? presentAgentTurn(message, events, closedInputRequestIds, { mergeSameTurn: true })
+        : undefined;
+    const copyableText = message
+        ? task
+            ? task.status === "completed" ? task.finalPart?.text.trim() : undefined
+            : message.metadata?.status === "failed"
+                ? undefined
+                : message.parts
+                    .filter((part) => part.type === "text")
+                    .map((part) => part.text)
+                    .join("\n")
+                    .trim() || undefined
+        : undefined;
+    return (_jsxs(MessagePrimitive.Root, { className: "group mx-auto flex w-full max-w-(--thread-max-width) scroll-mt-5 flex-col", children: [_jsx("div", { className: "min-w-0 px-1 text-[15px] leading-7 text-foreground", children: message ? (_jsx(AgentMessage, { assetUrl: assetUrl, canRespond: canRespond, closedInputRequestIds: closedInputRequestIds, events: events, fallbackStartedAt: fallbackStartedAt, isStreaming: isStreaming, isTurnContinuation: isTurnContinuation, locale: locale, message: message, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, showCopyAction: false })) : (_jsx(MessagePrimitive.Parts, { components: { Text: MarkdownText, tools: { Fallback: ToolFallback } } })) }), !isStreaming && copyableText ? (_jsx(ActionBarPrimitive.Root, { className: "mt-1 flex min-h-7 items-center opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100", children: _jsx(ReliableCopyButton, { label: messages.copyResponse, text: copyableText }) })) : null] }));
 }
-function presentTurnCompleted(message, events, closedInputRequestIds) {
-    return presentAgentTurn(message, events, closedInputRequestIds)?.status === "completed";
-}
-function ReliableCopyButton({ label }) {
+function ReliableCopyButton({ label, text }) {
     const aui = useAui();
     const [copied, setCopied] = useState(false);
     const timer = useRef(undefined);
     useEffect(() => () => window.clearTimeout(timer.current), []);
-    return (_jsx(Button, { "aria-label": label, className: "inline-flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground", onClick: () => {
-            void copyText(aui.message.getCopyText()).then(() => {
+    return (_jsx(Button, { "aria-label": label, className: "inline-flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground", size: "icon-sm", title: copied ? "Copied" : label, type: "button", variant: "ghost", onClick: () => {
+            const copyValue = text ?? aui.message.getCopyText();
+            void copyText(copyValue).then(() => {
                 setCopied(true);
                 window.clearTimeout(timer.current);
                 timer.current = window.setTimeout(() => setCopied(false), 1_500);
             }).catch(() => setCopied(false));
-        }, size: "icon-sm", title: copied ? "Copied" : label, type: "button", variant: "ghost", children: copied ? _jsx(CheckIcon, { className: "size-3.5" }) : _jsx(CopyIcon, { className: "size-3.5" }) }));
+        }, children: copied ? _jsx(CheckIcon, { className: "size-3.5" }) : _jsx(CopyIcon, { className: "size-3.5" }) }));
 }
 function EditMessage({ messages }) {
     const aui = useAui();

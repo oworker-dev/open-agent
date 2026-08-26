@@ -10,6 +10,7 @@ import {
   BracesIcon,
   CheckIcon,
   CheckCircleIcon,
+  CircleAlertIcon,
   ChevronDownIcon,
   CircleStopIcon,
   CopyIcon,
@@ -138,6 +139,7 @@ export function AgentMessage({
   events,
   fallbackStartedAt,
   isStreaming,
+  isTurnContinuation = false,
   locale,
   message,
   onOpenDeliverable,
@@ -152,6 +154,8 @@ export function AgentMessage({
   readonly events: readonly MessageStreamEvent[];
   readonly fallbackStartedAt?: number;
   readonly isStreaming: boolean;
+  /** Render steering output inside the existing turn without a second timer. */
+  readonly isTurnContinuation?: boolean;
   readonly locale: AgentLocale;
   readonly message: EveMessage;
   readonly onOpenDeliverable?: (deliverable: AgentSessionDeliverable) => void;
@@ -168,7 +172,9 @@ export function AgentMessage({
           : part),
       }
     : message;
-  const task = presentAgentTurn(displayMessage, events, closedInputRequestIds);
+  const task = presentAgentTurn(displayMessage, events, closedInputRequestIds, {
+    mergeSameTurn: Boolean(displayMessage.metadata?.turnId),
+  });
   const responseText = task?.finalPart?.text ?? (task ? undefined : lastText(displayMessage.parts));
   const failure = failureForTurn(events, displayMessage.metadata?.turnId);
   const hasFailureStepAnchor = task?.failureAnchored === true;
@@ -191,49 +197,87 @@ export function AgentMessage({
         ) : null}
         {task ? (
           <>
-            <ExecutionGroup
-              collapseWhenSettled={task.status === "completed" && Boolean(
-                task.finalPart?.text.trim() ||
-                hasLaterFinalDelivery(events, message.metadata?.turnId),
-              )}
-              fallbackStartedAt={fallbackStartedAt}
-              locale={locale}
-              task={task}
-            >
-              <ProcessParts
-                assetUrl={assetUrl}
-                canRespond={canRespond}
-                closedInputRequestIds={closedInputRequestIds}
-                events={events}
-                inActiveExecution={task.status === "running" || task.status === "waiting"}
+            {isTurnContinuation ? (
+              <div className="mt-2 space-y-3">
+                <ProcessParts
+                  assetUrl={assetUrl}
+                  canRespond={canRespond}
+                  closedInputRequestIds={closedInputRequestIds}
+                  events={events}
+                  inActiveExecution={task.status === "running" || task.status === "waiting"}
+                  locale={locale}
+                  onInputResponses={onInputResponses}
+                  onCloseInputRequest={onCloseInputRequest}
+                  onOpenSubagent={onOpenSubagent}
+                  parts={task.processParts}
+                  turnId={message.metadata?.turnId}
+                />
+                {task.proxiedInputParts.map((part) => (
+                  <div className="space-y-2" key={`proxied-input:${part.toolCallId}`}>
+                    <p className="text-xs font-medium text-amber-700 dark:text-amber-300">
+                      {localize(locale, "A delegated task needs your approval", "子代理任务需要你的批准")}
+                    </p>
+                    <AgentMessagePart
+                      assetUrl={assetUrl}
+                      canRespond={canRespond}
+                      closedInputRequestIds={closedInputRequestIds}
+                      events={events}
+                      inActiveExecution
+                      locale={locale}
+                      onInputResponses={onInputResponses}
+                      onCloseInputRequest={onCloseInputRequest}
+                      onOpenSubagent={onOpenSubagent}
+                      part={part}
+                      turnId={message.metadata?.turnId}
+                    />
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <ExecutionGroup
+                collapseWhenSettled={task.status === "completed" && Boolean(
+                  task.finalPart?.text.trim() ||
+                  hasLaterFinalDelivery(events, message.metadata?.turnId),
+                )}
+                fallbackStartedAt={fallbackStartedAt}
                 locale={locale}
-                onInputResponses={onInputResponses}
-                onCloseInputRequest={onCloseInputRequest}
-                onOpenSubagent={onOpenSubagent}
-                parts={task.processParts}
-                turnId={message.metadata?.turnId}
-              />
-              {task.proxiedInputParts.map((part) => (
-                <div className="space-y-2" key={`proxied-input:${part.toolCallId}`}>
-                  <p className="text-xs font-medium text-amber-700 dark:text-amber-300">
-                    {localize(locale, "A delegated task needs your approval", "子代理任务需要你的批准")}
-                  </p>
-                  <AgentMessagePart
-                    assetUrl={assetUrl}
-                    canRespond={canRespond}
-                    closedInputRequestIds={closedInputRequestIds}
-                    events={events}
-                    inActiveExecution
-                    locale={locale}
-                    onInputResponses={onInputResponses}
-                    onCloseInputRequest={onCloseInputRequest}
-                    onOpenSubagent={onOpenSubagent}
-                    part={part}
-                    turnId={message.metadata?.turnId}
-                  />
-                </div>
-              ))}
-            </ExecutionGroup>
+                task={task}
+              >
+                <ProcessParts
+                  assetUrl={assetUrl}
+                  canRespond={canRespond}
+                  closedInputRequestIds={closedInputRequestIds}
+                  events={events}
+                  inActiveExecution={task.status === "running" || task.status === "waiting"}
+                  locale={locale}
+                  onInputResponses={onInputResponses}
+                  onCloseInputRequest={onCloseInputRequest}
+                  onOpenSubagent={onOpenSubagent}
+                  parts={task.processParts}
+                  turnId={message.metadata?.turnId}
+                />
+                {task.proxiedInputParts.map((part) => (
+                  <div className="space-y-2" key={`proxied-input:${part.toolCallId}`}>
+                    <p className="text-xs font-medium text-amber-700 dark:text-amber-300">
+                      {localize(locale, "A delegated task needs your approval", "子代理任务需要你的批准")}
+                    </p>
+                    <AgentMessagePart
+                      assetUrl={assetUrl}
+                      canRespond={canRespond}
+                      closedInputRequestIds={closedInputRequestIds}
+                      events={events}
+                      inActiveExecution
+                      locale={locale}
+                      onInputResponses={onInputResponses}
+                      onCloseInputRequest={onCloseInputRequest}
+                      onOpenSubagent={onOpenSubagent}
+                      part={part}
+                      turnId={message.metadata?.turnId}
+                    />
+                  </div>
+                ))}
+              </ExecutionGroup>
+            )}
             {task.finalPart ? (
               <div className="pt-3">
                 <AgentMessagePart
@@ -356,6 +400,7 @@ function ProcessParts({
 }) {
   const rendered: React.ReactNode[] = [];
   let previousStepIndex = -1;
+  const toolGroupOrdinalByStep = new Map<number, number>();
   const lastReasoningPartByStep = new Map<number, number>();
   for (let partIndex = 0; partIndex < parts.length; partIndex += 1) {
     const candidate = parts[partIndex];
@@ -485,6 +530,13 @@ function ProcessParts({
         />,
       );
     } else {
+      const groupStepIndex = stepIndexForParts(toolParts, events, turnId, previousStepIndex) ?? previousStepIndex;
+      const groupOrdinal = groupStepIndex === undefined
+        ? index
+        : toolGroupOrdinalByStep.get(groupStepIndex) ?? 0;
+      if (groupStepIndex !== undefined) {
+        toolGroupOrdinalByStep.set(groupStepIndex, groupOrdinal + 1);
+      }
       rendered.push(<ProcessToolGroup
         active={active}
         assetUrl={assetUrl}
@@ -492,7 +544,9 @@ function ProcessParts({
         closedInputRequestIds={closedInputRequestIds}
         events={events}
         inActiveExecution={inActiveExecution}
-        key={`tools:${toolParts[0]?.toolCallId}`}
+        // A group's identity is the logical step, not whichever tool happens
+        // to be first after a retry projection updates the parts array.
+        key={`tools:${turnId ?? "unknown"}:${groupStepIndex ?? "unknown"}:${groupOrdinal}`}
         locale={locale}
         needsInput={needsInput}
         onCloseInputRequest={onCloseInputRequest}
@@ -899,6 +953,15 @@ function FileMutationToolContent({
       </div>
     );
   }
+  if (part.state === "output-error" || part.state === "output-denied") {
+    return (
+      <p className="text-xs text-muted-foreground">
+        {part.state === "output-denied"
+          ? localize(locale, "File change was not approved.", "文件变更未获批准。")
+          : localize(locale, "File change failed before a diff was produced.", "文件变更失败，未生成可展示的差异。")}
+      </p>
+    );
+  }
   return <p className="text-xs text-muted-foreground">{localize(locale, "Receiving file changes...", "正在接收文件变更…")}</p>;
 }
 
@@ -1129,6 +1192,8 @@ function fileMutationActionLabel(
 ): string {
   if (isCancellationPendingToolPart(part)) return localize(locale, "Stopping", "正在停止");
   if (isInterruptedToolPart(part)) return localize(locale, "Stopped", "已中断");
+  if (part.state === "output-error") return localize(locale, "Failed", "失败");
+  if (part.state === "output-denied") return localize(locale, "Not approved", "未批准");
   const running = !isToolTerminal(part);
   return summary.operation === "create"
     ? running ? localize(locale, "Creating", "正在创建") : localize(locale, "Created", "已创建")
@@ -1170,6 +1235,7 @@ function StepActivity({
   readonly turnId?: string;
 }) {
   const step = presentAgentStep(events, turnId, stepIndex);
+  const retryItems = step.retries ?? (step.retry ? [step.retry] : []);
   const hasReasoningContent = Boolean(reasoningContentForStep(events, turnId, stepIndex));
   // A step can legitimately contain only a tool call. Do not label its
   // terminal boundary as completed reasoning when the Provider emitted no
@@ -1178,17 +1244,19 @@ function StepActivity({
   if (!hasReasoningContent && step.status !== "running") {
     return (
       <>
-        {step.retry ? <RetryStatus locale={locale} retry={step.retry} /> : null}
-        {step.status === "failed" && step.failure ? <StepFailure failure={step.failure} locale={locale} /> : null}
+        {retryItems.map((retry, index) => (
+          <RetryStatus key={`retry:${turnId ?? "unknown"}:${stepIndex}:${index}`} locale={locale} retry={retry} />
+        ))}
+        {step.status === "failed" && step.failure && !step.retry?.exhausted ? <StepFailure failure={step.failure} locale={locale} /> : null}
       </>
     );
   }
   return (
     <>
-      {step.retry ? (
-        <RetryStatus locale={locale} retry={step.retry} />
-      ) : null}
-      {step.status === "failed" && step.failure ? <StepFailure failure={step.failure} locale={locale} /> : null}
+      {retryItems.map((retry, index) => (
+        <RetryStatus key={`retry:${turnId ?? "unknown"}:${stepIndex}:${index}`} locale={locale} retry={retry} />
+      ))}
+      {step.status === "failed" && step.failure && !step.retry?.exhausted ? <StepFailure failure={step.failure} locale={locale} /> : null}
       <ReasoningRoot className="mb-1" role="status" streaming={step.status === "running"} variant="ghost">
         <ReasoningTrigger
           active={step.status === "running"}
@@ -1226,18 +1294,47 @@ function RetryStatus({
   readonly locale: AgentLocale;
   readonly retry: NonNullable<ReturnType<typeof presentAgentStep>["retry"]>;
 }) {
+  if (retry.exhausted) {
+    return (
+      <div className="mb-1 text-sm text-muted-foreground">
+        <div className="flex max-w-full items-center gap-2 py-1.5 text-left">
+          <WifiIcon className="size-4 shrink-0" />
+          <span>
+            {localize(locale, "Retry failed", "重试失败")}
+            {retry.attempt !== undefined && retry.maximum !== undefined
+              ? ` (${retry.attempt}/${retry.maximum})`
+              : ""}
+          </span>
+        </div>
+        {retry.error ? (
+          <div className="ml-6 mt-1 flex min-w-0 items-start gap-2 rounded-xl border border-border/70 px-3 py-2 text-xs" role="alert">
+            <CircleAlertIcon className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+            <div className="min-w-0">
+              <p className="break-words text-foreground">{sanitizeFailureMessage(retry.error.message)}</p>
+              <code className="mt-1 block break-all text-muted-foreground">{retry.error.code}</code>
+            </div>
+          </div>
+        ) : null}
+      </div>
+    );
+  }
   return (
-    <Collapsible className="mb-1 text-sm text-muted-foreground">
+    <Collapsible className="mb-1 text-sm text-muted-foreground" defaultOpen={false}>
       <CollapsibleTrigger className="group/retry flex max-w-full items-center gap-2 py-1.5 text-left hover:text-foreground">
         <WifiIcon className="size-4 shrink-0" />
-        <span>{retryTitle(locale, retry.error)} {retry.attempt}/{retry.maximum}</span>
+        <span>
+          {retryTitle(locale, retry.error)}
+          {retry.attempt !== undefined && retry.maximum !== undefined
+            ? ` (${retry.attempt}/${retry.maximum})`
+            : ""}
+        </span>
         {retry.error ? <ChevronDownIcon className="size-3.5 -rotate-90 transition-transform group-data-[state=open]/retry:rotate-0" /> : null}
       </CollapsibleTrigger>
       {retry.error ? (
         <CollapsibleContent className="overflow-hidden">
-          <div className="ml-6 rounded-lg border border-border/60 px-3 py-2 text-xs">
+          <div className="ml-6 mt-1 max-w-full text-xs">
             <p className="break-words text-foreground">{sanitizeFailureMessage(retry.error.message)}</p>
-            <code className="mt-1 block text-muted-foreground">{retry.error.code}</code>
+            <code className="mt-1 block break-all text-muted-foreground">{retry.error.code}</code>
           </div>
         </CollapsibleContent>
       ) : null}
@@ -1258,6 +1355,8 @@ function ReasoningPart({
 }) {
   const timing = reasoningTiming(events, turnId, part.stepIndex);
   const step = presentAgentStep(events, turnId, part.stepIndex ?? 0);
+  const retryItems = step.retries ?? (step.retry ? [step.retry] : []);
+  const stepIndex = part.stepIndex ?? 0;
   const durationSeconds = useElapsedSeconds(timing.startedAt, timing.endedAt);
   const streaming = part.state === "streaming";
   const text = part.text.trim() || reasoningContentForStep(events, turnId, part.stepIndex);
@@ -1267,8 +1366,10 @@ function ReasoningPart({
   if (!text && !streaming) return null;
   return (
     <>
-      {step.retry ? <RetryStatus locale={locale} retry={step.retry} /> : null}
-      {step.status === "failed" && step.failure ? <StepFailure failure={step.failure} locale={locale} /> : null}
+      {retryItems.map((retry, index) => (
+        <RetryStatus key={`retry:${turnId ?? "unknown"}:${stepIndex}:${index}`} locale={locale} retry={retry} />
+      ))}
+      {step.status === "failed" && step.failure && !step.retry?.exhausted ? <StepFailure failure={step.failure} locale={locale} /> : null}
       <ReasoningRoot className="mb-1" streaming={streaming} variant="ghost">
         <ReasoningTrigger
           active={streaming}
@@ -1699,8 +1800,13 @@ function codexPatchToUnifiedDiff(value: string, allowPartial = false): string | 
       body.push(lines[index]!);
       index += 1;
     }
-    const oldName = operation === "Add" ? "/dev/null" : `a/${sourcePath}`;
-    const newName = operation === "Delete" ? "/dev/null" : `b/${destinationPath}`;
+    // The /dev/null side is useful to a patch parser but is not meaningful to
+    // end users. Keep the operation semantics in the tool title and show only
+    // the human-readable workspace path in the diff header.
+    const displaySourcePath = operation === "Add" ? destinationPath : sourcePath;
+    const displayDestinationPath = operation === "Delete" ? sourcePath : destinationPath;
+    const oldName = displaySourcePath;
+    const newName = displayDestinationPath;
     const hunks = operation === "Add"
       ? addFileHunk(body)
       : operation === "Delete"
@@ -1904,12 +2010,16 @@ function hasLaterFinalDelivery(
     event.data.turnId === turnId,
   );
   if (turnEnd < 0) return false;
-  return events.slice(turnEnd + 1).some((event) =>
+  const hasFinalMessage = (event: MessageStreamEvent) =>
     event.type === "message.completed" &&
     event.data.finishReason === "stop" &&
+    event.data.turnId === turnId &&
     typeof event.data.message === "string" &&
-    event.data.message.trim().length > 0,
-  );
+    event.data.message.trim().length > 0;
+  // A steering message keeps the same durable turn, so its final delivery is
+  // before `turn.completed`. Older HITL continuation turns have a separate
+  // terminal boundary and retain the post-terminal check.
+  return events.some(hasFinalMessage) || events.slice(turnEnd + 1).some(hasFinalMessage);
 }
 
 function CopyResponseAction({ locale, text }: { readonly locale: AgentLocale; readonly text: string }) {
@@ -2441,7 +2551,7 @@ function failureTitle(locale: AgentLocale, failure: { readonly code: string; rea
 function retryTitle(locale: AgentLocale, failure: { readonly code: string; readonly message: string } | undefined): string {
   if (!failure) return localize(locale, "Retrying", "正在重试");
   switch (classifyAgentFailure(failure)) {
-    case "network": return localize(locale, "Retrying connection", "正在重试连接");
+    case "network": return localize(locale, "Reconnecting", "正在重新连接");
     case "timeout": return localize(locale, "Retrying after timeout", "超时后正在重试");
     case "provider": return localize(locale, "Retrying provider request", "正在重试上游请求");
     default: return localize(locale, "Retrying", "正在重试");

@@ -66,6 +66,15 @@ export type AgentTurnPresentation = {
   readonly waitingFor?: InputRequest["kind"];
 };
 
+export type AgentTurnPresentationOptions = {
+  /**
+   * Use the complete root-turn event range for the visual execution group.
+   * Eve steering messages intentionally share a turn id, so their assistant
+   * segments must share one timer and terminal status in the UI.
+   */
+  readonly mergeSameTurn?: boolean;
+};
+
 export type AgentTurnFailure = {
   readonly code: string;
   readonly message: string;
@@ -91,10 +100,20 @@ export type AgentStepPresentation = {
   readonly endedAt?: number;
   readonly failure?: AgentTurnFailure;
   readonly retry?: {
-    readonly attempt: number;
+    /** Number of failed attempts observed in the durable stream. */
+    readonly attempt?: number;
     readonly error?: AgentTurnFailure;
-    readonly maximum: number;
+    /** The retry budget was exhausted at this terminal step. */
+    readonly exhausted?: boolean;
+    readonly maximum?: number;
   };
+  /** Every observed transient failure in this step, in event order. */
+  readonly retries?: readonly {
+    readonly attempt: number;
+    readonly error: AgentTurnFailure;
+    readonly exhausted?: boolean;
+    readonly maximum: number;
+  }[];
   readonly startedAt?: number;
   readonly status: "completed" | "failed" | "running";
 };
@@ -438,6 +457,16 @@ export function normalizeSettledAgentMessages(
       stepParts.push(synthetic);
       syntheticByStep.set(partial.data.stepIndex, stepParts);
     }
+    for (const [stepIndex, retryParts] of failedRetryToolParts(
+      segmentEvents,
+      messageTurnId,
+      visibleToolCallIds,
+    )) {
+      changed = true;
+      const stepParts = syntheticByStep.get(stepIndex) ?? [];
+      stepParts.push(...retryParts);
+      syntheticByStep.set(stepIndex, stepParts);
+    }
     // Keep a recovered failed tool next to its original step marker. This
     // preserves the event order users saw during the live run.
     const insertions = [...syntheticByStep.entries()]
@@ -462,6 +491,89 @@ export function normalizeSettledAgentMessages(
         }
       : message;
   });
+}
+
+type RetryToolAttempt = {
+  readonly actions: ReadonlyArray<Extract<MessageStreamEvent, { type: "actions.requested" }>['data']['actions'][number]>;
+  readonly failure?: AgentTurnFailure;
+  readonly stepIndex: number;
+};
+
+/**
+ * Eve retries a step with the same call id in some provider paths. Its
+ * reducer consequently keeps only the last tool part. Rebuild the earlier
+ * failed attempts from the ordered action/failure events so a retry never
+ * erases the tool card the user already saw.
+ */
+function failedRetryToolParts(
+  events: readonly MessageStreamEvent[],
+  turnId: string,
+  visibleToolCallIds: ReadonlySet<string>,
+): ReadonlyMap<number, readonly EveDynamicToolPart[]> {
+  const attempts: RetryToolAttempt[] = [];
+  let current: { actions: ReadonlyArray<Extract<MessageStreamEvent, { type: "actions.requested" }>['data']['actions'][number]>; stepIndex: number; failure?: AgentTurnFailure } | undefined;
+  for (const event of events) {
+    if (eventTurnId(event) !== turnId) continue;
+    if (event.type === "step.started") {
+      current = { actions: [], stepIndex: event.data.stepIndex };
+      attempts.push(current);
+      continue;
+    }
+    if (event.type === "actions.requested") {
+      if (!current || current.stepIndex !== event.data.stepIndex) {
+        current = { actions: [], stepIndex: event.data.stepIndex };
+        attempts.push(current);
+      }
+      current.actions = [...current.actions, ...event.data.actions];
+      continue;
+    }
+    if (event.type === "step.failed") {
+      if (!current || current.stepIndex !== event.data.stepIndex) continue;
+      current.failure = { code: event.data.code, message: event.data.message };
+    }
+  }
+
+  const failedAttempts = attempts.filter((attempt) => attempt.failure && attempt.actions.length > 0);
+  if (failedAttempts.length === 0) return new Map();
+  const completedCallIds = new Set(
+    events.flatMap((event) => event.type === "action.result" && event.data.status === "completed"
+      ? [event.data.result.callId]
+      : []),
+  );
+  const lastFailedAttemptByCall = new Map<string, number>();
+  failedAttempts.forEach((attempt, index) => {
+    for (const action of attempt.actions) lastFailedAttemptByCall.set(action.callId, index);
+  });
+  const byStep = new Map<number, EveDynamicToolPart[]>();
+  failedAttempts.forEach((attempt, attemptIndex) => {
+    for (const action of attempt.actions) {
+      // The reducer's visible part represents the final occurrence of this
+      // call. Only synthesize earlier occurrences when that final part exists;
+      // otherwise the partial-input recovery below owns the latest failure.
+      if (
+        visibleToolCallIds.has(action.callId) &&
+        !completedCallIds.has(action.callId) &&
+        lastFailedAttemptByCall.get(action.callId) === attemptIndex
+      ) continue;
+      const toolName = "toolName" in action && typeof action.toolName === "string"
+        ? action.toolName
+        : "subagentName" in action && typeof action.subagentName === "string"
+          ? action.subagentName
+          : "tool";
+      const stepParts = byStep.get(attempt.stepIndex) ?? [];
+      stepParts.push({
+        errorText: attempt.failure!.message,
+        input: "input" in action ? action.input ?? {} : {},
+        state: "output-error",
+        stepIndex: attempt.stepIndex,
+        toolCallId: `retry:${turnId}:${attempt.stepIndex}:${attemptIndex}:${action.callId}`,
+        toolName,
+        type: "dynamic-tool",
+      });
+      byStep.set(attempt.stepIndex, stepParts);
+    }
+  });
+  return byStep;
 }
 
 function incompleteToolError(
@@ -502,6 +614,19 @@ type OpenToolPart =
   | (Extract<EveDynamicToolPart, { readonly state: "output-available" }> & { readonly partial: true });
 
 const MAX_DURABLE_STEP_RETRIES = 3;
+
+/**
+ * Eve's message protocol exposes one terminal step failure after its internal
+ * model retry budget is exhausted. Only classify failures with a transient
+ * transport/provider signature as retry exhaustion; permanent rejections and
+ * unknown runtime errors remain an execution failure.
+ */
+function shouldPresentRetryFailure(failure: AgentTurnFailure): boolean {
+  const category = classifyAgentFailure(failure);
+  if (category === "unknown") return false;
+  const value = `${failure.code} ${failure.message}`.toLocaleLowerCase();
+  return !/\b(?:401|403|unauthori[sz]ed|forbidden|rejected|invalid[_ -]?request)\b/u.test(value);
+}
 
 export function shouldSuppressInterruptedTurnDisplayEvent(
   event: MessageStreamEvent,
@@ -649,12 +774,35 @@ export function presentAgentStep(
       }
     : undefined;
   const latestFailure = failures.at(-1);
-  const retryAttempt = terminalFailure || completed
-    ? 0
-    : Math.max(
-        starts.length - 1,
-        latestFailure ? failures.length : 0,
-      );
+  const retryFailure = latestFailure?.type === "step.failed"
+    ? { code: latestFailure.data.code, message: latestFailure.data.message }
+    : terminalFailure;
+  const retryableFailure = retryFailure && shouldPresentRetryFailure(retryFailure)
+    ? retryFailure
+    : undefined;
+  // Eve intentionally does not expose an attempt number. Count only durable
+  // failed step boundaries that are actually present; never turn one terminal
+  // failure into a fabricated "3/3" display.
+  const observedRetryAttempt = retryableFailure
+    ? Math.max(1, failures.length)
+    : undefined;
+  const retryExhausted = Boolean(terminalFailure && retryableFailure);
+  const retryEvents = failures.flatMap((failure, index) => {
+    const candidate = { code: failure.data.code, message: failure.data.message };
+    return shouldPresentRetryFailure(candidate)
+      ? [{
+          attempt: index + 1,
+          error: candidate,
+          ...(retryExhausted && index === failures.length - 1 ? { exhausted: true } : {}),
+          maximum: MAX_DURABLE_STEP_RETRIES,
+        }]
+      : [];
+  });
+  const retries = retryEvents.length > 0
+    ? retryEvents
+    : retryableFailure
+      ? [{ attempt: 1, error: retryableFailure, ...(retryExhausted ? { exhausted: true } : {}), maximum: MAX_DURABLE_STEP_RETRIES }]
+      : [];
   const latestStartIndex = stepEvents.findLastIndex((event) => event.type === "step.started");
   const latestAttemptEvents = latestStartIndex >= 0 ? stepEvents.slice(latestStartIndex) : stepEvents;
   const latestAttemptFailed = latestAttemptEvents.some((event) => event.type === "step.failed");
@@ -664,17 +812,17 @@ export function presentAgentStep(
   return {
     ...(endedAt ? { endedAt } : {}),
     ...(terminalFailure ? { failure: terminalFailure } : {}),
-    ...(retryAttempt > 0
+    ...(retryableFailure && !completed
       ? {
           retry: {
-            attempt: Math.min(retryAttempt, MAX_DURABLE_STEP_RETRIES),
-            ...(latestFailure?.type === "step.failed"
-              ? { error: { code: latestFailure.data.code, message: latestFailure.data.message } }
-              : {}),
+            ...(observedRetryAttempt !== undefined ? { attempt: observedRetryAttempt } : {}),
+            ...(retryExhausted ? { exhausted: true } : {}),
+            error: retryableFailure,
             maximum: MAX_DURABLE_STEP_RETRIES,
           },
         }
       : {}),
+    ...(retries.length > 0 ? { retries } : {}),
     ...(eventTimestamp(starts.at(-1)) ? { startedAt: eventTimestamp(starts.at(-1)) } : {}),
     status: terminalFailure
       ? "failed"
@@ -714,16 +862,23 @@ export function presentAgentTurn(
   message: EveMessage,
   events: readonly MessageStreamEvent[],
   closedInputRequestIds: ReadonlySet<string> = new Set(),
+  options: AgentTurnPresentationOptions = {},
 ): AgentTurnPresentation | undefined {
   if (message.role !== "assistant" || !message.metadata?.turnId) return undefined;
 
   const turnId = message.metadata.turnId;
-  const segment = eventsForAssistantSegment(message, events);
-  const turnEvents = segment.events;
+  const messageSegment = eventsForAssistantSegment(message, events);
+  const turnEvents = options.mergeSameTurn
+    ? eventsForRootTurn(events, turnId)
+    : messageSegment.events;
+  // Root-turn lifecycle events provide the shared timer/status. Part ordering
+  // remains scoped to this assistant segment so steering never duplicates the
+  // tools already rendered by the preceding segment.
+  const partEvents = options.mergeSameTurn ? messageSegment.events : turnEvents;
   const pendingIds = new Set(
     unresolvedInputRequests(events, closedInputRequestIds).map((request) => request.requestId),
   );
-  const pendingRequests = turnEvents
+  const pendingRequests = partEvents
     .flatMap((event) => event.type === "input.requested" ? event.data.requests : [])
     .filter((request) => pendingIds.has(request.requestId));
   const firstAction = turnEvents.find((event) => event.type === "actions.requested");
@@ -742,7 +897,7 @@ export function presentAgentTurn(
       ? "failed"
     : terminal?.type === "turn.cancelled"
         ? "cancelled"
-        : segment.settledAt !== undefined
+        : !options.mergeSameTurn && messageSegment.settledAt !== undefined
           ? "completed"
         : "running";
   const finalStepIndex = finalDeliveryStepIndex(turnEvents, message, status);
@@ -754,7 +909,7 @@ export function presentAgentTurn(
   // render ticks. Re-anchor parts to the durable event sequence before
   // splitting the final delivery from the execution process. This prevents a
   // narration that happened before a tool call from jumping below that tool.
-  for (const part of orderAssistantMessageParts(message.parts, turnEvents, turnId)) {
+  for (const part of orderAssistantMessageParts(message.parts, partEvents, turnId)) {
     if (part.type === "text" && part.stepIndex === finalStepIndex) {
       finalPart = part;
       continue;
@@ -781,7 +936,7 @@ export function presentAgentTurn(
   );
   const markerAnchored = status === "failed" && failedStepIndex !== undefined && hasStepMarkerForIndex(
     processParts,
-    events,
+    partEvents,
     turnId,
     failedStepIndex,
   );
@@ -794,7 +949,9 @@ export function presentAgentTurn(
   );
 
   return {
-    endedAt: eventTimestamp(terminal) ?? segment.settledAt,
+    endedAt: eventTimestamp(terminal) ?? (
+      options.mergeSameTurn ? undefined : messageSegment.settledAt
+    ),
     finalPart,
     ...(failureAnchored ? { failureAnchored: true } : {}),
     proxiedInputParts: pendingRequests

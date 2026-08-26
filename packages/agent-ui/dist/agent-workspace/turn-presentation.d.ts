@@ -26,6 +26,9 @@ export type AgentTurnPresentation = {
     readonly status: AgentTurnStatus;
     readonly waitingFor?: InputRequest["kind"];
 };
+export type AgentTurnPresentationOptions = {
+    readonly mergeSameTurn?: boolean;
+};
 export type AgentTurnFailure = {
     readonly code: string;
     readonly message: string;
@@ -36,10 +39,17 @@ export type AgentStepPresentation = {
     readonly endedAt?: number;
     readonly failure?: AgentTurnFailure;
     readonly retry?: {
-        readonly attempt: number;
+        readonly attempt?: number;
         readonly error?: AgentTurnFailure;
-        readonly maximum: number;
+        readonly exhausted?: boolean;
+        readonly maximum?: number;
     };
+    readonly retries?: readonly {
+        readonly attempt: number;
+        readonly error: AgentTurnFailure;
+        readonly exhausted?: boolean;
+        readonly maximum: number;
+    }[];
     readonly startedAt?: number;
     readonly status: "completed" | "failed" | "running";
 };
@@ -59,7 +69,7 @@ export declare function shouldSuppressInterruptedTurnStreamEvent(event: MessageS
 export declare function projectAgentDisplayTimeline(messages: readonly EveMessage[], events: readonly MessageStreamEvent[]): AgentDisplayProjection;
 export declare function presentAgentStep(events: readonly MessageStreamEvent[], turnId: string | undefined, stepIndex: number): AgentStepPresentation;
 export declare function reasoningContentForStep(events: readonly MessageStreamEvent[], turnId: string | undefined, stepIndex: number | undefined): string;
-export declare function presentAgentTurn(message: EveMessage, events: readonly MessageStreamEvent[], closedInputRequestIds?: ReadonlySet<string>): AgentTurnPresentation | undefined;
+export declare function presentAgentTurn(message: EveMessage, events: readonly MessageStreamEvent[], closedInputRequestIds?: ReadonlySet<string>, options?: AgentTurnPresentationOptions): AgentTurnPresentation | undefined;
 export declare function isProxiedInputOnlyMessage(message: EveMessage, events: readonly MessageStreamEvent[]): boolean;
 export declare function unresolvedInputRequests(events: readonly MessageStreamEvent[], closedInputRequestIds?: ReadonlySet<string>): readonly InputRequest[];
 export declare function hasUnresolvedInputRequests(events: readonly MessageStreamEvent[], closedInputRequestIds?: ReadonlySet<string>): boolean;

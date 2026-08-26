@@ -427,10 +427,16 @@ export function AgentWorkspace({
         }
       }
     }
-    // Summary hydration is owned by the server event-log loader. For an
-    // inline legacy prefix, however, the bounded tail read is still the
-    // correct compatibility path and must not be skipped.
-    if (!transcriptComplete && thread.hydration === "summary") return;
+    // A compact prefix whose absolute cursor is ahead of its visible event
+    // count has a transcript gap. A bounded tail cannot repair that missing
+    // middle. It may still contribute the authoritative terminal boundary for
+    // the currently visible turn so stale tool UI can settle; ordinary tail
+    // events remain server-repair-only and coverage stays explicitly partial.
+    const safeShortPrefix = !transcriptComplete &&
+      thread.session.streamIndex === thread.events.length &&
+      boundary.tailIndex !== undefined &&
+      boundary.tailIndex + 1 <= SETTLED_TAIL_EVENTS;
+    const boundaryOnly = !transcriptComplete && !safeShortPrefix;
 
     if (
       boundary.tailIndex === undefined ||
@@ -449,9 +455,23 @@ export function AgentWorkspace({
         AbortSignal.timeout(RECOVERY_TAIL_LOOKUP_TIMEOUT_MS * 2),
       );
       if (tailEvents.length === 0) return;
+      const latestVisibleTurnId = [...thread.events].reverse().find((event) =>
+        event.type === "turn.started"
+      );
+      const eventsToMerge = boundaryOnly
+        ? tailEvents.filter((event) =>
+            event.type === "session.waiting" ||
+            event.type === "session.completed" ||
+            event.type === "session.failed" ||
+            ((event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled") &&
+              latestVisibleTurnId?.type === "turn.started" &&
+              event.data.turnId === latestVisibleTurnId.data.turnId)
+          )
+        : tailEvents;
+      if (eventsToMerge.length === 0) return;
       const events = [...settledEvents];
       const eventIds = new Set(events.map(eventIdentity));
-      for (const event of tailEvents) appendThreadEventIndexed(events, eventIds, event);
+      for (const event of eventsToMerge) appendThreadEventIndexed(events, eventIds, event);
       const nextSettledEvents = compactThreadEvents(events);
       updateThread(thread.id, {
         events: nextSettledEvents,
@@ -2360,6 +2380,11 @@ function isUrgentPersistenceChange(
   for (const thread of next.threads) {
     const prior = previousThreads.get(thread.id);
     if (!prior) return true;
+    // Persist the first authoritative runtime event promptly. This closes the
+    // refresh window between an accepted turn becoming visibly active and the
+    // regular streamed checkpoint, without turning every token/event into an
+    // urgent database write.
+    if (prior.events.length === 0 && thread.events.length > 0) return true;
     if (
       prior.title !== thread.title ||
       prior.revision !== thread.revision ||

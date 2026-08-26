@@ -75,7 +75,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, isRecoverin
     const turnAdmissionBusyRef = useRef(false);
     const cancellationRecoveryRef = useRef(() => undefined);
     const cancellationIdleTimerRef = useRef(undefined);
-    const [cancellationState, setCancellationState] = useState("idle");
+    const [cancellationState, setCancellationState] = useState(thread.status === "cancelling" ? "cancelling" : "idle");
     const [localInterruption, setLocalInterruption] = useState();
     const [cancellationError, setCancellationError] = useState();
     const [queueError, setQueueError] = useState();
@@ -138,19 +138,15 @@ export function AgentThreadView({ client, commands, draftStorageKey, isRecoverin
             requestState.sentSessionId = durableSession.state.sessionId;
         }
         void durableSession.cancel(turnId ? { turnId } : undefined)
-            .then(() => {
+            .then((result) => {
             if (cancellationRef.current !== requestState || !requestState.requested)
                 return;
-            setCancellationState("cancelling");
-            if (cancellationIdleTimerRef.current !== undefined) {
-                window.clearTimeout(cancellationIdleTimerRef.current);
+            if (result.status === "no_active_turn") {
+                settleCancellationUi();
+                onChange({ status: "ready", updatedAt: Date.now() });
+                return;
             }
-            cancellationIdleTimerRef.current = window.setTimeout(() => {
-                cancellationIdleTimerRef.current = undefined;
-                if (cancellationRef.current === requestState && requestState.requested) {
-                    setCancellationState("idle");
-                }
-            }, 150);
+            setCancellationState("cancelling");
         })
             .catch((error) => {
             if (cancellationRef.current !== requestState)
@@ -159,20 +155,20 @@ export function AgentThreadView({ client, commands, draftStorageKey, isRecoverin
                 window.clearTimeout(cancellationIdleTimerRef.current);
                 cancellationIdleTimerRef.current = undefined;
             }
-            cancellationRef.current = { requested: false, turnId };
+            requestState.sentTurnId = undefined;
+            requestState.sentSessionId = undefined;
             setCancellationError(error instanceof Error ? error.message : "Unable to stop this turn.");
-            setCancellationState("idle");
+            setCancellationState("cancelling");
         });
-    }, []);
+    }, [onChange, settleCancellationUi]);
     const handleEvent = useCallback((event) => {
         lastObservedEventAtRef.current = Date.now();
         const sourceIndex = consumedStreamIndexRef.current;
         const suppressed = shouldSuppressInterruptedTurnStreamEvent(event, sourceIndex, interruptedTurnsRef.current);
-        const accepted = suppressed
-            ? undefined
-            : appendThreadEventIndexed(compactedEventsRef.current, compactedEventIdsRef.current, event);
-        if (accepted === true || suppressed)
-            consumedStreamIndexRef.current = sourceIndex + 1;
+        if (!suppressed) {
+            appendThreadEventIndexed(compactedEventsRef.current, compactedEventIdsRef.current, event);
+        }
+        consumedStreamIndexRef.current = sourceIndex + 1;
         checkpointDirtyRef.current = true;
         if (checkpointTimerRef.current === undefined) {
             checkpointTimerRef.current = window.setTimeout(() => {
@@ -211,7 +207,8 @@ export function AgentThreadView({ client, commands, draftStorageKey, isRecoverin
             setCancellationState("cancelling");
         }
         if (event.type === "session.waiting" &&
-            cancellationRef.current.requested) {
+            cancellationRef.current.requested &&
+            hasCancellationBoundary(compactedEventsRef.current, cancellationRef.current.turnId)) {
             settleCancellationUi();
         }
         onEvent?.(event);
@@ -254,6 +251,14 @@ export function AgentThreadView({ client, commands, draftStorageKey, isRecoverin
         ...(sessionRef.current ? { session: sessionRef.current } : {}),
     });
     const stopAgent = agent.stop;
+    useEffect(() => {
+        const attachedSession = sessionRef.current;
+        if (!cancellationRef.current.requested ||
+            thread.status !== "cancelling" ||
+            !attachedSession?.state.sessionId)
+            return;
+        requestDurableCancellation(attachedSession, persistedCancellationTurnId);
+    }, [agent.session?.sessionId, persistedCancellationTurnId, requestDurableCancellation, thread.status]);
     const flushLiveCheckpoint = useCallback(() => {
         if (checkpointTimerRef.current !== undefined) {
             window.clearTimeout(checkpointTimerRef.current);
@@ -481,7 +486,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, isRecoverin
             }
         }
         onChange({
-            events: compactedEventsRef.current,
+            events: [...compactedEventsRef.current],
             ...(acceptedPendingTurn ? { pendingTurn: undefined } : {}),
             ...(acceptedQueuedTurn ? { queuedTurns: queuedTurnsRef.current } : {}),
             ...(cancelledTurn ? { retainedContext } : {}),
@@ -545,10 +550,10 @@ export function AgentThreadView({ client, commands, draftStorageKey, isRecoverin
     useEffect(() => {
         if (!cancellationRef.current.requested)
             return;
-        if (thread.status === "ready" || thread.status === "waiting" || thread.status === "error") {
+        if (hasCancellationBoundary(thread.events, cancellationRef.current.turnId)) {
             settleCancellationUi();
         }
-    }, [settleCancellationUi, thread.status]);
+    }, [settleCancellationUi, thread.events]);
     const updateQueuedTurns = (queuedTurns) => {
         if (sameQueuedTurnSnapshots(queuedTurnsRef.current, queuedTurns))
             return;
@@ -667,15 +672,18 @@ export function AgentThreadView({ client, commands, draftStorageKey, isRecoverin
         });
         onCancelRecovery?.();
         const durableSession = sessionRef.current;
-        const waitsForDurableBoundary = !isRecovering && Boolean(turnId || durableSession);
+        const waitsForDurableBoundary = Boolean(durableSession);
+        if (!waitsForDurableBoundary) {
+            cancellationRef.current = { requested: false };
+        }
         setCancellationState(waitsForDurableBoundary ? "requested" : "idle");
         pendingTurnRef.current = interruptedPendingTurn;
         onChange({
-            events: compactedEventsRef.current,
+            events: [...compactedEventsRef.current],
             interruptedTurns,
             pendingTurn: interruptedPendingTurn,
             retainedContext,
-            status: "cancelling",
+            status: waitsForDurableBoundary ? "cancelling" : "ready",
             updatedAt: Date.now(),
         });
         const queuedFollowUpWithdrawal = withdrawLatestQueuedFollowUp();
@@ -1378,6 +1386,18 @@ async function sendPrompt(send, prompt, context) {
 }
 function isSessionBoundary(event) {
     return event.type === "session.waiting" || event.type === "session.completed" || event.type === "session.failed";
+}
+function hasCancellationBoundary(events, turnId) {
+    let cancelled = false;
+    for (const event of events) {
+        if (event.type === "turn.cancelled" && (!turnId || event.data.turnId === turnId)) {
+            cancelled = true;
+            continue;
+        }
+        if (cancelled && event.type === "session.waiting")
+            return true;
+    }
+    return false;
 }
 const DURABLE_PROGRESS_PROBE_DELAY_MS = 15_000;
 const DURABLE_PROGRESS_PROBE_INTERVAL_MS = 10_000;

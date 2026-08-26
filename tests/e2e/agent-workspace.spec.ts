@@ -718,7 +718,8 @@ test("a normal composer message bypasses a pending Agent question", async ({ pag
     message: "Ignore that question and create the content plan first",
   });
   expect(followUpBody).not.toMatchObject({ inputResponses: expect.anything() });
-  await page.getByRole("button", { name: /Worked for/u }).first().click();
+  const execution = page.getByRole("button", { name: /Worked for/u }).first();
+  if (await execution.getAttribute("aria-expanded") !== "true") await execution.click();
   await expect(question.getByRole("button", { name: /Closed/u })).toBeVisible();
 });
 
@@ -3003,12 +3004,12 @@ test("an in-flight turn reconnects after a hard refresh", async ({ page }) => {
   await expect.poll(() => JSON.stringify(threadEvents(page)).includes('"session.waiting"')).toBeTruthy();
 });
 
-test("stop immediately returns the thread to an interactive state while server cancellation settles", async ({ page }) => {
+test("stop keeps the composer locked until the durable cancellation boundary settles", async ({ page }) => {
   const sessionId = "mock-cancel-session";
-  let finishCancellation: (() => void) | undefined;
+  let releaseBoundary: (() => void) | undefined;
   let cancelledTurnId: string | undefined;
-  const cancelled = new Promise<void>((resolve) => {
-    finishCancellation = resolve;
+  const boundaryReleased = new Promise<void>((resolve) => {
+    releaseBoundary = resolve;
   });
   await page.route("**/eve/v1/session", async (route) => {
     await route.fulfill({
@@ -3020,8 +3021,6 @@ test("stop immediately returns the thread to an interactive state while server c
   });
   await page.route(`**/eve/v1/session/${sessionId}/cancel`, async (route) => {
     cancelledTurnId = (route.request().postDataJSON() as { turnId?: string }).turnId;
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    finishCancellation?.();
     await route.fulfill({
       body: JSON.stringify({ ok: true, sessionId, status: "accepted" }),
       contentType: "application/json",
@@ -3047,7 +3046,7 @@ test("stop immediately returns the thread to an interactive state while server c
       });
       return;
     }
-    await cancelled;
+    await boundaryReleased;
     await route.fulfill({
       body: `${events.slice(startIndex).map((event) => JSON.stringify(event)).join("\n")}\n`,
       contentType: "application/x-ndjson",
@@ -3066,7 +3065,12 @@ test("stop immediately returns the thread to an interactive state while server c
 
   await expect(page.getByRole("button", { name: "Stopping", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Send", exact: true })).toBeHidden();
-  await cancelled;
+  await expect.poll(() => cancelledTurnId).toBe("turn_0");
+  // The cancel HTTP response is only an accepted command. The old client
+  // released the composer here, which allowed a new turn to race the active
+  // server turn. Keep it locked until turn.cancelled -> session.waiting.
+  await expect(page.getByRole("button", { name: "Send", exact: true })).toBeHidden();
+  releaseBoundary?.();
   await expect(page.getByRole("button", { name: "Send", exact: true })).toBeVisible();
   expect(cancelledTurnId).toBe("turn_0");
 });
@@ -3097,6 +3101,7 @@ test("a recovering cancellation never revives late output from the interrupted t
     type: "session.waiting",
   } as const;
   let lateCatchUpServed = false;
+  let cancelRequests = 0;
   let releaseCancellation: (() => void) | undefined;
   const cancellationReleased = new Promise<void>((resolve) => {
     releaseCancellation = resolve;
@@ -3120,6 +3125,7 @@ test("a recovering cancellation never revives late output from the interrupted t
     version: 2,
   });
   await page.route(`**/eve/v1/session/${sessionId}/cancel`, async (route) => {
+    cancelRequests += 1;
     await route.fulfill({
       body: JSON.stringify({ ok: true, sessionId, status: "accepted" }),
       contentType: "application/json",
@@ -3151,8 +3157,9 @@ test("a recovering cancellation never revives late output from the interrupted t
 
   await page.goto(`/threads/${threadId}`);
   await expect.poll(() => lateCatchUpServed).toBeTruthy();
+  await expect.poll(() => cancelRequests).toBeGreaterThan(0);
   await expect(page.getByText("LATE OUTPUT MUST STAY HIDDEN", { exact: true })).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Send", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Send", exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Stop", exact: true })).toHaveCount(0);
   await expect.poll(() => firstStoredThread(page)?.status).toBe("cancelling");
 
@@ -3163,7 +3170,7 @@ test("a recovering cancellation never revives late output from the interrupted t
   expect(JSON.stringify(storedEvents)).not.toContain("LATE OUTPUT MUST STAY HIDDEN");
 });
 
-test("a message sent while cancellation settles becomes the next normal turn instead of mailbox steering", async ({ page }) => {
+test("a follow-up waits until cancellation settles before becoming the next normal turn", async ({ page }) => {
   const sessionId = "mock-post-cancel-follow-up-session";
   const at = new Date().toISOString();
   const turnId = "turn_0";
@@ -3247,6 +3254,11 @@ test("a message sent while cancellation settles becomes the next normal turn ins
   await composer.press("Enter");
   await expect(page.getByRole("button", { name: "Stop", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Stop", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Send" })).toHaveCount(0);
+
+  // The composer remains locked while Eve has only acknowledged the cancel.
+  // Release the durable boundary before admitting the follow-up.
+  releaseCancellation?.();
   await expect(page.getByRole("button", { name: "Send" })).toBeVisible();
 
   await composer.fill("Continue as a normal turn");
@@ -3254,9 +3266,7 @@ test("a message sent while cancellation settles becomes the next normal turn ins
   await expect(page.getByText("Continue as a normal turn", { exact: true })).toBeVisible();
   await expect(page.locator("[data-agent-steer-queue]")).toBeHidden();
   expect(mailboxEnqueues).toBe(0);
-  expect(followUpBody).toBeUndefined();
 
-  releaseCancellation?.();
   await expect.poll(() => followUpBody).toMatchObject({ message: "Continue as a normal turn" });
   await expect(page.getByText("Normal continuation completed.", { exact: true })).toBeVisible({ timeout: 15_000 });
   await expect(page.locator("[data-agent-steer-queue]")).toBeHidden();
@@ -3351,14 +3361,16 @@ test("a post-cancellation message survives a recovery event arriving in the same
   await page.goto(`/threads/${threadId}`);
   await page.waitForFunction(() => Reflect.get(window, "__openAgentRecoveryMidBatch") === true);
   await expect.poll(() => threadEvents(page).some((event) => isEventType(event, "turn.cancelled"))).toBeTruthy();
-  const composer = page.getByRole("textbox", { name: "Do anything" });
-  await composer.fill("Continue after the boundary");
-  await composer.press("Enter");
-  await expect(page.getByText("Continue after the boundary", { exact: true })).toBeVisible();
+  // The cancelled event is not the final admission boundary. The composer is
+  // released only after session.waiting arrives.
   await page.evaluate(() => {
     const release = Reflect.get(window, "__openAgentReleaseRecoveryBoundary");
     if (typeof release === "function") release();
   });
+  const composer = page.getByRole("textbox", { name: "Do anything" });
+  await composer.fill("Continue after the boundary");
+  await composer.press("Enter");
+  await expect(page.getByText("Continue after the boundary", { exact: true })).toBeVisible();
 
   await expect.poll(() => followUpBody).toMatchObject({ message: "Continue after the boundary" });
   await expect(page.getByText("Boundary continuation completed.", { exact: true })).toBeVisible({ timeout: 15_000 });
@@ -3590,7 +3602,9 @@ test("stop before session admission preserves the optimistic user message", asyn
   await composer.press("Enter");
   await page.getByRole("button", { name: "Stop", exact: true }).click();
 
-  await expect(page.getByRole("button", { name: "Send", exact: true })).toBeVisible({ timeout: 200 });
+  // No Eve session has been admitted yet, so this is a local-only stop and
+  // the composer can return immediately without racing a server turn.
+  await expect(page.getByRole("button", { name: "Send", exact: true })).toBeVisible();
   await expect(page.getByRole("log").getByText("Keep this message after stopping", { exact: true })).toBeVisible();
   await expect.poll(() => {
     const pending = firstStoredThread(page)?.pendingTurn;
@@ -3664,8 +3678,11 @@ test("stop cancels a recovered long-running turn after one bounded catch-up", as
 
   await page.goto("/threads/recovery-cancel-thread");
   await page.getByRole("button", { name: "Stop", exact: true }).click();
-  await expect(page.getByRole("button", { name: "Send", exact: true })).toBeVisible({ timeout: 300 });
+  await expect(page.getByRole("button", { name: "Send", exact: true })).toHaveCount(0);
   await expect.poll(() => cancelRequested).toBeTruthy();
+  await expect.poll(() => firstStoredThread(page)?.status).toBe("cancelling");
+  releaseStreams?.();
+  await expect(page.getByRole("button", { name: "Send", exact: true })).toBeVisible();
   await expect.poll(() => firstStoredThread(page)?.status).toBe("ready");
   expect(boundedTailRequests).toBe(1);
 });

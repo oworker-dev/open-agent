@@ -117,6 +117,43 @@ test("apply_patch preflights all operations before committing", async () => {
   assert.equal(files.get("/workspace/existing.txt"), "before\n");
 });
 
+test("apply_patch observes cancellation between multi-file validation and commit", async () => {
+  const controller = new AbortController();
+  const files = new Map<string, string>();
+  const writes: string[] = [];
+  let reads = 0;
+  const sandbox = {
+    async readTextFile({ path }: { path: string }) {
+      reads += 1;
+      if (reads === 1) controller.abort();
+      return files.get(path) ?? null;
+    },
+    async writeTextFile({ path, content }: { path: string; content: string }) {
+      writes.push(path);
+      files.set(path, content);
+    },
+    async removePath() {},
+    async run() { return { exitCode: 0, stdout: "", stderr: "" }; },
+  };
+  const context = {
+    abortSignal: controller.signal,
+    getSandbox: async () => sandbox,
+  } as never;
+  await assert.rejects(
+    () => (applyPatchTool as unknown as { execute(input: { patch: string }, context: unknown): Promise<unknown> }).execute({
+      patch: `*** Begin Patch
+*** Add File: first.txt
++first
+*** Add File: second.txt
++second
+*** End Patch`,
+    }, context),
+    /aborted/i,
+  );
+  assert.deepEqual(writes, []);
+  assert.deepEqual([...files], []);
+});
+
 test("apply_patch uses same-directory atomic rename and returns unique file count", async () => {
   const files = new Map([["/workspace/example.txt", "before\n"]]);
   const commands: string[] = [];

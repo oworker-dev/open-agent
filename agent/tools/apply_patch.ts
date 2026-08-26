@@ -31,7 +31,7 @@ type TextState = { readonly original: string | null; value: string | null };
  * stream. Every path is anchored to the current Eve workspace.
  */
 export default defineTool({
-  description: "Apply a Codex-style *** Begin Patch to files in /workspace. Supports Add File, Update File, Delete File, and Move to. Updates may contain multiple @@ hunks matched by exact context. Use this instead of inventing shell patch commands.",
+  description: "Apply a Codex-style patch to files in /workspace. The patch must start with *** Begin Patch and end with *** End Patch, with no text outside that envelope. Supports Add File, Update File, Delete File, and Move to. Updates may contain multiple @@ hunks matched by exact context. Use this instead of inventing shell patch commands.",
   inputSchema: z.object({ patch: z.string().min(1).max(512 * 1024) }).strict(),
   outputSchema: z.object({
     changes: z.array(z.object({
@@ -45,7 +45,10 @@ export default defineTool({
     totalDeletedLines: z.number(),
   }),
   async execute(input, ctx) {
+    const abortSignal = ctx.abortSignal;
+    abortSignal?.throwIfAborted();
     const operations = parsePatch(input.patch);
+    abortSignal?.throwIfAborted();
     const sandbox = await ctx.getSandbox();
     const states = new Map<string, TextState>();
     const changes: FileChange[] = [];
@@ -53,8 +56,9 @@ export default defineTool({
     // Read and validate every operation before writing anything. This makes a
     // multi-file patch all-or-nothing for parse/context/path conflicts.
     for (const operation of operations) {
+      abortSignal?.throwIfAborted();
       const path = workspacePath(operation.path);
-      const source = await stateFor(path, sandbox, states);
+      const source = await stateFor(path, sandbox, states, abortSignal);
       if (operation.kind === "add") {
         if (source.value !== null) throw new Error(`Cannot add ${path}: the file already exists.`);
         const content = operation.content;
@@ -73,7 +77,7 @@ export default defineTool({
       const result = applyUpdateText(source.value, operation.hunks);
       const destination = operation.moveTo ? workspacePath(operation.moveTo) : path;
       if (destination !== path) {
-        const target = await stateFor(destination, sandbox, states);
+        const target = await stateFor(destination, sandbox, states, abortSignal);
         if (target.value !== null) throw new Error(`Cannot move ${path} to ${destination}: the destination already exists.`);
         target.value = result.content;
         source.value = null;
@@ -90,7 +94,10 @@ export default defineTool({
 
     // Commit only states whose final value differs from their initial value.
     // writeAtomicTextFile uses a same-directory temp file plus mv on real
-    // sandboxes, preventing readers from observing a partial text file.
+    // sandboxes, preventing readers from observing a partial text file. Once
+    // this phase starts it is intentionally non-cancellable: stopping between
+    // files would turn a validated multi-file patch into a partial commit.
+    abortSignal?.throwIfAborted();
     for (const [path, state] of states) {
       if (state.value === state.original) continue;
       if (state.value === null) {
@@ -109,10 +116,15 @@ export default defineTool({
   },
 });
 
-async function stateFor(path: string, sandbox: SandboxSession, states: Map<string, TextState>): Promise<TextState> {
+async function stateFor(
+  path: string,
+  sandbox: SandboxSession,
+  states: Map<string, TextState>,
+  abortSignal?: AbortSignal,
+): Promise<TextState> {
   const known = states.get(path);
   if (known) return known;
-  const original = await sandbox.readTextFile({ path });
+  const original = await sandbox.readTextFile({ path, ...(abortSignal ? { abortSignal } : {}) });
   const state: TextState = { original, value: original };
   states.set(path, state);
   return state;
@@ -278,7 +290,11 @@ export function workspacePath(value: string): string {
   return path;
 }
 
-async function writeAtomicTextFile(sandbox: SandboxSession, path: string, content: string): Promise<void> {
+async function writeAtomicTextFile(
+  sandbox: SandboxSession,
+  path: string,
+  content: string,
+): Promise<void> {
   if (typeof sandbox.run !== "function") {
     await sandbox.writeTextFile({ content, path });
     return;
@@ -290,6 +306,8 @@ async function writeAtomicTextFile(sandbox: SandboxSession, path: string, conten
     const result = await sandbox.run({ command: `mv -f -- ${shellQuote(temporary)} ${shellQuote(path)}` });
     if (result.exitCode !== 0) throw new Error(`Atomic patch write failed for ${path}: ${result.stderr || "rename command failed"}`);
   } catch (error) {
+    // Cleanup must outlive the turn cancellation signal; otherwise an abort
+    // during the rename leaves the temporary file in the workspace.
     await sandbox.removePath({ force: true, path: temporary }).catch(() => undefined);
     throw error;
   }

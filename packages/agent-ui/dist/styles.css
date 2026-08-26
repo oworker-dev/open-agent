@@ -2011,11 +2011,14 @@
   .bg-sidebar {
     background-color: var(--sidebar);
   }
-  .bg-sidebar-accent {
-    background-color: var(--sidebar-accent);
-  }
   .bg-sidebar-border {
     background-color: var(--sidebar-border);
+  }
+  .bg-sidebar-foreground\/10 {
+    background-color: var(--sidebar-foreground);
+    @supports (color: color-mix(in lab, red, red)) {
+      background-color: color-mix(in oklab, var(--sidebar-foreground) 10%, transparent);
+    }
   }
   .bg-sidebar\/80 {
     background-color: var(--sidebar);
@@ -2529,9 +2532,6 @@
   .text-secondary-foreground {
     color: var(--secondary-foreground, oklch(0.19 0 0));
   }
-  .text-sidebar-accent-foreground {
-    color: var(--sidebar-accent-foreground);
-  }
   .text-sidebar-foreground {
     color: var(--sidebar-foreground);
   }
@@ -2664,12 +2664,6 @@
     --tw-ring-color: var(--ring, oklch(0.708 0 0));
     @supports (color: color-mix(in lab, red, red)) {
       --tw-ring-color: color-mix(in oklab, var(--ring, oklch(0.708 0 0)) 50%, transparent);
-    }
-  }
-  .ring-sidebar-border\/70 {
-    --tw-ring-color: var(--sidebar-border);
-    @supports (color: color-mix(in lab, red, red)) {
-      --tw-ring-color: color-mix(in oklab, var(--sidebar-border) 70%, transparent);
     }
   }
   .ring-sidebar-ring {
@@ -4360,6 +4354,16 @@
       }
     }
   }
+  .hover\:bg-sidebar-foreground\/5 {
+    &:hover {
+      @media (hover: hover) {
+        background-color: var(--sidebar-foreground);
+        @supports (color: color-mix(in lab, red, red)) {
+          background-color: color-mix(in oklab, var(--sidebar-foreground) 5%, transparent);
+        }
+      }
+    }
+  }
   .hover\:bg-transparent {
     &:hover {
       @media (hover: hover) {
@@ -4409,6 +4413,13 @@
     &:hover {
       @media (hover: hover) {
         color: var(--sidebar-accent-foreground);
+      }
+    }
+  }
+  .hover\:text-sidebar-foreground {
+    &:hover {
+      @media (hover: hover) {
+        color: var(--sidebar-foreground);
       }
     }
   }

@@ -49,7 +49,7 @@ function SidebarThreadItems({ activeThreadId, deletingThreadIds, editingThreadId
             if (!thread)
                 return null;
             return (_jsx(ThreadListPrimitive.ItemByIndex, { components: {
-                    ThreadListItem: () => (_jsxs(ThreadListItemPrimitive.Root, { className: cn("group relative flex min-h-9 items-center gap-0.5 overflow-visible rounded-md transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground", thread.id === activeThreadId && "bg-sidebar-accent text-sidebar-accent-foreground shadow-sm ring-1 ring-sidebar-border/70"), children: [editingThreadId === thread.id ? (_jsx(Input, { "aria-label": messages.renameThread, autoFocus: true, className: "m-1 h-9 min-w-0 flex-1 bg-background text-sm", onBlur: () => {
+                    ThreadListItem: () => (_jsxs(ThreadListItemPrimitive.Root, { className: cn("group relative flex min-h-9 items-center gap-0.5 overflow-visible rounded-md transition-colors hover:bg-sidebar-foreground/5 hover:text-sidebar-foreground", thread.id === activeThreadId && "bg-sidebar-foreground/10 text-sidebar-foreground"), children: [editingThreadId === thread.id ? (_jsx(Input, { "aria-label": messages.renameThread, autoFocus: true, className: "m-1 h-9 min-w-0 flex-1 bg-background text-sm", onBlur: () => {
                                     onRename(thread.id, editingTitle);
                                     setEditingThreadId(undefined);
                                 }, onChange: (event) => setEditingTitle(event.target.value), onKeyDown: (event) => {

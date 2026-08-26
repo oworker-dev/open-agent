@@ -7,13 +7,14 @@ export type AgentInputResponse = {
     readonly requestId: string;
     readonly text?: string;
 };
-export declare function AgentMessage({ assetUrl, canRespond, closedInputRequestIds, events, fallbackStartedAt, isStreaming, locale, message, onOpenDeliverable, onOpenSubagent, onInputResponses, onCloseInputRequest, showCopyAction, }: {
+export declare function AgentMessage({ assetUrl, canRespond, closedInputRequestIds, events, fallbackStartedAt, isStreaming, isTurnContinuation, locale, message, onOpenDeliverable, onOpenSubagent, onInputResponses, onCloseInputRequest, showCopyAction, }: {
     readonly assetUrl?: (assetId: string) => string;
     readonly canRespond: boolean;
     readonly closedInputRequestIds?: ReadonlySet<string>;
     readonly events: readonly MessageStreamEvent[];
     readonly fallbackStartedAt?: number;
     readonly isStreaming: boolean;
+    readonly isTurnContinuation?: boolean;
     readonly locale: AgentLocale;
     readonly message: EveMessage;
     readonly onOpenDeliverable?: (deliverable: AgentSessionDeliverable) => void;

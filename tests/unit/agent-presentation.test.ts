@@ -1113,6 +1113,120 @@ test("same-turn steering remains between the Agent output produced before and af
   assert.equal(presentAgentTurn(afterSteering, projection.events), undefined);
 });
 
+test("same-turn steering shares one visual execution timer while preserving message order", () => {
+  const steeredAt = "2026-08-06T01:00:05.000Z";
+  const deliveredAt = "2026-08-06T01:00:12.000Z";
+  const messages: EveMessage[] = [
+    {
+      id: "turn-root:assistant",
+      metadata: { status: "complete", turnId: "turn-root" },
+      parts: [
+        { type: "step-start" },
+        { state: "done", stepIndex: 0, text: "I inspected the existing files.", type: "text" },
+      ],
+      role: "assistant",
+    },
+    {
+      id: "turn-root:assistant:client-steer-1",
+      metadata: { status: "complete", turnId: "turn-root" },
+      parts: [
+        { type: "step-start" },
+        { state: "done", stepIndex: 1, text: "The blue design is ready.", type: "text" },
+      ],
+      role: "assistant",
+    },
+  ];
+  const events = [
+    event("turn.started", startedAt, { sequence: 0, turnId: "turn-root" }),
+    event("message.received", startedAt, { message: "Build the site", sequence: 0, turnId: "turn-root" }),
+    event("step.started", startedAt, { sequence: 0, stepIndex: 0, turnId: "turn-root" }),
+    event("actions.requested", startedAt, {
+      actions: [{ callId: "call-before", input: { command: "find ." }, kind: "tool-call", toolName: "bash" }],
+      sequence: 0,
+      stepIndex: 0,
+      turnId: "turn-root",
+    }),
+    event("message.completed", startedAt, {
+      finishReason: "tool-calls",
+      message: "I inspected the existing files.",
+      sequence: 0,
+      stepIndex: 0,
+      turnId: "turn-root",
+    }),
+    event("message.received", steeredAt, {
+      clientMessageId: "client-steer-1",
+      message: "Use the blue design",
+      sequence: 0,
+      turnId: "turn-root",
+    }),
+    event("step.started", steeredAt, { sequence: 0, stepIndex: 1, turnId: "turn-root" }),
+    event("message.completed", deliveredAt, {
+      finishReason: "stop",
+      message: "The blue design is ready.",
+      sequence: 0,
+      stepIndex: 1,
+      turnId: "turn-root",
+    }),
+    event("turn.completed", deliveredAt, { sequence: 0, turnId: "turn-root" }),
+  ];
+
+  const projection = projectAgentDisplayTimeline([
+    {
+      id: "turn-root:user",
+      metadata: { status: "complete", turnId: "turn-root" },
+      parts: [{ state: "done", text: "Build the site", type: "text" }],
+      role: "user",
+    },
+    {
+      id: "turn-root:assistant",
+      metadata: { status: "complete", turnId: "turn-root" },
+      parts: [{ type: "step-start" }, { state: "done", stepIndex: 0, text: "I inspected the existing files.", type: "text" }],
+      role: "assistant",
+    },
+    {
+      id: "turn-root:user:client-steer-1",
+      metadata: { status: "complete", turnId: "turn-root" },
+      parts: [{ state: "done", text: "Use the blue design", type: "text" }],
+      role: "user",
+    },
+    {
+      id: "turn-root:assistant:client-steer-1",
+      metadata: { status: "complete", turnId: "turn-root" },
+      parts: [{ type: "step-start" }, { state: "done", stepIndex: 1, text: "The blue design is ready.", type: "text" }],
+      role: "assistant",
+    },
+  ], events);
+  const before = projection.messages[1]!;
+  const after = projection.messages[3]!;
+  const beforeTask = presentAgentTurn(before, projection.events, new Set(), { mergeSameTurn: true });
+  const afterTask = presentAgentTurn(after, projection.events, new Set(), { mergeSameTurn: true });
+
+  assert.equal(beforeTask?.status, "completed");
+  assert.equal(beforeTask?.startedAt, Date.parse(startedAt));
+  assert.equal(beforeTask?.endedAt, Date.parse(deliveredAt));
+  assert.equal(beforeTask?.finalPart, undefined);
+  assert.equal(afterTask?.startedAt, Date.parse(startedAt));
+  assert.equal(afterTask?.endedAt, Date.parse(deliveredAt));
+  assert.equal(afterTask?.finalPart?.text, "The blue design is ready.");
+  const liveProjection = projectAgentDisplayTimeline(
+    [
+      projection.messages[0]!,
+      projection.messages[1]!,
+      projection.messages[2]!,
+      projection.messages[3]!,
+    ],
+    events.slice(0, -1),
+  );
+  assert.equal(
+    presentAgentTurn(liveProjection.messages[1]!, liveProjection.events, new Set(), { mergeSameTurn: true })?.status,
+    "running",
+  );
+  assert.deepEqual(
+    projection.messages.map((message) => message.role),
+    ["user", "assistant", "user", "assistant"],
+  );
+});
+
 test("unanchored independent turns are not merged into the previous execution", () => {
   const messages: EveMessage[] = [
     {
@@ -1296,6 +1410,14 @@ test("an interrupted durable model step remains visibly retrying", () => {
   ];
 
   assert.deepEqual(presentAgentStep(events, "turn-retry", 0), {
+    retries: [{
+      attempt: 1,
+      error: {
+        code: "provider_stream_interrupted",
+        message: "The Provider stream ended before completion.",
+      },
+      maximum: 3,
+    }],
     retry: {
       attempt: 1,
       error: {
@@ -1338,6 +1460,141 @@ test("a terminal step failure is attached to its step and does not masquerade as
     startedAt: Date.parse(startedAt),
     status: "failed",
   });
+});
+
+test("an exhausted transient provider failure is presented as retry failed with its diagnostics", () => {
+  const failedAt = "2026-08-06T01:00:03.000Z";
+  const events = [
+    event("turn.started", startedAt, { sequence: 0, turnId: "turn-retry-exhausted" }),
+    event("step.started", startedAt, { sequence: 0, stepIndex: 0, turnId: "turn-retry-exhausted" }),
+    event("step.failed", failedAt, {
+      code: "MODEL_CALL_FAILED",
+      message: "The model Provider request timed out.",
+      sequence: 0,
+      stepIndex: 0,
+      turnId: "turn-retry-exhausted",
+    }),
+    event("turn.failed", failedAt, {
+      code: "MODEL_CALL_FAILED",
+      message: "The model Provider request timed out.",
+      sequence: 0,
+      turnId: "turn-retry-exhausted",
+    }),
+  ];
+
+  assert.deepEqual(presentAgentStep(events, "turn-retry-exhausted", 0), {
+    endedAt: Date.parse(failedAt),
+    failure: {
+      code: "MODEL_CALL_FAILED",
+      message: "The model Provider request timed out.",
+    },
+    retry: {
+      attempt: 1,
+      error: {
+        code: "MODEL_CALL_FAILED",
+        message: "The model Provider request timed out.",
+      },
+      exhausted: true,
+      maximum: 3,
+    },
+    retries: [{
+      attempt: 1,
+      error: {
+        code: "MODEL_CALL_FAILED",
+        message: "The model Provider request timed out.",
+      },
+      exhausted: true,
+      maximum: 3,
+    }],
+    startedAt: Date.parse(startedAt),
+    status: "failed",
+  });
+});
+
+test("preserves earlier failed tool attempts when Eve reuses a call id", () => {
+  const turnId = "turn-retry-tool";
+  const message: EveMessage = {
+    id: `${turnId}:assistant`,
+    metadata: { status: "complete", turnId },
+    parts: [{ type: "step-start" }, {
+      input: { path: "index.html", content: "final" },
+      output: { path: "index.html", content: "final" },
+      state: "output-available",
+      stepIndex: 0,
+      toolCallId: "call-edit",
+      toolName: "edit_file",
+      type: "dynamic-tool",
+    }],
+    role: "assistant",
+  };
+  const events = [
+    event("turn.started", startedAt, { sequence: 0, turnId }),
+    event("step.started", startedAt, { sequence: 0, stepIndex: 0, turnId }),
+    event("actions.requested", startedAt, {
+      actions: [{ callId: "call-edit", input: { path: "index.html", content: "partial" }, kind: "tool-call", toolName: "edit_file" }],
+      sequence: 0,
+      stepIndex: 0,
+      turnId,
+    }),
+    event("step.failed", endedAt, {
+      code: "PATCH_INVALID",
+      message: "Patch failed",
+      sequence: 0,
+      stepIndex: 0,
+      turnId,
+    }),
+    event("step.started", endedAt, { sequence: 0, stepIndex: 0, turnId }),
+    event("actions.requested", endedAt, {
+      actions: [{ callId: "call-edit", input: { path: "index.html", content: "final" }, kind: "tool-call", toolName: "edit_file" }],
+      sequence: 0,
+      stepIndex: 0,
+      turnId,
+    }),
+    event("action.result", endedAt, {
+      result: { callId: "call-edit", kind: "tool-result", output: { path: "index.html", content: "final" }, toolName: "edit_file" },
+      sequence: 0,
+      status: "completed",
+      stepIndex: 0,
+      turnId,
+    }),
+    event("step.completed", endedAt, { finishReason: "tool-calls", sequence: 0, stepIndex: 0, turnId }),
+    event("turn.completed", endedAt, { sequence: 0, turnId }),
+  ];
+
+  const projected = normalizeSettledAgentMessages([message], events)[0]!;
+  assert.equal(projected.parts.filter((part) => part.type === "dynamic-tool").length, 2);
+  const failed = projected.parts.find((part) => part.type === "dynamic-tool" && part.state === "output-error");
+  assert.equal(failed?.type, "dynamic-tool");
+  if (failed?.type === "dynamic-tool") {
+    assert.match(failed.toolCallId, /^retry:turn-retry-tool:0:/);
+    assert.equal(failed.errorText, "Patch failed");
+  }
+});
+
+test("an unknown terminal failure remains an execution failure instead of a retry failure", () => {
+  const failedAt = "2026-08-06T01:00:03.000Z";
+  const events = [
+    event("turn.started", startedAt, { sequence: 0, turnId: "turn-unknown-failure" }),
+    event("step.started", startedAt, { sequence: 0, stepIndex: 0, turnId: "turn-unknown-failure" }),
+    event("step.failed", failedAt, {
+      code: "WORKSPACE_CORRUPTED",
+      message: "The workspace state is inconsistent.",
+      sequence: 0,
+      stepIndex: 0,
+      turnId: "turn-unknown-failure",
+    }),
+    event("turn.failed", failedAt, {
+      code: "WORKSPACE_CORRUPTED",
+      message: "The workspace state is inconsistent.",
+      sequence: 0,
+      turnId: "turn-unknown-failure",
+    }),
+  ];
+
+  const presentation = presentAgentStep(events, "turn-unknown-failure", 0);
+  assert.equal(presentation.retry, undefined);
+  assert.equal(presentation.failure?.code, "WORKSPACE_CORRUPTED");
+  assert.equal(presentation.status, "failed");
 });
 
 test("normal and recovery activity use one calm thinking state without transport details", () => {

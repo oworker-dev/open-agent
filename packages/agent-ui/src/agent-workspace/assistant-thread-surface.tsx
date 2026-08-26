@@ -156,20 +156,21 @@ export function AssistantThreadSurface({
         data-slot="thread-viewport"
         role="log"
       >
-        <div className="mx-auto flex w-full max-w-(--thread-max-width) flex-col gap-6 empty:hidden">
+        <div className="mx-auto flex w-full max-w-(--thread-max-width) flex-col gap-6 pb-3 empty:hidden">
           <ThreadPrimitive.Messages>
             {({ message }) => message.composer.isEditing ? (
               <EditMessage messages={messages} />
             ) : message.role === "user" ? (
               <UserMessage messages={messages} />
-            ) : (
-              <AssistantMessage
-                assetUrl={assetUrl}
-                canRespond={!isBusy || canRespondToInputRequest}
-                events={events}
+          ) : (
+            <AssistantMessage
+              assetUrl={assetUrl}
+              canRespond={!isBusy || canRespondToInputRequest}
+              events={events}
                 fallbackStartedAt={fallbackStartedAt}
-                isStreaming={isBusy && message.id === lastMessageId}
-                locale={locale}
+              isStreaming={isBusy && message.id === lastMessageId}
+              isTurnContinuation={isSteeringContinuationMessage(message, events)}
+              locale={locale}
                 message={eveMessagesById.get(message.id)}
                 messages={messages}
                 onInputResponses={onInputResponses}
@@ -227,6 +228,29 @@ export function AssistantThreadSurface({
       </ThreadPrimitive.Viewport>
     </ThreadPrimitive.Root>
   );
+}
+
+function isSteeringContinuationMessage(message: {
+  readonly id: string;
+  readonly metadata?: unknown;
+  readonly role: string;
+}, events: readonly MessageStreamEvent[]): boolean {
+  const metadata = typeof message.metadata === "object" && message.metadata !== null
+    ? message.metadata as { readonly turnId?: unknown }
+    : undefined;
+  const turnId = typeof metadata?.turnId === "string" ? metadata.turnId : undefined;
+  if (message.role !== "assistant" || !turnId || !message.id.startsWith(`${turnId}:assistant:`)) return false;
+  const clientMessageId = message.id.slice(`${turnId}:assistant:`.length);
+  if (!clientMessageId) return false;
+  const receipts = events.filter((event) =>
+    event.type === "message.received" && event.data.turnId === turnId,
+  );
+  const segmentIndex = receipts.findIndex((event) =>
+    event.type === "message.received" && event.data.clientMessageId === clientMessageId,
+  );
+  // A first message may also carry a client id. Only a receipt after another
+  // message in the same Eve turn is a steering continuation.
+  return segmentIndex > 0 || (segmentIndex < 0 && receipts.length > 0);
 }
 
 function RuntimeErrorMessage({
@@ -350,6 +374,7 @@ function AssistantMessage({
   events,
   fallbackStartedAt,
   isStreaming,
+  isTurnContinuation,
   locale,
   message,
   messages,
@@ -364,6 +389,7 @@ function AssistantMessage({
   readonly events: readonly MessageStreamEvent[];
   readonly fallbackStartedAt?: number;
   readonly isStreaming: boolean;
+  readonly isTurnContinuation: boolean;
   readonly locale: AgentLocale;
   readonly message?: EveMessage;
   readonly messages: AgentMessages;
@@ -372,7 +398,20 @@ function AssistantMessage({
   readonly onOpenDeliverable?: (deliverable: AgentSessionDeliverable) => void;
   readonly onOpenSubagent?: (sessionId: string) => void;
 }) {
-  const hasCopyableText = message?.parts.some((part) => part.type === "text" && part.text.trim().length > 0) ?? false;
+  const task = message
+    ? presentAgentTurn(message, events, closedInputRequestIds, { mergeSameTurn: true })
+    : undefined;
+  const copyableText = message
+    ? task
+      ? task.status === "completed" ? task.finalPart?.text.trim() : undefined
+      : message.metadata?.status === "failed"
+        ? undefined
+        : message.parts
+            .filter((part): part is Extract<typeof part, { type: "text" }> => part.type === "text")
+            .map((part) => part.text)
+            .join("\n")
+            .trim() || undefined
+    : undefined;
   return (
     <MessagePrimitive.Root className="group mx-auto flex w-full max-w-(--thread-max-width) scroll-mt-5 flex-col">
       <div className="min-w-0 px-1 text-[15px] leading-7 text-foreground">
@@ -384,6 +423,7 @@ function AssistantMessage({
             events={events}
             fallbackStartedAt={fallbackStartedAt}
             isStreaming={isStreaming}
+            isTurnContinuation={isTurnContinuation}
             locale={locale}
             message={message}
             onInputResponses={onInputResponses}
@@ -396,20 +436,16 @@ function AssistantMessage({
           <MessagePrimitive.Parts components={{ Text: MarkdownText, tools: { Fallback: ToolFallback } }} />
         )}
       </div>
-      {!isStreaming && hasCopyableText && (!message?.metadata?.turnId || (message !== undefined && presentTurnCompleted(message, events, closedInputRequestIds))) ? (
+      {!isStreaming && copyableText ? (
         <ActionBarPrimitive.Root className="mt-1 flex min-h-7 items-center opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
-          <ReliableCopyButton label={messages.copyResponse} />
+          <ReliableCopyButton label={messages.copyResponse} text={copyableText} />
         </ActionBarPrimitive.Root>
       ) : null}
     </MessagePrimitive.Root>
   );
 }
 
-function presentTurnCompleted(message: EveMessage, events: readonly MessageStreamEvent[], closedInputRequestIds: ReadonlySet<string>): boolean {
-  return presentAgentTurn(message, events, closedInputRequestIds)?.status === "completed";
-}
-
-function ReliableCopyButton({ label }: { readonly label: string }) {
+function ReliableCopyButton({ label, text }: { readonly label: string; readonly text?: string }) {
   const aui = useAui();
   const [copied, setCopied] = useState(false);
   const timer = useRef<number | undefined>(undefined);
@@ -418,17 +454,18 @@ function ReliableCopyButton({ label }: { readonly label: string }) {
     <Button
       aria-label={label}
       className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
+      size="icon-sm"
+      title={copied ? "Copied" : label}
+      type="button"
+      variant="ghost"
       onClick={() => {
-        void copyText(aui.message.getCopyText()).then(() => {
+        const copyValue = text ?? aui.message.getCopyText();
+        void copyText(copyValue).then(() => {
           setCopied(true);
           window.clearTimeout(timer.current);
           timer.current = window.setTimeout(() => setCopied(false), 1_500);
         }).catch(() => setCopied(false));
       }}
-      size="icon-sm"
-      title={copied ? "Copied" : label}
-      type="button"
-      variant="ghost"
     >
       {copied ? <CheckIcon className="size-3.5" /> : <CopyIcon className="size-3.5" />}
     </Button>

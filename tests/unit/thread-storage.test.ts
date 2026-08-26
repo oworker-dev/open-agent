@@ -43,6 +43,23 @@ test("uses Eve's durable event id even when a replay payload is normalized", () 
   assert.equal(dedupeThreadEvents([first, replay]).length, 1);
 });
 
+test("legacy id-less lifecycle events remain distinct while exact replays deduplicate", () => {
+  const at = new Date(0).toISOString();
+  const source = [
+    { data: { runtime: { agentId: "open-agent" } }, meta: { at }, type: "session.started" },
+    { data: { sequence: 0, turnId: "turn-legacy" }, meta: { at }, type: "turn.started" },
+    { data: { message: "Run", parts: [], sequence: 0, turnId: "turn-legacy" }, meta: { at }, type: "message.received" },
+    { data: { sequence: 0, stepIndex: 0, turnId: "turn-legacy" }, meta: { at }, type: "step.started" },
+  ] as unknown as MessageStreamEvent[];
+  const events: MessageStreamEvent[] = [];
+  const ids = new Set<string>();
+
+  for (const event of source) assert.equal(appendThreadEventIndexed(events, ids, event), true);
+  for (const event of source) assert.equal(appendThreadEventIndexed(events, ids, event), false);
+
+  assert.deepEqual(events.map((event) => event.type), source.map((event) => event.type));
+});
+
 test("pending edit reconciliation is anchored to the latest accepted message", () => {
   const pending = {
     id: "pending-edit",

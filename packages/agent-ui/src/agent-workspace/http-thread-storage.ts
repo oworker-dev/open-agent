@@ -1,5 +1,6 @@
 import {
   AGENT_THREAD_STORAGE_VERSION,
+  eventIdentity,
   parseThreadCollection,
   type AgentThreadCollection,
   type AgentThreadStorage,
@@ -102,7 +103,7 @@ export function createHttpAgentThreadStorage(
       const response = await request(
         fetchImplementation,
         options,
-        collectionUrl(`${endpoint}/repair`, storageKey, { threadId }),
+        repairCollectionUrl(endpoint, storageKey, { threadId }),
         {
           headers: { "content-type": "application/json" },
           method: "POST",
@@ -141,7 +142,12 @@ export function createHttpAgentThreadStorage(
       if (expectedRevision === undefined || baseline === undefined) {
         throw new Error("Agent thread storage must be loaded before it can be saved.");
       }
-      const patch = createCollectionPatch(baseline, collection);
+      // Snapshot before the asynchronous request. Live stream ingestion uses
+      // mutable buffers internally; a caller that keeps appending while this
+      // save is in flight must not mutate the baseline associated with the
+      // request body that was already sent.
+      const savedCollection = snapshotCollection(collection);
+      const patch = createCollectionPatch(baseline, savedCollection);
       const response = await request(
         fetchImplementation,
         options,
@@ -163,8 +169,22 @@ export function createHttpAgentThreadStorage(
       }
       await requireOk(response);
       revisions.set(storageKey, await readRevisionResponse(response));
-      baselines.set(storageKey, collection);
+      baselines.set(storageKey, savedCollection);
     },
+  };
+}
+
+function snapshotCollection(collection: AgentThreadCollection): AgentThreadCollection {
+  return {
+    ...(collection.activeThreadId ? { activeThreadId: collection.activeThreadId } : {}),
+    // Event payloads are immutable. Copy only the mutable ownership boundaries
+    // so a hot stream cannot change this save's baseline without duplicating
+    // large tool output and transcript strings every checkpoint.
+    threads: collection.threads.map((thread) => ({
+      ...thread,
+      events: [...thread.events],
+    })),
+    version: collection.version,
   };
 }
 
@@ -208,8 +228,13 @@ function createCollectionPatch(
     if (sameEventIds(previous.events, thread.events)) {
       return [{ ...thread, events: [], hydration: "summary" as const }];
     }
-    // Edit/resend can truncate history. Keep the explicit replacement path;
-    // normal streaming never takes it, so long sessions use tiny event deltas.
+    // A reconnect/remount can temporarily expose a shorter in-memory snapshot
+    // than the server's append-only transcript. Never let that stale view
+    // replace durable history. Only the explicit edit/resubmit transaction is
+    // allowed to truncate the event log.
+    if (!isExplicitTranscriptReplacement(thread)) {
+      return [{ ...thread, events: [], hydration: "summary" as const }];
+    }
     return [thread];
   });
   return {
@@ -224,6 +249,11 @@ function createCollectionPatch(
   };
 }
 
+function isExplicitTranscriptReplacement(thread: AgentThread): boolean {
+  return thread.pendingTurn?.state === "clearing" ||
+    thread.pendingTurn?.state === "resubmitting";
+}
+
 function appendOnlyEventDelta(
   previous: AgentThreadCollection["threads"][number]["events"],
   next: AgentThreadCollection["threads"][number]["events"],
@@ -231,12 +261,20 @@ function appendOnlyEventDelta(
   if (next.length < previous.length) return undefined;
   let firstDifference = -1;
   for (let index = 0; index < previous.length; index += 1) {
-    if (previous[index]?.meta.id !== next[index]?.meta.id) {
+    if (eventIdentity(previous[index]!) !== eventIdentity(next[index]!)) {
       firstDifference = index;
       break;
     }
   }
   if (firstDifference < 0) firstDifference = previous.length;
+  // A normal checkpoint may replace one cumulative snapshot in place, but it
+  // must leave every later event at the same position. If the suffix shifted,
+  // this is a reordered/recovered snapshot rather than an append delta; let
+  // the conflict path or authoritative repair handle it instead of replacing
+  // durable history with an ambiguous array.
+  for (let index = firstDifference + 1; index < previous.length; index += 1) {
+    if (eventIdentity(previous[index]!) !== eventIdentity(next[index]!)) return undefined;
+  }
   return { events: next.slice(firstDifference), replaceFrom: firstDifference };
 }
 
@@ -244,7 +282,9 @@ function sameEventIds(
   left: AgentThread["events"],
   right: AgentThread["events"],
 ): boolean {
-  return left.length === right.length && left.every((event, index) => event.meta.id === right[index]?.meta.id);
+  return left.length === right.length && left.every((event, index) =>
+    right[index] !== undefined && eventIdentity(event) === eventIdentity(right[index]),
+  );
 }
 
 async function request(
@@ -305,6 +345,17 @@ function collectionUrl(
   query?: Readonly<Record<string, string>>,
 ): string {
   const url = `${endpoint}/${encodeURIComponent(storageKey)}`;
+  if (!query) return url;
+  const search = new URLSearchParams(query);
+  return `${url}?${search.toString()}`;
+}
+
+function repairCollectionUrl(
+  endpoint: string,
+  storageKey: string,
+  query?: Readonly<Record<string, string>>,
+): string {
+  const url = `${endpoint}/${encodeURIComponent(storageKey)}/repair`;
   if (!query) return url;
   const search = new URLSearchParams(query);
   return `${url}?${search.toString()}`;

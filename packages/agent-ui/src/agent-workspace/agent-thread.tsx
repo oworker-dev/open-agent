@@ -164,7 +164,9 @@ export function AgentThreadView({
   const turnAdmissionBusyRef = useRef(false);
   const cancellationRecoveryRef = useRef<() => void>(() => undefined);
   const cancellationIdleTimerRef = useRef<number | undefined>(undefined);
-  const [cancellationState, setCancellationState] = useState<"idle" | "requested" | "cancelling">("idle");
+  const [cancellationState, setCancellationState] = useState<"idle" | "requested" | "cancelling">(
+    thread.status === "cancelling" ? "cancelling" : "idle",
+  );
   const [localInterruption, setLocalInterruption] = useState<LocalInterruption>();
   const [cancellationError, setCancellationError] = useState<string>();
   const [queueError, setQueueError] = useState<string>();
@@ -176,10 +178,9 @@ export function AgentThreadView({
 
   const settleCancellationUi = useCallback(() => {
     cancellationRef.current = { requested: false };
-    // Keep the stopping affordance visible for one paint even when Eve
-    // returns the cancellation boundary immediately. Without this small
-    // floor, a fast stream can batch `requested -> waiting -> idle` into one
-    // render and make a user click appear to have done nothing.
+    // Keep the stopping affordance visible for one paint after Eve has emitted
+    // the authoritative cancellation boundary. The HTTP `accepted` response
+    // is deliberately not enough to release the composer.
     setCancellationState("cancelling");
     if (cancellationIdleTimerRef.current !== undefined) {
       window.clearTimeout(cancellationIdleTimerRef.current);
@@ -247,26 +248,22 @@ export function AgentThreadView({
     }
 
     void durableSession.cancel(turnId ? { turnId } : undefined)
-      .then(() => {
+      .then((result) => {
         // A late response from an older cancel request must not resurrect the
         // stopping state after Eve has already emitted session.waiting and
         // replaced the cancellation object.
         if (cancellationRef.current !== requestState || !requestState.requested) return;
-        setCancellationState("cancelling");
-        // A recovery stream can be detached by `stop()` before the durable
-        // cancellation boundary is delivered to this component. Give the
-        // user a bounded escape hatch from a stale local spinner while the
-        // request remains marked as requested and the server continues to
-        // settle it authoritatively.
-        if (cancellationIdleTimerRef.current !== undefined) {
-          window.clearTimeout(cancellationIdleTimerRef.current);
+        if (result.status === "no_active_turn") {
+          // Eve reports this only when the target is already parked/terminal.
+          // There will be no cancellation boundary to wait for in that case.
+          settleCancellationUi();
+          onChange({ status: "ready", updatedAt: Date.now() });
+          return;
         }
-        cancellationIdleTimerRef.current = window.setTimeout(() => {
-          cancellationIdleTimerRef.current = undefined;
-          if (cancellationRef.current === requestState && requestState.requested) {
-            setCancellationState("idle");
-          }
-        }, 150);
+        // `accepted` means the cancellation command is durably queued, not
+        // that the running turn has stopped. Keep the composer locked while
+        // Eve emits turn.cancelled followed by session.waiting.
+        setCancellationState("cancelling");
       })
       .catch((error: unknown) => {
         if (cancellationRef.current !== requestState) return;
@@ -274,11 +271,16 @@ export function AgentThreadView({
           window.clearTimeout(cancellationIdleTimerRef.current);
           cancellationIdleTimerRef.current = undefined;
         }
-        cancellationRef.current = { requested: false, turnId };
+        // A lost response is ambiguous: Eve may already have accepted the
+        // command. Keep the requested marker and the composer locked so a new
+        // turn cannot race the still-running server turn. The next durable
+        // stream event (or a recovery attach) will settle it authoritatively.
+        requestState.sentTurnId = undefined;
+        requestState.sentSessionId = undefined;
         setCancellationError(error instanceof Error ? error.message : "Unable to stop this turn.");
-        setCancellationState("idle");
+        setCancellationState("cancelling");
       });
-  }, []);
+  }, [onChange, settleCancellationUi]);
 
   const handleEvent = useCallback(
     (event: MessageStreamEvent) => {
@@ -290,14 +292,15 @@ export function AgentThreadView({
       // dropping its compact transcript projection.
       const sourceIndex = consumedStreamIndexRef.current;
       const suppressed = shouldSuppressInterruptedTurnStreamEvent(event, sourceIndex, interruptedTurnsRef.current);
-      const accepted = suppressed
-        ? undefined
-        : appendThreadEventIndexed(compactedEventsRef.current, compactedEventIdsRef.current, event);
-      // The Eve cursor is an event cursor, not a callback counter. React can
-      // observe the same event twice during a reconnect/remount; duplicate
-      // callbacks must not advance the cursor or make the next recovery skip
-      // a durable event.
-      if (accepted === true || suppressed) consumedStreamIndexRef.current = sourceIndex + 1;
+      if (!suppressed) {
+        appendThreadEventIndexed(compactedEventsRef.current, compactedEventIdsRef.current, event);
+      }
+      // The cursor belongs to the Eve stream position, not to the compact UI
+      // projection. A replayed event can be a duplicate in the local event-id
+      // set while still occupying one position in this stream response. Using
+      // append success as the cursor gate can therefore pin recovery forever
+      // at the same startIndex after a reconnect.
+      consumedStreamIndexRef.current = sourceIndex + 1;
       checkpointDirtyRef.current = true;
       if (checkpointTimerRef.current === undefined) {
         checkpointTimerRef.current = window.setTimeout(() => {
@@ -344,7 +347,8 @@ export function AgentThreadView({
       }
       if (
         event.type === "session.waiting" &&
-        cancellationRef.current.requested
+        cancellationRef.current.requested &&
+        hasCancellationBoundary(compactedEventsRef.current, cancellationRef.current.turnId)
       ) {
         settleCancellationUi();
       }
@@ -400,6 +404,25 @@ export function AgentThreadView({
     ...(sessionRef.current ? { session: sessionRef.current } : {}),
   });
   const stopAgent = agent.stop;
+
+  // An initial ClientSession is attached before useEveAgent installs its
+  // onSessionChange callback. A refresh during cancellation can therefore
+  // miss the normal callback and leave Eve running without reissuing cancel.
+  // Reconcile the persisted cancelling state explicitly on every attach.
+  useEffect(() => {
+    const attachedSession = sessionRef.current;
+    // `useEveAgent` may publish its first snapshot without the externally
+    // supplied session while it is wiring callbacks. The attached session is
+    // already authoritative at this point, so do not gate cancellation on the
+    // hook snapshot alone. This is the refresh boundary that prevents a
+    // persisted `cancelling` thread from silently continuing on the server.
+    if (
+      !cancellationRef.current.requested ||
+      thread.status !== "cancelling" ||
+      !attachedSession?.state.sessionId
+    ) return;
+    requestDurableCancellation(attachedSession, persistedCancellationTurnId);
+  }, [agent.session?.sessionId, persistedCancellationTurnId, requestDurableCancellation, thread.status]);
 
   const flushLiveCheckpoint = useCallback(() => {
     if (checkpointTimerRef.current !== undefined) {
@@ -712,7 +735,9 @@ export function AgentThreadView({
       }
     }
     onChange({
-      events: compactedEventsRef.current,
+      // The recovery buffer is mutated in place for linear-time ingestion.
+      // Never let that mutable array escape into React or storage state.
+      events: [...compactedEventsRef.current],
       ...(acceptedPendingTurn ? { pendingTurn: undefined } : {}),
       ...(acceptedQueuedTurn ? { queuedTurns: queuedTurnsRef.current } : {}),
       ...(cancelledTurn ? { retainedContext } : {}),
@@ -786,15 +811,16 @@ export function AgentThreadView({
   };
 
   // Recovery is owned by the workspace and therefore does not invoke the
-  // live agent event callback above. Mirror its durable terminal state back
-  // into the local cancellation control so a recovered turn cannot leave the
-  // composer permanently disabled after Eve is already waiting.
+  // live agent event callback above. Mirror only the durable cancellation
+  // boundary back into the local control. A generic `ready` status is not
+  // sufficient because it can be produced by a stale checkpoint or a normal
+  // completed turn while the cancellation request is still in flight.
   useEffect(() => {
     if (!cancellationRef.current.requested) return;
-    if (thread.status === "ready" || thread.status === "waiting" || thread.status === "error") {
+    if (hasCancellationBoundary(thread.events, cancellationRef.current.turnId)) {
       settleCancellationUi();
     }
-  }, [settleCancellationUi, thread.status]);
+  }, [settleCancellationUi, thread.events]);
 
   const updateQueuedTurns = (queuedTurns: readonly AgentQueuedTurn[]) => {
     if (sameQueuedTurnSnapshots(queuedTurnsRef.current, queuedTurns)) return;
@@ -944,19 +970,24 @@ export function AgentThreadView({
     // the browser has not even obtained an Eve session yet, there is no
     // durable cancellation request to wait for, so the composer can remain
     // interactive immediately.
-    // Recovery is owned by the workspace. Stopping it intentionally detaches
-    // this browser stream before the durable cancellation response arrives,
-    // so keep the composer interactive while the server request continues in
-    // the background. A live Agent stream still waits for Eve's boundary.
-    const waitsForDurableBoundary = !isRecovering && Boolean(turnId || durableSession);
+    // Eve cancellation is asynchronous in both the live and recovery paths.
+    // Keep the composer locked until the durable turn.cancelled ->
+    // session.waiting boundary arrives; an accepted HTTP response is not a
+    // safe point for admitting the next turn.
+    const waitsForDurableBoundary = Boolean(durableSession);
+    if (!waitsForDurableBoundary) {
+      // No Eve session exists yet, so the optimistic submission can be
+      // stopped locally and there is no server-side turn to await.
+      cancellationRef.current = { requested: false };
+    }
     setCancellationState(waitsForDurableBoundary ? "requested" : "idle");
     pendingTurnRef.current = interruptedPendingTurn;
     onChange({
-      events: compactedEventsRef.current,
+      events: [...compactedEventsRef.current],
       interruptedTurns,
       pendingTurn: interruptedPendingTurn,
       retainedContext,
-      status: "cancelling",
+      status: waitsForDurableBoundary ? "cancelling" : "ready",
       updatedAt: Date.now(),
     });
     const queuedFollowUpWithdrawal = withdrawLatestQueuedFollowUp();
@@ -1869,6 +1900,21 @@ async function sendPrompt(
 
 function isSessionBoundary(event: MessageStreamEvent): boolean {
   return event.type === "session.waiting" || event.type === "session.completed" || event.type === "session.failed";
+}
+
+function hasCancellationBoundary(
+  events: readonly MessageStreamEvent[],
+  turnId?: string,
+): boolean {
+  let cancelled = false;
+  for (const event of events) {
+    if (event.type === "turn.cancelled" && (!turnId || event.data.turnId === turnId)) {
+      cancelled = true;
+      continue;
+    }
+    if (cancelled && event.type === "session.waiting") return true;
+  }
+  return false;
 }
 
 const DURABLE_PROGRESS_PROBE_DELAY_MS = 15_000;
