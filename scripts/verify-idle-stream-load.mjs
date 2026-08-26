@@ -79,15 +79,12 @@ const resetSessions = new Map(
     .filter((seed) => seed?.session && seed.session.state.sessionId)
     .map((seed) => [seed.session.state.sessionId, seed]),
 );
-await Promise.allSettled([...resetSessions.values()].map(async (seed) => {
-  activeSessions.delete(seed.session);
-  await seed.session.reset({ reason: `idle-stream-load:${batchId}` }).catch(() => undefined);
-}));
-// Direct Eve sessions used by this verifier do not have a host ownership row,
-// so the normal sandbox cleanup worker cannot authorize their containers. Remove
-// only containers carrying a session id created by this run; never scan or
-// delete unrelated host sandboxes.
-await removeOwnedTestSandboxes([...resetSessions.keys()]);
+const sessionCleanup = await retireSyntheticSessions([...resetSessions.values()]);
+// These sessions are intentionally owned only by this load identity, so the
+// production sandbox cleanup worker has no AgentRun retention record to use.
+// Remove containers only for sessions whose reset was acknowledged; never scan
+// or delete unrelated host sandboxes.
+await removeOwnedTestSandboxes(sessionCleanup.retiredSessionIds);
 
 const handshake = summarize(established.map((entry) => entry.handshakeMs));
 const errorRate = failures.length / totalStreams;
@@ -101,6 +98,9 @@ if ((handshake.p95Ms ?? Number.POSITIVE_INFINITY) > p95HandshakeMs) {
 }
 if (unexpectedDisconnects.length > 0) {
   violations.push(`${unexpectedDisconnects.length} established streams disconnected during the hold interval.`);
+}
+if (sessionCleanup.failures.length > 0) {
+  violations.push(`${sessionCleanup.failures.length} synthetic Eve sessions could not be retired.`);
 }
 if (targetMetricsUrl && (targetMetricsBefore?.error || targetMetricsAfter?.error)) {
   violations.push("Target metrics endpoint did not return valid snapshots for the full load window.");
@@ -129,6 +129,7 @@ const evidence = {
     establishmentDurationMs: Math.round(establishedAt - startedAt),
     seedSetupDurationMs,
     handshake,
+    sessionCleanup,
     // This is the verifier process only. It is intentionally not presented as
     // target-server capacity evidence; collect target metrics separately.
     loadGeneratorMemory: memory.result(),
@@ -236,6 +237,29 @@ async function createSeed(index) {
   } catch (cause) {
     return { error: safeError(cause), index, ok: false };
   }
+}
+
+async function retireSyntheticSessions(seeds) {
+  const failures = [];
+  const retiredSessionIds = [];
+  let retired = 0;
+  await mapWithConcurrency(seeds, Math.min(concurrency, 16), async (seed) => {
+    const session = seed.session;
+    const sessionId = seed.sessionId;
+    if (!session || !sessionId) return;
+    try {
+      const result = await session.reset({ reason: `idle-stream-load:${batchId}` });
+      if (result.status !== "reset" && result.status !== "no_active_session") {
+        throw new Error(`session reset returned ${result.status}`);
+      }
+      retired += 1;
+      retiredSessionIds.push(sessionId);
+      activeSessions.delete(session);
+    } catch (cause) {
+      failures.push({ sessionId, error: safeError(cause) });
+    }
+  });
+  return { attempted: seeds.length, failures, retired, retiredSessionIds };
 }
 
 async function removeOwnedTestSandboxes(sessionIds) {
