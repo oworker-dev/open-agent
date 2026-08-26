@@ -188,7 +188,16 @@ test("maps cumulative replacements from a bounded window to absolute event index
   const thread = {
     ...createAgentThread(100, "Windowed replacement"),
     events: [{
-      data: { callId: "call-1", stepIndex: 0, turnId: "turn-1", input: "old" },
+      data: {
+        callId: "call-1",
+        input: "old",
+        inputTextDelta: "old",
+        inputTextSoFar: "old",
+        sequence: 0,
+        stepIndex: 0,
+        toolName: "apply_patch",
+        turnId: "turn-1",
+      },
       meta: { at: new Date(0).toISOString(), id: "partial-1" },
       type: "action.input.partial" as const,
     }],
