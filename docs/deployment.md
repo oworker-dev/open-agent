@@ -79,6 +79,11 @@ external production still requires HTTPS ingress and must pass
 MinIO release uses a loopback-only wildcard CORS policy because it does not
 implement `PutBucketCors`; configure an explicit Web-origin allowlist on the
 target S3/R2 service.
+`start:preview` also generates one process-shared `AGENT_METRICS_SECRET` when
+the variable is not supplied, so the protected `/api/internal/metrics` route
+can be sampled by local capacity verifiers without exposing a credential to
+the browser. Set an explicit secret in deployed environments and rotate it
+through the deployment secret manager.
 
 Pin the exact source revision and container digest. Load secrets from the target
 secret manager, then run:

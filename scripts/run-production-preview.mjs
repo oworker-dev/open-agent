@@ -40,6 +40,10 @@ const hostJwtSecret = await resolveProductionPreviewHostJwtSecret();
 const minioEnvironment = containerEnvironment("open-agent-gate-minio");
 const mailboxDispatchSecret = process.env.AGENT_MAILBOX_DISPATCH_SECRET?.trim() || randomBytes(32).toString("base64url");
 const mailboxWorkerSecret = process.env.AGENT_MAILBOX_WORKER_SECRET?.trim() || randomBytes(32).toString("base64url");
+// Keep diagnostics protected while making the local production preview
+// observable by the capacity verifiers. The generated value is shared by all
+// preview workers through this process environment and never sent to clients.
+const metricsSecret = process.env.AGENT_METRICS_SECRET?.trim() || randomBytes(32).toString("base64url");
 const runtimeEnvironment = {
   ...process.env,
   AGENT_BASH_APPROVAL_MODE: "risky",
@@ -68,6 +72,8 @@ const runtimeEnvironment = {
   AGENT_HOST_JWT_AUDIENCE: process.env.AGENT_HOST_JWT_AUDIENCE || "open-agent-local-production",
   AGENT_HOST_JWT_ISSUER: process.env.AGENT_HOST_JWT_ISSUER || "https://open-agent.local",
   AGENT_HOST_JWT_SECRET: hostJwtSecret,
+  AGENT_HOST_REQUIRE_DOCKER_LIMITS: process.env.AGENT_HOST_REQUIRE_DOCKER_LIMITS || "1",
+  AGENT_METRICS_SECRET: metricsSecret,
   AGENT_MODEL_MAX_OUTPUT_TOKENS: "4096",
   // Admission is persisted in PostgreSQL so multiple Web replicas cannot
   // oversubscribe this small single-host preview. Hosts with a scheduler may
