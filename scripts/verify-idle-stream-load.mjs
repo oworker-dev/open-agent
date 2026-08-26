@@ -1,6 +1,8 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { performance } from "node:perf_hooks";
 
 import { Client } from "eve/client";
@@ -24,6 +26,7 @@ const sessionCount = boundedInteger(
 );
 
 const marker = `STREAM_LOAD_READY_${batchId}`;
+const execFileAsync = promisify(execFile);
 const memory = createMemorySampler();
 const activeSessions = new Set();
 let signalCleanupPromise;
@@ -80,6 +83,11 @@ await Promise.allSettled([...resetSessions.values()].map(async (seed) => {
   activeSessions.delete(seed.session);
   await seed.session.reset({ reason: `idle-stream-load:${batchId}` }).catch(() => undefined);
 }));
+// Direct Eve sessions used by this verifier do not have a host ownership row,
+// so the normal sandbox cleanup worker cannot authorize their containers. Remove
+// only containers carrying a session id created by this run; never scan or
+// delete unrelated host sandboxes.
+await removeOwnedTestSandboxes([...resetSessions.keys()]);
 
 const handshake = summarize(established.map((entry) => entry.handshakeMs));
 const errorRate = failures.length / totalStreams;
@@ -227,6 +235,25 @@ async function createSeed(index) {
     return { accessToken, index, ok: true, session: created.session, sessionId, streamIndex };
   } catch (cause) {
     return { error: safeError(cause), index, ok: false };
+  }
+}
+
+async function removeOwnedTestSandboxes(sessionIds) {
+  for (const sessionId of sessionIds) {
+    if (!/^wrun_[A-Za-z0-9_-]+$/u.test(sessionId)) continue;
+    try {
+      const { stdout } = await execFileAsync(
+        process.env.EVE_DOCKER_PATH?.trim() || "docker",
+        ["ps", "-aq", "--filter", "label=eve.sandbox=1", "--filter", `label=eve.sandbox.tag.sessionId=${sessionId}`],
+        { maxBuffer: 64 * 1024 },
+      );
+      const ids = stdout.split(/\s+/u).filter(Boolean);
+      if (ids.length === 0) continue;
+      await execFileAsync(process.env.EVE_DOCKER_PATH?.trim() || "docker", ["rm", "-f", ...ids], { maxBuffer: 64 * 1024 });
+    } catch {
+      // Cleanup is best-effort. The evidence still reports protocol failures;
+      // the host reaper remains responsible for authorized production sessions.
+    }
   }
 }
 

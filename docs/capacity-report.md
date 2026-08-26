@@ -11,22 +11,25 @@ simultaneous Agent execution.
 - Next Web + Eve Runtime + mailbox/cleanup workers on one host
 - PostgreSQL World and Agent database on local containers
 - Workflow pool 22, Workflow workers 20, Agent database pool 10
-- Only about 1.3 GiB free disk during the run; this is below a production
-  operating threshold and invalidates any claim of long-term storage capacity.
+- The guarded 2026-08-26 run started with about 2.9 GiB free disk (the
+  configured minimum is 2 GiB). This is enough for the test but still a narrow
+  margin for long-term production storage.
 
 ## Evidence
 
 | Workload | Result | Measured values |
 | --- | --- | --- |
-| 100 idle SSE streams | Pass | 0 errors, 0 unexpected disconnects, handshake p95 185ms |
-| 500 idle SSE streams across an independent durable-session pool | Pass | 500/500 HTTP 200, all handshakes established in 30.7s, held 10s |
-| 257 idle SSE streams on one durable session | Fail by test design | 256 established; the 257th timed out. This is a per-session fan-out boundary, not a server-wide user limit |
+| 100 idle SSE streams | Pass | 0 errors, 0 unexpected disconnects, handshake p95 250ms |
+| 250 idle SSE streams across an independent durable-session pool | Pass | 250/250 established, 0 unexpected disconnects, handshake p95 237ms |
+| 500 idle SSE streams across an independent durable-session pool | Fail | 500 established, handshake p95 29.8s, 256 unexpected disconnects during hold |
+| 1,000 idle SSE streams across an independent durable-session pool | Fail | 1,000 established, handshake p95 29.8s, 768 unexpected disconnects during hold |
 | 2 simple live AgentRuns, concurrency 1 | Pass for host admission/error gate | 0 errors, admission p95 102ms, Provider completion p95 57.4s; this is an upstream/route latency observation, not a host saturation result |
 | 4 simple live AgentRuns, concurrency 2 | Host gate pass; Provider latency observation | 0 errors, admission p95 192ms, completion p95 28.9s in the earlier 20s budget run; the capacity runner now uses a 60s observation budget and records resource/event-loop metrics separately |
 | 4 live AgentRuns, concurrency 4 | Pass | 0 errors, admission p95 198ms, completion p95 165.0s, event-loop p95 20.5ms |
 | 8 live AgentRuns, concurrency 8 | Pass | 0 errors, admission p95 319ms, completion p95 104.7s, event-loop p95 20.6ms |
-| 16 live AgentRuns, concurrency 16 | Pass | 0 errors, admission p95 665ms, completion p95 132.0s, event-loop p95 20.7ms |
-| 32 live AgentRuns, concurrency 32 | Fail | 16/32 failed during inspection/settlement (502 or timeout), error rate 50%; event-loop p95 20.6ms |
+| 12 live AgentRuns, concurrency 12 | Pass | 0 errors, admission p95 638ms, completion p95 10.5s, event-loop p95 30.9ms |
+| 16 live AgentRuns, concurrency 16 | Fail | 1/16 failed during inspection/settlement (502), error rate 6.25%; successful admission p95 1.05s, completion p95 14.3s |
+| 20 idle streams + 2 live AgentRuns (mixed smoke) | Pass | 0 errors, stream handshake p95 52ms, AgentRun completion p95 4.7s |
 | 100 MiB multipart upload | Pass | 1 upload, 38.72 MiB/s, ownership isolation passed |
 
 The AgentRun result is not classified as a server saturation limit: the run
@@ -38,14 +41,14 @@ at this tiny active workload.
 
 The current single-server evidence supports these **verified operating levels**:
 
-- **500 concurrently connected online sessions** (one SSE stream per user),
-  with all connections established and held for 10 seconds. This is a lower
-  bound for this topology, not a proven maximum; a 1,000-connection attempt
-  did not produce complete, trustworthy evidence and is not claimed.
-- **16 concurrently executing AgentRuns**, with 0% measured errors in the
-  controlled run. At 32, the error rate was 50%, so the production admission
-  ceiling should remain below 32 until the database, sandbox, and Provider
-  pools are isolated and retested.
+- **250 concurrently connected online sessions** (one SSE stream per user),
+  with all connections established and held for five seconds and zero
+  unexpected disconnects. The 500-stream attempt failed its stability SLO, so
+  250 is the current verified lower bound for this exact host/topology.
+- **12 concurrently executing AgentRuns**, with 0% measured errors in the
+  controlled run. At 16, one run failed inspection/settlement (6.25% error),
+  so production admission should remain at or below 12 until the Provider,
+  Workflow, and database pools are isolated and retested.
 
 These figures are measured separately. They do **not** mean that 500 users can
 all run Agent tasks at once. A user with an idle open session consumes an SSE
@@ -78,16 +81,18 @@ The next capacity run must use a disk-safe isolated database and report at
 least 1k/5k/10k idle streams plus controlled 10/25/50/100 active turns. Real
 Provider latency, Provider quota, Workflow queue age, database pool wait,
 sandbox allocation, CPU, RSS, event-loop lag, and reconnect rate must be
-recorded separately. Until that run is completed, use 500 online connections
-and 16 active turns as conservative deployment planning numbers, not marketing
+recorded separately. Until that run is completed, use 250 online connections
+and 12 active turns as conservative deployment planning numbers, not marketing
 capacity.
 
 The sequential matrix does not exercise online and active workloads at the same
 time. Use `npm run verify:mixed-capacity` for that envelope: it runs the idle
 stream and AgentRun verifiers concurrently and records both child reports plus
 before/after target metrics. No mixed-workload result has been measured for this
-report yet, so the conservative figures above must not be extrapolated to a
-combined workload.
+The mixed verifier has now been exercised with a 20-stream/2-run smoke
+envelope. This is only a protocol smoke result; no large mixed-workload
+capacity claim is made until target metrics are configured and a clean host run
+completes.
 
 ## Storage finding
 

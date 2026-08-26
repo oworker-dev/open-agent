@@ -1,7 +1,9 @@
 import { createHmac, randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { monitorEventLoopDelay, performance } from "node:perf_hooks";
+import { promisify } from "node:util";
 
 import { evaluateHostLoadSlo, evaluateLoadSlo, summarizeLatencies } from "../lib/load-slo.ts";
 
@@ -54,6 +56,8 @@ const targetMetricsBefore = targetMetricsUrl
 const generatedAt = new Date().toISOString();
 const resourceSampler = createResourceSampler();
 const activeRunIds = new Set();
+const testSessionIds = new Set();
+const execFileAsync = promisify(execFile);
 let shutdownPromise;
 process.once("SIGTERM", () => {
   shutdownPromise = cancelOutstandingRuns().finally(() => {
@@ -211,10 +215,12 @@ async function runPhase(phase, count) {
       assert(typeof payload.run?.runId === "string", "A load run did not return a runId.");
       const admissionMs = performance.now() - startedAt;
       runId = payload.run.runId;
+      if (typeof payload.run.sessionId === "string") testSessionIds.add(payload.run.sessionId);
       activeRunIds.add(runId);
 
       stage = "completion";
       const run = await poll(runId, startedAt + deadlineMs);
+      if (typeof run.sessionId === "string") testSessionIds.add(run.sessionId);
       activeRunIds.delete(runId);
       const completionMs = performance.now() - startedAt;
       assert(run.status === "completed", `AgentRun ${runId} ended as ${run.status}.`);
@@ -279,7 +285,9 @@ async function cancelAndWait(runId) {
         200,
       );
       if (["completed", "failed", "cancelled", "submission-ambiguous"].includes(payload.run.status)) {
+        if (typeof payload.run.sessionId === "string") testSessionIds.add(payload.run.sessionId);
         activeRunIds.delete(runId);
+        await removeOwnedTestSandboxes();
         return;
       }
     } catch {
@@ -288,6 +296,26 @@ async function cancelAndWait(runId) {
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   activeRunIds.delete(runId);
+  await removeOwnedTestSandboxes();
+}
+
+async function removeOwnedTestSandboxes() {
+  const docker = process.env.EVE_DOCKER_PATH?.trim() || "docker";
+  for (const sessionId of testSessionIds) {
+    if (!/^wrun_[A-Za-z0-9_-]+$/u.test(sessionId)) continue;
+    try {
+      const { stdout } = await execFileAsync(docker, [
+        "ps", "-aq", "--filter", "label=eve.sandbox=1",
+        "--filter", `label=eve.sandbox.tag.sessionId=${sessionId}`,
+      ], { maxBuffer: 64 * 1024 });
+      const ids = stdout.split(/\s+/u).filter(Boolean);
+      if (ids.length > 0) await execFileAsync(docker, ["rm", "-f", ...ids], { maxBuffer: 64 * 1024 });
+    } catch {
+      // Best effort for synthetic runs; production sandboxes are reaped only
+      // through the ownership-authorized cleanup worker.
+    }
+    testSessionIds.delete(sessionId);
+  }
 }
 
 // AgentRun events are paged by the API. Consume every page and require a
