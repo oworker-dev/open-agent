@@ -84,6 +84,8 @@ export interface AgentRunStore {
   markCancellationRequested(runId: string): Promise<AgentRunRecord>;
   markSubmissionFailed(runId: string, message: string): Promise<AgentRunRecord>;
   markSubmissionAmbiguous(runId: string, message: string): Promise<AgentRunRecord>;
+  /** Returns only pre-Eve reservations old enough to be reconciled safely. */
+  listStaleSubmissions?(olderThanMs: number, limit: number): Promise<readonly AgentRunRecord[]>;
   reserve(input: ReserveAgentRunInput): Promise<ReserveAgentRunResult>;
   updateProjection(runId: string, projection: AgentRunProjection): Promise<AgentRunRecord>;
 }
@@ -306,7 +308,25 @@ function postgresAgentRunStore(pool: Pool, table: string, config: AgentDatabaseC
           returning ${selectColumns()}`,
         [runId, JSON.stringify({ code: "submission-ambiguous", message, retryable: false })],
       );
-      return toRecord(requireRow(result.rows[0]));
+      if (result.rows[0]) return toRecord(result.rows[0]);
+      const existing = await pool.query<AgentRunRow>(
+        `select ${selectColumns()} from ${table} where run_id = $1`,
+        [runId],
+      );
+      return toRecord(requireRow(existing.rows[0]));
+    },
+    async listStaleSubmissions(olderThanMs, limit) {
+      assertBoundedInteger(olderThanMs, "olderThanMs", 1, 86_400_000);
+      assertBoundedInteger(limit, "limit", 1, 10_000);
+      const result = await pool.query<AgentRunRow>(
+        `select ${selectColumns()} from ${table}
+           where status = 'submitting'
+             and updated_at < now() - ($1::bigint * interval '1 millisecond')
+           order by updated_at asc
+           limit $2`,
+        [olderThanMs, limit],
+      );
+      return result.rows.map(toRecord);
     },
     async updateProjection(runId, projection) {
       return await inTransaction(pool, async (client) => {
@@ -454,6 +474,12 @@ function parseRevision(value: string): number {
   const revision = Number(value);
   if (!Number.isSafeInteger(revision) || revision < 1) throw new Error("Invalid AgentRun revision.");
   return revision;
+}
+
+function assertBoundedInteger(value: number, name: string, minimum: number, maximum: number): void {
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new RangeError(`${name} must be an integer from ${minimum} to ${maximum}.`);
+  }
 }
 
 function toIso(value: Date | string): string {

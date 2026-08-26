@@ -331,6 +331,11 @@ indexes on status and tenant, so admission remains cheap as terminal history
 grows. `npm run doctor:host` provides read-only host/cgroup/Docker evidence and
 fails closed for low free disk or memory before a load test starts.
 
+The run reconciler closes only stale pre-Eve reservations as
+`submission-ambiguous`; it never resets an active Eve session or blindly
+replays uncertain work. This prevents a process crash during admission from
+permanently consuming the active-run gate.
+
 ### Capacity and chaos gates
 
 The release test matrix includes:

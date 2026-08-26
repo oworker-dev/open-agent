@@ -31,6 +31,7 @@
     "eval:fixed": "node scripts/run-fixed-evals.mjs",
     "start:eve": "eve start",
     "start:mailbox-worker": "node scripts/run-agent-mailbox-worker.mjs",
+    "start:run-reconciler": "node scripts/run-agent-run-reconciler.mjs",
     "test:e2e": "playwright test",
     "test:unit": "npm run build:sdk && node --test tests/unit/*.test.ts",
     "verify:ci": "npm run typecheck && npm run test:unit && npm run verify:provider-failures && npm run verify:mcp-conformance && npm run build:eve && npm run build && npm run verify:sdk-source-distribution && npm run verify:sdk-packages && npm run verify:custom-host-example",

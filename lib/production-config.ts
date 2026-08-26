@@ -467,6 +467,27 @@ export function inspectProductionConfiguration(
     10_000,
     error,
   );
+  inspectOptionalInteger(
+    environment.AGENT_RUN_RECONCILE_INTERVAL_MS,
+    "AGENT_RUN_RECONCILE_INTERVAL_MS",
+    1_000,
+    86_400_000,
+    error,
+  );
+  inspectOptionalInteger(
+    environment.AGENT_RUN_RECONCILE_LIMIT,
+    "AGENT_RUN_RECONCILE_LIMIT",
+    1,
+    10_000,
+    error,
+  );
+  inspectOptionalInteger(
+    environment.AGENT_RUN_SUBMISSION_STALE_MS,
+    "AGENT_RUN_SUBMISSION_STALE_MS",
+    10_000,
+    86_400_000,
+    error,
+  );
 
   const revoked = environment.AGENT_REVOKED_EXTENSIONS?.trim();
   if (revoked) {

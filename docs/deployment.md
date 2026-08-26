@@ -22,6 +22,14 @@ Agent Web database. Multiple worker replicas are safe: PostgreSQL leases and
 per-session FIFO blockers prevent duplicate delivery. Do not replace it with a
 browser timer or a client-owned session retry loop.
 
+Run one AgentRun reconciler per deployment alongside the mailbox worker. It
+only marks reservations that are still `submitting` and have no Eve session
+handle after `AGENT_RUN_SUBMISSION_STALE_MS` as
+`submission-ambiguous`. This releases a leaked admission slot without
+replaying an uncertain request or interrupting a real long-running Eve turn.
+Bound its cadence with `AGENT_RUN_RECONCILE_INTERVAL_MS` and
+`AGENT_RUN_RECONCILE_LIMIT`.
+
 The AgentRun admission gate is also persisted in PostgreSQL. Set
 `AGENT_MAX_ACTIVE_RUNS_TOTAL` for the safe active-turn ceiling of one Open
 Agent deployment and `AGENT_MAX_ACTIVE_RUNS_PER_TENANT` for a fair per-tenant
@@ -166,6 +174,10 @@ AGENT_WEB_INTERNAL_URL=https://agent.example.com \
 AGENT_MAILBOX_WORKER_SECRET='replace-with-32-byte-secret' \
 AGENT_MAILBOX_DISPATCH_SECRET='replace-with-another-32-byte-secret' \
   npm run start:mailbox-worker
+
+AGENT_RUN_RECONCILE_INTERVAL_MS=60000 \
+AGENT_RUN_SUBMISSION_STALE_MS=120000 \
+  npm run start:run-reconciler
 ```
 
 For the Docker backend, also run the terminal sandbox cleanup worker. It only

@@ -71,6 +71,9 @@ const runtimeEnvironment = {
   // override both values with their measured safe limits.
   AGENT_MAX_ACTIVE_RUNS_TOTAL: process.env.AGENT_MAX_ACTIVE_RUNS_TOTAL || "16",
   AGENT_MAX_ACTIVE_RUNS_PER_TENANT: process.env.AGENT_MAX_ACTIVE_RUNS_PER_TENANT || "16",
+  AGENT_RUN_RECONCILE_INTERVAL_MS: process.env.AGENT_RUN_RECONCILE_INTERVAL_MS || "60000",
+  AGENT_RUN_RECONCILE_LIMIT: process.env.AGENT_RUN_RECONCILE_LIMIT || "100",
+  AGENT_RUN_SUBMISSION_STALE_MS: process.env.AGENT_RUN_SUBMISSION_STALE_MS || "120000",
   AGENT_MAILBOX_DISPATCH_SECRET: mailboxDispatchSecret,
   AGENT_MAILBOX_WORKER_SECRET: mailboxWorkerSecret,
   AGENT_MAILBOX_WORKER_INTERVAL_MS: process.env.AGENT_MAILBOX_WORKER_INTERVAL_MS || "1000",
@@ -148,6 +151,11 @@ const sandboxCleanupWorker = spawn(process.execPath, ["scripts/run-sandbox-clean
   stdio: "inherit",
 });
 
+const runReconciler = spawn(process.execPath, ["scripts/run-agent-run-reconciler.mjs"], {
+  env: runtimeEnvironment,
+  stdio: "inherit",
+});
+
 console.log(`OPEN_AGENT_PUBLIC_URL=${publicOrigin}`);
 
 let stopping = false;
@@ -160,6 +168,7 @@ const stop = (signal = "SIGTERM") => {
   mailboxWorker.kill(signal);
   assetCleanupWorker.kill(signal);
   sandboxCleanupWorker.kill(signal);
+  runReconciler.kill(signal);
   collector.kill(signal);
 };
 for (const signal of ["SIGINT", "SIGTERM"]) {
@@ -175,6 +184,7 @@ const outcome = await Promise.race([
   childExit("mailbox-worker", mailboxWorker),
   childExit("asset-cleanup-worker", assetCleanupWorker),
   childExit("sandbox-cleanup-worker", sandboxCleanupWorker),
+  childExit("run-reconciler", runReconciler),
   childExit("otel-collector", collector),
 ]);
 stop();
@@ -184,6 +194,7 @@ await Promise.allSettled([
   childExit("mailbox-worker", mailboxWorker),
   childExit("asset-cleanup-worker", assetCleanupWorker),
   childExit("sandbox-cleanup-worker", sandboxCleanupWorker),
+  childExit("run-reconciler", runReconciler),
   childExit("otel-collector", collector),
 ]);
 if (!stopping || outcome.code !== 0) {

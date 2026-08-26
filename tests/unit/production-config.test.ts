@@ -93,6 +93,19 @@ test("database pool timeouts are bounded and defaulted", () => {
   );
 });
 
+test("run reconciliation settings reject unsafe ranges", () => {
+  const diagnostics = inspectProductionConfiguration({
+    ...validEnvironment,
+    AGENT_RUN_RECONCILE_INTERVAL_MS: "999",
+    AGENT_RUN_RECONCILE_LIMIT: "0",
+    AGENT_RUN_SUBMISSION_STALE_MS: "9999",
+  }, "24.18.1");
+  assert.equal(
+    diagnostics.filter((item) => item.code === "integer-range").length,
+    3,
+  );
+});
+
 test("accepts the built-in S3 AssetStore production topology", () => {
   const diagnostics = inspectProductionConfiguration({
     ...validEnvironment,
