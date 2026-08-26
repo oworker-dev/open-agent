@@ -490,7 +490,12 @@ async function inspectMailboxBoundary(
   session: Session,
 ): Promise<MailboxBoundary> {
   const tailIndex = await session.getStreamTailIndex();
-  const stream = await session.getEventStream({ startIndex: -1 });
+  // Resolve the tail to an absolute cursor before reading it. Tail-relative
+  // streams are intentionally live-following in Eve and can remain open when
+  // a proxy/runtime has no immediately available event. A non-negative tail
+  // read is finite and gives inspection a deterministic lifecycle boundary.
+  if (tailIndex < 0) return { state: "running", tailIndex };
+  const stream = await session.getEventStream({ startIndex: tailIndex });
   const reader = stream.getReader();
   try {
     const latest = await reader.read();
