@@ -424,6 +424,73 @@ function postgresThreadCollectionStore<TCollection>(
       const serialized = JSON.stringify(normalized);
       if (serialized === undefined) throw new Error("Thread collection must be JSON serializable.");
 
+      // Full snapshots are used for edits and legacy callers. Keep the
+      // collection revision update and any transcript replacement in one
+      // transaction; otherwise a concurrent append-only checkpoint can commit
+      // between these operations and then be deleted by replaceThreadEvents.
+      // Test/fallback pools without connect() retain the original single-query
+      // behavior below.
+      if (typeof (pool as Pool & { connect?: unknown }).connect === "function") {
+        const connection = await pool.connect();
+        try {
+          await connection.query("begin");
+          const result = expectedRevision === 0
+            ? await connection.query<{ collection: TCollection; revision: string }>(
+                `insert into ${table}
+                  (tenant_id, principal_id, storage_key, revision, collection)
+                 values ($1, $2, $3, 1, $4::jsonb)
+                 on conflict (tenant_id, principal_id, storage_key) do nothing
+                 returning collection, revision::text`,
+                [tenantId, principalId, storageKey, serialized],
+              )
+            : await connection.query<{ collection: TCollection; revision: string }>(
+                `update ${table}
+                    set collection = $5::jsonb,
+                        revision = revision + 1,
+                        updated_at = now()
+                  where tenant_id = $1 and principal_id = $2 and storage_key = $3
+                    and revision = $4
+                 returning collection, revision::text`,
+                [tenantId, principalId, storageKey, expectedRevision, serialized],
+              );
+
+          const saved = result.rows[0];
+          if (!saved) {
+            await connection.query("rollback");
+            const current = await load(tenantId, principalId, storageKey);
+            return { currentRevision: current?.revision ?? 0, status: "conflict" };
+          }
+
+          const persistedThreads = isRecordValue(normalized) && Array.isArray(normalized.threads)
+            ? normalized.threads.filter(isRecordValue)
+            : [];
+          for (const thread of persistedThreads) {
+            const events = threadEvents(thread);
+            if (typeof thread.id === "string" && events.length > 0) {
+              await replaceThreadEvents(
+                connection,
+                eventTable,
+                tenantId,
+                principalId,
+                storageKey,
+                thread.id,
+                events,
+              );
+            }
+          }
+          await connection.query("commit");
+          return {
+            record: { collection: saved.collection, revision: parseRevision(saved.revision) },
+            status: "saved",
+          };
+        } catch (error) {
+          await connection.query("rollback").catch(() => undefined);
+          throw error;
+        } finally {
+          connection.release();
+        }
+      }
+
       const result = expectedRevision === 0
         ? await pool.query<{ collection: TCollection; revision: string }>(
             `insert into ${table}

@@ -72,6 +72,46 @@ test("normalizes nested JSONB strings without changing normal Unicode or caller 
   assert.deepEqual(original.values[2], { content: "before\u0000after" });
 });
 
+test("full snapshot save replaces transcript inside the collection transaction", async () => {
+  const calls: string[] = [];
+  const collection = {
+    threads: [{
+      events: [{
+        data: { sequence: 0 },
+        meta: { id: "event-1" },
+        type: "step.started",
+      }],
+      id: "thread-1",
+      status: "ready",
+    }],
+    version: 2,
+  };
+  const client = {
+    async query(sql: string) {
+      calls.push(sql);
+      if (sql === "begin" || sql === "commit" || sql === "rollback") return { rows: [] };
+      if (sql.includes("set collection = $5::jsonb")) {
+        return { rows: [{ collection, revision: "6" }] };
+      }
+      return { rows: [] };
+    },
+    release() {},
+  };
+  const pool = {
+    async connect() { return client; },
+  } as unknown as Pool;
+  const store = createPostgresThreadCollectionStore(config, pool);
+
+  const result = await store.save("tenant-1", "principal-1", "workspace-1", 5, collection);
+
+  assert.equal(result.status, "saved");
+  assert.equal(calls[0], "begin");
+  assert.match(calls[1] ?? "", /set collection = \$5::jsonb/u);
+  assert.equal(calls.at(-1), "commit");
+  assert.equal(calls.filter((sql) => sql.startsWith("delete from")).length, 1);
+  assert.equal(calls.filter((sql) => sql.startsWith("insert into")).length, 1);
+});
+
 test("append-only thread patches do not load the existing transcript", async () => {
   const calls: string[] = [];
   let updatedCollection: Record<string, unknown> | undefined;

@@ -2,7 +2,7 @@ import type { AgentThread, AgentThreadCollection } from "@oworker/open-agent-ui/
 import { AGENT_THREAD_STORAGE_VERSION } from "@oworker/open-agent-ui/agent-workspace";
 import { createEveAgentMailboxRuntime } from "@/server/agent-mailbox/eve-runtime";
 import { createPostgresThreadCollectionStoreFromEnvironment, type ThreadCollectionPatchRecord } from "@/server/data/thread-collection-store";
-import { authenticateHostRequest } from "@/server/http/host-request-auth";
+import { authenticateHostRequest, HOST_AGENT_SCOPE, requireHostScope } from "@/server/http/host-request-auth";
 import { parseStrictThreadCollection } from "@/server/http/thread-collection-contract";
 import { rebuildSettledThreadTranscript } from "@/server/thread-transcript-repair";
 
@@ -18,7 +18,10 @@ type RouteContext = { readonly params: Promise<{ readonly storageKey: string }> 
  * read: clients must never repair a settled window during ordinary hydration.
  */
 export async function POST(request: Request, context: RouteContext): Promise<Response> {
-  const authenticated = await authenticateHostRequest(request);
+  const authenticated = requireHostScope(
+    await authenticateHostRequest(request),
+    HOST_AGENT_SCOPE.sessionWrite,
+  );
   if (!authenticated.ok) return authenticated.response;
   if (!store || !store.loadThread || !store.patch) return problem(503, "agent_database_unavailable", "Agent transcript storage is not configured.");
 
