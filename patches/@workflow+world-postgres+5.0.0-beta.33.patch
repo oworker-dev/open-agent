@@ -1,5 +1,5 @@
 diff --git a/node_modules/@workflow/world-postgres/dist/streamer.js b/node_modules/@workflow/world-postgres/dist/streamer.js
-index adb21a0..6ca893f 100644
+index adb21a0..4f8dee1 100644
 --- a/node_modules/@workflow/world-postgres/dist/streamer.js
 +++ b/node_modules/@workflow/world-postgres/dist/streamer.js
 @@ -249,7 +249,20 @@ export function createStreamer(pool, drizzle) {
@@ -41,7 +41,7 @@ index adb21a0..6ca893f 100644
                                  controller.close();
                              }
                              lastChunkId = msg.id;
-@@ -285,30 +302,56 @@ export function createStreamer(pool, drizzle) {
+@@ -285,30 +302,81 @@ export function createStreamer(pool, drizzle) {
                          cleanups.push(() => {
                              events.off(`strm:${name}`, onData);
                          });
@@ -78,6 +78,8 @@ index adb21a0..6ca893f 100644
 +                            let queryOffset = offset;
 +                            offset = 0;
 +                            for (;;) {
++                                if (closed)
++                                    break;
 +                                const chunks = await drizzle
 +                                    .select({
 +                                    id: streams.chunkId,
@@ -89,15 +91,38 @@ index adb21a0..6ca893f 100644
 +                                    .orderBy(streams.chunkId)
 +                                    .offset(queryOffset)
 +                                    .limit(PAGE_SIZE);
-+                                if (chunks.length === 0) break;
++                                if (closed)
++                                    break;
++                                if (chunks.length === 0) {
++                                    // A cursor can legitimately point past the
++                                    // trailing EOF marker (for example after a
++                                    // reconnect at an already-consumed tail).
++                                    // Close the finite stream instead of leaving
++                                    // a listener attached forever.
++                                    const [eofRow] = await drizzle
++                                        .select({ eof: streams.eof })
++                                        .from(streams)
++                                        .where(and(eq(streams.streamId, name), eq(streams.eof, true)))
++                                        .limit(1);
++                                    if (!closed && eofRow) {
++                                        closed = true;
++                                        cleanup();
++                                        controller.close();
++                                    }
++                                    break;
++                                }
 +                                for (const chunk of chunks) enqueue(chunk);
++                                if (closed)
++                                    break;
 +                                queryOffset += chunks.length;
 +                                // An EOF row closes the controller. Do not query
 +                                // or enqueue another page after the stream ended.
 +                                if (closed || chunks.some((chunk) => chunk.eof)) break;
 +                                if (chunks.length < PAGE_SIZE) break;
 +                            }
-+                            for (const chunk of buffer ?? []) enqueue(chunk);
++                            if (!closed) {
++                                for (const chunk of buffer ?? []) enqueue(chunk);
++                            }
 +                            buffer = null;
                          }
 -                        for (const chunk of [...chunks, ...(buffer ?? [])]) {
