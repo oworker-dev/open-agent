@@ -400,6 +400,21 @@ users are supported. Capacity runs use
 `AGENT_LOAD_COMPLETION_SLO_MODE=observe` so Provider latency remains visible
 without being confused with local admission saturation.
 
+To measure the interaction between online connections and active work, run
+`npm run verify:mixed-capacity` against the same isolated deployment. The
+command launches `verify-idle-stream-load.mjs` and
+`verify-agent-run-load.mjs` concurrently, writes each verifier's evidence, and
+produces one combined report. Configure `AGENT_MIXED_STREAM_TOTAL`,
+`AGENT_MIXED_STREAM_CONCURRENCY`, `AGENT_MIXED_RUN_TOTAL`, and
+`AGENT_MIXED_RUN_CONCURRENCY` for the target host; the existing verifier SLO
+variables continue to control pass/fail behavior. `AGENT_MIXED_CHILD_TIMEOUT_MS`
+is a cleanup deadline for a hung verifier, not an Agent or message limit. The
+runner samples the protected metrics endpoint before and after the mixed
+window when `AGENT_MIXED_TARGET_METRICS_URL` and its token are configured. A
+passing mixed batch is evidence for that exact topology and workload only; it
+does not translate directly into a user-count guarantee. The same free-disk
+safety preflight as the sequential matrix is applied before load starts.
+
 Host JWTs for the interactive control plane use separate least-privilege
 scopes. Grant only the operations that the embedding surface exposes:
 

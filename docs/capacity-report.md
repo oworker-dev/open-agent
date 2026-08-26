@@ -82,6 +82,13 @@ recorded separately. Until that run is completed, use 500 online connections
 and 16 active turns as conservative deployment planning numbers, not marketing
 capacity.
 
+The sequential matrix does not exercise online and active workloads at the same
+time. Use `npm run verify:mixed-capacity` for that envelope: it runs the idle
+stream and AgentRun verifiers concurrently and records both child reports plus
+before/after target metrics. No mixed-workload result has been measured for this
+report yet, so the conservative figures above must not be extrapolated to a
+combined workload.
+
 ## Storage finding
 
 The local Workflow database currently contains roughly 634 MiB. The
