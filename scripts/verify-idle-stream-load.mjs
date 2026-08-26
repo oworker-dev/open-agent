@@ -27,21 +27,6 @@ const client = new Client({
 });
 
 const marker = `STREAM_LOAD_READY_${batchId}`;
-const seed = await client.sessions.create({
-  message: `Do not use tools. Reply exactly: ${marker}`,
-});
-const seedEvents = [];
-for await (const event of seed.response) seedEvents.push(event);
-const session = seed.session;
-const sessionId = session.state.sessionId;
-const streamIndex = session.state.streamIndex;
-assert(sessionId, "The seed turn did not return a durable session id.");
-assert(streamIndex > 0, "The seed turn did not advance the durable stream cursor.");
-assert(
-  seedEvents.some((event) => event.type === "session.waiting" || event.type === "session.completed"),
-  "The seed session did not reach a stable stream boundary.",
-);
-
 const memory = createMemorySampler();
 const startedAt = performance.now();
 const attempts = await mapWithConcurrency(
@@ -63,7 +48,7 @@ const unexpectedDisconnects = liveness.filter((entry) => !entry.alive);
 for (const entry of established) entry.controller.abort("stream-load-complete");
 await Promise.allSettled(established.map((entry) => entry.reader.cancel().catch(() => undefined)));
 memory.stop();
-await session.reset({ reason: `idle-stream-load:${batchId}` }).catch(() => undefined);
+await Promise.allSettled(attempts.map((entry) => entry.session?.reset({ reason: `idle-stream-load:${batchId}` }).catch(() => undefined)));
 
 const handshake = summarize(established.map((entry) => entry.handshakeMs));
 const errorRate = failures.length / totalStreams;
@@ -95,7 +80,9 @@ const evidence = {
     unexpectedDisconnects: unexpectedDisconnects.length,
     establishmentDurationMs: Math.round(establishedAt - startedAt),
     handshake,
-    processMemory: memory.result(),
+    // This is the verifier process only. It is intentionally not presented as
+    // target-server capacity evidence; collect target metrics separately.
+    loadGeneratorMemory: memory.result(),
   },
   failures: failures.map((entry) => ({ index: entry.index, error: entry.error })),
   violations,
@@ -115,7 +102,24 @@ async function openFollower(index) {
   );
   const signal = AbortSignal.any([controller.signal, handshakeController.signal]);
   const openedAt = performance.now();
+  let session;
   try {
+    // Every follower owns an independent durable session. Reusing one seed
+    // session measures per-session fan-out, not server-wide online users.
+    const seed = await client.sessions.create({
+      message: `Do not use tools. Reply exactly: ${marker}_${index}`,
+    });
+    const seedEvents = [];
+    for await (const event of seed.response) seedEvents.push(event);
+    session = seed.session;
+    const sessionId = session.state.sessionId;
+    const streamIndex = session.state.streamIndex;
+    assert(sessionId, "The seed turn did not return a durable session id.");
+    assert(streamIndex > 0, "The seed turn did not advance the durable stream cursor.");
+    assert(
+      seedEvents.some((event) => event.type === "session.waiting" || event.type === "session.completed"),
+      "The seed session did not reach a stable stream boundary.",
+    );
     const path = `/eve/v1/session/${encodeURIComponent(sessionId)}/stream?startIndex=${Math.max(0, streamIndex - 1)}`;
     let delayMs = 250;
     let lastStatus;
@@ -154,13 +158,14 @@ async function openFollower(index) {
         index,
         ok: true,
         reader,
+        session,
       };
     }
     throw new Error(`stream handshake timed out${lastStatus ? ` after HTTP ${lastStatus}` : ""}`);
   } catch (cause) {
     clearTimeout(handshakeTimer);
     controller.abort("stream-load-open-failed");
-    return { error: safeError(cause), index, ok: false };
+    return { error: safeError(cause), index, ok: false, session };
   }
 }
 

@@ -30,10 +30,12 @@ replaying an uncertain request or interrupting a real long-running Eve turn.
 Bound its cadence with `AGENT_RUN_RECONCILE_INTERVAL_MS` and
 `AGENT_RUN_RECONCILE_LIMIT`.
 
-The AgentRun admission gate is also persisted in PostgreSQL. Set
-`AGENT_MAX_ACTIVE_RUNS_TOTAL` for the safe active-turn ceiling of one Open
-Agent deployment and `AGENT_MAX_ACTIVE_RUNS_PER_TENANT` for a fair per-tenant
-ceiling. A value of `0` disables the corresponding gate (development only).
+The AgentRun admission gate is also persisted in PostgreSQL. Production must
+set finite, positive values for `AGENT_MAX_ACTIVE_RUNS_TOTAL` (the safe
+active-turn ceiling of one Open Agent deployment) and
+`AGENT_MAX_ACTIVE_RUNS_PER_TENANT` (a fair per-tenant ceiling). Omitting either
+variable is rejected by the production doctor. A value of `0` disables the
+corresponding gate and is supported only for development/test environments.
 The check is serialized with a short PostgreSQL advisory-lock transaction, so
 multiple Web replicas cannot oversubscribe the same limit. Idempotent replays
 are resolved before the gate and remain available while a tenant is full;

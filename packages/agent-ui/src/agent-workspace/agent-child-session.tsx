@@ -173,7 +173,7 @@ export function AgentChildSessionView({
               streamIndex: storedWindow.endIndex,
             }
           : snapshot!.session;
-        setThread({
+        const hydratedThread: AgentThread = {
           ...createChildThread(sessionId, preferences),
           ...(storedThread ? persistedChildControls(storedThread) : {}),
           events: initialEvents,
@@ -183,7 +183,14 @@ export function AgentChildSessionView({
           session: initialSession,
           status: storedThread?.status ?? statusFromEvents(initialEvents),
           updatedAt: Date.now(),
-        });
+        };
+        setThread(hydratedThread);
+        // A child has no parent-side transcript window API of its own. Write
+        // the first checkpoint immediately after snapshot hydration so future
+        // opens use the bounded event-window path instead of replaying Eve
+        // from index zero. Subsequent changes remain coalesced by the normal
+        // checkpoint scheduler.
+        if (!storedWindow) schedulePersistedChild(hydratedThread);
       } catch (error: unknown) {
         if (disposed || controller.signal.aborted) return;
         setLoadError(error instanceof Error ? error.message : "The sub-agent history could not be loaded.");
@@ -193,7 +200,7 @@ export function AgentChildSessionView({
       disposed = true;
       controller.abort();
     };
-  }, [childStorageKey, client, preferences, reloadGeneration, sessionId, threadStorage]);
+  }, [childStorageKey, client, preferences, reloadGeneration, schedulePersistedChild, sessionId, threadStorage]);
 
   useEffect(() => () => {
     if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
@@ -222,15 +229,19 @@ export function AgentChildSessionView({
       if (!loaded) return;
       setThread((latest) => {
         if (!latest) return latest;
+        const latestWindow = latest.transcriptWindow ?? window;
         return {
           ...latest,
           events: compactThreadEvents([...loaded.thread.events, ...latest.events]),
           transcriptWindow: {
-            endIndex: Math.max(window.endIndex, loaded.window.endIndex),
+            endIndex: Math.max(latestWindow.endIndex, loaded.window.endIndex),
             hasMoreBefore: loaded.window.hasMoreBefore,
             startIndex: loaded.window.startIndex,
-            total: Math.max(window.total, loaded.window.total),
+            total: Math.max(latestWindow.total, loaded.window.total),
           },
+          // AgentThreadView's Eve reducer is initialized once per mount. The
+          // revision key below remounts it with the newly prepended page.
+          revision: (latest.revision ?? 0) + 1,
           updatedAt: Date.now(),
         };
       });
@@ -273,6 +284,7 @@ export function AgentChildSessionView({
       providerReady={providerReady}
       reasoningLevels={reasoningLevels}
       thread={thread}
+      key={`${thread.id}:${thread.revision ?? 0}`}
       historyHasMore={thread.transcriptWindow?.hasMoreBefore === true}
       historyLoading={historyLoading}
       onLoadEarlier={loadEarlier}

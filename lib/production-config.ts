@@ -161,6 +161,10 @@ export function inspectProductionConfiguration(
   requireValue(environment, "AGENT_EMBED_ALLOWED_ORIGINS", error);
   requireValue(environment, "AGENT_PUBLIC_BASE_URL", error);
   requireValue(environment, "AGENT_PREVIEW_SIGNING_SECRET", error);
+  // Admission limits are mandatory in production. Omitting either limit would
+  // silently disable the PostgreSQL-backed run gate and allow unbounded work.
+  requireValue(environment, "AGENT_MAX_ACTIVE_RUNS_TOTAL", error);
+  requireValue(environment, "AGENT_MAX_ACTIVE_RUNS_PER_TENANT", error);
   const assetBackend = environment.AGENT_ASSET_STORAGE_BACKEND?.trim().toLowerCase();
   if (assetBackend !== "host" && assetBackend !== "external" && assetBackend !== "s3" && assetBackend !== "object-store" && assetBackend !== "object_store") {
     error(
@@ -453,17 +457,17 @@ export function inspectProductionConfiguration(
     1_000,
     error,
   );
-  inspectOptionalInteger(
+  inspectInteger(
     environment.AGENT_MAX_ACTIVE_RUNS_TOTAL,
     "AGENT_MAX_ACTIVE_RUNS_TOTAL",
-    0,
+    1,
     10_000,
     error,
   );
-  inspectOptionalInteger(
+  inspectInteger(
     environment.AGENT_MAX_ACTIVE_RUNS_PER_TENANT,
     "AGENT_MAX_ACTIVE_RUNS_PER_TENANT",
-    0,
+    1,
     10_000,
     error,
   );

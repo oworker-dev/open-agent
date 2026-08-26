@@ -393,13 +393,15 @@ export function AgentWorkspace({
     // allowed to rebuild such history from index zero.
     const transcriptComplete = hasCompleteTranscriptCoverage(thread, settledCursor) ||
       settledCursor <= thread.events.length;
-    // A server-backed thread can have a stale compact prefix after a browser
-    // disconnect. Once Eve is settled, retry the finite server repair here as
-    // well as during initial hydration. This closes the race where hydration
-    // observed a running session (HTTP 409) and the later waiting boundary
-    // would otherwise leave the prefix permanently incomplete.
+    // A bounded event window is an intentional representation of a long
+    // settled transcript. It is not a damaged transcript, and repairing it
+    // here would reopen Eve from index zero and replay the entire run on every
+    // refresh. Keep the window and lifecycle boundary as-is; older/legacy
+    // snapshots without a window may still use the explicit finite repair
+    // endpoint below.
     if (
       !transcriptComplete &&
+      !thread.transcriptWindow &&
       serverHydrationThreads.current.has(thread.id) &&
       threadStorage.repairThread &&
       thread.session.sessionId &&
@@ -429,11 +431,13 @@ export function AgentWorkspace({
         }
       }
     }
-    // A compact prefix whose absolute cursor is ahead of its visible event
-    // count has a transcript gap. A bounded tail cannot repair that missing
-    // middle. It may still contribute the authoritative terminal boundary for
-    // the currently visible turn so stale tool UI can settle; ordinary tail
-    // events remain server-repair-only and coverage stays explicitly partial.
+    // A compact legacy prefix whose absolute cursor is ahead of its visible
+    // event count has a transcript gap. A bounded tail cannot repair that
+    // missing middle. It may still contribute the authoritative terminal
+    // boundary for the currently visible turn so stale tool UI can settle;
+    // ordinary tail events remain server-repair-only and coverage stays
+    // explicitly partial. Windowed transcripts intentionally follow this same
+    // rule without escalating to an unbounded repair.
     const safeShortPrefix = !transcriptComplete &&
       thread.session.streamIndex === thread.events.length &&
       boundary.tailIndex !== undefined &&
@@ -916,6 +920,7 @@ export function AgentWorkspace({
       if (!loaded) return;
       const latest = threadsRef.current.find((candidate) => candidate.id === threadId);
       if (!latest) return;
+      const latestWindow = latest.transcriptWindow ?? window;
       const mergedEvents = compactThreadEvents([
         ...loaded.thread.events,
         ...latest.events,
@@ -923,11 +928,16 @@ export function AgentWorkspace({
       updateThread(threadId, {
         events: mergedEvents,
         transcriptWindow: {
-          endIndex: Math.max(window.endIndex, loaded.window.endIndex),
+          endIndex: Math.max(latestWindow.endIndex, loaded.window.endIndex),
           hasMoreBefore: loaded.window.hasMoreBefore,
           startIndex: loaded.window.startIndex,
-          total: Math.max(window.total, loaded.window.total),
+          total: Math.max(latestWindow.total, loaded.window.total),
         },
+        // AgentThreadView seeds Eve's reducer from initialEvents once per
+        // mount. Bump the hydration revision so the newly prepended page is
+        // projected immediately instead of remaining invisible in the stale
+        // external-store snapshot.
+        revision: (latest.revision ?? 0) + 1,
         updatedAt: Date.now(),
       });
     } catch (error) {

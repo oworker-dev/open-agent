@@ -41,6 +41,8 @@ const validEnvironment = {
   AGENT_ASSET_STORAGE_BACKEND: "host",
   AGENT_ASSET_CLEANUP_INTERVAL_MS: "3600000",
   AGENT_ASSET_CLEANUP_LIMIT: "100",
+  AGENT_MAX_ACTIVE_RUNS_TOTAL: "16",
+  AGENT_MAX_ACTIVE_RUNS_PER_TENANT: "8",
   EVE_NEXT_PRODUCTION_PORT: "4275",
   NODE_ENV: "production",
   OPENAI_API_KEY: "provider-key",
@@ -56,7 +58,7 @@ test("accepts the verified production topology", () => {
   assert.deepEqual(inspectProductionConfiguration(validEnvironment, "24.18.1"), []);
 });
 
-test("validates optional AgentRun admission limits", () => {
+test("requires finite AgentRun admission limits in production", () => {
   assert.deepEqual(inspectProductionConfiguration({
     ...validEnvironment,
     AGENT_MAX_ACTIVE_RUNS_TOTAL: "16",
@@ -69,6 +71,15 @@ test("validates optional AgentRun admission limits", () => {
   }, "24.18.1");
   assert.equal(
     diagnostics.filter((item) => item.code === "integer-range").length,
+    2,
+  );
+  const missing = inspectProductionConfiguration({
+    ...validEnvironment,
+    AGENT_MAX_ACTIVE_RUNS_TOTAL: undefined,
+    AGENT_MAX_ACTIVE_RUNS_PER_TENANT: undefined,
+  }, "24.18.1");
+  assert.equal(
+    missing.filter((item) => item.code === "missing-required").length,
     2,
   );
 });
