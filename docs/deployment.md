@@ -102,6 +102,12 @@ the diagnostic inspects the actual `HostConfig` values and, when the three
 `AGENT_DOCKER_*` values are present, verifies they match the declared limits.
 It does not assume the Eve Docker backend applied limits that it cannot
 configure itself.
+For server-side capacity evidence, expose the protected
+`/api/internal/metrics` route with a random `AGENT_METRICS_SECRET` (at least 32
+bytes), then pass its URL and bearer token as
+`AGENT_*_TARGET_METRICS_URL` and `AGENT_*_TARGET_METRICS_TOKEN` to the stream
+and AgentRun verifiers. The endpoint is read-only and reports only process and
+pool counters; it is not a public Prometheus surface.
 
 The doctor must pass in the same environment used for the build. In particular,
 `AGENT_EMBED_ALLOWED_ORIGINS` and `EVE_NEXT_PRODUCTION_PORT` are build inputs.

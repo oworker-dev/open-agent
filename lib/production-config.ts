@@ -229,10 +229,7 @@ export function inspectProductionConfiguration(
   }
 
   requireValue(environment, "OPENAI_API_KEY", error);
-  requireValue(environment, "AGENT_MODEL_MAX_OUTPUT_TOKENS", error);
-  requireValue(environment, "AGENT_PROVIDER_HTTP_TIMEOUT_MS", error);
   requireValue(environment, "AGENT_DATABASE_URL", error);
-  requireValue(environment, "AGENT_DEPLOYMENT_TENANCY", error);
   requireValue(environment, "AGENT_RUNTIME_URL", error);
   requireValue(environment, "AGENT_SANDBOX_IMAGE", error);
   requireValue(environment, "AGENT_HOST_JWT_SECRET", error);
