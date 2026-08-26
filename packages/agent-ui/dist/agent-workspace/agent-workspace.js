@@ -275,6 +275,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
         const transcriptComplete = hasCompleteTranscriptCoverage(thread, settledCursor) ||
             settledCursor <= thread.events.length;
         if (!transcriptComplete &&
+            !thread.transcriptWindow &&
             serverHydrationThreads.current.has(thread.id) &&
             threadStorage.repairThread &&
             thread.session.sessionId &&
@@ -750,6 +751,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
             const latest = threadsRef.current.find((candidate) => candidate.id === threadId);
             if (!latest)
                 return;
+            const latestWindow = latest.transcriptWindow ?? window;
             const mergedEvents = compactThreadEvents([
                 ...loaded.thread.events,
                 ...latest.events,
@@ -757,11 +759,12 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
             updateThread(threadId, {
                 events: mergedEvents,
                 transcriptWindow: {
-                    endIndex: Math.max(window.endIndex, loaded.window.endIndex),
+                    endIndex: Math.max(latestWindow.endIndex, loaded.window.endIndex),
                     hasMoreBefore: loaded.window.hasMoreBefore,
                     startIndex: loaded.window.startIndex,
-                    total: Math.max(window.total, loaded.window.total),
+                    total: Math.max(latestWindow.total, loaded.window.total),
                 },
+                revision: (latest.revision ?? 0) + 1,
                 updatedAt: Date.now(),
             });
         }

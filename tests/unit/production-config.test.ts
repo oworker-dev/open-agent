@@ -30,6 +30,7 @@ const validEnvironment = {
   AGENT_MAILBOX_WORKER_SECRET: "a-mailbox-worker-secret-at-least-32-bytes-long",
   AGENT_MODEL_MAX_OUTPUT_TOKENS: "4096",
   AGENT_PREVIEW_SIGNING_SECRET: "preview-signing-secret-at-least-32-bytes-long",
+  AGENT_METRICS_SECRET: "metrics-secret-at-least-32-bytes-long",
   AGENT_PUBLIC_BASE_URL: "https://agent.example.com",
   AGENT_PROVIDER_HTTP_TIMEOUT_MS: "120000",
   AGENT_RUNTIME_URL: "https://agent-runtime.example.com",

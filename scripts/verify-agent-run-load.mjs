@@ -43,11 +43,28 @@ const accessToken = signToken({
   tenantId: `load-tenant-${randomUUID()}`,
 });
 const providerDebugUrl = process.env.AGENT_LOAD_PROVIDER_DEBUG_URL?.trim();
+const targetMetricsUrl = process.env.AGENT_LOAD_TARGET_METRICS_URL?.trim();
+const targetMetricsToken = process.env.AGENT_LOAD_TARGET_METRICS_TOKEN?.trim();
 const providerBefore = providerDebugUrl
   ? await providerRequestCount(providerDebugUrl)
   : undefined;
+const targetMetricsBefore = targetMetricsUrl
+  ? await readTargetMetrics(targetMetricsUrl)
+  : undefined;
 const generatedAt = new Date().toISOString();
 const resourceSampler = createResourceSampler();
+const activeRunIds = new Set();
+let shutdownPromise;
+process.once("SIGTERM", () => {
+  shutdownPromise = cancelOutstandingRuns().finally(() => {
+    process.exitCode = 1;
+  });
+});
+process.once("SIGINT", () => {
+  shutdownPromise = cancelOutstandingRuns().finally(() => {
+    process.exitCode = 130;
+  });
+});
 
 const warmup = await runPhase("warmup", warmupRuns);
 const measuredStartedAt = performance.now();
@@ -69,6 +86,9 @@ await mapWithConcurrency(succeeded, concurrency, async (entry) => {
 
 const providerAfter = providerDebugUrl
   ? await providerRequestCount(providerDebugUrl)
+  : undefined;
+const targetMetricsAfter = targetMetricsUrl
+  ? await readTargetMetrics(targetMetricsUrl)
   : undefined;
 const providerRequests =
   providerAfter !== undefined && providerBefore !== undefined
@@ -102,6 +122,9 @@ if (
     `Expected ${expectedProviderRequests} Provider requests, received ${providerRequests}.`,
   );
 }
+if (targetMetricsUrl && (targetMetricsBefore?.error || targetMetricsAfter?.error)) {
+  violations.push("Target metrics endpoint did not return valid snapshots for the full load window.");
+}
 
 const evidence = {
   schemaVersion: "open-agent.load-evidence.v1",
@@ -125,7 +148,14 @@ const evidence = {
     eventCount: succeeded.reduce((total, entry) => total + entry.eventCount, 0),
     idempotencyReplays: succeeded.length - replayFailures.length,
     providerRequests,
-    resource,
+    resource: {
+      // This is the verifier process only. Target host metrics must be
+      // collected from the deployment, not inferred from this client.
+      loadGenerator: resource,
+      target: targetMetricsUrl
+        ? { url: targetMetricsUrl, before: targetMetricsBefore, after: targetMetricsAfter }
+        : undefined,
+    },
   },
   failures: failed.map(({ index, stage, error }) => ({ index, stage, error })),
   warmupFailures: warmupFailures.map(({ index, stage, error }) => ({ index, stage, error })),
@@ -173,16 +203,19 @@ async function runPhase(phase, count) {
   const cases = Array.from({ length: count }, (_, index) => createCase(phase, index));
   return await mapWithConcurrency(cases, concurrency, async (loadCase) => {
     let stage = "admission";
+    let runId;
     try {
       const startedAt = performance.now();
       const payload = await api("POST", "/api/agent/runs", loadCase.request, 202);
       assert(payload.disposition === "started", "A load run was not newly started.");
       assert(typeof payload.run?.runId === "string", "A load run did not return a runId.");
       const admissionMs = performance.now() - startedAt;
-      const runId = payload.run.runId;
+      runId = payload.run.runId;
+      activeRunIds.add(runId);
 
       stage = "completion";
       const run = await poll(runId, startedAt + deadlineMs);
+      activeRunIds.delete(runId);
       const completionMs = performance.now() - startedAt;
       assert(run.status === "completed", `AgentRun ${runId} ended as ${run.status}.`);
       assert(
@@ -194,25 +227,15 @@ async function runPhase(phase, count) {
       assert(run.usage?.outputTokens > 0, `AgentRun ${runId} did not project output usage.`);
 
       stage = "events";
-      const eventPage = await api(
-        "GET",
-        `/api/agent/runs/${encodeURIComponent(runId)}/events?after=0`,
-        undefined,
-        200,
-      );
-      assert(Array.isArray(eventPage.events), `AgentRun ${runId} returned invalid events.`);
-      assert(eventPage.events.length > 0, `AgentRun ${runId} returned no events.`);
-      assert(
-        eventPage.nextCursor === eventPage.events.length,
-        `AgentRun ${runId} returned an invalid event cursor.`,
-      );
-      eventPage.events.forEach((event, index) => {
+      const events = await readAllEvents(runId);
+      assert(events.length > 0, `AgentRun ${runId} returned no events.`);
+      events.forEach((event, index) => {
         assert(event.runId === runId, `AgentRun ${runId} received a foreign event.`);
         assert(event.sequence === index + 1, `AgentRun ${runId} has a broken event sequence.`);
       });
       const exhausted = await api(
         "GET",
-        `/api/agent/runs/${encodeURIComponent(runId)}/events?after=${eventPage.nextCursor}`,
+        `/api/agent/runs/${encodeURIComponent(runId)}/events?after=${events.length}`,
         undefined,
         200,
       );
@@ -221,11 +244,14 @@ async function runPhase(phase, count) {
         ...loadCase,
         admissionMs,
         completionMs,
-        eventCount: eventPage.nextCursor,
+        eventCount: events.length,
         ok: true,
         runId,
       };
     } catch (cause) {
+      if (typeof runId === "string") {
+        await cancelAndWait(runId).catch(() => undefined);
+      }
       return {
         ...loadCase,
         error: safeError(cause),
@@ -234,6 +260,66 @@ async function runPhase(phase, count) {
       };
     }
   });
+}
+
+async function cancelOutstandingRuns() {
+  if (activeRunIds.size === 0) return;
+  await Promise.allSettled([...activeRunIds].map((runId) => cancelAndWait(runId)));
+}
+
+async function cancelAndWait(runId) {
+  await api("DELETE", `/api/agent/runs/${encodeURIComponent(runId)}`, undefined, 202).catch(() => undefined);
+  const deadline = performance.now() + 15_000;
+  while (performance.now() < deadline) {
+    try {
+      const payload = await api(
+        "GET",
+        `/api/agent/runs/${encodeURIComponent(runId)}`,
+        undefined,
+        200,
+      );
+      if (["completed", "failed", "cancelled", "submission-ambiguous"].includes(payload.run.status)) {
+        activeRunIds.delete(runId);
+        return;
+      }
+    } catch {
+      // Keep polling until the bounded cleanup deadline.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  activeRunIds.delete(runId);
+}
+
+// AgentRun events are paged by the API. Consume every page and require a
+// strictly advancing cursor; this avoids truncating long runs or spinning on
+// malformed responses without imposing an arbitrary event-count cap.
+async function readAllEvents(runId) {
+  const events = [];
+  let cursor = 0;
+  while (true) {
+    const page = await api(
+      "GET",
+      `/api/agent/runs/${encodeURIComponent(runId)}/events?after=${cursor}`,
+      undefined,
+      200,
+    );
+    assert(Array.isArray(page.events), `AgentRun ${runId} returned invalid events.`);
+    if (page.events.length === 0) {
+      assert(page.nextCursor === cursor, `AgentRun ${runId} returned an invalid terminal event cursor.`);
+      return events;
+    }
+    const nextCursor = Number(page.nextCursor);
+    assert(
+      Number.isSafeInteger(nextCursor) && nextCursor > cursor,
+      `AgentRun ${runId} returned a non-advancing event cursor.`,
+    );
+    assert(
+      nextCursor - cursor === page.events.length,
+      `AgentRun ${runId} returned a discontinuous event page.`,
+    );
+    events.push(...page.events);
+    cursor = nextCursor;
+  }
 }
 
 function createCase(phase, index) {
@@ -318,6 +404,24 @@ async function providerRequestCount(url) {
   const payload = await response.json();
   assert(Number.isSafeInteger(payload.requestCount), "Provider debug requestCount is invalid.");
   return payload.requestCount;
+}
+
+async function readTargetMetrics(url) {
+  try {
+    const response = await fetch(url, {
+      cache: "no-store",
+      headers: targetMetricsToken ? { authorization: `Bearer ${targetMetricsToken}` } : undefined,
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (!response.ok) throw new Error(`Target metrics endpoint returned ${response.status}.`);
+    const payload = await response.json();
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      throw new Error("Target metrics endpoint returned a non-object payload.");
+    }
+    return { capturedAt: new Date().toISOString(), value: payload };
+  } catch (error) {
+    return { capturedAt: new Date().toISOString(), error: safeError(error) };
+  }
 }
 
 async function writeEvidence(value) {

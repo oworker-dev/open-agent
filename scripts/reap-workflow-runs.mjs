@@ -43,10 +43,9 @@ try {
     ? new Map()
     : await loadCandidateSizes(pool, schema, candidateIds);
   const bytes = [...sizes.values()].reduce((total, value) => total + value, 0);
-  let deleted = false;
+  let deletedRuns = 0;
   if (apply && candidateIds.length > 0) {
-    await deleteRuns(pool, schema, candidateIds, now);
-    deleted = true;
+    deletedRuns = await deleteRuns(pool, schema, candidateIds, now, selection.cutoff);
   }
 
   const evidence = {
@@ -61,7 +60,7 @@ try {
       candidateBytes: bytes,
       skippedActiveRoots: selection.skippedActiveRoots,
       skippedProtected: selection.skippedProtected,
-      deletedRuns: deleted ? candidateIds.length : 0,
+      deletedRuns,
     },
     candidates: selection.candidates.map((run) => ({
       id: run.id,
@@ -71,7 +70,7 @@ try {
       bytes: sizes.get(run.id) ?? 0,
     })),
     cutoff: selection.cutoff.toISOString(),
-    safe: !apply || deleted,
+    safe: !apply || deletedRuns <= candidateIds.length,
   };
   await writeEvidence(evidence);
   console.log(JSON.stringify(evidence));
@@ -130,23 +129,77 @@ async function loadCandidateSizes(pool, schema, ids) {
   return new Map(result.rows.map((row) => [String(row.run_id), Number(row.bytes)]));
 }
 
-async function deleteRuns(pool, schema, ids, now) {
+async function deleteRuns(pool, schema, ids, now, cutoff) {
   const client = await pool.connect();
   try {
     await client.query("begin");
-    await client.query(
-      `delete from ${schema}.workflow_hooks
-        where run_id = any($1::varchar[])
-          and (token_retention_until is null or token_retention_until <= $2)`,
-      [ids, now],
+    // Re-check under row locks. The initial candidate scan is intentionally
+    // outside this transaction for cheap dry-runs, so status, descendants, or
+    // hook retention may change before apply mode reaches the delete phase.
+    const locked = await client.query(
+      `select id,
+              status::text as status,
+              coalesce(attributes->>'$rootRunId', id) as root_run_id,
+              completed_at
+         from ${schema}.workflow_runs
+        where id = any($1::varchar[])
+        for update`,
+      [ids],
     );
-    await client.query(`delete from ${schema}.workflow_stream_chunks where run_id = any($1::varchar[])`, [ids]);
-    await client.query(`delete from ${schema}.workflow_events where run_id = any($1::varchar[])`, [ids]);
-    await client.query(`delete from ${schema}.workflow_steps where run_id = any($1::varchar[])`, [ids]);
-    await client.query(`delete from ${schema}.workflow_waits where run_id = any($1::varchar[])`, [ids]);
-    await client.query(`delete from ${schema}.workflow_event_slots where run_id = any($1::varchar[])`, [ids]);
-    await client.query(`delete from ${schema}.workflow_runs where id = any($1::varchar[])`, [ids]);
+    if (locked.rows.length === 0) {
+      await client.query("commit");
+      return 0;
+    }
+    const rootIds = [...new Set(locked.rows.map((row) => String(row.root_run_id || row.id)))];
+    const rootRuns = await client.query(
+      `select id,
+              status::text as status,
+              coalesce(attributes->>'$rootRunId', id) as root_run_id
+         from ${schema}.workflow_runs
+        where coalesce(attributes->>'$rootRunId', id) = any($1::varchar[])
+        for update`,
+      [rootIds],
+    );
+    const activeRoots = new Set(
+      rootRuns.rows
+        .filter((row) => !["completed", "failed", "cancelled"].includes(String(row.status)))
+        .map((row) => String(row.root_run_id || row.id)),
+    );
+    const protectedRootsResult = await client.query(
+      `select distinct coalesce(r.attributes->>'$rootRunId', r.id) as root_run_id
+         from ${schema}.workflow_hooks h
+         join ${schema}.workflow_runs r on r.id = h.run_id
+        where coalesce(r.attributes->>'$rootRunId', r.id) = any($1::varchar[])
+          and (h.token_retention_until is null or h.token_retention_until > $2)`,
+      [rootIds, now],
+    );
+    const protectedRoots = new Set(
+      protectedRootsResult.rows.map((row) => String(row.root_run_id)),
+    );
+    const eligibleIds = locked.rows
+      .filter((row) => ["completed", "failed", "cancelled"].includes(String(row.status)))
+      .filter((row) => row.completed_at && new Date(row.completed_at).getTime() <= cutoff.getTime())
+      .filter((row) => {
+        const rootId = String(row.root_run_id || row.id);
+        return !activeRoots.has(rootId) && !protectedRoots.has(rootId);
+      })
+      .map((row) => String(row.id));
+    if (eligibleIds.length === 0) {
+      await client.query("commit");
+      return 0;
+    }
+    await client.query(`delete from ${schema}.workflow_hooks where run_id = any($1::varchar[])`, [eligibleIds]);
+    await client.query(`delete from ${schema}.workflow_stream_chunks where run_id = any($1::varchar[])`, [eligibleIds]);
+    await client.query(`delete from ${schema}.workflow_events where run_id = any($1::varchar[])`, [eligibleIds]);
+    await client.query(`delete from ${schema}.workflow_steps where run_id = any($1::varchar[])`, [eligibleIds]);
+    await client.query(`delete from ${schema}.workflow_waits where run_id = any($1::varchar[])`, [eligibleIds]);
+    await client.query(`delete from ${schema}.workflow_event_slots where run_id = any($1::varchar[])`, [eligibleIds]);
+    const deleted = await client.query(
+      `delete from ${schema}.workflow_runs where id = any($1::varchar[]) returning id`,
+      [eligibleIds],
+    );
     await client.query("commit");
+    return deleted.rowCount ?? 0;
   } catch (error) {
     await client.query("rollback").catch(() => undefined);
     throw error;

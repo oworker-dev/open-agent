@@ -496,6 +496,15 @@ export function inspectProductionConfiguration(
       "AGENT_PREVIEW_SIGNING_SECRET must contain at least 32 bytes.",
     );
   }
+  const metricsSecret = environment.AGENT_METRICS_SECRET?.trim();
+  if (metricsSecret && Buffer.byteLength(metricsSecret) < 32) {
+    error("metrics-secret", "AGENT_METRICS_SECRET must contain at least 32 bytes when configured.");
+  } else if (!metricsSecret) {
+    warning(
+      "metrics-secret",
+      "AGENT_METRICS_SECRET is not configured; protected point-in-time capacity metrics are unavailable.",
+    );
+  }
   inspectHttpUrl(environment.OPENAI_BASE_URL, "OPENAI_BASE_URL", { allowLoopbackHttp: true }, error);
   inspectInteger(
     environment.AGENT_MODEL_MAX_OUTPUT_TOKENS,

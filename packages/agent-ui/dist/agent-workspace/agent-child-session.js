@@ -101,7 +101,7 @@ export function AgentChildSessionView({ client, commands, locale, mailbox, menti
                         streamIndex: storedWindow.endIndex,
                     }
                     : snapshot.session;
-                setThread({
+                const hydratedThread = {
                     ...createChildThread(sessionId, preferences),
                     ...(storedThread ? persistedChildControls(storedThread) : {}),
                     events: initialEvents,
@@ -111,7 +111,10 @@ export function AgentChildSessionView({ client, commands, locale, mailbox, menti
                     session: initialSession,
                     status: storedThread?.status ?? statusFromEvents(initialEvents),
                     updatedAt: Date.now(),
-                });
+                };
+                setThread(hydratedThread);
+                if (!storedWindow)
+                    schedulePersistedChild(hydratedThread);
             }
             catch (error) {
                 if (disposed || controller.signal.aborted)
@@ -123,7 +126,7 @@ export function AgentChildSessionView({ client, commands, locale, mailbox, menti
             disposed = true;
             controller.abort();
         };
-    }, [childStorageKey, client, preferences, reloadGeneration, sessionId, threadStorage]);
+    }, [childStorageKey, client, preferences, reloadGeneration, schedulePersistedChild, sessionId, threadStorage]);
     useEffect(() => () => {
         if (persistTimerRef.current)
             clearTimeout(persistTimerRef.current);
@@ -151,15 +154,17 @@ export function AgentChildSessionView({ client, commands, locale, mailbox, menti
             setThread((latest) => {
                 if (!latest)
                     return latest;
+                const latestWindow = latest.transcriptWindow ?? window;
                 return {
                     ...latest,
                     events: compactThreadEvents([...loaded.thread.events, ...latest.events]),
                     transcriptWindow: {
-                        endIndex: Math.max(window.endIndex, loaded.window.endIndex),
+                        endIndex: Math.max(latestWindow.endIndex, loaded.window.endIndex),
                         hasMoreBefore: loaded.window.hasMoreBefore,
                         startIndex: loaded.window.startIndex,
-                        total: Math.max(window.total, loaded.window.total),
+                        total: Math.max(latestWindow.total, loaded.window.total),
                     },
+                    revision: (latest.revision ?? 0) + 1,
                     updatedAt: Date.now(),
                 };
             });
@@ -181,7 +186,7 @@ export function AgentChildSessionView({ client, commands, locale, mailbox, menti
     if (!thread) {
         return _jsx("div", { className: "flex min-h-0 flex-1 items-center justify-center px-6 text-sm text-muted-foreground", role: "status", children: "Loading sub-agent history\u2026" });
     }
-    return (_jsx(AgentThreadView, { client: client, commands: commands, draftStorageKey: `open-agent:child-draft:${sessionId}`, locale: locale, mailbox: mailbox, mentions: mentions, models: models, onChange: handleThreadChange, onEvent: onEvent, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, onRecoveryNeeded: recoverChild, providerReady: providerReady, reasoningLevels: reasoningLevels, thread: thread, historyHasMore: thread.transcriptWindow?.hasMoreBefore === true, historyLoading: historyLoading, onLoadEarlier: loadEarlier }));
+    return (_jsx(AgentThreadView, { client: client, commands: commands, draftStorageKey: `open-agent:child-draft:${sessionId}`, locale: locale, mailbox: mailbox, mentions: mentions, models: models, onChange: handleThreadChange, onEvent: onEvent, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, onRecoveryNeeded: recoverChild, providerReady: providerReady, reasoningLevels: reasoningLevels, thread: thread, historyHasMore: thread.transcriptWindow?.hasMoreBefore === true, historyLoading: historyLoading, onLoadEarlier: loadEarlier }, `${thread.id}:${thread.revision ?? 0}`));
 }
 function persistedChildControls(thread) {
     return {

@@ -19,7 +19,7 @@ simultaneous Agent execution.
 | Workload | Result | Measured values |
 | --- | --- | --- |
 | 100 idle SSE streams | Pass | 0 errors, 0 unexpected disconnects, handshake p95 185ms |
-| 500 idle SSE streams across 32 durable sessions | Pass | 500/500 HTTP 200, all handshakes established in 30.7s, held 10s |
+| 500 idle SSE streams across an independent durable-session pool | Pass | 500/500 HTTP 200, all handshakes established in 30.7s, held 10s |
 | 257 idle SSE streams on one durable session | Fail by test design | 256 established; the 257th timed out. This is a per-session fan-out boundary, not a server-wide user limit |
 | 2 simple live AgentRuns, concurrency 1 | Pass for host admission/error gate | 0 errors, admission p95 102ms, Provider completion p95 57.4s; this is an upstream/route latency observation, not a host saturation result |
 | 4 simple live AgentRuns, concurrency 2 | Host gate pass; Provider latency observation | 0 errors, admission p95 192ms, completion p95 28.9s in the earlier 20s budget run; the capacity runner now uses a 60s observation budget and records resource/event-loop metrics separately |
@@ -54,12 +54,15 @@ Provider quota/latency, and usually a sandbox. The maximum stable mixed workload
 has not yet been established. Ten thousand or one hundred thousand users cannot
 be claimed from this evidence.
 
-The capacity runner now starts AgentRun levels at 1 and records RSS, heap, and
-event-loop delay. It treats admission latency, error rate, throughput, and
-resource ceilings as the host gate; Provider completion latency remains a
-separate reported SLO. This separation prevents a slow model response from
-being “fixed” by arbitrary event or payload limits and prevents a passing
-Provider call from being mistaken for a saturated host.
+The capacity runner now starts AgentRun levels at 1 and records load-generator
+RSS, heap, and event-loop delay. These client-side values are diagnostic only;
+they are not target-server capacity evidence. A deployment capacity run must
+collect Web/Eve/worker RSS and event-loop lag, database-pool wait, Workflow
+queue age, sandbox count, and reconnect/error rates from the target host. It
+treats admission latency and error rate as the local gate; Provider completion
+latency remains a separately reported SLO. This separation prevents a slow
+model response from being “fixed” by arbitrary event or payload limits and
+prevents a passing Provider call from being mistaken for a saturated host.
 
 The runner performs a filesystem preflight and refuses to start load when free
 space is below `AGENT_CAPACITY_MIN_FREE_DISK_BYTES` (2 GiB by default). This is

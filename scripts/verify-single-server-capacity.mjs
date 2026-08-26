@@ -9,8 +9,14 @@ import {
 } from "../lib/capacity-config.ts";
 
 const root = process.cwd();
-const streamLevels = parseCapacityLevels(process.env.AGENT_CAPACITY_STREAM_LEVELS, [100, 250, 500, 1_000]);
-const runLevels = parseCapacityLevels(process.env.AGENT_CAPACITY_RUN_LEVELS, [1, 2, 4, 8]);
+const streamLevels = parseCapacityLevels(
+  process.env.AGENT_CAPACITY_STREAM_LEVELS,
+  [1_000, 5_000, 10_000],
+);
+const runLevels = parseCapacityLevels(
+  process.env.AGENT_CAPACITY_RUN_LEVELS,
+  [10, 25, 50, 100],
+);
 const stopOnFailure = process.env.AGENT_CAPACITY_STOP_ON_FAILURE !== "0";
 const batchTimeoutMs = boundedInteger("AGENT_CAPACITY_BATCH_TIMEOUT_MS", 900_000, 30_000, 3_600_000);
 const evidenceDirectory = resolve(process.env.AGENT_CAPACITY_EVIDENCE_DIR?.trim() || ".tmp/capacity");
@@ -109,7 +115,7 @@ async function runCapacityLevels(kind, levels, extraEnvironment) {
             AGENT_STREAM_LOAD_EVIDENCE_PATH: evidencePath,
           }
         : {
-            AGENT_LOAD_TOTAL_RUNS: String(Math.max(level * 2, level)),
+            AGENT_LOAD_TOTAL_RUNS: String(level),
             AGENT_LOAD_CONCURRENCY: String(level),
             AGENT_LOAD_EVIDENCE_PATH: evidencePath,
           }),
@@ -149,24 +155,49 @@ function runVerifier(script, environment) {
     const child = spawn(process.execPath, [script], {
       cwd: root,
       env: environment,
+      detached: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stderr = "";
+    let settled = false;
     child.stderr.on("data", (chunk) => { stderr += String(chunk); });
     const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      reject(new Error(`${script} exceeded ${batchTimeoutMs}ms.`));
+      if (settled) return;
+      settled = true;
+      terminateProcessTree(child).finally(() => {
+        reject(new Error(`${script} exceeded ${batchTimeoutMs}ms.`));
+      });
     }, batchTimeoutMs);
     child.once("error", (error) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
       reject(error);
     });
     child.once("exit", (code, signal) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
       if (code === 0) return resolvePromise();
       reject(new Error(`${script} exited with ${code ?? `signal ${signal}`}: ${safeError(stderr)}`));
     });
   });
+}
+
+async function terminateProcessTree(child) {
+  const pid = child.pid;
+  if (!pid) return;
+  try {
+    process.kill(-pid, "SIGTERM");
+  } catch {
+    child.kill("SIGTERM");
+  }
+  await new Promise((resolve) => setTimeout(resolve, 15_000));
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch {
+    // The process group may already have exited after graceful cleanup.
+  }
 }
 
 async function readEvidenceFile(path) {

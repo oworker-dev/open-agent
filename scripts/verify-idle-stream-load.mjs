@@ -12,22 +12,40 @@ const holdMs = boundedInteger("AGENT_STREAM_LOAD_HOLD_MS", 5_000, 1_000, 300_000
 const handshakeDeadlineMs = boundedInteger("AGENT_STREAM_LOAD_HANDSHAKE_DEADLINE_MS", 30_000, 1_000, 300_000);
 const maxErrorRate = boundedNumber("AGENT_STREAM_LOAD_MAX_ERROR_RATE", 0, 0, 1);
 const p95HandshakeMs = boundedInteger("AGENT_STREAM_LOAD_P95_HANDSHAKE_MS", 5_000, 10, 300_000);
+const targetMetricsUrl = process.env.AGENT_STREAM_LOAD_TARGET_METRICS_URL?.trim();
+const targetMetricsToken = process.env.AGENT_STREAM_LOAD_TARGET_METRICS_TOKEN?.trim();
 const batchId = `stream-load-${Date.now()}-${randomUUID()}`;
-const principalId = `stream-load-runner-${randomUUID()}`;
-const accessToken = signToken({
-  actorType: "service",
-  scope: ["agent:sessions"],
-  sub: principalId,
-  tenantId: `stream-load-tenant-${randomUUID()}`,
-});
-const client = new Client({
-  auth: { bearer: accessToken },
-  host: baseUrl,
-  redirect: "error",
-});
+const tenantId = `stream-load-tenant-${randomUUID()}`;
+const sessionCount = boundedInteger(
+  "AGENT_STREAM_LOAD_SESSION_COUNT",
+  Math.max(1, Math.ceil(totalStreams / 128)),
+  1,
+  totalStreams,
+);
 
 const marker = `STREAM_LOAD_READY_${batchId}`;
 const memory = createMemorySampler();
+const activeSessions = new Set();
+let signalCleanupPromise;
+const cleanupSessionsOnSignal = () => {
+  signalCleanupPromise ??= Promise.allSettled(
+    [...activeSessions].map((session) =>
+      session.reset({ reason: `idle-stream-load-aborted:${batchId}` }).catch(() => undefined),
+    ),
+  );
+};
+process.once("SIGTERM", cleanupSessionsOnSignal);
+process.once("SIGINT", cleanupSessionsOnSignal);
+const targetMetricsBefore = targetMetricsUrl
+  ? await readTargetMetrics(targetMetricsUrl)
+  : undefined;
+const seedStartedAt = performance.now();
+const seeds = await mapWithConcurrency(
+  Array.from({ length: sessionCount }, (_, index) => index),
+  Math.min(concurrency, sessionCount),
+  async (index) => await createSeed(index),
+);
+const seedSetupDurationMs = Math.round(performance.now() - seedStartedAt);
 const startedAt = performance.now();
 const attempts = await mapWithConcurrency(
   Array.from({ length: totalStreams }, (_, index) => index),
@@ -37,6 +55,7 @@ const attempts = await mapWithConcurrency(
 const establishedAt = performance.now();
 const established = attempts.filter((entry) => entry.ok);
 const failures = attempts.filter((entry) => !entry.ok);
+const seedFailures = seeds.filter((seed) => !seed.ok);
 
 await delay(holdMs);
 const liveness = await Promise.all(established.map(async (entry) => ({
@@ -44,21 +63,39 @@ const liveness = await Promise.all(established.map(async (entry) => ({
   alive: await followerIsOpen(entry.reader),
 })));
 const unexpectedDisconnects = liveness.filter((entry) => !entry.alive);
+const targetMetricsAfter = targetMetricsUrl
+  ? await readTargetMetrics(targetMetricsUrl)
+  : undefined;
 
 for (const entry of established) entry.controller.abort("stream-load-complete");
 await Promise.allSettled(established.map((entry) => entry.reader.cancel().catch(() => undefined)));
 memory.stop();
-await Promise.allSettled(attempts.map((entry) => entry.session?.reset({ reason: `idle-stream-load:${batchId}` }).catch(() => undefined)));
+const resetSessions = new Map(
+  attempts
+    .map((entry) => entry.seed)
+    .filter((seed) => seed?.session && seed.session.state.sessionId)
+    .map((seed) => [seed.session.state.sessionId, seed]),
+);
+await Promise.allSettled([...resetSessions.values()].map(async (seed) => {
+  activeSessions.delete(seed.session);
+  await seed.session.reset({ reason: `idle-stream-load:${batchId}` }).catch(() => undefined);
+}));
 
 const handshake = summarize(established.map((entry) => entry.handshakeMs));
 const errorRate = failures.length / totalStreams;
 const violations = [];
+if (seedFailures.length > 0) {
+  violations.push(`${seedFailures.length} durable seed sessions failed to reach a stable boundary.`);
+}
 if (errorRate > maxErrorRate) violations.push(`Stream error rate ${round(errorRate, 4)} exceeded ${maxErrorRate}.`);
 if ((handshake.p95Ms ?? Number.POSITIVE_INFINITY) > p95HandshakeMs) {
   violations.push(`p95 stream handshake ${handshake.p95Ms} ms exceeded ${p95HandshakeMs} ms.`);
 }
 if (unexpectedDisconnects.length > 0) {
   violations.push(`${unexpectedDisconnects.length} established streams disconnected during the hold interval.`);
+}
+if (targetMetricsUrl && (targetMetricsBefore?.error || targetMetricsAfter?.error)) {
+  violations.push("Target metrics endpoint did not return valid snapshots for the full load window.");
 }
 
 const evidence = {
@@ -71,20 +108,30 @@ const evidence = {
     handshakeDeadlineMs,
     holdMs,
     totalStreams,
+    sessionCount,
+    sessionModel: "independent-durable-session-pool",
   },
   budgets: { maxErrorRate, p95HandshakeMs },
   metrics: {
     established: established.length,
     failures: failures.length,
+    seedFailures: seedFailures.length,
     errorRate: round(errorRate, 4),
     unexpectedDisconnects: unexpectedDisconnects.length,
     establishmentDurationMs: Math.round(establishedAt - startedAt),
+    seedSetupDurationMs,
     handshake,
     // This is the verifier process only. It is intentionally not presented as
     // target-server capacity evidence; collect target metrics separately.
     loadGeneratorMemory: memory.result(),
+    target: targetMetricsUrl
+      ? { url: targetMetricsUrl, before: targetMetricsBefore, after: targetMetricsAfter }
+      : undefined,
   },
-  failures: failures.map((entry) => ({ index: entry.index, error: entry.error })),
+  failures: [
+    ...seedFailures.map((entry) => ({ stage: "seed", index: entry.index, error: entry.error })),
+    ...failures.map((entry) => ({ stage: "stream", index: entry.index, error: entry.error })),
+  ],
   violations,
   ok: violations.length === 0,
 };
@@ -102,25 +149,10 @@ async function openFollower(index) {
   );
   const signal = AbortSignal.any([controller.signal, handshakeController.signal]);
   const openedAt = performance.now();
-  let session;
+  const seed = seeds[index % seeds.length];
   try {
-    // Every follower owns an independent durable session. Reusing one seed
-    // session measures per-session fan-out, not server-wide online users.
-    const seed = await client.sessions.create({
-      message: `Do not use tools. Reply exactly: ${marker}_${index}`,
-    });
-    const seedEvents = [];
-    for await (const event of seed.response) seedEvents.push(event);
-    session = seed.session;
-    const sessionId = session.state.sessionId;
-    const streamIndex = session.state.streamIndex;
-    assert(sessionId, "The seed turn did not return a durable session id.");
-    assert(streamIndex > 0, "The seed turn did not advance the durable stream cursor.");
-    assert(
-      seedEvents.some((event) => event.type === "session.waiting" || event.type === "session.completed"),
-      "The seed session did not reach a stable stream boundary.",
-    );
-    const path = `/eve/v1/session/${encodeURIComponent(sessionId)}/stream?startIndex=${Math.max(0, streamIndex - 1)}`;
+    if (!seed?.ok) throw new Error(seed?.error ?? "seed session unavailable");
+    const path = `/eve/v1/session/${encodeURIComponent(seed.sessionId)}/stream?startIndex=${Math.max(0, seed.streamIndex - 1)}`;
     let delayMs = 250;
     let lastStatus;
     while (!signal.aborted) {
@@ -128,7 +160,7 @@ async function openFollower(index) {
         cache: "no-store",
         headers: {
           accept: "application/x-ndjson",
-          authorization: `Bearer ${accessToken}`,
+          authorization: `Bearer ${seed.accessToken}`,
         },
         redirect: "error",
         signal,
@@ -158,14 +190,43 @@ async function openFollower(index) {
         index,
         ok: true,
         reader,
-        session,
+        seed,
       };
     }
     throw new Error(`stream handshake timed out${lastStatus ? ` after HTTP ${lastStatus}` : ""}`);
   } catch (cause) {
     clearTimeout(handshakeTimer);
     controller.abort("stream-load-open-failed");
-    return { error: safeError(cause), index, ok: false, session };
+    return { error: safeError(cause), index, ok: false, seed };
+  }
+}
+
+async function createSeed(index) {
+  const accessToken = signToken({
+    actorType: "service",
+    scope: ["agent:sessions"],
+    sub: `stream-load-user-${index}-${randomUUID()}`,
+    tenantId,
+  });
+  try {
+    const client = new Client({ auth: { bearer: accessToken }, host: baseUrl, redirect: "error" });
+    const created = await client.sessions.create({
+      message: `Do not use tools. Reply exactly: ${marker}_${index}`,
+    });
+    const seedEvents = [];
+    for await (const event of created.response) seedEvents.push(event);
+    const sessionId = created.session.state.sessionId;
+    const streamIndex = created.session.state.streamIndex;
+    assert(sessionId, "The seed turn did not return a durable session id.");
+    assert(streamIndex > 0, "The seed turn did not advance the durable stream cursor.");
+    assert(
+      seedEvents.some((event) => event.type === "session.waiting" || event.type === "session.completed"),
+      "The seed session did not reach a stable stream boundary.",
+    );
+    activeSessions.add(created.session);
+    return { accessToken, index, ok: true, session: created.session, sessionId, streamIndex };
+  } catch (cause) {
+    return { error: safeError(cause), index, ok: false };
   }
 }
 
@@ -175,6 +236,24 @@ async function followerIsOpen(reader) {
     () => "closed",
   );
   return await Promise.race([probe, delay(100).then(() => "open")]) !== "closed";
+}
+
+async function readTargetMetrics(url) {
+  try {
+    const response = await fetch(url, {
+      cache: "no-store",
+      headers: targetMetricsToken ? { authorization: `Bearer ${targetMetricsToken}` } : undefined,
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (!response.ok) throw new Error(`Target metrics endpoint returned ${response.status}.`);
+    const payload = await response.json();
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      throw new Error("Target metrics endpoint returned a non-object payload.");
+    }
+    return { capturedAt: new Date().toISOString(), value: payload };
+  } catch (error) {
+    return { capturedAt: new Date().toISOString(), error: safeError(error) };
+  }
 }
 
 function createMemorySampler() {

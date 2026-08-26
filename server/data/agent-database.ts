@@ -2,9 +2,9 @@ import { Pool } from "pg";
 
 export type AgentDatabaseConfig = {
   readonly connectionString: string;
-  /** Maximum number of non-terminal AgentRuns allowed across this service. 0 disables the gate. */
+  /** Maximum number of non-terminal AgentRuns allowed across this service. 0 disables the gate (development only). */
   readonly maxActiveRuns?: number;
-  /** Maximum number of non-terminal AgentRuns allowed for one tenant. 0 disables the gate. */
+  /** Maximum number of non-terminal AgentRuns allowed for one tenant. 0 disables the gate (development only). */
   readonly maxActiveRunsPerTenant?: number;
   /** Abort a pool checkout when PostgreSQL cannot provide a connection in time. */
   readonly connectionTimeoutMillis?: number;
@@ -102,6 +102,23 @@ export async function closeAgentDatabasePools(): Promise<void> {
   if (!pools) return;
   globalAgentDatabase.__openAgentDatabasePools = new Map();
   await Promise.all([...pools.values()].map((pool) => pool.end()));
+}
+
+/** Read-only pool counters used by the protected capacity diagnostics route. */
+export function getAgentDatabasePoolStats(): readonly {
+  readonly key: string;
+  readonly total: number;
+  readonly idle: number;
+  readonly waiting: number;
+}[] {
+  const pools = globalAgentDatabase.__openAgentDatabasePools;
+  if (!pools) return [];
+  return [...pools.entries()].map(([key, pool]) => ({
+    key: key.replace(/^[^\u0000]+\u0000/u, "<redacted>\u0000"),
+    total: pool.totalCount,
+    idle: pool.idleCount,
+    waiting: pool.waitingCount,
+  }));
 }
 
 export function quoteIdentifier(identifier: string): string {
