@@ -30,6 +30,7 @@ simultaneous Agent execution.
 | 12 live AgentRuns, concurrency 12 | Pass | 0 errors, admission p95 638ms, completion p95 10.5s, event-loop p95 30.9ms |
 | 16 live AgentRuns, concurrency 16 | Fail | 1/16 failed during inspection/settlement (502), error rate 6.25%; successful admission p95 1.05s, completion p95 14.3s |
 | 20 idle streams + 2 live AgentRuns (mixed smoke) | Pass | 0 errors, stream handshake p95 52ms, AgentRun completion p95 4.7s |
+| 20 idle streams + 2 live AgentRuns (mixed smoke with target metrics) | Pass | 0 errors, stream handshake p95 83ms, AgentRun completion p95 6.4s, target Web RSS 230->258MiB, event-loop p95 <=21ms, Agent DB pool wait 0 |
 | 100 MiB multipart upload | Pass | 1 upload, 38.72 MiB/s, ownership isolation passed |
 
 The AgentRun result is not classified as a server saturation limit: the run
@@ -88,11 +89,13 @@ capacity.
 The sequential matrix does not exercise online and active workloads at the same
 time. Use `npm run verify:mixed-capacity` for that envelope: it runs the idle
 stream and AgentRun verifiers concurrently and records both child reports plus
-before/after target metrics. No mixed-workload result has been measured for this
-The mixed verifier has now been exercised with a 20-stream/2-run smoke
-envelope. This is only a protocol smoke result; no large mixed-workload
-capacity claim is made until target metrics are configured and a clean host run
-completes.
+before/after target metrics. A 20-stream/2-run smoke envelope now passes with
+target metrics enabled; this is still only a protocol smoke result, not a large
+mixed-workload capacity claim. The Workflow streamer may log Node's
+`MaxListenersExceededWarning` when more than ten followers intentionally attach
+to one stream; this is a warning threshold, not evidence of a leak. The
+streamer patch removes listeners on EOF, errors, and cancellation, and should be
+monitored under repeated same-stream follower tests.
 
 The AgentRun verifier retires every synthetic Eve session it creates after the
 measurement (and records attempted, retired, and failed cleanup counts in the
