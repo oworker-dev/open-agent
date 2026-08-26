@@ -267,6 +267,9 @@ Production also requires `AGENT_SANDBOX_IMAGE` pinned by OCI sha256 digest.
 Git, FFmpeg, ImageMagick, and Playwright/Chromium runtime. Build and publish it
 as an immutable image, then run `npm run verify:sandbox-runtime` against the
 published digest before promotion.
+Run `npm run doctor:host` before load testing; it reports read-only CPU, cgroup,
+memory, swap, disk, and Docker state and refuses to proceed when the default
+2 GiB disk or 512 MiB memory safety margin is unavailable.
 The Agent Web API and Eve runtime both register OpenTelemetry through
 `@vercel/otel`. Configure `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` (or the Vercel
 collector) in both processes and use the same collector as Muses. Synchronous

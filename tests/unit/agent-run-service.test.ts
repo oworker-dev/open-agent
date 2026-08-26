@@ -116,6 +116,31 @@ test("rejects reuse of an idempotency key for a different request", async () => 
   assert.equal(runtime.calls.start, 1);
 });
 
+test("rejects a new AgentRun when the durable admission gate is full", async () => {
+  const store = new MemoryAgentRunStore();
+  store.reserve = async () => ({
+    activeCount: 16,
+    activeTenantCount: 16,
+    maxActiveRuns: 16,
+    maxActiveRunsPerTenant: 16,
+    status: "capacity",
+  });
+  const runtime = fakeRuntime();
+
+  await assert.rejects(
+    startAgentRun({
+      accessToken: "token",
+      identity: user,
+      request: parseRequest({ idempotencyKey: "capacity-1", message: "Do the work" }),
+      runtime,
+      store,
+    }),
+    (error: unknown) => error instanceof AgentRunOperationError &&
+      error.status === 429 && error.code === "agent_run_capacity",
+  );
+  assert.equal(runtime.calls.start, 0);
+});
+
 test("does not expose a run to another tenant or principal", async () => {
   const store = new MemoryAgentRunStore();
   const runtime = fakeRuntime();

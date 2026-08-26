@@ -7,6 +7,7 @@ import {
   readAgentSandboxBackend,
   readAgentSandboxWorkspaceQuota,
 } from "../../lib/production-config.ts";
+import { readAgentDatabaseConfig } from "../../server/data/agent-database.ts";
 import {
   readAgentEvalContextWindowTokens,
   readAgentModelMaxOutputTokens,
@@ -15,6 +16,8 @@ import {
 const validEnvironment = {
   AGENT_DATABASE_SCHEMA: "open_agent",
   AGENT_DATABASE_URL: "postgresql://agent:secret@db.internal:5432/muses_product",
+  AGENT_DATABASE_CONNECTION_TIMEOUT_MS: "10000",
+  AGENT_DATABASE_IDLE_TIMEOUT_MS: "30000",
   AGENT_DEPLOYMENT_TENANCY: "multi-tenant",
   AGENT_EMBED_ALLOWED_ORIGINS: "https://muses.example.com",
   AGENT_HOST_JWT_ALGORITHM: "HS256",
@@ -51,6 +54,43 @@ const validEnvironment = {
 
 test("accepts the verified production topology", () => {
   assert.deepEqual(inspectProductionConfiguration(validEnvironment, "24.18.1"), []);
+});
+
+test("validates optional AgentRun admission limits", () => {
+  assert.deepEqual(inspectProductionConfiguration({
+    ...validEnvironment,
+    AGENT_MAX_ACTIVE_RUNS_TOTAL: "16",
+    AGENT_MAX_ACTIVE_RUNS_PER_TENANT: "8",
+  }, "24.18.1"), []);
+  const diagnostics = inspectProductionConfiguration({
+    ...validEnvironment,
+    AGENT_MAX_ACTIVE_RUNS_TOTAL: "10001",
+    AGENT_MAX_ACTIVE_RUNS_PER_TENANT: "-1",
+  }, "24.18.1");
+  assert.equal(
+    diagnostics.filter((item) => item.code === "integer-range").length,
+    2,
+  );
+});
+
+test("database pool timeouts are bounded and defaulted", () => {
+  const defaults = readAgentDatabaseConfig({ AGENT_DATABASE_URL: "postgresql://agent:secret@db.internal:5432/open_agent" });
+  assert.equal(defaults?.connectionTimeoutMillis, 10_000);
+  assert.equal(defaults?.idleTimeoutMillis, 30_000);
+  const configured = readAgentDatabaseConfig({
+    AGENT_DATABASE_URL: "postgresql://agent:secret@db.internal:5432/open_agent",
+    AGENT_DATABASE_CONNECTION_TIMEOUT_MS: "5000",
+    AGENT_DATABASE_IDLE_TIMEOUT_MS: "60000",
+  });
+  assert.equal(configured?.connectionTimeoutMillis, 5_000);
+  assert.equal(configured?.idleTimeoutMillis, 60_000);
+  assert.throws(
+    () => readAgentDatabaseConfig({
+      AGENT_DATABASE_URL: "postgresql://agent:secret@db.internal:5432/open_agent",
+      AGENT_DATABASE_CONNECTION_TIMEOUT_MS: "50",
+    }),
+    /AGENT_DATABASE_CONNECTION_TIMEOUT_MS/,
+  );
 });
 
 test("accepts the built-in S3 AssetStore production topology", () => {

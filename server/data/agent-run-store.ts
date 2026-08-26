@@ -54,7 +54,14 @@ export type ReserveAgentRunInput = {
 export type ReserveAgentRunResult =
   | { readonly record: AgentRunRecord; readonly status: "reserved" }
   | { readonly record: AgentRunRecord; readonly status: "replay" }
-  | { readonly record: AgentRunRecord; readonly status: "conflict" };
+  | { readonly record: AgentRunRecord; readonly status: "conflict" }
+  | {
+      readonly activeCount: number;
+      readonly activeTenantCount: number;
+      readonly maxActiveRuns: number;
+      readonly maxActiveRunsPerTenant: number;
+      readonly status: "capacity";
+    };
 
 export type AgentRunProjection = {
   readonly eventCount: number;
@@ -84,7 +91,7 @@ export interface AgentRunStore {
 export function createPostgresAgentRunStore(config: AgentDatabaseConfig): AgentRunStore {
   const pool = getAgentDatabasePool(config);
   const table = `${quoteIdentifier(config.schema)}."agent_runs"`;
-  return postgresAgentRunStore(pool, table);
+  return postgresAgentRunStore(pool, table, config);
 }
 
 export function createPostgresAgentRunStoreFromEnvironment(
@@ -94,43 +101,117 @@ export function createPostgresAgentRunStoreFromEnvironment(
   return config ? createPostgresAgentRunStore(config) : undefined;
 }
 
-function postgresAgentRunStore(pool: Pool, table: string): AgentRunStore {
+function postgresAgentRunStore(pool: Pool, table: string, config: AgentDatabaseConfig): AgentRunStore {
   return {
     async reserve(input) {
       const runId = `arun_${randomUUID()}`;
-      const inserted = await pool.query<AgentRunRow>(
-        `insert into ${table}
-          (run_id, tenant_id, principal_id, idempotency_key, request_fingerprint,
-           correlation_id, profile, policy, parent, metadata, status)
-         values ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10::jsonb, 'submitting')
-         on conflict (tenant_id, principal_id, idempotency_key) do nothing
-         returning ${selectColumns()}`,
-        [
-          runId,
-          input.tenantId,
-          input.principalId,
-          input.idempotencyKey,
-          input.requestFingerprint,
-          input.correlationId,
-          JSON.stringify(input.profile),
-          JSON.stringify(input.policy),
-          input.parent ? JSON.stringify(input.parent) : null,
-          JSON.stringify(input.metadata),
-        ],
-      );
-      const created = inserted.rows[0];
-      if (created) return { record: toRecord(created), status: "reserved" };
+      return await inTransaction(pool, async (client) => {
+        // The idempotency lookup happens before admission. Replaying an
+        // existing request must remain possible even while the tenant is at
+        // capacity, and it must not consume another slot.
+        const existing = await client.query<AgentRunRow>(
+          `select ${selectColumns()} from ${table}
+            where tenant_id = $1 and principal_id = $2 and idempotency_key = $3
+            limit 1`,
+          [input.tenantId, input.principalId, input.idempotencyKey],
+        );
+        const row = existing.rows[0];
+        if (row) {
+          return {
+            record: toRecord(row),
+            status: row.requestFingerprint === input.requestFingerprint ? "replay" : "conflict",
+          } as const;
+        }
 
-      const existing = await pool.query<AgentRunRow>(
-        `select ${selectColumns()} from ${table}
-          where tenant_id = $1 and principal_id = $2 and idempotency_key = $3`,
-        [input.tenantId, input.principalId, input.idempotencyKey],
-      );
-      const row = requireRow(existing.rows[0]);
-      return {
-        record: toRecord(row),
-        status: row.requestFingerprint === input.requestFingerprint ? "replay" : "conflict",
-      };
+        const maxActiveRuns = config.maxActiveRuns ?? 0;
+        const maxActiveRunsPerTenant = config.maxActiveRunsPerTenant ?? 0;
+        if (maxActiveRuns > 0 || maxActiveRunsPerTenant > 0) {
+          // Serialize the short admission transaction across all writers. A
+          // process-local semaphore would allow multiple Web/Eve replicas to
+          // oversubscribe the same host or tenant.
+          await client.query(
+            "select pg_advisory_xact_lock(hashtextextended($1, 0))",
+            ["open-agent:active-run-admission"],
+          );
+          // Another request with the same idempotency key may have committed
+          // while this transaction waited for the admission lock. Re-read it
+          // before counting capacity so retries remain replayable at the
+          // limit instead of being misclassified as a new request.
+          const lockedExisting = await client.query<AgentRunRow>(
+            `select ${selectColumns()} from ${table}
+              where tenant_id = $1 and principal_id = $2 and idempotency_key = $3
+              limit 1`,
+            [input.tenantId, input.principalId, input.idempotencyKey],
+          );
+          const lockedRow = lockedExisting.rows[0];
+          if (lockedRow) {
+            return {
+              record: toRecord(lockedRow),
+              status: lockedRow.requestFingerprint === input.requestFingerprint ? "replay" : "conflict",
+            } as const;
+          }
+          const counts = await client.query<{ activeCount: string; activeTenantCount: string }>(
+            `select
+                count(*)::text as "activeCount",
+                count(*) filter (where tenant_id = $1)::text as "activeTenantCount"
+               from ${table}
+              where status in ('submitting', 'running', 'waiting-input', 'waiting-authorization')`,
+            [input.tenantId],
+          );
+          const activeCount = Number(counts.rows[0]?.activeCount ?? 0);
+          const activeTenantCount = Number(counts.rows[0]?.activeTenantCount ?? 0);
+          if (
+            (maxActiveRuns > 0 && activeCount >= maxActiveRuns) ||
+            (maxActiveRunsPerTenant > 0 && activeTenantCount >= maxActiveRunsPerTenant)
+          ) {
+            return {
+              activeCount,
+              activeTenantCount,
+              maxActiveRuns,
+              maxActiveRunsPerTenant,
+              status: "capacity",
+            } as const;
+          }
+        }
+
+        const inserted = await client.query<AgentRunRow>(
+          `insert into ${table}
+            (run_id, tenant_id, principal_id, idempotency_key, request_fingerprint,
+             correlation_id, profile, policy, parent, metadata, status)
+           values ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10::jsonb, 'submitting')
+           on conflict (tenant_id, principal_id, idempotency_key) do nothing
+           returning ${selectColumns()}`,
+          [
+            runId,
+            input.tenantId,
+            input.principalId,
+            input.idempotencyKey,
+            input.requestFingerprint,
+            input.correlationId,
+            JSON.stringify(input.profile),
+            JSON.stringify(input.policy),
+            input.parent ? JSON.stringify(input.parent) : null,
+            JSON.stringify(input.metadata),
+          ],
+        );
+        const created = inserted.rows[0];
+        if (created) return { record: toRecord(created), status: "reserved" } as const;
+
+        // A caller that raced an installation without the admission lock can
+        // still lose the unique constraint. Resolve it as a normal replay or
+        // conflict rather than leaking a database error.
+        const raced = await client.query<AgentRunRow>(
+          `select ${selectColumns()} from ${table}
+            where tenant_id = $1 and principal_id = $2 and idempotency_key = $3
+            limit 1`,
+          [input.tenantId, input.principalId, input.idempotencyKey],
+        );
+        const racedRow = requireRow(raced.rows[0]);
+        return {
+          record: toRecord(racedRow),
+          status: racedRow.requestFingerprint === input.requestFingerprint ? "replay" : "conflict",
+        } as const;
+      });
     },
     async attachSession(runId, sessionId) {
       const result = await pool.query<AgentRunRow>(

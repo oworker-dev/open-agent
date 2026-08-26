@@ -138,6 +138,12 @@ one transaction. It is intentionally independent from UI transcript compaction:
 no retention task may delete or rewrite the authoritative event projection used
 for session recovery without a verified root/session mapping.
 
+Agent product queries use a bounded PostgreSQL pool. Connection checkout and
+idle-client timeouts are configurable per deployment, while AgentRun admission
+uses partial indexes over non-terminal statuses. This keeps a growing terminal
+history from turning every new run into an unbounded database wait or a full
+table scan.
+
 ### Transcript ordering invariant
 
 The UI transcript is a compact projection, not a second event source. Eve's

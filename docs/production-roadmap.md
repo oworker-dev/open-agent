@@ -316,6 +316,21 @@ TTL jobs, stream/event fan-out, object-store lifecycle rules, and cold session
 recovery. A single server cannot run ten thousand trusted 2 vCPU sandboxes; the
 system must make that constraint explicit instead of accepting unbounded work.
 
+The current self-hosted runtime now has a PostgreSQL-backed AgentRun admission
+gate (`AGENT_MAX_ACTIVE_RUNS_TOTAL` and
+`AGENT_MAX_ACTIVE_RUNS_PER_TENANT`). It serializes only the short reservation
+transaction, preserves idempotent replays, and returns a typed `429` with a
+retry hint when capacity is exhausted. This is the first safety boundary; a
+future distributed scheduler should move queued work behind the same contract
+instead of removing the gate or adding process-local semaphores.
+
+The Agent PostgreSQL pool now has bounded connection checkout and idle-client
+timeouts (`AGENT_DATABASE_CONNECTION_TIMEOUT_MS` and
+`AGENT_DATABASE_IDLE_TIMEOUT_MS`). The active-run query is backed by partial
+indexes on status and tenant, so admission remains cheap as terminal history
+grows. `npm run doctor:host` provides read-only host/cgroup/Docker evidence and
+fails closed for low free disk or memory before a load test starts.
+
 ### Capacity and chaos gates
 
 The release test matrix includes:

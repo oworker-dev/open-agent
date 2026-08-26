@@ -85,7 +85,13 @@ export async function POST(request: Request): Promise<Response> {
     );
   } catch (error) {
     if (error instanceof AgentRunOperationError) {
-      return problem(error.status, error.code, error.message);
+      return problem(
+        error.status,
+        error.code,
+        error.message,
+        {},
+        error.code === "agent_run_capacity" ? { "retry-after": "2" } : {},
+      );
     }
     return problem(500, "agent_run_start_failed", "The AgentRun could not be started.");
   }

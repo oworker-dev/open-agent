@@ -2,11 +2,21 @@ import { Pool } from "pg";
 
 export type AgentDatabaseConfig = {
   readonly connectionString: string;
+  /** Maximum number of non-terminal AgentRuns allowed across this service. 0 disables the gate. */
+  readonly maxActiveRuns?: number;
+  /** Maximum number of non-terminal AgentRuns allowed for one tenant. 0 disables the gate. */
+  readonly maxActiveRunsPerTenant?: number;
+  /** Abort a pool checkout when PostgreSQL cannot provide a connection in time. */
+  readonly connectionTimeoutMillis?: number;
+  /** Release idle clients so a quiet replica does not retain all database slots. */
+  readonly idleTimeoutMillis?: number;
   readonly maxPoolSize: number;
   readonly schema: string;
 };
 
 const DEFAULT_SCHEMA = "open_agent";
+export const DEFAULT_AGENT_DATABASE_CONNECTION_TIMEOUT_MS = 10_000;
+export const DEFAULT_AGENT_DATABASE_IDLE_TIMEOUT_MS = 30_000;
 const globalAgentDatabase = globalThis as typeof globalThis & {
   __openAgentDatabasePools?: Map<string, Pool>;
 };
@@ -28,11 +38,50 @@ export function readAgentDatabaseConfig(
     throw new Error("AGENT_DATABASE_MAX_POOL_SIZE must be an integer from 1 to 100.");
   }
 
-  return { connectionString, maxPoolSize, schema };
+  const connectionTimeoutMillis = readBoundedMillis(
+    environment.AGENT_DATABASE_CONNECTION_TIMEOUT_MS,
+    "AGENT_DATABASE_CONNECTION_TIMEOUT_MS",
+    DEFAULT_AGENT_DATABASE_CONNECTION_TIMEOUT_MS,
+  );
+  const idleTimeoutMillis = readBoundedMillis(
+    environment.AGENT_DATABASE_IDLE_TIMEOUT_MS,
+    "AGENT_DATABASE_IDLE_TIMEOUT_MS",
+    DEFAULT_AGENT_DATABASE_IDLE_TIMEOUT_MS,
+  );
+
+  return {
+    connectionString,
+    maxActiveRuns: readOptionalBoundedLimit(environment.AGENT_MAX_ACTIVE_RUNS_TOTAL, "AGENT_MAX_ACTIVE_RUNS_TOTAL"),
+    maxActiveRunsPerTenant: readOptionalBoundedLimit(environment.AGENT_MAX_ACTIVE_RUNS_PER_TENANT, "AGENT_MAX_ACTIVE_RUNS_PER_TENANT"),
+    connectionTimeoutMillis,
+    idleTimeoutMillis,
+    maxPoolSize,
+    schema,
+  };
+}
+
+function readOptionalBoundedLimit(value: string | undefined, name: string): number {
+  if (!value?.trim()) return 0;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0 || parsed > 10_000) {
+    throw new Error(`${name} must be an integer from 0 to 10000.`);
+  }
+  return parsed;
+}
+
+function readBoundedMillis(value: string | undefined, name: string, fallback: number): number {
+  if (!value?.trim()) return fallback;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 100 || parsed > 300_000) {
+    throw new Error(`${name} must be an integer from 100 to 300000 milliseconds.`);
+  }
+  return parsed;
 }
 
 export function getAgentDatabasePool(config: AgentDatabaseConfig): Pool {
-  const key = `${config.connectionString}\u0000${config.maxPoolSize}`;
+  const connectionTimeoutMillis = config.connectionTimeoutMillis ?? DEFAULT_AGENT_DATABASE_CONNECTION_TIMEOUT_MS;
+  const idleTimeoutMillis = config.idleTimeoutMillis ?? DEFAULT_AGENT_DATABASE_IDLE_TIMEOUT_MS;
+  const key = `${config.connectionString}\u0000${config.maxPoolSize}\u0000${connectionTimeoutMillis}\u0000${idleTimeoutMillis}`;
   const pools = globalAgentDatabase.__openAgentDatabasePools ??= new Map();
   const existing = pools.get(key);
   if (existing) return existing;
@@ -40,6 +89,8 @@ export function getAgentDatabasePool(config: AgentDatabaseConfig): Pool {
   const pool = new Pool({
     application_name: "open-agent",
     connectionString: config.connectionString,
+    connectionTimeoutMillis,
+    idleTimeoutMillis,
     max: config.maxPoolSize,
   });
   pools.set(key, pool);

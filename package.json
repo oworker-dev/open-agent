@@ -27,6 +27,7 @@
     "build:examples": "npm run build --workspace @oworker/open-agent-example-custom-host-react",
     "dev:eve": "eve dev",
     "doctor:production": "node scripts/doctor-production.ts",
+    "doctor:host": "node scripts/doctor-host-resources.mjs",
     "eval:fixed": "node scripts/run-fixed-evals.mjs",
     "start:eve": "eve start",
     "start:mailbox-worker": "node scripts/run-agent-mailbox-worker.mjs",

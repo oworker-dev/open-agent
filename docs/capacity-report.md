@@ -66,6 +66,11 @@ space is below `AGENT_CAPACITY_MIN_FREE_DISK_BYTES` (2 GiB by default). This is
 a safety stop, not a data-retention policy: it does not delete or rewrite
 Workflow history.
 
+Use `npm run doctor:host` for the broader host preflight. It reports effective
+CPU and cgroup limits, available memory, swap, Docker reachability, and disk
+without changing the host. The default gate requires 2 GiB free disk and 512
+MiB available memory; these are safety margins, not capacity claims.
+
 The next capacity run must use a disk-safe isolated database and report at
 least 1k/5k/10k idle streams plus controlled 10/25/50/100 active turns. Real
 Provider latency, Provider quota, Workflow queue age, database pool wait,

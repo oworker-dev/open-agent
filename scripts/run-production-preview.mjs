@@ -66,6 +66,11 @@ const runtimeEnvironment = {
   AGENT_HOST_JWT_ISSUER: process.env.AGENT_HOST_JWT_ISSUER || "https://open-agent.local",
   AGENT_HOST_JWT_SECRET: hostJwtSecret,
   AGENT_MODEL_MAX_OUTPUT_TOKENS: "4096",
+  // Admission is persisted in PostgreSQL so multiple Web replicas cannot
+  // oversubscribe this small single-host preview. Hosts with a scheduler may
+  // override both values with their measured safe limits.
+  AGENT_MAX_ACTIVE_RUNS_TOTAL: process.env.AGENT_MAX_ACTIVE_RUNS_TOTAL || "16",
+  AGENT_MAX_ACTIVE_RUNS_PER_TENANT: process.env.AGENT_MAX_ACTIVE_RUNS_PER_TENANT || "16",
   AGENT_MAILBOX_DISPATCH_SECRET: mailboxDispatchSecret,
   AGENT_MAILBOX_WORKER_SECRET: mailboxWorkerSecret,
   AGENT_MAILBOX_WORKER_INTERVAL_MS: process.env.AGENT_MAILBOX_WORKER_INTERVAL_MS || "1000",

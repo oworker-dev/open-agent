@@ -256,6 +256,20 @@ export function inspectProductionConfiguration(
     10_000,
     error,
   );
+  inspectOptionalInteger(
+    environment.AGENT_DATABASE_CONNECTION_TIMEOUT_MS,
+    "AGENT_DATABASE_CONNECTION_TIMEOUT_MS",
+    100,
+    300_000,
+    error,
+  );
+  inspectOptionalInteger(
+    environment.AGENT_DATABASE_IDLE_TIMEOUT_MS,
+    "AGENT_DATABASE_IDLE_TIMEOUT_MS",
+    100,
+    300_000,
+    error,
+  );
 
   const algorithm = environment.AGENT_HOST_JWT_ALGORITHM?.trim() || "HS256";
   if (algorithm !== "HS256") {
@@ -439,6 +453,20 @@ export function inspectProductionConfiguration(
     1_000,
     error,
   );
+  inspectOptionalInteger(
+    environment.AGENT_MAX_ACTIVE_RUNS_TOTAL,
+    "AGENT_MAX_ACTIVE_RUNS_TOTAL",
+    0,
+    10_000,
+    error,
+  );
+  inspectOptionalInteger(
+    environment.AGENT_MAX_ACTIVE_RUNS_PER_TENANT,
+    "AGENT_MAX_ACTIVE_RUNS_PER_TENANT",
+    0,
+    10_000,
+    error,
+  );
 
   const revoked = environment.AGENT_REVOKED_EXTENSIONS?.trim();
   if (revoked) {
@@ -471,6 +499,17 @@ function requireConfiguredValue(
   error: (code: string, message: string) => void,
 ): void {
   if (!value?.trim()) error("missing-required", `${name} is required for production.`);
+}
+
+function inspectOptionalInteger(
+  value: string | undefined,
+  name: string,
+  minimum: number,
+  maximum: number,
+  error: (code: string, message: string) => void,
+): void {
+  if (!value?.trim()) return;
+  inspectInteger(value, name, minimum, maximum, error);
 }
 
 function postgresDatabaseIdentity(

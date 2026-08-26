@@ -130,6 +130,17 @@ export async function startAgentRun(options: {
       "This idempotency key was already used for a different AgentRun request.",
     );
   }
+  if (reservation.status === "capacity") {
+    const scope = reservation.maxActiveRunsPerTenant > 0 &&
+      reservation.activeTenantCount >= reservation.maxActiveRunsPerTenant
+      ? "tenant"
+      : "service";
+    throw new AgentRunOperationError(
+      429,
+      "agent_run_capacity",
+      `The Agent service is at its ${scope} concurrency limit. Retry after active work settles.`,
+    );
+  }
   if (reservation.status === "replay") {
     return { disposition: "replayed", record: reservation.record };
   }

@@ -22,6 +22,25 @@ Agent Web database. Multiple worker replicas are safe: PostgreSQL leases and
 per-session FIFO blockers prevent duplicate delivery. Do not replace it with a
 browser timer or a client-owned session retry loop.
 
+The AgentRun admission gate is also persisted in PostgreSQL. Set
+`AGENT_MAX_ACTIVE_RUNS_TOTAL` for the safe active-turn ceiling of one Open
+Agent deployment and `AGENT_MAX_ACTIVE_RUNS_PER_TENANT` for a fair per-tenant
+ceiling. A value of `0` disables the corresponding gate (development only).
+The check is serialized with a short PostgreSQL advisory-lock transaction, so
+multiple Web replicas cannot oversubscribe the same limit. Idempotent replays
+are resolved before the gate and remain available while a tenant is full;
+new work receives HTTP `429` with `Retry-After: 2` and should be queued or
+retried by the host scheduler. These values are admission protection, not a
+substitute for Workflow/provider quotas, and must be tuned from a clean
+capacity run rather than copied from another machine.
+
+The Agent PostgreSQL pool has bounded waits by default: connection checkout
+times out after 10 seconds and idle clients are released after 30 seconds.
+Override `AGENT_DATABASE_CONNECTION_TIMEOUT_MS` and
+`AGENT_DATABASE_IDLE_TIMEOUT_MS` only after measuring the target database; both
+values are validated between 100 ms and 5 minutes. A database outage should
+surface as a recoverable error, not leave an HTTP request waiting forever.
+
 Use a unique `WORKFLOW_POSTGRES_JOB_PREFIX` for every World. The supported Eve
 prefix is `open_agent_`; the Muses host uses `muses_` in its own database.
 
@@ -59,6 +78,14 @@ npm ci
 npm run verify:ci
 npm run doctor:production
 ```
+
+Run `npm run doctor:host` on the deployment host before a capacity test. It is a
+read-only check that reports effective CPU, cgroup, memory, swap, disk, and
+Docker daemon state. The default safety thresholds are 2 GiB free disk and
+512 MiB available memory; set `AGENT_HOST_MIN_FREE_DISK_BYTES` or
+`AGENT_HOST_MIN_FREE_MEMORY_BYTES` to match the workload. A failed host check
+must stop load testing and be treated as an infrastructure issue, not fixed by
+shrinking event history or dropping durable records.
 
 The doctor must pass in the same environment used for the build. In particular,
 `AGENT_EMBED_ALLOWED_ORIGINS` and `EVE_NEXT_PRODUCTION_PORT` are build inputs.
