@@ -232,6 +232,24 @@ async function readEvidence(path) {
   }
 }
 
+async function readTargetMetrics(url, token) {
+  try {
+    const response = await fetch(url, {
+      cache: "no-store",
+      headers: token ? { authorization: `Bearer ${token}` } : undefined,
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (!response.ok) throw new Error(`Target metrics endpoint returned ${response.status}.`);
+    const payload = await response.json();
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      throw new Error("Target metrics endpoint returned a non-object payload.");
+    }
+    return { capturedAt: new Date().toISOString(), value: payload };
+  } catch (error) {
+    return { capturedAt: new Date().toISOString(), error: safeError(error) };
+  }
+}
+
 async function writeEvidence(value, path) {
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
