@@ -64,14 +64,14 @@ assert(
 );
 assert(run.usage.inputTokens > 0 && run.usage.outputTokens > 0 && run.usage.steps > 0, "Agent usage was not projected.");
 
-const eventPayload = await api("GET", `/api/agent/runs/${encodeURIComponent(run.runId)}/events?after=0`, undefined, 200);
-const serialized = JSON.stringify(eventPayload.events);
+const events = await readAllAgentRunEvents(run.runId);
+const serialized = JSON.stringify(events);
 for (const capability of ["canvas.inspect", "workflow.invoke", "workflow.run.wait", "canvas.item.put"]) {
   assert(serialized.includes(capability), `Agent event stream is missing ${capability}.`);
 }
 assert(serialized.includes("completed"), "Agent never observed a completed Workflow run.");
-assert(eventPayload.events.some((event) => event.type === "tool.completed"), "Host tool completion was not projected.");
-const hostResults = eventPayload.events
+assert(events.some((event) => event.type === "tool.completed"), "Host tool completion was not projected.");
+const hostResults = events
   .filter((event) => event.type === "tool.completed" && event.data?.status === "completed")
   .map((event) => event.data?.result?.output)
   .filter((output) => output?.capability);
@@ -115,6 +115,29 @@ console.log(JSON.stringify({
   result: run.result.value,
   usage: run.usage,
 }));
+
+async function readAllAgentRunEvents(runId) {
+  const events = [];
+  let cursor = 0;
+  while (true) {
+    const page = await api(
+      "GET",
+      `/api/agent/runs/${encodeURIComponent(runId)}/events?after=${cursor}`,
+      undefined,
+      200,
+    );
+    assert(Array.isArray(page.events), "AgentRun event page is not an array.");
+    const nextCursor = Number(page.nextCursor);
+    assert(Number.isSafeInteger(nextCursor) && nextCursor >= cursor, "AgentRun event cursor is invalid.");
+    if (page.events.length === 0) {
+      assert(nextCursor === cursor, "AgentRun event cursor advanced without events.");
+      return events;
+    }
+    assert(nextCursor > cursor && nextCursor - cursor === page.events.length, "AgentRun event cursor did not advance continuously.");
+    events.push(...page.events);
+    cursor = nextCursor;
+  }
+}
 
 async function poll(runId) {
   const deadline = Date.now() + runDurationMs + 60_000;
