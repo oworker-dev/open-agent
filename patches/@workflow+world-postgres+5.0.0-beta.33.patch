@@ -1,8 +1,8 @@
 diff --git a/node_modules/@workflow/world-postgres/dist/streamer.js b/node_modules/@workflow/world-postgres/dist/streamer.js
-index adb21a0..667174a 100644
+index adb21a0..c250264 100644
 --- a/node_modules/@workflow/world-postgres/dist/streamer.js
 +++ b/node_modules/@workflow/world-postgres/dist/streamer.js
-@@ -249,7 +249,20 @@ export function createStreamer(pool, drizzle) {
+@@ -249,19 +249,38 @@ export function createStreamer(pool, drizzle) {
                  };
              },
              async get(_runId, name, startIndex) {
@@ -23,16 +23,28 @@ index adb21a0..667174a 100644
                  return new ReadableStream({
                      async start(controller) {
                          // an empty string is always < than any string,
-@@ -258,6 +271,8 @@ export function createStreamer(pool, drizzle) {
+                         // so `'' < ulid()` and `ulid() < ulid()` (maintaining order)
+-                        let lastChunkId = '';
++                        const seenChunkIds = new Set();
                          let offset = startIndex ?? 0;
                          let buffer = [];
                          function enqueue(msg) {
+-                            if (lastChunkId >= msg.id) {
+-                                // already sent or out of order
 +                            if (closed)
 +                                return;
-                             if (lastChunkId >= msg.id) {
-                                 // already sent or out of order
++                            if (seenChunkIds.has(msg.id)) {
++                                // A replayed notification can race the
++                                // historical page. De-duplicate exact chunks
++                                // without comparing ULIDs: Eve IDs are stable
++                                // but are not a cross-process total order.
                                  return;
-@@ -270,6 +285,8 @@ export function createStreamer(pool, drizzle) {
+                             }
++                            seenChunkIds.add(msg.id);
+                             if (offset > 0) {
+                                 offset--;
+                                 return;
+@@ -270,9 +289,10 @@ export function createStreamer(pool, drizzle) {
                                  controller.enqueue(new Uint8Array(msg.data));
                              }
                              if (msg.eof) {
@@ -40,8 +52,11 @@ index adb21a0..667174a 100644
 +                                cleanup();
                                  controller.close();
                              }
-                             lastChunkId = msg.id;
-@@ -285,30 +302,91 @@ export function createStreamer(pool, drizzle) {
+-                            lastChunkId = msg.id;
+                         }
+                         function onData(data) {
+                             if (buffer) {
+@@ -285,30 +305,86 @@ export function createStreamer(pool, drizzle) {
                          cleanups.push(() => {
                              events.off(`strm:${name}`, onData);
                          });
@@ -75,19 +90,17 @@ index adb21a0..667174a 100644
 +                            // The SQL offset already removes the historical
 +                            // prefix, so the in-memory enqueue cursor must start
 +                            // at zero for the returned page.
-+                            // Locate the first page by absolute index once, then
-+                            // continue with a keyset cursor. Repeated OFFSET
-+                            // scans become increasingly expensive for long
-+                            // sessions and can contend with concurrent followers.
++                            // Keep the stream cursor as an absolute position. Eve
++                            // event ids are stable but are not a cross-process
++                            // total order, so chunk-id keysets can skip events.
++                            // Paging by the authoritative absolute offset keeps
++                            // reconnects lossless while bounding memory.
 +                            let queryOffset = offset;
-+                            let afterChunkId = '';
 +                            offset = 0;
 +                            for (;;) {
 +                                if (closed)
 +                                    break;
 +                                const conditions = [eq(streams.streamId, name)];
-+                                if (afterChunkId)
-+                                    conditions.push(gt(streams.chunkId, afterChunkId));
 +                                const query = drizzle
 +                                    .select({
 +                                    id: streams.chunkId,
@@ -97,9 +110,7 @@ index adb21a0..667174a 100644
 +                                    .from(streams)
 +                                    .where(and(...conditions))
 +                                    .orderBy(asc(streams.chunkId));
-+                                const chunks = queryOffset > 0
-+                                    ? await query.offset(queryOffset).limit(PAGE_SIZE)
-+                                    : await query.limit(PAGE_SIZE);
++                                const chunks = await query.offset(queryOffset).limit(PAGE_SIZE);
 +                                if (closed)
 +                                    break;
 +                                if (chunks.length === 0) {
@@ -123,8 +134,7 @@ index adb21a0..667174a 100644
 +                                for (const chunk of chunks) enqueue(chunk);
 +                                if (closed)
 +                                    break;
-+                                afterChunkId = chunks.at(-1)?.id ?? afterChunkId;
-+                                queryOffset = 0;
++                                queryOffset += chunks.length;
 +                                // An EOF row closes the controller. Do not query
 +                                // or enqueue another page after the stream ended.
 +                                if (closed || chunks.some((chunk) => chunk.eof)) break;

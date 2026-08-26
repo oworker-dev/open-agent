@@ -86,6 +86,30 @@ test("keeps a live stream open when history has no EOF", async () => {
   }
 });
 
+test("does not drop chunks whose stable ids are not lexicographically ordered", async () => {
+  // Eve guarantees event identity across replays, but IDs from independent
+  // writers are not a total ordering. The stream cursor is positional; a
+  // lexical last-id filter would silently lose a valid chunk here.
+  const drizzle = fakeDrizzle([
+    chunk("chnk_z", "first"),
+    chunk("chnk_a", "second"),
+    chunk("chnk_eof", "", true),
+  ]);
+  const streamer = createStreamer(fakePool(), drizzle);
+  try {
+    const stream = await streamer.streams.get("run", "stream", 0);
+    const reader = stream.getReader();
+    const first = await reader.read();
+    const second = await reader.read();
+    const done = await reader.read();
+    assert.deepEqual(first.value, new Uint8Array(Buffer.from("first")));
+    assert.deepEqual(second.value, new Uint8Array(Buffer.from("second")));
+    assert.equal(done.done, true);
+  } finally {
+    await streamer.close();
+  }
+});
+
 function fakePool() {
   return {
     options: {},
