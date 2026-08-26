@@ -88,6 +88,12 @@ await mapWithConcurrency(succeeded, concurrency, async (entry) => {
   }
 });
 
+// AgentRun load cases create durable Eve sessions so the normal ownership and
+// admission paths are exercised. Retire those synthetic sessions after the
+// run, otherwise every preview restart will legitimately recover them as
+// active conversation roots and inflate the Workflow queue.
+const sessionCleanup = await retireSyntheticSessions();
+
 const providerAfter = providerDebugUrl
   ? await providerRequestCount(providerDebugUrl)
   : undefined;
@@ -115,6 +121,9 @@ if (warmupFailures.length > 0) {
 }
 if (replayFailures.length > 0) {
   violations.push(`${replayFailures.length} idempotent replays failed.`);
+}
+if (sessionCleanup.failures.length > 0) {
+  violations.push(`${sessionCleanup.failures.length} synthetic Eve sessions could not be retired.`);
 }
 if (
   providerRequests !== undefined &&
@@ -164,6 +173,7 @@ const evidence = {
   failures: failed.map(({ index, stage, error }) => ({ index, stage, error })),
   warmupFailures: warmupFailures.map(({ index, stage, error }) => ({ index, stage, error })),
   replayFailures,
+  sessionCleanup,
   violations,
   ok: violations.length === 0,
 };
@@ -215,12 +225,12 @@ async function runPhase(phase, count) {
       assert(typeof payload.run?.runId === "string", "A load run did not return a runId.");
       const admissionMs = performance.now() - startedAt;
       runId = payload.run.runId;
-      if (typeof payload.run.sessionId === "string") testSessionIds.add(payload.run.sessionId);
+      if (typeof payload.run.harness?.sessionId === "string") testSessionIds.add(payload.run.harness.sessionId);
       activeRunIds.add(runId);
 
       stage = "completion";
       const run = await poll(runId, startedAt + deadlineMs);
-      if (typeof run.sessionId === "string") testSessionIds.add(run.sessionId);
+      if (typeof run.harness?.sessionId === "string") testSessionIds.add(run.harness.sessionId);
       activeRunIds.delete(runId);
       const completionMs = performance.now() - startedAt;
       assert(run.status === "completed", `AgentRun ${runId} ended as ${run.status}.`);
@@ -268,6 +278,40 @@ async function runPhase(phase, count) {
   });
 }
 
+async function retireSyntheticSessions() {
+  const sessionIds = [...testSessionIds];
+  const failures = [];
+  let retired = 0;
+  await mapWithConcurrency(sessionIds, Math.min(concurrency, 16), async (sessionId) => {
+    try {
+      const response = await fetch(
+        `${baseUrl}/eve/v1/session/${encodeURIComponent(sessionId)}/reset`,
+        {
+          body: JSON.stringify({ reason: `agent-run-load:${batchId}` }),
+          headers: {
+            authorization: `Bearer ${accessToken}`,
+            "content-type": "application/json",
+          },
+          method: "POST",
+          redirect: "error",
+          signal: AbortSignal.timeout(Math.min(deadlineMs, 120_000)),
+        },
+      );
+      const payload = await response.json().catch(() => undefined);
+      if (!response.ok || payload?.status !== "reset" && payload?.status !== "no_active_session") {
+        throw new Error(
+          `session reset returned HTTP ${response.status}: ${payload?.error || payload?.code || "unknown error"}`,
+        );
+      }
+      retired += 1;
+      testSessionIds.delete(sessionId);
+    } catch (cause) {
+      failures.push({ sessionId, error: safeError(cause) });
+    }
+  });
+  return { attempted: sessionIds.length, failures, retired };
+}
+
 async function cancelOutstandingRuns() {
   if (activeRunIds.size === 0) return;
   await Promise.allSettled([...activeRunIds].map((runId) => cancelAndWait(runId)));
@@ -285,7 +329,7 @@ async function cancelAndWait(runId) {
         200,
       );
       if (["completed", "failed", "cancelled", "submission-ambiguous"].includes(payload.run.status)) {
-        if (typeof payload.run.sessionId === "string") testSessionIds.add(payload.run.sessionId);
+        if (typeof payload.run.harness?.sessionId === "string") testSessionIds.add(payload.run.harness.sessionId);
         activeRunIds.delete(runId);
         await removeOwnedTestSandboxes();
         return;

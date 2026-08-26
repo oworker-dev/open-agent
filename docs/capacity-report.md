@@ -94,6 +94,12 @@ envelope. This is only a protocol smoke result; no large mixed-workload
 capacity claim is made until target metrics are configured and a clean host run
 completes.
 
+The AgentRun verifier retires every synthetic Eve session it creates after the
+measurement (and records attempted, retired, and failed cleanup counts in the
+evidence). This keeps capacity runs from leaving resumable Workflow roots that
+would otherwise be re-enqueued on the next runtime restart. Historical user
+sessions and Muses host sessions are never selected by that cleanup path.
+
 ## Storage finding
 
 The local Workflow database currently contains roughly 634 MiB. The
