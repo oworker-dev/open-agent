@@ -120,6 +120,12 @@ export type AgentTranscriptCoverage = {
     readonly startIndex: number;
     readonly version: 1;
 };
+export type AgentTranscriptWindow = {
+    readonly endIndex: number;
+    readonly hasMoreBefore: boolean;
+    readonly startIndex: number;
+    readonly total: number;
+};
 export type AgentRuntimeStatus = {
     readonly provider: "mock" | "ready" | "unconfigured";
 };
@@ -143,6 +149,7 @@ export type AgentThread = {
     readonly session: AgentThreadSessionState;
     readonly status: AgentThreadStatus;
     readonly transcriptCoverage?: AgentTranscriptCoverage;
+    readonly transcriptWindow?: AgentTranscriptWindow;
     readonly title: string;
     readonly updatedAt: number;
 };

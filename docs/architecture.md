@@ -110,8 +110,10 @@ The reference app stores thread data in `localStorage` through the default
 inject an authenticated database adapter without forking the workspace. The
 bundled PostgreSQL adapter scopes every collection by verified
 `tenantId + principalId + storageKey`. Its first response contains lightweight
-thread metadata plus only the URL-selected transcript; selecting another thread
-hydrates that transcript on demand. Writes are serialized `PATCH` requests that
+thread metadata; selecting another thread hydrates only a bounded tail window.
+Older history is fetched with an absolute event window cursor, so opening a
+long conversation never materializes its entire event log in one SQL aggregate.
+Writes are serialized `PATCH` requests that
 carry changed threads and deleted IDs rather than every conversation history.
 Pending messages, accepted session IDs, input pauses, errors, and turn/session
 boundaries are persisted promptly; streaming-only deltas use a periodic

@@ -44,6 +44,7 @@ export type {
   AgentSessionBoundary,
   AgentSessionInspector,
   AgentTranscriptCoverage,
+  AgentTranscriptWindow,
 } from "./contracts.js";
 export {
   filterPromptMenuItems,

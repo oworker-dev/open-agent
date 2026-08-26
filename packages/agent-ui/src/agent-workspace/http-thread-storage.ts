@@ -5,7 +5,7 @@ import {
   type AgentThreadCollection,
   type AgentThreadStorage,
 } from "./thread-storage.js";
-import type { AgentThread } from "./contracts.js";
+import type { AgentThread, AgentTranscriptWindow } from "./contracts.js";
 
 export type HttpAgentThreadStorageOptions = {
   readonly endpoint?: string;
@@ -97,6 +97,53 @@ export function createHttpAgentThreadStorage(
         });
       }
       return hydrated;
+    },
+    async loadThreadWindow(storageKey, threadId, windowOptions = {}) {
+      preferredThreadId = threadId;
+      const query: Record<string, string> = { eventWindow: "1", threadId };
+      if (windowOptions.before !== undefined) query.eventBefore = String(windowOptions.before);
+      if (windowOptions.limit !== undefined) query.eventLimit = String(windowOptions.limit);
+      const response = await request(
+        fetchImplementation,
+        options,
+        collectionUrl(endpoint, storageKey, query),
+      );
+      await requireOk(response);
+      const body = await response.json() as {
+        eventWindow?: unknown;
+        revision?: unknown;
+        thread?: unknown;
+      };
+      if (!Number.isSafeInteger(body.revision) || (body.revision as number) < 0) {
+        throw new Error("Agent thread storage returned an invalid revision.");
+      }
+      if (body.thread == null || !isTranscriptWindow(body.eventWindow)) return undefined;
+      const parsedThread = parseThreadCollection({
+        threads: [body.thread],
+        version: AGENT_THREAD_STORAGE_VERSION,
+      }).threads[0];
+      if (!parsedThread) return undefined;
+      const hydrated = withoutSummaryHydration(parsedThread);
+      const baseline = baselines.get(storageKey);
+      const baselineThread = baseline?.threads.find((thread) => thread.id === hydrated.id);
+      const baselineEvents = baselineThread?.events ?? [];
+      baselines.set(storageKey, {
+        ...(baseline?.activeThreadId ? { activeThreadId: baseline.activeThreadId } : {}),
+        threads: [
+          ...(baseline?.threads ?? []).filter((thread) => thread.id !== hydrated.id),
+          {
+            ...hydrated,
+            // Keep previously fetched pages in the optimistic baseline so a
+            // metadata checkpoint never mistakes a prepend for a truncation.
+            events: [...hydrated.events, ...baselineEvents].filter((event, index, all) =>
+              all.findIndex((candidate) => eventIdentity(candidate) === eventIdentity(event)) === index,
+            ),
+          },
+        ],
+        version: AGENT_THREAD_STORAGE_VERSION,
+      });
+      revisions.set(storageKey, body.revision as number);
+      return { thread: hydrated, window: body.eventWindow };
     },
     async repairThread(storageKey, threadId) {
       preferredThreadId = threadId;
@@ -337,6 +384,18 @@ async function readCollectionResponse(response: Response): Promise<{
   }
   const collection = parseThreadCollection(body.collection);
   return { collection, revision: body.revision as number };
+}
+
+function isTranscriptWindow(value: unknown): value is AgentTranscriptWindow {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  const startIndex = candidate.startIndex;
+  const endIndex = candidate.endIndex;
+  const total = candidate.total;
+  return Number.isSafeInteger(startIndex) && (startIndex as number) >= 0 &&
+    Number.isSafeInteger(endIndex) && (endIndex as number) >= (startIndex as number) &&
+    Number.isSafeInteger(total) && (total as number) >= (endIndex as number) &&
+    typeof candidate.hasMoreBefore === "boolean";
 }
 
 function collectionUrl(

@@ -161,6 +161,7 @@ function parseThread(value) {
         : [];
     const retainedContext = sanitizeRetainedContext(value.retainedContext) ?? [];
     const transcriptCoverage = parseTranscriptCoverage(value.transcriptCoverage);
+    const transcriptWindow = parseTranscriptWindow(value.transcriptWindow);
     const rawEvents = Array.isArray(value.events)
         ? value.events
         : [];
@@ -194,8 +195,23 @@ function parseThread(value) {
         },
         status,
         ...(transcriptCoverage ? { transcriptCoverage } : {}),
+        ...(transcriptWindow ? { transcriptWindow } : {}),
         title: value.title,
         updatedAt,
+    };
+}
+function parseTranscriptWindow(value) {
+    if (!isRecord(value) ||
+        typeof value.startIndex !== "number" || !Number.isSafeInteger(value.startIndex) || value.startIndex < 0 ||
+        typeof value.endIndex !== "number" || !Number.isSafeInteger(value.endIndex) || value.endIndex < value.startIndex ||
+        typeof value.total !== "number" || !Number.isSafeInteger(value.total) || value.total < value.endIndex ||
+        typeof value.hasMoreBefore !== "boolean")
+        return undefined;
+    return {
+        endIndex: value.endIndex,
+        hasMoreBefore: value.hasMoreBefore,
+        startIndex: value.startIndex,
+        total: value.total,
     };
 }
 function parseTranscriptCoverage(value) {

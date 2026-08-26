@@ -19,7 +19,7 @@ import { AgentSubagentMenu } from "./agent-subagent-menu.js";
 import { AgentSecondaryView, type AgentSecondaryChild, type AgentSecondaryTab } from "./agent-secondary-view.js";
 import { AgentThreadView } from "./agent-thread.js";
 import { cn } from "../utils.js";
-import type { AgentAssetEndpoint, AgentDeliverableEndpoint, AgentInterruptedTurn, AgentModelOption, AgentPendingTurn, AgentQueuedTurn, AgentSessionAsset, AgentSessionBoundary, AgentSessionInspector, AgentSessionDeliverable, AgentSubagentController, AgentSubagentLoader, AgentSubagentSummary, AgentThread, AgentThreadPatch, AgentThreadPreferences, AgentWorkspaceClientConfig, AgentWorkspaceMailbox } from "./contracts.js";
+import type { AgentAssetEndpoint, AgentDeliverableEndpoint, AgentInterruptedTurn, AgentModelOption, AgentPendingTurn, AgentQueuedTurn, AgentSessionAsset, AgentSessionBoundary, AgentSessionInspector, AgentSessionDeliverable, AgentSubagentController, AgentSubagentLoader, AgentSubagentSummary, AgentThread, AgentThreadPatch, AgentThreadPreferences, AgentTranscriptWindow, AgentWorkspaceClientConfig, AgentWorkspaceMailbox } from "./contracts.js";
 import { AgentThreadStorageConflictError, AgentThreadStorageHttpError } from "./http-thread-storage.js";
 import { messagesFor, resolveBrowserLocale, type AgentLocale, type AgentMessages } from "./i18n.js";
 import {
@@ -131,6 +131,7 @@ export function AgentWorkspace({
   const [recoveryErrors, setRecoveryErrors] = useState<Map<string, string>>(new Map());
   const [hydratingThreadIds, setHydratingThreadIds] = useState<Set<string>>(new Set());
   const [threadHydrationErrors, setThreadHydrationErrors] = useState<Map<string, string>>(new Map());
+  const [threadHistoryLoading, setThreadHistoryLoading] = useState<Set<string>>(new Set());
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [workbenchMode, setWorkbenchMode] = useState<WorkbenchLayoutMode>("split");
   const [panelResizing, setPanelResizing] = useState(false);
@@ -155,6 +156,7 @@ export function AgentWorkspace({
   const recoveryControllers = useRef(new Map<string, AbortController>());
   const runtimeChecksStarted = useRef(new Set<string>());
   const hydrationInFlight = useRef(new Set<string>());
+  const historyWindowInFlight = useRef(new Set<string>());
   const serverHydrationThreads = useRef(new Set<string>());
   const storageSaveQueue = useRef<Promise<void>>(Promise.resolve());
   const storageSaveTimer = useRef<number | undefined>(undefined);
@@ -813,19 +815,25 @@ export function AgentWorkspace({
   const hydrateThread = useCallback((thread: AgentThread) => {
     if (
       thread.hydration !== "summary" ||
-      !threadStorage.loadThread ||
+      (!threadStorage.loadThread && !threadStorage.loadThreadWindow) ||
       hydrationInFlight.current.has(thread.id)
     ) return;
     hydrationInFlight.current.add(thread.id);
     serverHydrationThreads.current.add(thread.id);
     setThreadHydrationErrors((current) => withoutMapKey(current, thread.id));
     setHydratingThreadIds((current) => new Set(current).add(thread.id));
-    const loadHydratedThread = async (): Promise<AgentThread | undefined> => {
+    const loadHydratedThread = async (): Promise<{ readonly thread: AgentThread; readonly window?: AgentTranscriptWindow } | undefined> => {
       // Load the durable UI transcript first. Older checkpoints can have a
       // stale coverage marker even though their append-only event log is
       // complete. Repairing before this read would replay a potentially
       // hundreds-of-megabytes Eve stream on every page open.
-      const hydrated = await threadStorage.loadThread!(storageKey, thread.id);
+      if (threadStorage.loadThreadWindow) {
+        const windowed = await threadStorage.loadThreadWindow(storageKey, thread.id);
+        if (!windowed) return undefined;
+        return { thread: windowed.thread, window: windowed.window };
+      }
+      if (!threadStorage.loadThread) return undefined;
+      const hydrated = await threadStorage.loadThread(storageKey, thread.id);
       if (!hydrated) return undefined;
       if (
         threadStorage.repairThread &&
@@ -834,16 +842,17 @@ export function AgentWorkspace({
       ) {
         try {
           const repaired = await threadStorage.repairThread(storageKey, thread.id);
-          if (repaired) return repaired;
+          if (repaired) return { thread: repaired };
         } catch (error) {
           if (!(error instanceof AgentThreadStorageHttpError) || error.status !== 409) throw error;
         }
       }
-      return hydrated;
+      return { thread: hydrated };
     };
     void loadHydratedThread()
-      .then((hydrated) => {
-        if (!hydrated) throw new Error("The selected Agent session no longer exists.");
+      .then((loaded) => {
+        if (!loaded) throw new Error("The selected Agent session no longer exists.");
+        const hydrated = loaded.thread;
         const sanitizedEvents = compactThreadEvents(hydrated.events);
         const reconciledPendingTurn = reconcileHydratedPendingTurn(
           hydrated.pendingTurn,
@@ -865,14 +874,18 @@ export function AgentWorkspace({
               ...(reconciledPendingTurn ? { pendingTurn: reconciledPendingTurn } : {}),
               ...(!reconciledPendingTurn ? { pendingTurn: undefined } : {}),
               ...(healedCoverage ? { transcriptCoverage: healedCoverage } : {}),
+              ...(loaded.window ? { transcriptWindow: loaded.window } : {}),
               updatedAt: Date.now(),
             };
+        const withWindow = loaded.window && nextThread.transcriptWindow !== loaded.window
+          ? { ...nextThread, transcriptWindow: loaded.window }
+          : nextThread;
         setThreads((current) => {
-          const next = current.map((candidate) => candidate.id === thread.id ? nextThread : candidate);
+          const next = current.map((candidate) => candidate.id === thread.id ? withWindow : candidate);
           threadsRef.current = next;
           return next;
         });
-        void inspectThreadRuntime(nextThread);
+        void inspectThreadRuntime(withWindow);
       })
       .catch((error: unknown) => {
         onStorageError?.(error);
@@ -886,6 +899,44 @@ export function AgentWorkspace({
         setHydratingThreadIds((current) => withoutSetValue(current, thread.id));
       });
   }, [inspectThreadRuntime, messages.recoveryFailed, onStorageError, storageKey, threadStorage]);
+
+  const loadEarlierThreadEvents = useCallback(async (threadId: string) => {
+    const current = threadsRef.current.find((candidate) => candidate.id === threadId);
+    const window = current?.transcriptWindow;
+    if (
+      !current || !window?.hasMoreBefore || !threadStorage.loadThreadWindow ||
+      historyWindowInFlight.current.has(threadId)
+    ) return;
+    historyWindowInFlight.current.add(threadId);
+    setThreadHistoryLoading((value) => new Set(value).add(threadId));
+    try {
+      const loaded = await threadStorage.loadThreadWindow(storageKey, threadId, {
+        before: window.startIndex,
+      });
+      if (!loaded) return;
+      const latest = threadsRef.current.find((candidate) => candidate.id === threadId);
+      if (!latest) return;
+      const mergedEvents = compactThreadEvents([
+        ...loaded.thread.events,
+        ...latest.events,
+      ]);
+      updateThread(threadId, {
+        events: mergedEvents,
+        transcriptWindow: {
+          endIndex: Math.max(window.endIndex, loaded.window.endIndex),
+          hasMoreBefore: loaded.window.hasMoreBefore,
+          startIndex: loaded.window.startIndex,
+          total: Math.max(window.total, loaded.window.total),
+        },
+        updatedAt: Date.now(),
+      });
+    } catch (error) {
+      onStorageError?.(error);
+    } finally {
+      historyWindowInFlight.current.delete(threadId);
+      setThreadHistoryLoading((value) => withoutSetValue(value, threadId));
+    }
+  }, [onStorageError, storageKey, threadStorage, updateThread]);
 
   useEffect(() => {
     if (
@@ -1562,6 +1613,8 @@ export function AgentWorkspace({
                 ? `${storageKey}:draft:new`
                 : `${storageKey}:draft:${activeThread.id}`}
               isRecovering={activeIsRecovering}
+              historyHasMore={activeThread.transcriptWindow?.hasMoreBefore === true}
+              historyLoading={threadHistoryLoading.has(activeThread.id)}
               key={`${activeThread.id}:${activeThread.revision ?? 0}:${activeIsRecovering ? "recovering" : "ready"}`}
               locale={locale}
               mailbox={mailbox}
@@ -1572,6 +1625,7 @@ export function AgentWorkspace({
               onEvent={onEvent}
               onOpenDeliverable={openDeliverable}
               onOpenSubagent={openSubagent}
+              onLoadEarlier={() => loadEarlierThreadEvents(activeThread.id)}
               onRetryRecovery={() => requestThreadRecovery(activeThread.id)}
               onRecoveryNeeded={recoverActiveThread}
               providerReady={runtimeStatus.provider !== "unconfigured"}
@@ -2182,6 +2236,17 @@ function threadNeedsRecovery(thread: AgentThread): boolean {
 
 function threadNeedsRuntimeInspection(thread: AgentThread): boolean {
   if (threadNeedsRecovery(thread)) return true;
+  // A bounded history window is expected for settled sessions. Its missing
+  // prefix is a pagination concern, not evidence that Eve is still running;
+  // probing it and invoking transcript repair would re-read the full stream
+  // on every refresh. Active/cancelling states still require inspection.
+  if (
+    thread.transcriptWindow &&
+    thread.status !== "streaming" &&
+    thread.status !== "submitted" &&
+    thread.status !== "cancelling" &&
+    !thread.pendingTurn
+  ) return false;
   if (!transcriptCoversSession(thread)) return true;
   return thread.pendingTurn?.state === "clearing" ||
     thread.pendingTurn?.state === "resubmitting" ||
@@ -2306,9 +2371,10 @@ async function saveThreadCollectionWithConflictRecovery(
       if (!(error instanceof AgentThreadStorageConflictError) || attempt === 2) throw error;
       // The normal HTTP load is an index-only read. Merging that summary into
       // a local checkpoint would replace a complete remote transcript with an
-      // empty `events` array on the next PATCH. Hydrate every remote summary
-      // before resolving a revision conflict; the extra reads occur only on a
-      // conflict and keep the append-only event log authoritative.
+      // empty `events` array on the next PATCH. Hydrate a bounded remote
+      // window before resolving a revision conflict; the extra reads occur
+      // only on a conflict and keep the append-only event log authoritative
+      // without materializing every historical event.
       const remote = await loadConflictCollection(storageKey, storage);
       candidate = mergeThreadCollectionsForConflict(candidate, remote);
     }
@@ -2321,7 +2387,7 @@ async function loadConflictCollection(
   storage: AgentThreadStorage,
 ): Promise<AgentThreadCollection> {
   const index = await storage.load(storageKey);
-  if (!storage.loadThread) return index;
+  if (!storage.loadThread && !storage.loadThreadWindow) return index;
   const threads: AgentThread[] = [];
   // Keep hydration sequential. createHttpAgentThreadStorage updates its
   // baseline after each single-thread read; parallel reads can race and leave
@@ -2333,7 +2399,11 @@ async function loadConflictCollection(
       continue;
     }
     try {
-      threads.push(await storage.loadThread!(storageKey, thread.id) ?? thread);
+      if (storage.loadThreadWindow) {
+        threads.push((await storage.loadThreadWindow(storageKey, thread.id))?.thread ?? thread);
+      } else {
+        threads.push(await storage.loadThread!(storageKey, thread.id) ?? thread);
+      }
     } catch {
       // Preserve the summary only when a single thread cannot be hydrated;
       // the conflict merge will prefer any complete local transcript over

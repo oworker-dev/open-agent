@@ -81,6 +81,8 @@ export function AgentThreadView({
   client,
   commands,
   draftStorageKey,
+  historyHasMore = false,
+  historyLoading = false,
   isRecovering = false,
   locale,
   mailbox,
@@ -91,6 +93,7 @@ export function AgentThreadView({
   onEvent,
   onOpenDeliverable,
   onOpenSubagent,
+  onLoadEarlier,
   onRetryRecovery,
   onRecoveryNeeded,
   providerReady,
@@ -101,6 +104,8 @@ export function AgentThreadView({
   readonly client?: AgentWorkspaceClientConfig;
   readonly commands: readonly AgentPromptMenuItem[];
   readonly draftStorageKey: string;
+  readonly historyHasMore?: boolean;
+  readonly historyLoading?: boolean;
   readonly isRecovering?: boolean;
   readonly locale: AgentLocale;
   readonly mailbox?: AgentWorkspaceMailbox;
@@ -111,6 +116,7 @@ export function AgentThreadView({
   readonly onEvent?: (event: MessageStreamEvent) => void;
   readonly onOpenDeliverable?: (deliverable: AgentSessionDeliverable) => void;
   readonly onOpenSubagent?: (sessionId: string) => void;
+  readonly onLoadEarlier?: () => void;
   readonly onRetryRecovery?: () => void;
   readonly onRecoveryNeeded: () => void;
   readonly providerReady: boolean;
@@ -1533,6 +1539,8 @@ export function AgentThreadView({
             />
           ) : undefined}
           draftStorageKey={draftStorageKey}
+          historyHasMore={historyHasMore}
+          historyLoading={historyLoading}
           events={displayEvents}
           eveMessages={visibleMessages}
           fallbackStartedAt={thread.pendingTurn?.submittedAt}
@@ -1546,6 +1554,7 @@ export function AgentThreadView({
           onCloseInputRequest={closeInputRequest}
           onOpenDeliverable={onOpenDeliverable}
           onOpenSubagent={onOpenSubagent}
+          onLoadEarlier={onLoadEarlier}
           onPreferencesChange={(preferences) => onChange({ preferences })}
           onDraftRestoreConsumed={(id) => {
             if (thread.draftRestore?.id === id) onChange({ draftRestore: undefined });

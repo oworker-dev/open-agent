@@ -508,6 +508,10 @@ become unbounded write loops. Normal checkpoints use only event deltas; the
 legacy `PUT` full snapshot route has a separate 64 MiB compatibility guard and
 is not a session or context-window limit. Large assets remain object-storage
 references and large transcripts are hydrated by thread rather than collection.
+The HTTP adapter's `eventWindow=1` route returns a bounded tail (`eventLimit`,
+default 256) with `startIndex`, `endIndex`, `total`, and `hasMoreBefore`; the
+workspace uses that contract to load older history on demand instead of
+replaying a settled session from cursor zero.
 Production PostgreSQL deployments must apply migration `0010_thread_event_log.sql`;
 it backfills legacy JSONB events and moves subsequent append checkpoints to the
 bounded event log. The JSONB collection remains a metadata/compatibility snapshot,

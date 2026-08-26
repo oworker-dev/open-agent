@@ -1,5 +1,5 @@
 import type { MessageStreamEvent } from "eve/client";
-import type { AgentPendingTurn, AgentThread, AgentThreadPreferences } from "./contracts.js";
+import type { AgentPendingTurn, AgentThread, AgentThreadPreferences, AgentTranscriptWindow } from "./contracts.js";
 export declare const AGENT_THREAD_STORAGE_VERSION = 2;
 export type AgentThreadCollection = {
     readonly activeThreadId?: string;
@@ -9,6 +9,13 @@ export type AgentThreadCollection = {
 export type AgentThreadStorage = {
     load(storageKey: string): AgentThreadCollection | Promise<AgentThreadCollection>;
     loadThread?(storageKey: string, threadId: string): AgentThread | undefined | Promise<AgentThread | undefined>;
+    loadThreadWindow?(storageKey: string, threadId: string, options?: {
+        readonly before?: number;
+        readonly limit?: number;
+    }): Promise<{
+        readonly thread: AgentThread;
+        readonly window: AgentTranscriptWindow;
+    } | undefined>;
     repairThread?(storageKey: string, threadId: string): AgentThread | undefined | Promise<AgentThread | undefined>;
     save(storageKey: string, collection: AgentThreadCollection): void | Promise<void>;
 };

@@ -145,3 +145,48 @@ test("hydrating one thread removes the index-only summary marker", async () => {
   assert.equal(loadedSql.includes("thread - 'events' - 'hydration'"), true);
   assert.equal(loadedSql.includes("jsonb_build_object(\n            'events'"), true);
 });
+
+test("loads a bounded ordered transcript window without aggregating the full event log", async () => {
+  const calls: string[] = [];
+  const pool = {
+    async query(sql: string) {
+      calls.push(sql);
+      if (sql.includes("with target as")) {
+        return {
+          rows: [{
+            thread: { id: "thread-1", events: [{ type: "event-2" }, { type: "event-3" }] },
+            revision: "7",
+            total: "10",
+            start_index: "8",
+            end_index: "10",
+            has_more_before: true,
+          }],
+        } as unknown as QueryResult;
+      }
+      throw new Error(`Unexpected query: ${sql}`);
+    },
+  } as unknown as Pool;
+  const store = createPostgresThreadCollectionStore(config, pool);
+
+  const result = await store.loadThreadWindow?.(
+    "tenant-1",
+    "principal-1",
+    "workspace-1",
+    "thread-1",
+    { before: 10, limit: 2 },
+  );
+
+  assert.equal(result?.revision, 7);
+  assert.deepEqual(result?.window, {
+    endIndex: 10,
+    hasMoreBefore: true,
+    startIndex: 8,
+    total: 10,
+  });
+  assert.deepEqual((result?.thread as { events?: unknown[] }).events, [
+    { type: "event-2" },
+    { type: "event-3" },
+  ]);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0]!, /limit \$6/u);
+});

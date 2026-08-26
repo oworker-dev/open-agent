@@ -157,6 +157,33 @@ test("loads a lightweight thread index before fetching one transcript", async ()
   assert.match(requestedUrls[1] ?? "", new RegExp(`threadId=${thread.id}`));
 });
 
+test("loads transcript windows with an absolute before cursor", async () => {
+  const thread = createAgentThread(100, "Windowed");
+  const urls: string[] = [];
+  const storage = createHttpAgentThreadStorage({
+    fetch: (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      urls.push(url);
+      return Response.json({
+        eventWindow: { endIndex: 12, hasMoreBefore: true, startIndex: 8, total: 20 },
+        revision: 3,
+        thread: {
+          ...thread,
+          events: [{ type: "step.started", data: {}, meta: { id: "evt-8", at: new Date(0).toISOString() } }],
+        },
+      });
+    }) as typeof fetch,
+  });
+
+  const page = await storage.loadThreadWindow?.("workspace-window", thread.id, { before: 12, limit: 4 });
+
+  assert.equal(page?.window.startIndex, 8);
+  assert.equal(page?.window.endIndex, 12);
+  assert.match(urls[0] ?? "", /eventWindow=1/u);
+  assert.match(urls[0] ?? "", /eventBefore=12/u);
+  assert.match(urls[0] ?? "", /eventLimit=4/u);
+});
+
 test("a server transcript repair advances the revision used by the next metadata save", async () => {
   const thread = {
     ...createAgentThread(100, "Repair me"),

@@ -63,6 +63,45 @@ export function createHttpAgentThreadStorage(options) {
             }
             return hydrated;
         },
+        async loadThreadWindow(storageKey, threadId, windowOptions = {}) {
+            preferredThreadId = threadId;
+            const query = { eventWindow: "1", threadId };
+            if (windowOptions.before !== undefined)
+                query.eventBefore = String(windowOptions.before);
+            if (windowOptions.limit !== undefined)
+                query.eventLimit = String(windowOptions.limit);
+            const response = await request(fetchImplementation, options, collectionUrl(endpoint, storageKey, query));
+            await requireOk(response);
+            const body = await response.json();
+            if (!Number.isSafeInteger(body.revision) || body.revision < 0) {
+                throw new Error("Agent thread storage returned an invalid revision.");
+            }
+            if (body.thread == null || !isTranscriptWindow(body.eventWindow))
+                return undefined;
+            const parsedThread = parseThreadCollection({
+                threads: [body.thread],
+                version: AGENT_THREAD_STORAGE_VERSION,
+            }).threads[0];
+            if (!parsedThread)
+                return undefined;
+            const hydrated = withoutSummaryHydration(parsedThread);
+            const baseline = baselines.get(storageKey);
+            const baselineThread = baseline?.threads.find((thread) => thread.id === hydrated.id);
+            const baselineEvents = baselineThread?.events ?? [];
+            baselines.set(storageKey, {
+                ...(baseline?.activeThreadId ? { activeThreadId: baseline.activeThreadId } : {}),
+                threads: [
+                    ...(baseline?.threads ?? []).filter((thread) => thread.id !== hydrated.id),
+                    {
+                        ...hydrated,
+                        events: [...hydrated.events, ...baselineEvents].filter((event, index, all) => all.findIndex((candidate) => eventIdentity(candidate) === eventIdentity(event)) === index),
+                    },
+                ],
+                version: AGENT_THREAD_STORAGE_VERSION,
+            });
+            revisions.set(storageKey, body.revision);
+            return { thread: hydrated, window: body.eventWindow };
+        },
         async repairThread(storageKey, threadId) {
             preferredThreadId = threadId;
             const response = await request(fetchImplementation, options, repairCollectionUrl(endpoint, storageKey, { threadId }), {
@@ -240,6 +279,18 @@ async function readCollectionResponse(response) {
     }
     const collection = parseThreadCollection(body.collection);
     return { collection, revision: body.revision };
+}
+function isTranscriptWindow(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value))
+        return false;
+    const candidate = value;
+    const startIndex = candidate.startIndex;
+    const endIndex = candidate.endIndex;
+    const total = candidate.total;
+    return Number.isSafeInteger(startIndex) && startIndex >= 0 &&
+        Number.isSafeInteger(endIndex) && endIndex >= startIndex &&
+        Number.isSafeInteger(total) && total >= endIndex &&
+        typeof candidate.hasMoreBefore === "boolean";
 }
 function collectionUrl(endpoint, storageKey, query) {
     const url = `${endpoint}/${encodeURIComponent(storageKey)}`;

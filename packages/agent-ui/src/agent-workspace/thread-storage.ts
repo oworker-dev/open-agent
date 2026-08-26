@@ -1,5 +1,5 @@
 import type { MessageStreamEvent } from "eve/client";
-import type { AgentPendingTurn, AgentQueuedTurn, AgentThread, AgentThreadPreferences, AgentThreadSessionState, AgentThreadStatus, AgentTranscriptCoverage, PromptInputMessage } from "./contracts.js";
+import type { AgentPendingTurn, AgentQueuedTurn, AgentThread, AgentThreadPreferences, AgentThreadSessionState, AgentThreadStatus, AgentTranscriptCoverage, AgentTranscriptWindow, PromptInputMessage } from "./contracts.js";
 import { sanitizeRetainedContext } from "./retained-context.js";
 
 export const AGENT_THREAD_STORAGE_VERSION = 2;
@@ -19,6 +19,11 @@ export type AgentThreadCollection = {
 export type AgentThreadStorage = {
   load(storageKey: string): AgentThreadCollection | Promise<AgentThreadCollection>;
   loadThread?(storageKey: string, threadId: string): AgentThread | undefined | Promise<AgentThread | undefined>;
+  loadThreadWindow?(
+    storageKey: string,
+    threadId: string,
+    options?: { readonly before?: number; readonly limit?: number },
+  ): Promise<{ readonly thread: AgentThread; readonly window: AgentTranscriptWindow } | undefined>;
   /** Rebuilds an unverified settled Eve transcript on the host/server. */
   repairThread?(storageKey: string, threadId: string): AgentThread | undefined | Promise<AgentThread | undefined>;
   save(storageKey: string, collection: AgentThreadCollection): void | Promise<void>;
@@ -208,6 +213,7 @@ function parseThread(value: unknown): AgentThread | undefined {
     : [];
   const retainedContext = sanitizeRetainedContext(value.retainedContext) ?? [];
   const transcriptCoverage = parseTranscriptCoverage(value.transcriptCoverage);
+  const transcriptWindow = parseTranscriptWindow(value.transcriptWindow);
   const rawEvents = Array.isArray(value.events)
     ? (value.events as readonly MessageStreamEvent[])
     : [];
@@ -243,8 +249,23 @@ function parseThread(value: unknown): AgentThread | undefined {
     },
     status,
     ...(transcriptCoverage ? { transcriptCoverage } : {}),
+    ...(transcriptWindow ? { transcriptWindow } : {}),
     title: value.title,
     updatedAt,
+  };
+}
+
+function parseTranscriptWindow(value: unknown): AgentTranscriptWindow | undefined {
+  if (!isRecord(value) ||
+      typeof value.startIndex !== "number" || !Number.isSafeInteger(value.startIndex) || value.startIndex < 0 ||
+      typeof value.endIndex !== "number" || !Number.isSafeInteger(value.endIndex) || value.endIndex < value.startIndex ||
+      typeof value.total !== "number" || !Number.isSafeInteger(value.total) || value.total < value.endIndex ||
+      typeof value.hasMoreBefore !== "boolean") return undefined;
+  return {
+    endIndex: value.endIndex,
+    hasMoreBefore: value.hasMoreBefore,
+    startIndex: value.startIndex,
+    total: value.total,
   };
 }
 

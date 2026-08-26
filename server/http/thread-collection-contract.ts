@@ -136,7 +136,7 @@ function mergeSummaryThread(
     title: replacement.title,
     updatedAt: replacement.updatedAt,
   };
-  for (const key of ["draftRestore", "interruptedTurns", "pendingTurn", "retainedContext"] as const) {
+  for (const key of ["draftRestore", "interruptedTurns", "pendingTurn", "retainedContext", "transcriptWindow"] as const) {
     if (Object.prototype.hasOwnProperty.call(replacement, key)) next[key] = replacement[key];
     else delete next[key];
   }
@@ -202,6 +202,7 @@ export function summarizeThreadCollection(
           session: thread.session,
           status: thread.status,
           ...(thread.transcriptCoverage ? { transcriptCoverage: thread.transcriptCoverage } : {}),
+          ...(thread.transcriptWindow ? { transcriptWindow: thread.transcriptWindow } : {}),
           title: thread.title,
           updatedAt: thread.updatedAt,
         };

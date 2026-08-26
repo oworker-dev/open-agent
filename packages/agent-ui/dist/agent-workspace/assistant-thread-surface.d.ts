@@ -12,7 +12,7 @@ export type AgentApprovalTakeover = {
     readonly prompt: string;
     readonly toolName: string;
 };
-export declare function AssistantThreadSurface({ assetUrl, approvalTakeover, cancellationState, closedInputRequestIds, commands, composerTop, draftStorageKey, draftRestore, events, eveMessages, fallbackStartedAt, inputDisabled, isBusy, locale, mentions, messages, models, onInputResponses, onCloseInputRequest, onDraftRestoreConsumed, onOpenDeliverable, onOpenSubagent, onPreferencesChange, onRetryRuntimeError, preferences, reasoningLevels, runtimeError, usage, }: {
+export declare function AssistantThreadSurface({ assetUrl, approvalTakeover, cancellationState, closedInputRequestIds, commands, composerTop, draftStorageKey, draftRestore, events, eveMessages, fallbackStartedAt, historyHasMore, historyLoading, inputDisabled, isBusy, locale, mentions, messages, models, onInputResponses, onCloseInputRequest, onDraftRestoreConsumed, onOpenDeliverable, onOpenSubagent, onLoadEarlier, onPreferencesChange, onRetryRuntimeError, preferences, reasoningLevels, runtimeError, usage, }: {
     readonly assetUrl?: (assetId: string) => string;
     readonly approvalTakeover?: AgentApprovalTakeover;
     readonly cancellationState: AgentCancellationState;
@@ -24,6 +24,8 @@ export declare function AssistantThreadSurface({ assetUrl, approvalTakeover, can
     readonly events: readonly MessageStreamEvent[];
     readonly eveMessages: readonly EveMessage[];
     readonly fallbackStartedAt?: number;
+    readonly historyHasMore?: boolean;
+    readonly historyLoading?: boolean;
     readonly inputDisabled?: boolean;
     readonly isBusy: boolean;
     readonly locale: AgentLocale;
@@ -35,6 +37,7 @@ export declare function AssistantThreadSurface({ assetUrl, approvalTakeover, can
     readonly onDraftRestoreConsumed: (id: string) => void;
     readonly onOpenDeliverable?: (deliverable: AgentSessionDeliverable) => void;
     readonly onOpenSubagent?: (sessionId: string) => void;
+    readonly onLoadEarlier?: () => void;
     readonly onPreferencesChange: (preferences: AgentThreadPreferences) => void;
     readonly onRetryRuntimeError?: () => void;
     readonly preferences: AgentThreadPreferences;

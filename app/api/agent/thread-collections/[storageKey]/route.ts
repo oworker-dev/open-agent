@@ -15,6 +15,8 @@ export const runtime = "nodejs";
 // checkpoints use PATCH event deltas and never scale with transcript size.
 const MAX_LEGACY_SNAPSHOT_BYTES = 64 * 1024 * 1024;
 const MAX_PATCH_BYTES = 64 * 1024 * 1024;
+const DEFAULT_EVENT_WINDOW = 256;
+const MAX_EVENT_WINDOW = 1_000;
 const store = createPostgresThreadCollectionStoreFromEnvironment<AgentThreadCollection>();
 
 type RouteContext = { readonly params: Promise<{ readonly storageKey: string }> };
@@ -28,6 +30,21 @@ export async function GET(request: Request, context: RouteContext): Promise<Resp
   const url = new URL(request.url);
   const threadId = url.searchParams.get("threadId");
   const indexView = url.searchParams.get("view") === "index";
+  if (threadId && url.searchParams.get("eventWindow") === "1" && store.loadThreadWindow) {
+    const window = parseEventWindow(url);
+    if (!window) return problem(400, "invalid_event_window", "The event window cursor or limit is invalid.");
+    const record = await store.loadThreadWindow(
+      authenticated.identity.tenantId,
+      authenticated.identity.principalId,
+      storageKey,
+      threadId,
+      window,
+    );
+    return Response.json(
+      { eventWindow: record?.window ?? null, revision: record?.revision ?? 0, thread: record?.thread ?? null },
+      { headers: responseHeaders(record?.revision ?? 0) },
+    );
+  }
   if (threadId && !indexView && store.loadThread) {
     const record = await store.loadThread(
       authenticated.identity.tenantId,
@@ -60,6 +77,17 @@ export async function GET(request: Request, context: RouteContext): Promise<Resp
     { collection: responseCollection, revision },
     { headers: responseHeaders(revision) },
   );
+}
+
+function parseEventWindow(url: URL): { before?: number; limit: number } | undefined {
+  const rawBefore = url.searchParams.get("eventBefore");
+  const rawLimit = url.searchParams.get("eventLimit");
+  const limit = rawLimit === null ? DEFAULT_EVENT_WINDOW : Number(rawLimit);
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_EVENT_WINDOW) return undefined;
+  if (rawBefore === null || rawBefore === "") return { limit };
+  const before = Number(rawBefore);
+  if (!Number.isSafeInteger(before) || before < 0) return undefined;
+  return { before, limit };
 }
 
 export async function PUT(request: Request, context: RouteContext): Promise<Response> {

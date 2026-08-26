@@ -16,6 +16,18 @@ export type StoredThread<TThread = unknown> = {
   readonly revision: number;
 };
 
+/** A bounded, ordered slice of the append-only transcript. Indexes are
+ * collection-event indexes (zero-based, end exclusive), not an arbitrary
+ * retention limit and not the Eve runtime cursor. */
+export type StoredThreadWindow<TThread = unknown> = StoredThread<TThread> & {
+  readonly window: {
+    readonly endIndex: number;
+    readonly hasMoreBefore: boolean;
+    readonly startIndex: number;
+    readonly total: number;
+  };
+};
+
 export type ThreadCollectionWriteResult<TCollection> =
   | { readonly record: StoredThreadCollection<TCollection>; readonly status: "saved" }
   | { readonly currentRevision: number; readonly status: "conflict" };
@@ -52,6 +64,14 @@ export interface AgentThreadCollectionStore<TCollection = unknown> {
     storageKey: string,
     threadId: string,
   ): Promise<StoredThread | undefined>;
+  /** Reads one bounded transcript window without materializing older events. */
+  loadThreadWindow?(
+    tenantId: string,
+    principalId: string,
+    storageKey: string,
+    threadId: string,
+    options?: { readonly before?: number; readonly limit?: number },
+  ): Promise<StoredThreadWindow | undefined>;
   /** Applies normal append-only stream checkpoints without loading history. */
   patch?(
     tenantId: string,
@@ -130,6 +150,7 @@ function postgresThreadCollectionStore<TCollection>(
                     'session', thread->'session',
                     'status', thread->'status',
                     'transcriptCoverage', thread->'transcriptCoverage',
+                    'transcriptWindow', thread->'transcriptWindow',
                     'title', thread->'title',
                     'updatedAt', thread->'updatedAt'
                   ) order by coalesce((thread->>'updatedAt')::double precision, 0) desc)
@@ -185,10 +206,105 @@ function postgresThreadCollectionStore<TCollection>(
       : undefined;
   };
 
+  const loadThreadWindow = async (
+    tenantId: string,
+    principalId: string,
+    storageKey: string,
+    threadId: string,
+    options: { readonly before?: number; readonly limit?: number } = {},
+  ): Promise<StoredThreadWindow | undefined> => {
+    assertScope(tenantId, principalId, storageKey);
+    assertText(threadId, "threadId", 200);
+    const limit = boundedWindowInteger(options.limit, 256, 1, 1_000, "limit");
+    const before = options.before === undefined
+      ? undefined
+      : boundedWindowInteger(options.before, 0, 0, Number.MAX_SAFE_INTEGER, "before");
+    // The bounds are computed in the same SQL snapshot as the selected rows.
+    // This keeps pagination monotonic when a live turn appends events between
+    // requests and avoids jsonb_agg over the whole transcript.
+    const result = await pool.query<{
+      end_index: string;
+      has_more_before: boolean;
+      revision: string;
+      start_index: string;
+      thread: unknown;
+      total: string;
+    }>(
+      `with target as (
+       select
+           (thread - 'events' - 'hydration') as metadata,
+           thread->'events' as legacy_events,
+           collection_row.revision::text as revision
+           from ${table} collection_row,
+                lateral jsonb_array_elements(coalesce(collection_row.collection->'threads', '[]'::jsonb)) as thread
+          where collection_row.tenant_id = $1
+            and collection_row.principal_id = $2
+            and collection_row.storage_key = $3
+            and thread->>'id' = $4
+          limit 1
+       ), counts as (
+         select coalesce((
+           select max(event_index) + 1
+             from ${eventTable}
+            where tenant_id = $1 and principal_id = $2 and storage_key = $3 and thread_id = $4
+         ), jsonb_array_length(coalesce(target.legacy_events, '[]'::jsonb)), 0)::text as total
+           from target
+       ), bounds as (
+         select
+           total,
+           least(total::bigint, coalesce($5::bigint, total::bigint)) as end_index,
+           greatest(0::bigint, least(total::bigint, coalesce($5::bigint, total::bigint)) - $6::bigint) as start_index
+           from counts
+       )
+       select
+         target.metadata || jsonb_build_object(
+           'events', coalesce((
+             select jsonb_agg(windowed.event order by windowed.event_index asc)
+               from (
+                 select entry.event_index, entry.event
+                   from ${eventTable} entry, bounds
+                  where entry.tenant_id = $1
+                    and entry.principal_id = $2
+                    and entry.storage_key = $3
+                    and entry.thread_id = $4
+                    and entry.event_index >= bounds.start_index
+                    and entry.event_index < bounds.end_index
+                  order by entry.event_index asc
+                  limit $6
+               ) as windowed
+           ), coalesce((
+             select jsonb_agg(legacy.value order by legacy.ordinality)
+               from target, bounds,
+                    jsonb_array_elements(coalesce(target.legacy_events, '[]'::jsonb)) with ordinality as legacy(value, ordinality)
+              where legacy.ordinality > bounds.start_index
+                and legacy.ordinality <= bounds.end_index
+           ), '[]'::jsonb))
+         ) as thread,
+         target.revision,
+         bounds.total,
+         bounds.start_index,
+         bounds.end_index,
+         (bounds.start_index > 0) as has_more_before
+         from target cross join bounds`,
+      [tenantId, principalId, storageKey, threadId, before ?? null, limit],
+    );
+    const row = result.rows[0];
+    if (!row) return undefined;
+    const total = parseRevision(row.total);
+    const startIndex = parseRevision(row.start_index);
+    const endIndex = parseRevision(row.end_index);
+    return {
+      thread: row.thread,
+      revision: parseRevision(row.revision),
+      window: { endIndex, hasMoreBefore: row.has_more_before === true, startIndex, total },
+    };
+  };
+
   return {
     load,
     loadIndex,
     loadThread,
+    loadThreadWindow,
     async patch(tenantId, principalId, storageKey, expectedRevision, input) {
       assertScope(tenantId, principalId, storageKey);
       assertRevision(expectedRevision);
@@ -412,6 +528,20 @@ function parseRevision(value: string): number {
   return revision;
 }
 
+function boundedWindowInteger(
+  value: number | undefined,
+  fallback: number,
+  minimum: number,
+  maximum: number,
+  name: string,
+): number {
+  const candidate = value ?? fallback;
+  if (!Number.isSafeInteger(candidate) || candidate < minimum || candidate > maximum) {
+    throw new Error(`${name} must be an integer from ${minimum} to ${maximum}.`);
+  }
+  return candidate;
+}
+
 function isRecordValue(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -452,7 +582,7 @@ function mergeSummaryThread(
     title: replacement.title,
     updatedAt: replacement.updatedAt,
   };
-  for (const key of ["draftRestore", "interruptedTurns", "pendingTurn", "retainedContext"] as const) {
+  for (const key of ["draftRestore", "interruptedTurns", "pendingTurn", "retainedContext", "transcriptWindow"] as const) {
     if (Object.prototype.hasOwnProperty.call(replacement, key)) next[key] = replacement[key];
     else delete next[key];
   }

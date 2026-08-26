@@ -82,6 +82,8 @@ export function AssistantThreadSurface({
   events,
   eveMessages,
   fallbackStartedAt,
+  historyHasMore = false,
+  historyLoading = false,
   inputDisabled,
   isBusy,
   locale,
@@ -93,6 +95,7 @@ export function AssistantThreadSurface({
   onDraftRestoreConsumed,
   onOpenDeliverable,
   onOpenSubagent,
+  onLoadEarlier,
   onPreferencesChange,
   onRetryRuntimeError,
   preferences,
@@ -111,6 +114,8 @@ export function AssistantThreadSurface({
   readonly events: readonly MessageStreamEvent[];
   readonly eveMessages: readonly EveMessage[];
   readonly fallbackStartedAt?: number;
+  readonly historyHasMore?: boolean;
+  readonly historyLoading?: boolean;
   /** Locks the main composer without disabling assistant-ui's edit composer. */
   readonly inputDisabled?: boolean;
   readonly isBusy: boolean;
@@ -123,6 +128,7 @@ export function AssistantThreadSurface({
   readonly onDraftRestoreConsumed: (id: string) => void;
   readonly onOpenDeliverable?: (deliverable: AgentSessionDeliverable) => void;
   readonly onOpenSubagent?: (sessionId: string) => void;
+  readonly onLoadEarlier?: () => void;
   readonly onPreferencesChange: (preferences: AgentThreadPreferences) => void;
   readonly onRetryRuntimeError?: () => void;
   readonly preferences: AgentThreadPreferences;
@@ -156,6 +162,19 @@ export function AssistantThreadSurface({
         data-slot="thread-viewport"
         role="log"
       >
+        {historyHasMore ? (
+          <div className="mx-auto mb-3 flex w-full max-w-(--thread-max-width) justify-center">
+            <Button
+              className="text-xs text-muted-foreground"
+              disabled={historyLoading}
+              onClick={onLoadEarlier}
+              size="sm"
+              variant="ghost"
+            >
+              {historyLoading ? (locale === "zh-CN" ? "正在加载更早消息…" : "Loading earlier messages…") : (locale === "zh-CN" ? "加载更早消息" : "Load earlier messages")}
+            </Button>
+          </div>
+        ) : null}
         <div className="mx-auto flex w-full max-w-(--thread-max-width) flex-col gap-6 pb-3 empty:hidden">
           <ThreadPrimitive.Messages>
             {({ message }) => message.composer.isEditing ? (
