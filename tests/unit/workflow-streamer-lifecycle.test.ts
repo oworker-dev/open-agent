@@ -67,6 +67,25 @@ test("stops historical pagination after a reader is cancelled", async () => {
   }
 });
 
+test("keeps a live stream open when history has no EOF", async () => {
+  const drizzle = fakeDrizzle([chunk("chnk_0001", "one")]);
+  const streamer = createStreamer(fakePool(), drizzle);
+  try {
+    const stream = await streamer.streams.get("run", "stream", 0);
+    const reader = stream.getReader();
+    const first = await reader.read();
+    assert.deepEqual(first.value, new Uint8Array(Buffer.from("one")));
+    assert.equal(first.done, false);
+    const pending = reader.read();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(drizzle.eofQueries, 0);
+    await reader.cancel();
+    await pending.catch(() => undefined);
+  } finally {
+    await streamer.close();
+  }
+});
+
 function fakePool() {
   return {
     options: {},
