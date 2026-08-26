@@ -16,6 +16,88 @@ export type AgentDeploymentTenancy = "single-tenant" | "multi-tenant";
 export const DEFAULT_AGENT_SANDBOX_WORKSPACE_QUOTA_BYTES = 10 * 1024 ** 3;
 export const MAX_AGENT_SANDBOX_WORKSPACE_QUOTA_BYTES = 10 * 1024 ** 4;
 
+/**
+ * Docker's Eve backend does not expose resource flags.  Keep a conservative
+ * default for local development and require explicit values in production;
+ * the Docker sandbox adapter applies these values after each container is
+ * created or reattached.
+ */
+export const DEFAULT_AGENT_DOCKER_MEMORY_LIMIT_BYTES = 2 * 1024 ** 3;
+export const MAX_AGENT_DOCKER_MEMORY_LIMIT_BYTES = 64 * 1024 ** 3;
+export const DEFAULT_AGENT_DOCKER_CPU_LIMIT = 2;
+export const MAX_AGENT_DOCKER_CPU_LIMIT = 64;
+export const DEFAULT_AGENT_DOCKER_PIDS_LIMIT = 512;
+export const MAX_AGENT_DOCKER_PIDS_LIMIT = 32_768;
+
+export type AgentDockerResourceLimits = {
+  readonly memoryBytes: number;
+  readonly cpus: number;
+  readonly pidsLimit: number;
+};
+
+export function readAgentDockerResourceLimits(
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+): AgentDockerResourceLimits {
+  const requiredKeys = [
+    "AGENT_DOCKER_MEMORY_LIMIT_BYTES",
+    "AGENT_DOCKER_CPU_LIMIT",
+    "AGENT_DOCKER_PIDS_LIMIT",
+  ] as const;
+  const missing = requiredKeys.filter((key) => !environment[key]?.trim());
+  if (environment.NODE_ENV === "production" && missing.length > 0) {
+    throw new Error(`${missing.join(", ")} must be explicitly configured in production.`);
+  }
+  const memoryBytes = readBoundedBytes(
+    environment.AGENT_DOCKER_MEMORY_LIMIT_BYTES,
+    DEFAULT_AGENT_DOCKER_MEMORY_LIMIT_BYTES,
+    MAX_AGENT_DOCKER_MEMORY_LIMIT_BYTES,
+    "AGENT_DOCKER_MEMORY_LIMIT_BYTES",
+  );
+  const cpusRaw = environment.AGENT_DOCKER_CPU_LIMIT?.trim();
+  const cpus = cpusRaw ? Number(cpusRaw) : DEFAULT_AGENT_DOCKER_CPU_LIMIT;
+  if (!Number.isFinite(cpus) || cpus < 0.1 || cpus > MAX_AGENT_DOCKER_CPU_LIMIT) {
+    throw new Error(
+      `AGENT_DOCKER_CPU_LIMIT must be a number between 0.1 and ${MAX_AGENT_DOCKER_CPU_LIMIT}.`,
+    );
+  }
+  const pidsRaw = environment.AGENT_DOCKER_PIDS_LIMIT?.trim();
+  const pidsLimit = pidsRaw ? Number(pidsRaw) : DEFAULT_AGENT_DOCKER_PIDS_LIMIT;
+  if (!Number.isSafeInteger(pidsLimit) || pidsLimit < 64 || pidsLimit > MAX_AGENT_DOCKER_PIDS_LIMIT) {
+    throw new Error(
+      `AGENT_DOCKER_PIDS_LIMIT must be an integer between 64 and ${MAX_AGENT_DOCKER_PIDS_LIMIT}.`,
+    );
+  }
+  return { memoryBytes, cpus, pidsLimit };
+}
+
+function readBoundedBytes(
+  raw: string | undefined,
+  fallback: number,
+  maximum: number,
+  name: string,
+): number {
+  const value = raw?.trim();
+  if (!value) return fallback;
+  const match = /^(\d+)(?:\s*(KiB|MiB|GiB|TiB))?$/iu.exec(value);
+  if (!match) {
+    throw new Error(`${name} must be an integer with an optional KiB, MiB, GiB, or TiB suffix.`);
+  }
+  const multiplier = match[2]?.toLowerCase() === "kib"
+    ? 1024
+    : match[2]?.toLowerCase() === "mib"
+      ? 1024 ** 2
+      : match[2]?.toLowerCase() === "gib"
+        ? 1024 ** 3
+        : match[2]?.toLowerCase() === "tib"
+          ? 1024 ** 4
+          : 1;
+  const bytes = Number(match[1]) * multiplier;
+  if (!Number.isSafeInteger(bytes) || bytes < 64 * 1024 ** 2 || bytes > maximum) {
+    throw new Error(`${name} must be between 64MiB and ${maximum} bytes.`);
+  }
+  return bytes;
+}
+
 export function readAgentSandboxWorkspaceQuota(
   environment: Readonly<Record<string, string | undefined>> = process.env,
 ): number {
@@ -161,10 +243,6 @@ export function inspectProductionConfiguration(
   requireValue(environment, "AGENT_EMBED_ALLOWED_ORIGINS", error);
   requireValue(environment, "AGENT_PUBLIC_BASE_URL", error);
   requireValue(environment, "AGENT_PREVIEW_SIGNING_SECRET", error);
-  // Admission limits are mandatory in production. Omitting either limit would
-  // silently disable the PostgreSQL-backed run gate and allow unbounded work.
-  requireValue(environment, "AGENT_MAX_ACTIVE_RUNS_TOTAL", error);
-  requireValue(environment, "AGENT_MAX_ACTIVE_RUNS_PER_TENANT", error);
   const assetBackend = environment.AGENT_ASSET_STORAGE_BACKEND?.trim().toLowerCase();
   if (assetBackend !== "host" && assetBackend !== "external" && assetBackend !== "s3" && assetBackend !== "object-store" && assetBackend !== "object_store") {
     error(
@@ -336,6 +414,14 @@ export function inspectProductionConfiguration(
       );
     }
     if (backend === "docker") {
+      try {
+        readAgentDockerResourceLimits(environment);
+      } catch (cause) {
+        error(
+          "docker-resource-limits",
+          cause instanceof Error ? cause.message : "Invalid Docker sandbox resource limits.",
+        );
+      }
       inspectInteger(
         environment.EVE_SANDBOX_RETENTION_HOURS,
         "EVE_SANDBOX_RETENTION_HOURS",

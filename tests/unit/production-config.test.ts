@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   inspectProductionConfiguration,
+  readAgentDockerResourceLimits,
   readAgentDeploymentTenancy,
   readAgentSandboxBackend,
   readAgentSandboxWorkspaceQuota,
@@ -201,6 +202,38 @@ test("bounds the logical sandbox import quota", () => {
   );
 });
 
+test("parses bounded Docker sandbox resource limits", () => {
+  assert.deepEqual(
+    readAgentDockerResourceLimits({
+      AGENT_DOCKER_MEMORY_LIMIT_BYTES: "1GiB",
+      AGENT_DOCKER_CPU_LIMIT: "1.5",
+      AGENT_DOCKER_PIDS_LIMIT: "256",
+    }),
+    { memoryBytes: 1024 ** 3, cpus: 1.5, pidsLimit: 256 },
+  );
+  assert.deepEqual(readAgentDockerResourceLimits({}), {
+    memoryBytes: 2 * 1024 ** 3,
+    cpus: 2,
+    pidsLimit: 512,
+  });
+  assert.throws(
+    () => readAgentDockerResourceLimits({ NODE_ENV: "production" }),
+    /must be explicitly configured in production/u,
+  );
+  assert.throws(
+    () => readAgentDockerResourceLimits({ AGENT_DOCKER_MEMORY_LIMIT_BYTES: "32MiB" }),
+    /AGENT_DOCKER_MEMORY_LIMIT_BYTES/u,
+  );
+  assert.throws(
+    () => readAgentDockerResourceLimits({ AGENT_DOCKER_CPU_LIMIT: "0" }),
+    /AGENT_DOCKER_CPU_LIMIT/u,
+  );
+  assert.throws(
+    () => readAgentDockerResourceLimits({ AGENT_DOCKER_PIDS_LIMIT: "32" }),
+    /AGENT_DOCKER_PIDS_LIMIT/u,
+  );
+});
+
 test("requires an explicit deployment tenancy", () => {
   assert.equal(readAgentDeploymentTenancy(validEnvironment), "multi-tenant");
   assert.throws(
@@ -224,11 +257,15 @@ test("requires an explicit Docker sandbox retention policy", () => {
     missing.filter((item) => item.code === "missing-required" && item.level === "error").length,
     2,
   );
+  assert.ok(missing.some((item) => item.code === "docker-resource-limits" && item.level === "error"));
 
   const valid = inspectProductionConfiguration({
     ...validEnvironment,
     AGENT_DEPLOYMENT_TENANCY: "single-tenant",
     AGENT_SANDBOX_BACKEND: "docker",
+    AGENT_DOCKER_MEMORY_LIMIT_BYTES: "2GiB",
+    AGENT_DOCKER_CPU_LIMIT: "2",
+    AGENT_DOCKER_PIDS_LIMIT: "512",
     EVE_SANDBOX_REAPER_MAX_REMOVALS: "50",
     EVE_SANDBOX_RETENTION_HOURS: "168",
   }, "24.18.1");

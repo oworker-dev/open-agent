@@ -422,6 +422,19 @@ durable session. Stopping the Agent server stops sandbox compute but intentional
 keeps the container so the next server can reattach. Deletion is therefore an
 application retention decision, not an Eve server-shutdown side effect.
 
+For an explicit Docker deployment, configure finite per-container limits:
+
+```bash
+AGENT_DOCKER_MEMORY_LIMIT_BYTES=2GiB \
+AGENT_DOCKER_CPU_LIMIT=2 \
+AGENT_DOCKER_PIDS_LIMIT=512
+```
+
+Open Agent applies these limits with `docker update` after each sandbox is
+created or reattached and fails closed if the daemon reports a mismatch. They
+bound memory, CPU, and process count; disk and inode quotas remain Docker-host
+responsibilities. Production configuration requires all three values.
+
 The operator reaper is conservative and prints a JSON dry-run by default:
 
 ```bash

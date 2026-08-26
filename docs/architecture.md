@@ -354,7 +354,13 @@ production doctor rejects Docker for mutually untrusted multi-tenant traffic;
 that topology must select a reviewed microVM backend and pass physical
 isolation tests there. Single-tenant Docker deployments also require
 `EVE_SANDBOX_RETENTION_HOURS` and
-`EVE_SANDBOX_REAPER_MAX_REMOVALS`. The operator reaper is dry-run by default,
+`EVE_SANDBOX_REAPER_MAX_REMOVALS`, plus explicit finite
+`AGENT_DOCKER_MEMORY_LIMIT_BYTES`, `AGENT_DOCKER_CPU_LIMIT`, and
+`AGENT_DOCKER_PIDS_LIMIT` values. Eve does not expose these flags directly;
+Open Agent applies them with `docker update` immediately after each session is
+created or reattached and fails closed if Docker reports different values.
+These are per-container limits, not a host-wide capacity guarantee; configure
+daemon-level disk/inode quotas separately. The operator reaper is dry-run by default,
 owns only stopped containers carrying Eve's exact session labels and naming
 convention, honors a protected-session list, revalidates a candidate before
 deletion, and caps each invocation. A running container can be selected only by
