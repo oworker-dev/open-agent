@@ -234,6 +234,7 @@ function readConfiguredDockerLimits() {
   const memoryBytes = boundedBytes(
     process.env.AGENT_DOCKER_MEMORY_LIMIT_BYTES,
     0,
+    0,
     64 * 1024 ** 3,
   );
   if (memoryBytes <= 0) {
