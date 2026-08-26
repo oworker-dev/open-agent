@@ -724,6 +724,36 @@ async function appendThreadEvents(
       [tenantId, principalId, storageKey, append.threadId, replaceFrom],
     );
   }
+  const candidates = append.events.flatMap((rawEvent, offset) => {
+    if (!isRecordValue(rawEvent)) return [];
+    const meta = isRecordValue(rawEvent.meta) ? rawEvent.meta : {};
+    const eventId = typeof meta.id === "string" && meta.id
+      ? meta.id
+      : `legacy:${append.threadId}:${nextIndex + offset}`;
+    return [{ event: rawEvent, eventId }];
+  });
+  if (candidates.length === 0) return;
+
+  // Reconnects can resend a suffix that is already durable. Filter those
+  // identities before assigning indexes; relying on INSERT ... ON CONFLICT
+  // alone would leave holes when an early duplicate causes a later event to
+  // retain its old offset. A contiguous event log is required by absolute
+  // transcript pagination and recovery cursors.
+  const existing = await connection.query<{ event_id: string }>(
+    `select event_id
+       from ${eventTable}
+      where tenant_id = $1 and principal_id = $2 and storage_key = $3
+        and thread_id = $4 and event_id = any($5::text[])`,
+    [tenantId, principalId, storageKey, append.threadId, candidates.map((candidate) => candidate.eventId)],
+  );
+  const existingIds = new Set(existing.rows.map((row) => row.event_id));
+  const seenIds = new Set<string>();
+  const fresh = candidates.filter((candidate) => {
+    if (existingIds.has(candidate.eventId) || seenIds.has(candidate.eventId)) return false;
+    seenIds.add(candidate.eventId);
+    return true;
+  });
+  if (fresh.length === 0) return;
   await insertThreadEvents(
     connection,
     eventTable,
@@ -731,8 +761,7 @@ async function appendThreadEvents(
     principalId,
     storageKey,
     append.threadId,
-    append.events.flatMap((rawEvent, offset) =>
-      isRecordValue(rawEvent) ? [{ event: rawEvent, eventIndex: nextIndex + offset }] : []),
+    fresh.map(({ event }, offset) => ({ event, eventIndex: nextIndex + offset })),
   );
 }
 

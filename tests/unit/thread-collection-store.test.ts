@@ -160,6 +160,52 @@ test("append-only thread patches do not load the existing transcript", async () 
   assert.equal(updatedCollection?.activeThreadId, "thread-1");
 });
 
+test("append-only thread patches keep event indexes contiguous after replay deduplication", async () => {
+  let insertedParameters: readonly unknown[] | undefined;
+  const client = {
+    async query(sql: string, parameters?: readonly unknown[]) {
+      if (sql === "begin" || sql === "commit" || sql === "rollback") return { rows: [] };
+      if (sql.includes("for update")) {
+        return {
+          rows: [{
+            collection: { threads: [{ id: "thread-1", events: [] }], version: 2 },
+            revision: "1",
+          }],
+        };
+      }
+      if (sql.includes("max(event_index)")) return { rows: [{ next_index: "4" }] };
+      if (sql.includes("select event_id")) return { rows: [{ event_id: "evt-duplicate" }] };
+      if (sql.includes("insert into") && sql.includes("jsonb_to_recordset")) {
+        insertedParameters = parameters;
+      }
+      return { rows: [] };
+    },
+    release() {},
+  };
+  const pool = { async connect() { return client; } } as unknown as Pool;
+  const store = createPostgresThreadCollectionStore(config, pool);
+
+  const result = await store.patch?.("tenant-1", "principal-1", "workspace-1", 1, {
+    deletedThreadIds: [],
+    eventAppends: [{
+      events: [
+        { type: "duplicate", meta: { id: "evt-duplicate" } },
+        { type: "fresh-a", meta: { id: "evt-a" } },
+        { type: "fresh-b", meta: { id: "evt-b" } },
+      ],
+      threadId: "thread-1",
+    }],
+    upsertThreads: [{ events: [], id: "thread-1", status: "streaming" }],
+  });
+
+  assert.equal(result?.status, "saved");
+  const records = JSON.parse(String(insertedParameters?.[4])) as Array<{ event_index: number; event_id: string }>;
+  assert.deepEqual(records.map((record) => [record.event_index, record.event_id]), [
+    [4, "evt-a"],
+    [5, "evt-b"],
+  ]);
+});
+
 test("hydrating one thread removes the index-only summary marker", async () => {
   let loadedSql = "";
   const pool = {
