@@ -3,10 +3,11 @@ import { jsx as _jsx } from "react/jsx-runtime";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AgentThreadView } from "./agent-thread.js";
 import { attachAgentSession, createAgentSession } from "./agent-client.js";
-import { AGENT_THREAD_STORAGE_VERSION } from "./thread-storage.js";
+import { AGENT_THREAD_STORAGE_VERSION, compactThreadEvents } from "./thread-storage.js";
 export function AgentChildSessionView({ client, commands, locale, mailbox, mentions, models, onEvent, onOpenDeliverable, onOpenSubagent, onStorageError, preferences, providerReady = true, reasoningLevels, sessionId, storageKey, threadStorage, }) {
     const [thread, setThread] = useState();
     const [loadError, setLoadError] = useState();
+    const [historyLoading, setHistoryLoading] = useState(false);
     const [reloadGeneration, setReloadGeneration] = useState(0);
     const pendingPersistRef = useRef(undefined);
     const persistTimerRef = useRef(undefined);
@@ -16,11 +17,14 @@ export function AgentChildSessionView({ client, commands, locale, mailbox, menti
         if (!next || !childStorageKey || !threadStorage)
             return;
         pendingPersistRef.current = undefined;
+        const boundedStorage = Boolean(threadStorage.loadThreadWindow);
         const persisted = {
             ...next,
-            events: [],
-            hydration: "summary",
-            session: { streamIndex: 0 },
+            ...(boundedStorage ? { events: [...next.events], hydration: undefined, session: { ...next.session } } : {
+                events: [],
+                hydration: "summary",
+                session: { streamIndex: 0 },
+            }),
             updatedAt: Date.now(),
         };
         const collection = {
@@ -46,7 +50,7 @@ export function AgentChildSessionView({ client, commands, locale, mailbox, menti
             if (!current)
                 return current;
             const next = { ...current, ...patch, updatedAt: patch.updatedAt ?? Date.now() };
-            const hasClientStateChange = Object.keys(patch).some((key) => key !== "events" && key !== "session" && key !== "updatedAt");
+            const hasClientStateChange = Object.keys(patch).some((key) => key !== "updatedAt");
             if (hasClientStateChange)
                 schedulePersistedChild(next);
             return next;
@@ -57,6 +61,7 @@ export function AgentChildSessionView({ client, commands, locale, mailbox, menti
         const controller = new AbortController();
         setThread(undefined);
         setLoadError(undefined);
+        setHistoryLoading(false);
         const connection = createAgentSession(client, preferences, { sessionId, streamIndex: 0 });
         const session = attachAgentSession(connection, connection.initialSession);
         if (!session) {
@@ -65,24 +70,46 @@ export function AgentChildSessionView({ client, commands, locale, mailbox, menti
         }
         void (async () => {
             try {
-                const [snapshot, storedCollection] = await Promise.all([
-                    readChildSnapshot(session, controller.signal),
-                    childStorageKey && threadStorage
-                        ? Promise.resolve(threadStorage.load(childStorageKey))
-                        : Promise.resolve(undefined),
-                ]);
+                let storedThread;
+                let storedWindow;
+                if (childStorageKey && threadStorage?.loadThreadWindow) {
+                    const windowed = await threadStorage.loadThreadWindow(childStorageKey, sessionId);
+                    storedThread = windowed?.thread;
+                    storedWindow = windowed?.window;
+                    if (!windowed && threadStorage.load) {
+                        const emptyCollection = await threadStorage.load(childStorageKey);
+                        storedThread = emptyCollection.threads.find((candidate) => candidate.id === sessionId);
+                    }
+                }
+                else if (childStorageKey && threadStorage) {
+                    const storedCollection = await threadStorage.load(childStorageKey);
+                    storedThread = storedCollection.threads.find((candidate) => candidate.id === sessionId);
+                }
+                const snapshot = storedWindow
+                    ? undefined
+                    : await readChildSnapshot(session, controller.signal);
                 if (disposed)
                     return;
-                const storedThread = storedCollection?.threads.find((candidate) => candidate.id === sessionId);
                 const childDefaults = storedThread?.preferences ?? preferences;
+                const initialEvents = storedWindow
+                    ? storedThread?.events ?? []
+                    : snapshot?.events ?? [];
+                const initialSession = storedWindow
+                    ? {
+                        ...(storedThread?.session ?? {}),
+                        sessionId,
+                        streamIndex: storedWindow.endIndex,
+                    }
+                    : snapshot.session;
                 setThread({
                     ...createChildThread(sessionId, preferences),
                     ...(storedThread ? persistedChildControls(storedThread) : {}),
-                    events: snapshot.events,
+                    events: initialEvents,
                     id: sessionId,
                     preferences: childDefaults,
-                    session: snapshot.session,
-                    status: statusFromEvents(snapshot.events),
+                    ...(storedWindow ? { transcriptWindow: storedWindow } : {}),
+                    session: initialSession,
+                    status: storedThread?.status ?? statusFromEvents(initialEvents),
                     updatedAt: Date.now(),
                 });
             }
@@ -108,6 +135,42 @@ export function AgentChildSessionView({ client, commands, locale, mailbox, menti
             ? { ...current, preferences, updatedAt: Date.now() }
             : current);
     }, [preferences, sessionId]);
+    const loadEarlier = useCallback(async () => {
+        const current = thread;
+        const window = current?.transcriptWindow;
+        if (!current || !window?.hasMoreBefore || !childStorageKey ||
+            !threadStorage?.loadThreadWindow || historyLoading)
+            return;
+        setHistoryLoading(true);
+        try {
+            const loaded = await threadStorage.loadThreadWindow(childStorageKey, sessionId, {
+                before: window.startIndex,
+            });
+            if (!loaded)
+                return;
+            setThread((latest) => {
+                if (!latest)
+                    return latest;
+                return {
+                    ...latest,
+                    events: compactThreadEvents([...loaded.thread.events, ...latest.events]),
+                    transcriptWindow: {
+                        endIndex: Math.max(window.endIndex, loaded.window.endIndex),
+                        hasMoreBefore: loaded.window.hasMoreBefore,
+                        startIndex: loaded.window.startIndex,
+                        total: Math.max(window.total, loaded.window.total),
+                    },
+                    updatedAt: Date.now(),
+                };
+            });
+        }
+        catch (error) {
+            onStorageError?.(error);
+        }
+        finally {
+            setHistoryLoading(false);
+        }
+    }, [childStorageKey, historyLoading, onStorageError, sessionId, thread, threadStorage]);
     const recoverChild = useCallback(() => {
         setThread(undefined);
         setReloadGeneration((value) => value + 1);
@@ -118,7 +181,7 @@ export function AgentChildSessionView({ client, commands, locale, mailbox, menti
     if (!thread) {
         return _jsx("div", { className: "flex min-h-0 flex-1 items-center justify-center px-6 text-sm text-muted-foreground", role: "status", children: "Loading sub-agent history\u2026" });
     }
-    return (_jsx(AgentThreadView, { client: client, commands: commands, draftStorageKey: `open-agent:child-draft:${sessionId}`, locale: locale, mailbox: mailbox, mentions: mentions, models: models, onChange: handleThreadChange, onEvent: onEvent, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, onRecoveryNeeded: recoverChild, providerReady: providerReady, reasoningLevels: reasoningLevels, thread: thread }));
+    return (_jsx(AgentThreadView, { client: client, commands: commands, draftStorageKey: `open-agent:child-draft:${sessionId}`, locale: locale, mailbox: mailbox, mentions: mentions, models: models, onChange: handleThreadChange, onEvent: onEvent, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, onRecoveryNeeded: recoverChild, providerReady: providerReady, reasoningLevels: reasoningLevels, thread: thread, historyHasMore: thread.transcriptWindow?.hasMoreBefore === true, historyLoading: historyLoading, onLoadEarlier: loadEarlier }));
 }
 function persistedChildControls(thread) {
     return {

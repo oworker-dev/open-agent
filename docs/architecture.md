@@ -113,6 +113,10 @@ bundled PostgreSQL adapter scopes every collection by verified
 thread metadata; selecting another thread hydrates only a bounded tail window.
 Older history is fetched with an absolute event window cursor, so opening a
 long conversation never materializes its entire event log in one SQL aggregate.
+Child-agent views use the same contract and storage adapter as root threads;
+they do not call Eve `snapshot()` when a bounded host adapter is available.
+This keeps parent and child navigation consistent while ensuring a long-lived
+child cannot trigger an index-zero replay or a second unbounded SSE reader.
 Writes are serialized `PATCH` requests that
 carry changed threads and deleted IDs rather than every conversation history.
 Pending messages, accepted session IDs, input pauses, errors, and turn/session

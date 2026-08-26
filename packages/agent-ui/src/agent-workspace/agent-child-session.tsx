@@ -15,7 +15,7 @@ import type {
   AgentWorkspaceMailbox,
 } from "./contracts.js";
 import type { AgentLocale } from "./i18n.js";
-import { AGENT_THREAD_STORAGE_VERSION, type AgentThreadCollection, type AgentThreadStorage } from "./thread-storage.js";
+import { AGENT_THREAD_STORAGE_VERSION, compactThreadEvents, type AgentThreadCollection, type AgentThreadStorage } from "./thread-storage.js";
 
 /**
  * Child sessions intentionally use the same thread controller and assistant-ui
@@ -60,6 +60,7 @@ export function AgentChildSessionView({
 }) {
   const [thread, setThread] = useState<AgentThread>();
   const [loadError, setLoadError] = useState<string>();
+  const [historyLoading, setHistoryLoading] = useState(false);
   const [reloadGeneration, setReloadGeneration] = useState(0);
   const pendingPersistRef = useRef<AgentThread | undefined>(undefined);
   const persistTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -69,14 +70,20 @@ export function AgentChildSessionView({
     const next = pendingPersistRef.current;
     if (!next || !childStorageKey || !threadStorage) return;
     pendingPersistRef.current = undefined;
+    const boundedStorage = Boolean(threadStorage.loadThreadWindow);
     const persisted: AgentThread = {
       ...next,
-      // Eve's durable stream is the source of truth for transcript/cursor.
-      // Keep the client-only controls here so a refresh does not lose a
-      // queued follow-up or an in-flight presentation state.
-      events: [],
-      hydration: "summary",
-      session: { streamIndex: 0 },
+      // Persist event deltas through the append-only HTTP storage adapter. It
+      // sends only the new suffix while retaining the full transcript in the
+      // event table for bounded hydration on the next open.
+      ...(boundedStorage ? { events: [...next.events], hydration: undefined as undefined, session: { ...next.session } } : {
+        // Browser-only/custom legacy stores intentionally retain the old
+        // summary behavior. Eve remains authoritative there and localStorage
+        // must never receive an unbounded transcript copy.
+        events: [],
+        hydration: "summary" as const,
+        session: { streamIndex: 0 },
+      }),
       updatedAt: Date.now(),
     };
     const collection: AgentThreadCollection = {
@@ -101,9 +108,10 @@ export function AgentChildSessionView({
     setThread((current) => {
       if (!current) return current;
       const next = { ...current, ...patch, updatedAt: patch.updatedAt ?? Date.now() };
-      // Stream events and the absolute cursor are already durable in Eve and
-      // can be very high frequency. Persist only presentation/control state.
-      const hasClientStateChange = Object.keys(patch).some((key) => key !== "events" && key !== "session" && key !== "updatedAt");
+      // Persist event/checkpoint deltas as well as presentation state. The
+      // storage adapter coalesces hot updates and converts the transcript to
+      // an append-only PATCH, so long streams never send the full history.
+      const hasClientStateChange = Object.keys(patch).some((key) => key !== "updatedAt");
       if (hasClientStateChange) schedulePersistedChild(next);
       return next;
     });
@@ -114,6 +122,7 @@ export function AgentChildSessionView({
     const controller = new AbortController();
     setThread(undefined);
     setLoadError(undefined);
+    setHistoryLoading(false);
     const connection = createAgentSession(client, preferences, { sessionId, streamIndex: 0 });
     const session = attachAgentSession(connection, connection.initialSession);
     if (!session) {
@@ -122,27 +131,57 @@ export function AgentChildSessionView({
     }
     void (async () => {
       try {
-        // Hydrate exactly once. AgentThreadView owns the single live stream
-        // after this snapshot is projected. Keeping a second child-local SSE
-        // here caused duplicate readers and remounted the thread on every
-        // event, which made long-running child sessions appear to replay.
-        const [snapshot, storedCollection] = await Promise.all([
-          readChildSnapshot(session, controller.signal),
-          childStorageKey && threadStorage
-            ? Promise.resolve(threadStorage.load(childStorageKey))
-            : Promise.resolve<AgentThreadCollection | undefined>(undefined),
-        ]);
+        // Prefer the host's bounded transcript window. Eve snapshot() always
+        // reads from index zero and becomes an unbounded browser payload for
+        // long-running children. AgentThreadView owns the single live stream
+        // after this prefix and resumes from its absolute end cursor.
+        let storedThread: AgentThread | undefined;
+        let storedWindow: AgentThread["transcriptWindow"];
+        if (childStorageKey && threadStorage?.loadThreadWindow) {
+          const windowed = await threadStorage.loadThreadWindow(childStorageKey, sessionId);
+          storedThread = windowed?.thread;
+          storedWindow = windowed?.window;
+          // A brand-new child has no metadata row yet. Initialize the HTTP
+          // storage baseline with its empty collection so the first event
+          // checkpoint can create the row instead of failing with a missing
+          // optimistic revision.
+          if (!windowed && threadStorage.load) {
+            const emptyCollection = await threadStorage.load(childStorageKey);
+            storedThread = emptyCollection.threads.find((candidate) => candidate.id === sessionId);
+          }
+        } else if (childStorageKey && threadStorage) {
+          const storedCollection = await threadStorage.load(childStorageKey);
+          storedThread = storedCollection.threads.find((candidate) => candidate.id === sessionId);
+        }
+        // A host without the event-window contract (or a brand-new child with
+        // no checkpoint) retains the Eve snapshot compatibility path. Once a
+        // first checkpoint is written, subsequent opens use the bounded path.
+        const snapshot = storedWindow
+          ? undefined
+          : await readChildSnapshot(session, controller.signal);
         if (disposed) return;
-        const storedThread = storedCollection?.threads.find((candidate) => candidate.id === sessionId);
         const childDefaults = storedThread?.preferences ?? preferences;
+        const initialEvents = storedWindow
+          ? storedThread?.events ?? []
+          : snapshot?.events ?? [];
+        const initialSession = storedWindow
+          ? {
+              ...(storedThread?.session ?? {}),
+              sessionId,
+              // Never trust a stale metadata cursor when the bounded window
+              // is the authoritative prefix currently materialized in memory.
+              streamIndex: storedWindow.endIndex,
+            }
+          : snapshot!.session;
         setThread({
           ...createChildThread(sessionId, preferences),
           ...(storedThread ? persistedChildControls(storedThread) : {}),
-          events: snapshot.events,
+          events: initialEvents,
           id: sessionId,
           preferences: childDefaults,
-          session: snapshot.session,
-          status: statusFromEvents(snapshot.events),
+          ...(storedWindow ? { transcriptWindow: storedWindow } : {}),
+          session: initialSession,
+          status: storedThread?.status ?? statusFromEvents(initialEvents),
           updatedAt: Date.now(),
         });
       } catch (error: unknown) {
@@ -167,6 +206,40 @@ export function AgentChildSessionView({
       ? { ...current, preferences, updatedAt: Date.now() }
       : current);
   }, [preferences, sessionId]);
+
+  const loadEarlier = useCallback(async () => {
+    const current = thread;
+    const window = current?.transcriptWindow;
+    if (
+      !current || !window?.hasMoreBefore || !childStorageKey ||
+      !threadStorage?.loadThreadWindow || historyLoading
+    ) return;
+    setHistoryLoading(true);
+    try {
+      const loaded = await threadStorage.loadThreadWindow(childStorageKey, sessionId, {
+        before: window.startIndex,
+      });
+      if (!loaded) return;
+      setThread((latest) => {
+        if (!latest) return latest;
+        return {
+          ...latest,
+          events: compactThreadEvents([...loaded.thread.events, ...latest.events]),
+          transcriptWindow: {
+            endIndex: Math.max(window.endIndex, loaded.window.endIndex),
+            hasMoreBefore: loaded.window.hasMoreBefore,
+            startIndex: loaded.window.startIndex,
+            total: Math.max(window.total, loaded.window.total),
+          },
+          updatedAt: Date.now(),
+        };
+      });
+    } catch (error: unknown) {
+      onStorageError?.(error);
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, [childStorageKey, historyLoading, onStorageError, sessionId, thread, threadStorage]);
 
   const recoverChild = useCallback(() => {
     // Rehydrate from Eve's durable snapshot. The thread controller will attach
@@ -200,6 +273,9 @@ export function AgentChildSessionView({
       providerReady={providerReady}
       reasoningLevels={reasoningLevels}
       thread={thread}
+      historyHasMore={thread.transcriptWindow?.hasMoreBefore === true}
+      historyLoading={historyLoading}
+      onLoadEarlier={loadEarlier}
     />
   );
 }
