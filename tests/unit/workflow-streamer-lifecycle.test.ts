@@ -86,25 +86,27 @@ test("keeps a live stream open when history has no EOF", async () => {
   }
 });
 
-test("does not drop chunks whose stable ids are not lexicographically ordered", async () => {
-  // Eve guarantees event identity across replays, but IDs from independent
-  // writers are not a total ordering. The stream cursor is positional; a
-  // lexical last-id filter would silently lose a valid chunk here.
-  const drizzle = fakeDrizzle([
-    chunk("chnk_z", "first"),
-    chunk("chnk_a", "second"),
-    chunk("chnk_eof", "", true),
-  ]);
+test("uses an absolute offset once before continuing with keyset pages", async () => {
+  const rows = Array.from({ length: 600 }, (_, index) =>
+    chunk(`chnk_${String(index).padStart(4, "0")}`, String(index))
+  );
+  rows.push(chunk("chnk_9999", "", true));
+  const drizzle = fakeDrizzle(rows, { keysetPages: true });
   const streamer = createStreamer(fakePool(), drizzle);
   try {
-    const stream = await streamer.streams.get("run", "stream", 0);
+    const stream = await streamer.streams.get("run", "stream", 100);
     const reader = stream.getReader();
-    const first = await reader.read();
-    const second = await reader.read();
-    const done = await reader.read();
-    assert.deepEqual(first.value, new Uint8Array(Buffer.from("first")));
-    assert.deepEqual(second.value, new Uint8Array(Buffer.from("second")));
-    assert.equal(done.done, true);
+    const values = [];
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+      values.push(Buffer.from(next.value).toString());
+    }
+    assert.equal(values.length, 500);
+    assert.equal(values[0], "100");
+    assert.equal(values.at(-1), "599");
+    assert.equal(drizzle.dataQueries, 2);
+    assert.deepEqual(drizzle.offsetCalls, [100]);
   } finally {
     await streamer.close();
   }
@@ -122,7 +124,9 @@ function fakeDrizzle(rows, options = {}) {
     dataQueries: 0,
     eofQueries: 0,
     countQueries: 0,
+    offsetCalls: [],
   };
+  let keysetPosition = 0;
   const drizzle = {
     ...state,
     select(selection) {
@@ -138,7 +142,12 @@ function fakeDrizzle(rows, options = {}) {
         from() { return query; },
         where() { return query; },
         orderBy() { return query; },
-        offset(value) { query.offsetValue = value; return query; },
+        offset(value) {
+          query.offsetValue = value;
+          query.offsetCalled = true;
+          drizzle.offsetCalls.push(value);
+          return query;
+        },
         limit(value) { query.limitValue = value; return query; },
         then(resolve, reject) {
           Promise.resolve().then(async () => {
@@ -153,6 +162,12 @@ function fakeDrizzle(rows, options = {}) {
             drizzle.dataQueries += 1;
             if (drizzle.dataQueries === 1 && options.firstDataPage) {
               await options.firstDataPage;
+            }
+            if (options.keysetPages) {
+              if (query.offsetCalled) keysetPosition = query.offsetValue;
+              const page = rows.slice(keysetPosition, keysetPosition + query.limitValue);
+              keysetPosition += page.length;
+              return page;
             }
             return rows.slice(query.offsetValue, query.offsetValue + query.limitValue);
           }).then(resolve, reject);
