@@ -14,7 +14,7 @@ import {
   quoteIdentifier,
   readAgentDatabaseConfig,
   type AgentDatabaseConfig,
-} from "./agent-database";
+} from "./agent-database.ts";
 
 export type AgentRunRecord = {
   readonly cancellationRequestedAt?: string;

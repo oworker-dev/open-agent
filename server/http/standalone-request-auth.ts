@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 
-import type { AgentSessionOwner } from "../data/session-ownership-store";
+import type { AgentSessionOwner } from "../data/session-ownership-store.ts";
 
 const COOKIE_NAME = "open_agent_anonymous";
 const COOKIE_MAX_AGE_SECONDS = 365 * 24 * 60 * 60;

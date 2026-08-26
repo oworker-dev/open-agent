@@ -1,5 +1,5 @@
 import type { AgentRunRecord } from "../data/agent-run-store";
-import { toAgentRunSnapshot } from "./service";
+import { toAgentRunSnapshot } from "./service.ts";
 
 export function agentRunResponse(
   record: AgentRunRecord,

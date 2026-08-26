@@ -4,7 +4,7 @@ import type {
   AgentRunInputResponse,
   AgentRunPolicy,
 } from "@oworker/open-agent-contracts/agent-run";
-import type { ParsedStartAgentRun } from "./input";
+import type { ParsedStartAgentRun } from "./input.ts";
 
 const DEFAULT_RUNTIME_REQUEST_TIMEOUT_MS = 60_000;
 const DEFAULT_EVENT_READ_LIMIT = 200;

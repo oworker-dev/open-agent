@@ -4,7 +4,7 @@ import { authenticateStandaloneRequest } from "./standalone-request-auth.ts";
 export type AssetRequestAuthentication =
   | HostRequestAuthentication
   | {
-      readonly identity: import("../data/session-ownership-store").AgentSessionOwner;
+      readonly identity: import("../data/session-ownership-store.ts").AgentSessionOwner;
       readonly ok: true;
       readonly setCookie?: string;
     }
