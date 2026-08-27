@@ -20,9 +20,11 @@ simultaneous Agent execution.
 | Workload | Result | Measured values |
 | --- | --- | --- |
 | 100 idle SSE streams | Pass | 0 errors, 0 unexpected disconnects, handshake p95 250ms |
-| 250 idle SSE streams across an independent durable-session pool | Pass | 250/250 established, 0 unexpected disconnects, handshake p95 237ms |
-| 500 idle SSE streams across an independent durable-session pool | Fail | 500 established, handshake p95 29.8s, 256 unexpected disconnects during hold |
-| 1,000 idle SSE streams across an independent durable-session pool | Fail | 1,000 established, handshake p95 29.8s, 768 unexpected disconnects during hold |
+| 250 pooled idle SSE followers | Pass | 250/250 established, 0 unexpected disconnects, handshake p95 237ms |
+| 500 idle SSE streams through the legacy Next proxy | Fail (superseded) | 500 established, handshake p95 29.8s, 256 unexpected disconnects during hold; the fixed 256-socket upstream agent was the cause |
+| 1,000 idle SSE streams through the legacy Next proxy | Fail (superseded) | 1,000 established, handshake p95 29.8s, 768 unexpected disconnects during hold; the fixed 256-socket upstream agent was the cause |
+| 500 pooled SSE followers through the dedicated gateway | Pass | 500/500 established, 0 errors, 0 unexpected disconnects, handshake p95 261ms |
+| 1,000 pooled SSE followers through the dedicated gateway | Pass | 1,000/1,000 established in 1.88s, 0 errors, 0 unexpected disconnects, handshake p95 402ms; sampled gateway RSS peaked at 160 MiB and Eve RSS at 389 MiB |
 | 2 simple live AgentRuns, concurrency 1 | Pass for host admission/error gate | 0 errors, admission p95 102ms, Provider completion p95 57.4s; this is an upstream/route latency observation, not a host saturation result |
 | 4 simple live AgentRuns, concurrency 2 | Host gate pass; Provider latency observation | 0 errors, admission p95 192ms, completion p95 28.9s in the earlier 20s budget run; the capacity runner now uses a 60s observation budget and records resource/event-loop metrics separately |
 | 4 live AgentRuns, concurrency 4 | Pass | 0 errors, admission p95 198ms, completion p95 165.0s, event-loop p95 20.5ms |
@@ -41,6 +43,18 @@ All synthetic Eve sessions were reset and removed by the verifier. These
 results confirm the current deployment path, but remain operating points rather
 than a maximum-capacity claim.
 
+The public preview now terminates traffic in a dedicated loopback-only gateway
+instead of asking Next's compiled rewrite proxy to carry Eve streams. The
+legacy proxy instantiated a fixed `maxSockets: 256` HTTP agent, which explains
+the exact 256/768 disconnect counts at 500/1,000 followers. After the routing
+change, pooled 500- and 1,000-follower gates both passed. The 1,000-follower
+sample used one durable Eve session to isolate network/stream fan-out from
+Provider and session-creation load. Sampled gateway RSS rose from about 131 MiB
+to 160 MiB, Eve RSS from about 250 MiB to 389 MiB, and Next remained near 224
+MiB. Peak one-second CPU samples were 32% for the gateway and 127% for Eve on
+the four-vCPU host. These are useful stream-server measurements, but are not
+distinct-session or distinct-user evidence.
+
 The AgentRun result is not classified as a server saturation limit: the run
 was error-free and the latency includes the live Provider. It does mean the
 current deployment does not meet the configured 20-second completion SLO even
@@ -50,11 +64,12 @@ at this tiny active workload.
 
 The current single-server evidence supports these **verified operating levels**:
 
-- **250 concurrent SSE follower connections**, with all connections established
-  and held for five seconds and zero unexpected disconnects. The historical
-  load reused a small pool of durable sessions, so this is connection/fan-out
-  evidence, not proof of 250 distinct online users. The 500-stream attempt
-  failed its stability SLO.
+- **1,000 concurrent pooled SSE follower connections**, with all connections
+  established and held for five seconds and zero unexpected disconnects. This
+  is connection/fan-out evidence over one durable session, not proof of 1,000
+  distinct online users. The separate disk-safe campaign verified **100
+  distinct durable sessions**; a larger one-session-per-connection campaign is
+  still required before increasing the distinct-session planning number.
 - **12 concurrently executing AgentRuns**, with 0% measured errors in the
   controlled run. At 16, one run failed inspection/settlement (6.25% error),
   so production admission should remain at or below 12 until the Provider,
@@ -106,6 +121,13 @@ the production recommendation for mutually untrusted tenants and elastic
 compute; changing backends does not remove Provider, Workflow, database, or
 object-store bottlenecks.
 
+The lazy-allocation boundary was rechecked against the live production build:
+two no-tool seed sessions completed and were retired while the Eve session
+container inventory remained at 960 stopped containers and zero running
+containers. This proves text-only conversations no longer allocate Docker
+workspaces. The historical stopped inventory was not deleted because it
+contains user-owned durable workspaces without explicit retirement evidence.
+
 The next capacity run must use a disk-safe isolated database and report at
 least 100/250/500/1k/5k/10k idle streams, controlled 4/8/12/16/25/50/100 active
 turns, and explicit mixed envelopes. Distinct-user evidence requires one
@@ -113,9 +135,10 @@ durable session per stream; pooled follower tests remain useful but must be
 reported only as connection fan-out. Real
 Provider latency, Provider quota, Workflow queue age, database pool wait,
 sandbox allocation, CPU, RSS, event-loop lag, and reconnect rate must be
-recorded separately. Until that run is completed, use 250 concurrent follower
-connections and 12 active turns as conservative deployment planning numbers,
-not distinct-user or marketing capacity.
+recorded separately. Until that run is completed, use 1,000 pooled follower
+connections, 100 distinct durable sessions, and 12 active turns as separate
+conservative deployment planning numbers, not a single inferred user or
+marketing-capacity number.
 
 The capacity matrix now also exercises online and active workloads at the same
 time through `verify:mixed-capacity`: it runs the idle stream and AgentRun

@@ -1,6 +1,7 @@
 export const PRODUCTION_PREVIEW_PORTS: Readonly<{
   readonly eve: 4275;
-  readonly web: 3000;
+  readonly next: 3101;
+  readonly web: 3100;
 }>;
 
 export function configureEveNextProductionPort(
@@ -16,3 +17,8 @@ export function assertBuiltEveWorkflowWorld(
   compiledAgentManifest: unknown,
   expectedWorld?: string,
 ): void;
+
+export function productionPreviewExitCode(
+  outcome: Readonly<{ code: number | null; signal: NodeJS.Signals | null }>,
+  shutdownRequested: boolean,
+): number;

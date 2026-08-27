@@ -46,3 +46,9 @@ export function assertBuiltEveWorkflowWorld(
     );
   }
 }
+
+export function productionPreviewExitCode(outcome, shutdownRequested) {
+  if (shutdownRequested) return 0;
+  if (typeof outcome?.code === "number" && outcome.code !== 0) return outcome.code;
+  return 1;
+}

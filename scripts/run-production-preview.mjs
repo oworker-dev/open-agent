@@ -6,6 +6,7 @@ import {
   assertBuiltEveProxy,
   assertBuiltEveWorkflowWorld,
   configureEveNextProductionPort,
+  productionPreviewExitCode,
   PRODUCTION_PREVIEW_PORTS,
 } from "./production-preview-topology.mjs";
 import {
@@ -115,117 +116,144 @@ const runtimeEnvironment = {
   WORKFLOW_TARGET_WORLD: "@workflow/world-postgres",
 };
 
-await assertPortsAvailable([WEB_PORT, NEXT_PORT, EVE_PORT, 4318]);
-
-const migration = spawnSync(process.execPath, ["scripts/migrate-agent-data.mjs"], {
-  env: runtimeEnvironment,
-  stdio: "inherit",
-});
-if (migration.status !== 0) process.exit(migration.status ?? 1);
-
-const collector = spawn(process.execPath, ["scripts/mock-otlp-json.mjs"], {
-  env: { ...runtimeEnvironment, MOCK_OTLP_PORT: "4318" },
-  stdio: "inherit",
-});
-await waitForHealth("http://127.0.0.1:4318/debug/traces", collector);
-
-const eve = spawn(process.execPath, [".output/server/index.mjs"], {
-  env: {
-    ...runtimeEnvironment,
-    HOST: "127.0.0.1",
-    PORT: String(EVE_PORT),
-  },
-  stdio: "inherit",
-});
-
-await waitForHealth(`http://127.0.0.1:${EVE_PORT}/eve/v1/health`, eve);
-
-const web = spawn(
-  process.execPath,
-  ["node_modules/next/dist/bin/next", "start", "--hostname", "127.0.0.1", "--port", String(NEXT_PORT)],
-  { env: runtimeEnvironment, stdio: "inherit" },
-);
-
-await waitForHealth(`http://127.0.0.1:${NEXT_PORT}`, web);
-const gateway = await startProductionPreviewGateway({
-  eveOrigin: `http://127.0.0.1:${EVE_PORT}`,
-  host: "0.0.0.0",
-  maxSockets: readPreviewProxyMaxSockets(runtimeEnvironment),
-  port: WEB_PORT,
-  webOrigin: `http://127.0.0.1:${NEXT_PORT}`,
-});
-await waitForHealth(`http://127.0.0.1:${WEB_PORT}`, web);
-
-const mailboxWorker = spawn(process.execPath, ["scripts/run-agent-mailbox-worker.mjs"], {
-  env: {
-    ...runtimeEnvironment,
-    AGENT_WEB_INTERNAL_URL: `http://127.0.0.1:${WEB_PORT}`,
-  },
-  stdio: "inherit",
-});
-
-const assetCleanupWorker = spawn(process.execPath, ["scripts/run-asset-cleanup-worker.mjs"], {
-  env: runtimeEnvironment,
-  stdio: "inherit",
-});
-
-const sandboxCleanupWorker = spawn(process.execPath, ["scripts/run-sandbox-cleanup-worker.mjs"], {
-  env: runtimeEnvironment,
-  stdio: "inherit",
-});
-
-const runReconciler = spawn(process.execPath, ["scripts/run-agent-run-reconciler.mjs"], {
-  env: runtimeEnvironment,
-  stdio: "inherit",
-});
-
-console.log(`OPEN_AGENT_PUBLIC_URL=${publicOrigin}`);
-
-let stopping = false;
 let shutdownRequested = false;
-const stop = (signal = "SIGTERM") => {
-  if (stopping) return;
-  stopping = true;
-  web.kill(signal);
-  eve.kill(signal);
-  mailboxWorker.kill(signal);
-  assetCleanupWorker.kill(signal);
-  sandboxCleanupWorker.kill(signal);
-  runReconciler.kill(signal);
-  collector.kill(signal);
-  void gateway.close();
-};
+let stopping = false;
+let gateway;
+let stopPromise;
+const managedChildren = new Map();
+const signalHandlers = new Map();
 for (const signal of ["SIGINT", "SIGTERM"]) {
-  process.on(signal, () => {
+  const handler = () => {
     shutdownRequested = true;
-    stop(signal);
-  });
+    void stop(signal);
+  };
+  signalHandlers.set(signal, handler);
+  process.on(signal, handler);
 }
 
-const outcome = await Promise.race([
-  childExit("eve", eve),
-  childExit("web", web),
-  childExit("mailbox-worker", mailboxWorker),
-  childExit("asset-cleanup-worker", assetCleanupWorker),
-  childExit("sandbox-cleanup-worker", sandboxCleanupWorker),
-  childExit("run-reconciler", runReconciler),
-  childExit("otel-collector", collector),
-]);
-stop();
-await Promise.allSettled([
-  gateway.close(),
-  childExit("eve", eve),
-  childExit("web", web),
-  childExit("mailbox-worker", mailboxWorker),
-  childExit("asset-cleanup-worker", assetCleanupWorker),
-  childExit("sandbox-cleanup-worker", sandboxCleanupWorker),
-  childExit("run-reconciler", runReconciler),
-  childExit("otel-collector", collector),
-]);
-if (!stopping || outcome.code !== 0) {
-  console.error(`${outcome.name} exited`, { code: outcome.code, signal: outcome.signal });
+let outcome;
+try {
+  await assertPortsAvailable([WEB_PORT, NEXT_PORT, EVE_PORT, 4318]);
+
+  const migration = spawnSync(process.execPath, ["scripts/migrate-agent-data.mjs"], {
+    env: runtimeEnvironment,
+    stdio: "inherit",
+  });
+  if (migration.error) throw migration.error;
+  if (migration.status !== 0) {
+    throw new Error(`Agent data migration exited with code ${String(migration.status ?? 1)}.`);
+  }
+
+  const collector = spawnManaged("otel-collector", process.execPath, ["scripts/mock-otlp-json.mjs"], {
+    env: { ...runtimeEnvironment, MOCK_OTLP_PORT: "4318" },
+    stdio: "inherit",
+  });
+  await waitForHealth("http://127.0.0.1:4318/debug/traces", collector);
+
+  const eve = spawnManaged("eve", process.execPath, [".output/server/index.mjs"], {
+    env: {
+      ...runtimeEnvironment,
+      HOST: "127.0.0.1",
+      PORT: String(EVE_PORT),
+    },
+    stdio: "inherit",
+  });
+  await waitForHealth(`http://127.0.0.1:${EVE_PORT}/eve/v1/health`, eve);
+
+  const web = spawnManaged(
+    "web",
+    process.execPath,
+    ["node_modules/next/dist/bin/next", "start", "--hostname", "127.0.0.1", "--port", String(NEXT_PORT)],
+    { env: runtimeEnvironment, stdio: "inherit" },
+  );
+  await waitForHealth(`http://127.0.0.1:${NEXT_PORT}`, web);
+
+  assertCanStart();
+  const startedGateway = await startProductionPreviewGateway({
+    eveOrigin: `http://127.0.0.1:${EVE_PORT}`,
+    host: "0.0.0.0",
+    maxSockets: readPreviewProxyMaxSockets(runtimeEnvironment),
+    port: WEB_PORT,
+    webOrigin: `http://127.0.0.1:${NEXT_PORT}`,
+  });
+  if (stopping) {
+    await startedGateway.close();
+    throw new Error("Production preview shutdown is already in progress.");
+  }
+  gateway = startedGateway;
+  await waitForHealth(`http://127.0.0.1:${WEB_PORT}`, web, "production-gateway");
+
+  spawnManaged("mailbox-worker", process.execPath, ["scripts/run-agent-mailbox-worker.mjs"], {
+    env: {
+      ...runtimeEnvironment,
+      AGENT_WEB_INTERNAL_URL: `http://127.0.0.1:${NEXT_PORT}`,
+    },
+    stdio: "inherit",
+  });
+  spawnManaged("asset-cleanup-worker", process.execPath, ["scripts/run-asset-cleanup-worker.mjs"], {
+    env: runtimeEnvironment,
+    stdio: "inherit",
+  });
+  spawnManaged("sandbox-cleanup-worker", process.execPath, ["scripts/run-sandbox-cleanup-worker.mjs"], {
+    env: runtimeEnvironment,
+    stdio: "inherit",
+  });
+  spawnManaged("run-reconciler", process.execPath, ["scripts/run-agent-run-reconciler.mjs"], {
+    env: runtimeEnvironment,
+    stdio: "inherit",
+  });
+
+  console.log(`OPEN_AGENT_PUBLIC_URL=${publicOrigin}`);
+  outcome = await Promise.race([...managedChildren.values()].map((entry) => entry.exit));
+  if (!shutdownRequested) {
+    console.error(`${outcome.name} exited unexpectedly`, {
+      code: outcome.code,
+      error: outcome.error?.message,
+      signal: outcome.signal,
+    });
+  }
+} catch (error) {
+  if (!shutdownRequested) console.error("Production preview failed", error);
+} finally {
+  await stop();
+  for (const [signal, handler] of signalHandlers) process.off(signal, handler);
+  process.exitCode = outcome
+    ? productionPreviewExitCode(outcome, shutdownRequested)
+    : shutdownRequested ? 0 : 1;
 }
-process.exitCode = shutdownRequested ? 0 : outcome.code ?? (outcome.signal ? 1 : 0);
+
+function assertCanStart() {
+  if (stopping) throw new Error("Production preview shutdown is already in progress.");
+}
+
+function spawnManaged(name, command, args, options) {
+  assertCanStart();
+  const child = spawn(command, args, options);
+  const entry = { child, exit: childExit(name, child), name };
+  managedChildren.set(name, entry);
+  return entry;
+}
+
+function stop(signal = "SIGTERM") {
+  if (stopPromise) return stopPromise;
+  stopping = true;
+  stopPromise = (async () => {
+    const exits = [...managedChildren.values()].map((entry) => entry.exit);
+    for (const { child } of managedChildren.values()) {
+      if (child.exitCode === null && child.signalCode === null) child.kill(signal);
+    }
+    const gatewayClose = gateway?.close() ?? Promise.resolve();
+    await Promise.race([
+      Promise.allSettled(exits),
+      new Promise((resolvePromise) => setTimeout(resolvePromise, 10_000)),
+    ]);
+    for (const { child } of managedChildren.values()) {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    }
+    await Promise.allSettled([gatewayClose, ...exits]);
+  })();
+  return stopPromise;
+}
 
 function containerEnvironment(container) {
   const raw = execFileSync("docker", ["inspect", "--format", "{{json .Config.Env}}", container], { encoding: "utf8" });
@@ -266,9 +294,12 @@ async function resolvePublicOrigin() {
   return `http://127.0.0.1:${WEB_PORT}`;
 }
 
-async function waitForHealth(url, child) {
+async function waitForHealth(url, entry, serviceName = entry.name) {
   for (let attempt = 0; attempt < 120; attempt += 1) {
-    if (child.exitCode !== null) throw new Error("Eve exited before becoming healthy.");
+    if (stopping) throw new Error("Production preview shutdown is already in progress.");
+    if (entry.child.exitCode !== null || entry.child.signalCode !== null) {
+      throw new Error(`${serviceName} exited before becoming healthy.`);
+    }
     try {
       const response = await fetch(url, { signal: AbortSignal.timeout(1_000) });
       if (response.ok) return;
@@ -277,7 +308,7 @@ async function waitForHealth(url, child) {
     }
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
-  throw new Error("Eve did not become healthy within 30 seconds.");
+  throw new Error(`${serviceName} did not become healthy within 30 seconds.`);
 }
 
 async function assertPortsAvailable(ports) {
@@ -292,9 +323,16 @@ async function assertPortsAvailable(ports) {
 
 function childExit(name, child) {
   if (child.exitCode !== null || child.signalCode !== null) {
-    return Promise.resolve({ code: child.exitCode, name, signal: child.signalCode });
+    return Promise.resolve({ code: child.exitCode, error: undefined, name, signal: child.signalCode });
   }
   return new Promise((resolve) => {
-    child.once("exit", (code, signal) => resolve({ code, name, signal }));
+    let settled = false;
+    const settle = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+    child.once("error", (error) => settle({ code: 1, error, name, signal: null }));
+    child.once("exit", (code, signal) => settle({ code, error: undefined, name, signal }));
   });
 }

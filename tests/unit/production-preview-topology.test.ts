@@ -4,6 +4,7 @@ import {
   assertBuiltEveProxy,
   assertBuiltEveWorkflowWorld,
   configureEveNextProductionPort,
+  productionPreviewExitCode,
   PRODUCTION_PREVIEW_PORTS,
 } from "../../scripts/production-preview-topology.mjs";
 
@@ -55,4 +56,11 @@ test("accepts an Eve artifact compiled with the Postgres Workflow World", () => 
       },
     },
   }));
+});
+
+test("treats every unexpected critical process exit as a supervisor failure", () => {
+  assert.equal(productionPreviewExitCode({ code: 0, signal: null }, false), 1);
+  assert.equal(productionPreviewExitCode({ code: 23, signal: null }, false), 23);
+  assert.equal(productionPreviewExitCode({ code: null, signal: "SIGKILL" }, false), 1);
+  assert.equal(productionPreviewExitCode({ code: null, signal: "SIGTERM" }, true), 0);
 });

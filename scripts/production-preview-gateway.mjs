@@ -41,31 +41,34 @@ export async function startProductionPreviewGateway(options) {
   };
 
   const server = createServer((request, response) => {
-    const pathname = new URL(request.url || "/", "http://open-agent.local").pathname;
+    const pathname = parseRequestPathname(request.url);
+    if (pathname === undefined) {
+      writeHttpError(response, 400, "preview_invalid_request_url");
+      return;
+    }
+    sanitizeForwardingHeaders(request.headers);
     proxy.web(request, response, {
       agent,
       target: selectProductionPreviewTarget(pathname, targets),
-    });
+    }).catch((error) => handleProxyError(error, request, response));
   });
   server.on("connection", (socket) => {
     sockets.add(socket);
     socket.once("close", () => sockets.delete(socket));
   });
   server.on("upgrade", (request, socket, head) => {
-    const pathname = new URL(request.url || "/", "http://open-agent.local").pathname;
+    const pathname = parseRequestPathname(request.url);
+    if (pathname === undefined) {
+      socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+      return;
+    }
+    sanitizeForwardingHeaders(request.headers);
     proxy.ws(request, socket, head, {
       agent,
       target: selectProductionPreviewTarget(pathname, targets),
-    });
+    }).catch((error) => handleProxyError(error, request, socket));
   });
-  proxy.on("error", (error, _request, responseOrSocket) => {
-    if (responseOrSocket && "writeHead" in responseOrSocket && !responseOrSocket.headersSent) {
-      responseOrSocket.writeHead(502, { "content-type": "application/json" });
-      responseOrSocket.end(JSON.stringify({ code: "preview_upstream_unavailable", ok: false }));
-      return;
-    }
-    responseOrSocket?.destroy?.(error);
-  });
+  proxy.on("error", handleProxyError);
 
   await new Promise((resolvePromise, reject) => {
     const onError = (error) => {
@@ -90,11 +93,52 @@ export async function startProductionPreviewGateway(options) {
         server.close(() => resolvePromise());
         server.closeIdleConnections?.();
         for (const socket of sockets) socket.destroy();
+        proxy.close();
         agent.destroy();
       });
       return closing;
     },
   };
+}
+
+function parseRequestPathname(value) {
+  try {
+    return new URL(value || "/", "http://open-agent.local").pathname;
+  } catch {
+    return undefined;
+  }
+}
+
+function sanitizeForwardingHeaders(headers) {
+  for (const name of [
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-port",
+    "x-forwarded-proto",
+    "x-forwarded-server",
+    "x-real-ip",
+  ]) {
+    delete headers[name];
+  }
+}
+
+function handleProxyError(error, _request, responseOrSocket) {
+  if (!responseOrSocket || responseOrSocket.destroyed) return;
+  if ("writeHead" in responseOrSocket && !responseOrSocket.headersSent) {
+    writeHttpError(responseOrSocket, 502, "preview_upstream_unavailable");
+    return;
+  }
+  responseOrSocket.destroy(error);
+}
+
+function writeHttpError(response, status, code) {
+  const body = JSON.stringify({ code, ok: false });
+  response.writeHead(status, {
+    "content-length": Buffer.byteLength(body),
+    "content-type": "application/json",
+  });
+  response.end(body);
 }
 
 function normalizeOrigin(value, name) {
