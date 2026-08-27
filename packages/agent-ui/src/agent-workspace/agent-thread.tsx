@@ -485,7 +485,15 @@ export function AgentThreadView({
 
   const runtimeIsBusy = agent.status === "submitted" || agent.status === "streaming";
   latestEventsRef.current = agent.events;
-  const authoritativeEvents = isRecovering ? thread.events : agent.events;
+  const durableSessionSettled = hasSettledSessionBoundary(thread.events);
+  const localSessionSettled = hasSettledSessionBoundary(agent.events);
+  // A recovery worker can commit session.waiting before the mounted Eve hook
+  // receives the same tail. Keep the durable boundary authoritative across
+  // the recovery hand-off so a stale local `isRunning` snapshot cannot reopen
+  // a completed composer or trigger another follow stream.
+  const authoritativeEvents = isRecovering || (durableSessionSettled && !localSessionSettled)
+    ? thread.events
+    : agent.events;
   // A durable turn boundary is authoritative. React stream state can remain
   // stale after a reconnect even though Eve has already parked the session.
   const pendingTurnInFlight = isPendingTurnInFlight(thread.pendingTurn) &&
@@ -1548,6 +1556,7 @@ export function AgentThreadView({
           fallbackStartedAt={thread.pendingTurn?.submittedAt}
           inputDisabled={inputLocked}
           isBusy={isBusy}
+          sessionSettled={durableTurnSettled}
           onCancel={requestCancellation}
           locale={locale}
           mentions={mentions}

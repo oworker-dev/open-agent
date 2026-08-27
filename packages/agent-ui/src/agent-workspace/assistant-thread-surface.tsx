@@ -86,6 +86,7 @@ export function AssistantThreadSurface({
   historyLoading = false,
   inputDisabled,
   isBusy,
+  sessionSettled,
   onCancel,
   locale,
   mentions,
@@ -120,6 +121,8 @@ export function AssistantThreadSurface({
   /** Locks the main composer without disabling assistant-ui's edit composer. */
   readonly inputDisabled?: boolean;
   readonly isBusy: boolean;
+  /** Authoritative Eve session boundary; overrides a stale local hook state. */
+  readonly sessionSettled?: boolean;
   readonly onCancel?: () => void;
   readonly locale: AgentLocale;
   readonly mentions: readonly AgentPromptMenuItem[];
@@ -235,6 +238,7 @@ export function AssistantThreadSurface({
             draftRestore={draftRestore}
             inputDisabled={inputDisabled}
             isBusy={isBusy}
+            sessionSettled={sessionSettled}
             locale={locale}
             mentions={mentions}
             messages={messages}
@@ -537,6 +541,7 @@ export function AssistantComposer({
   draftRestore,
   inputDisabled = false,
   isBusy = false,
+  sessionSettled = false,
   locale,
   mentions,
   messages,
@@ -557,6 +562,7 @@ export function AssistantComposer({
   readonly draftRestore?: AgentComposerDraftRestore;
   readonly inputDisabled?: boolean;
   readonly isBusy?: boolean;
+  readonly sessionSettled?: boolean;
   readonly locale: AgentLocale;
   readonly mentions: readonly AgentPromptMenuItem[];
   readonly messages: AgentMessages;
@@ -575,7 +581,7 @@ export function AssistantComposer({
   const composerText = useAuiState((state) => state.composer.text);
   const runtimeInputDisabled = useAuiState((state) => state.thread.isDisabled);
   const stopping = cancellationState !== "idle";
-  const runtimeBusy = isRunning || isBusy;
+  const runtimeBusy = isBusy || (isRunning && !sessionSettled);
   const composerDisabled = inputDisabled || runtimeInputDisabled || stopping;
   const composerInputRef = useRef<HTMLDivElement>(null);
   const auiRef = useRef(aui);
