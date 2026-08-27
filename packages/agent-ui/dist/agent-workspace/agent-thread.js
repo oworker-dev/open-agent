@@ -300,7 +300,9 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     const authoritativeEvents = isRecovering ? thread.events : agent.events;
     const pendingTurnInFlight = isPendingTurnInFlight(thread.pendingTurn) &&
         !hasSettledLatestTurn(authoritativeEvents);
-    const durableTurnSettled = !pendingTurnInFlight && hasSettledLatestTurn(authoritativeEvents);
+    const durableTurnSettled = !pendingTurnInFlight &&
+        hasSettledLatestTurn(authoritativeEvents) &&
+        hasSettledSessionBoundary(authoritativeEvents);
     const durableTurnOpen = !pendingTurnInFlight && !durableTurnSettled &&
         thread.status !== "ready" && thread.status !== "error" &&
         authoritativeEvents.some((event) => event.type === "turn.started");
@@ -1509,6 +1511,12 @@ function latestTurnOutcome(events) {
     if (event?.type === "turn.failed" || event?.type === "session.failed")
         return "failed";
     return undefined;
+}
+function hasSettledSessionBoundary(events) {
+    const last = events.at(-1);
+    return last?.type === "session.waiting" ||
+        last?.type === "session.completed" ||
+        last?.type === "session.failed";
 }
 function latestTurnFailure(events) {
     if (latestTurnOutcome(events) !== "failed")

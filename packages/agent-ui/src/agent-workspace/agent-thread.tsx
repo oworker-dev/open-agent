@@ -490,7 +490,9 @@ export function AgentThreadView({
   // stale after a reconnect even though Eve has already parked the session.
   const pendingTurnInFlight = isPendingTurnInFlight(thread.pendingTurn) &&
     !hasSettledLatestTurn(authoritativeEvents);
-  const durableTurnSettled = !pendingTurnInFlight && hasSettledLatestTurn(authoritativeEvents);
+  const durableTurnSettled = !pendingTurnInFlight &&
+    hasSettledLatestTurn(authoritativeEvents) &&
+    hasSettledSessionBoundary(authoritativeEvents);
   // A bounded Eve stream can close at its current durable tail while the
   // session is still executing. In that window `agent.status` may already be
   // idle even though the latest persisted turn has no terminal boundary. Keep
@@ -2068,6 +2070,16 @@ function latestTurnOutcome(events: readonly MessageStreamEvent[]): "cancelled" |
   if (event?.type === "turn.completed") return "completed";
   if (event?.type === "turn.failed" || event?.type === "session.failed") return "failed";
   return undefined;
+}
+
+/** A model turn can complete while Eve is still committing the session
+ * boundary. The composer must remain locked until the session is parked or
+ * terminal, otherwise a follow-up can race the still-active runtime. */
+function hasSettledSessionBoundary(events: readonly MessageStreamEvent[]): boolean {
+  const last = events.at(-1);
+  return last?.type === "session.waiting" ||
+    last?.type === "session.completed" ||
+    last?.type === "session.failed";
 }
 
 function latestTurnFailure(events: readonly MessageStreamEvent[]): string | undefined {
