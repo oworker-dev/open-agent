@@ -1820,6 +1820,21 @@ test("a committed normal-turn mailbox message without a client id clears after t
     mockContinuationTurn("Continue without a client id", "Committed delivery completed."),
   );
   let streamRequests = 0;
+  let runtimeWaiting = false;
+
+  await page.route(`**/api/standalone/sessions/${sessionId}`, async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({
+        ok: true,
+        state: runtimeWaiting ? "waiting" : "running",
+        ...(runtimeWaiting
+          ? { tailIndex: settledEvents.length + admittedEvents.length - 1 }
+          : {}),
+      }),
+      contentType: "application/json",
+      status: 200,
+    });
+  });
 
   setFakeThreadCollection(page, {
     activeThreadId: threadId,
@@ -1856,6 +1871,7 @@ test("a committed normal-turn mailbox message without a client id clears after t
   });
   await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
     streamRequests += 1;
+    runtimeWaiting = true;
     const startIndex = Number(new URL(route.request().url()).searchParams.get("startIndex") ?? "0");
     const events = startIndex <= settledEvents.length ? admittedEvents : [];
     await route.fulfill({
