@@ -45,10 +45,11 @@ than a maximum-capacity claim.
 
 The public preview now terminates traffic in a dedicated loopback-only gateway
 instead of asking Next's compiled rewrite proxy to carry Eve streams. The
-legacy proxy instantiated a fixed `maxSockets: 256` HTTP agent, which explains
-the exact 256/768 disconnect counts at 500/1,000 followers. After the routing
-change, pooled 500- and 1,000-follower gates both passed. The 1,000-follower
-sample used one durable Eve session to isolate network/stream fan-out from
+legacy proxy instantiated a fixed `maxSockets: 256` HTTP agent and applied a
+30-second proxy timeout. That combination explains the wave-shaped 256/768
+disconnect counts and roughly 30-second handshakes at 500/1,000 followers.
+After the routing change, pooled 500- and 1,000-follower gates both passed. The
+1,000-follower sample used one durable Eve session to isolate network/stream fan-out from
 Provider and session-creation load. Sampled gateway RSS rose from about 131 MiB
 to 160 MiB, Eve RSS from about 250 MiB to 389 MiB, and Next remained near 224
 MiB. Peak one-second CPU samples were 32% for the gateway and 127% for Eve on
