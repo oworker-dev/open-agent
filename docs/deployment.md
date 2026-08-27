@@ -195,25 +195,28 @@ AGENT_RUN_SUBMISSION_STALE_MS=120000 \
   npm run start:run-reconciler
 ```
 
-For the Docker backend, also run the terminal sandbox cleanup worker. It only
-selects sessions whose latest AgentRun is terminal, whose retention window has
-elapsed, and which have no queued follow-up or active child. The worker first
-retires the exact Eve session, records the owner-scoped deletion authorization,
-then invokes the exact-session reaper with a bounded limit. It never performs a
- broad container deletion and it leaves an authorization ledger for retries.
+For the Docker backend, configure idle compute shutdown and run the authorized
+sandbox deletion worker. Eve creates a session sandbox only when a sandbox tool
+or authored `ctx.getSandbox()` first needs it. After a durable checkpoint, Open
+Agent stops an inactive Docker container after the configured timeout. The
+container filesystem and Eve session remain intact; the next sandbox access
+starts the same container and resumes `/workspace`.
 
 ```bash
-AGENT_SANDBOX_TERMINAL_RETENTION_HOURS=168 \
+AGENT_DOCKER_IDLE_TIMEOUT_MS=1800000 \
 AGENT_SANDBOX_CLEANUP_INTERVAL_MS=900000 \
 AGENT_SANDBOX_CLEANUP_MAX_SESSIONS=25 \
   npm run start:sandbox-cleanup
 ```
 
-The production wrapper starts both cleanup workers. Keep the terminal retention
-long enough for normal follow-up conversations; deleting a completed AgentRun
-does not immediately delete its sandbox because the durable session may still
-be reopened. Microsandbox and Vercel Sandbox deployments use their backend
-lifecycle controls instead of this Docker-specific worker.
+The deletion worker reads only owner-scoped tombstones written after an
+authenticated session deletion has retired Eve. A completed, failed, or
+cancelled AgentRun never authorizes session or workspace deletion. The reaper
+claims each tombstone with a lease, revalidates the exact container, and records
+completion or a retryable failure. This keeps long conversations resumable
+without paying CPU/RAM for every idle Docker session. Microsandbox snapshots at
+durable capture boundaries and Vercel Sandbox supplies its own idle/resume
+lifecycle, so neither uses this Docker-specific worker.
 
 Inspection and busy-session failures are deferred with bounded backoff. A
 transport failure after admission begins is marked `submission-ambiguous` and
@@ -382,21 +385,31 @@ that a deployment meets the full 1k/5k/10k stream or tenant SLO matrix.
 
 `@workflow/world-postgres` does not perform general workflow-run cleanup. Run
 `npm run reap:workflow` with `WORKFLOW_POSTGRES_URL` to produce a read-only
-retention report. It protects active roots and unexpired Hooks, and only selects
-completed, failed, or cancelled runs older than the configured age. Deletion is
-disabled unless both `WORKFLOW_RETENTION_APPLY=1` and
-`WORKFLOW_RETENTION_CONFIRM=delete-workflow-runs` are supplied. Review the JSON
-report and take a database backup before applying cleanup. This worker never
-cleans the Agent UI event projection; that projection and Eve's authoritative
-stream remain separate lifecycles.
+retention and storage report. It selects complete root trees only, protects any
+tree with an active member or unexpired Hook, reports relation and uncompressed
+stream payload sizes, and lists the largest roots without reading their payloads
+into Node memory. `WORKFLOW_RETENTION_MAX_ROOTS` bounds the audit result; it is
+not a history limit.
+
+Destructive apply is intentionally disabled. A terminal Eve root is still
+replay state, so a PostgreSQL backup by itself is not enough to authorize
+deletion. The production archive lifecycle must export the complete root tree,
+store a versioned manifest and checksum in durable object storage, restore it
+into an isolated Workflow World, and pass session replay verification before an
+external purge job can remove hot rows. Until that restore drill exists, keep
+terminal history in PostgreSQL and use the audit for storage forecasting. Never
+delete individual child runs or stream chunks, and never use an event-count,
+payload-size, or conversation-length threshold as retention policy.
 
 ### Single-server capacity matrix
 
 Run `npm run verify:capacity` against an isolated deployment. It sequentially
 raises idle stream and simple AgentRun levels using the existing bounded gates,
-stops at the first failed level, and writes one redacted report plus per-level
-evidence. Configure `AGENT_CAPACITY_STREAM_LEVELS` and
-`AGENT_CAPACITY_RUN_LEVELS` for the target machine. The runner refuses to
+then executes mixed stream/run envelopes. It stops each ramp at the first failed
+level and writes one redacted report plus per-level evidence. Configure
+`AGENT_CAPACITY_STREAM_LEVELS`, `AGENT_CAPACITY_RUN_LEVELS`, and
+`AGENT_CAPACITY_MIXED_LEVELS` (`streams:runs`, comma-separated) for the target
+machine. The runner refuses to
 start when free disk is below `AGENT_CAPACITY_MIN_FREE_DISK_BYTES`; this
 protects the Workflow World from the load test itself. The result reports the
 highest passing test level only; it is not a claim that the same number of
@@ -404,6 +417,23 @@ users can run long sandbox tasks or that ten thousand/one hundred thousand
 users are supported. Capacity runs use
 `AGENT_LOAD_COMPLETION_SLO_MODE=observe` so Provider latency remains visible
 without being confused with local admission saturation.
+
+An idle stream level counts open connections. The verifier now reports the
+number of distinct durable sessions and maximum followers per session. Shared
+session fan-out tests the stream server but cannot be reported as online-user
+capacity. Set `AGENT_CAPACITY_STREAM_SESSION_COUNT` equal to the tested stream
+level for a one-session-per-connection run; only child evidence marked
+`distinctSessionCapacityEvidence=true` supports a distinct-session claim.
+Because seeding a durable session performs a real Agent turn, use a mock or
+controlled Provider for large connection matrices.
+
+For production evidence, configure `AGENT_CAPACITY_TARGET_METRICS_URL` and its
+token so the verifier samples Web process RSS, heap, event-loop delay and Agent
+database pool pressure throughout the load window, not only before and after.
+Also provide `WORKFLOW_POSTGRES_URL`; the aggregate report records Workflow
+relation bytes, stream payload bytes, chunks, and run-count deltas. Set
+`AGENT_CAPACITY_REQUIRE_PRODUCTION_EVIDENCE=1` in release gates so missing
+target metrics, storage deltas, or a passing mixed envelope fails the run.
 
 To measure the interaction between online connections and active work, run
 `npm run verify:mixed-capacity` against the same isolated deployment. The
@@ -414,8 +444,8 @@ produces one combined report. Configure `AGENT_MIXED_STREAM_TOTAL`,
 `AGENT_MIXED_RUN_CONCURRENCY` for the target host; the existing verifier SLO
 variables continue to control pass/fail behavior. `AGENT_MIXED_CHILD_TIMEOUT_MS`
 is a cleanup deadline for a hung verifier, not an Agent or message limit. The
-runner samples the protected metrics endpoint before and after the mixed
-window when `AGENT_MIXED_TARGET_METRICS_URL` and its token are configured. A
+runner samples the protected metrics endpoint throughout the mixed window when
+`AGENT_MIXED_TARGET_METRICS_URL` and its token are configured. A
 passing mixed batch is evidence for that exact topology and workload only; it
 does not translate directly into a user-count guarantee. The same free-disk
 safety preflight as the sequential matrix is applied before load starts.

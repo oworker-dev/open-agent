@@ -15,6 +15,7 @@ test("retention selects only old terminal runs", () => {
     { id: "active", rootRunId: "active", status: "running", completedAt: null },
   ], now, { maxRuns: 10, olderThanMs: 7 * 24 * 60 * 60 * 1_000 });
   assert.deepEqual(result.candidates.map((run) => run.id), ["old"]);
+  assert.deepEqual(result.candidateRootIds, ["old"]);
 });
 
 test("retention protects terminal children of an active root", () => {
@@ -24,6 +25,22 @@ test("retention protects terminal children of an active root", () => {
   ], now, { maxRuns: 10, olderThanMs: 7 * 24 * 60 * 60 * 1_000 });
   assert.equal(result.candidates.length, 0);
   assert.equal(result.skippedActiveRoots, 1);
+});
+
+test("retention selects or rejects a root tree as one unit", () => {
+  const selected = selectWorkflowRetentionCandidates([
+    { id: "root", rootRunId: "root", status: "completed", completedAt: old },
+    { id: "turn-a", rootRunId: "root", status: "failed", completedAt: old },
+    { id: "turn-b", rootRunId: "root", status: "cancelled", completedAt: old },
+  ], now, { maxRuns: 1, olderThanMs: 7 * 24 * 60 * 60 * 1_000 });
+  assert.deepEqual(selected.candidateRootIds, ["root"]);
+  assert.deepEqual(selected.candidates.map((run) => run.id), ["root", "turn-a", "turn-b"]);
+
+  const tooNew = selectWorkflowRetentionCandidates([
+    { id: "root", rootRunId: "root", status: "completed", completedAt: old },
+    { id: "turn", rootRunId: "root", status: "completed", completedAt: new Date("2026-08-23T00:00:00.000Z") },
+  ], now, { maxRuns: 1, olderThanMs: 7 * 24 * 60 * 60 * 1_000 });
+  assert.deepEqual(tooNew.candidates, []);
 });
 
 test("retention protects explicitly retained roots and caps work", () => {

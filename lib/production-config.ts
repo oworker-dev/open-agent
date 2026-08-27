@@ -28,12 +28,37 @@ export const DEFAULT_AGENT_DOCKER_CPU_LIMIT = 2;
 export const MAX_AGENT_DOCKER_CPU_LIMIT = 64;
 export const DEFAULT_AGENT_DOCKER_PIDS_LIMIT = 512;
 export const MAX_AGENT_DOCKER_PIDS_LIMIT = 32_768;
+export const DEFAULT_AGENT_DOCKER_IDLE_TIMEOUT_MS = 30 * 60 * 1_000;
+export const MAX_AGENT_DOCKER_IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
 
 export type AgentDockerResourceLimits = {
   readonly memoryBytes: number;
   readonly cpus: number;
   readonly pidsLimit: number;
 };
+
+export function readAgentDockerIdleTimeoutMs(
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+): number {
+  const value = environment.AGENT_DOCKER_IDLE_TIMEOUT_MS?.trim();
+  if (!value) {
+    if (environment.NODE_ENV === "production") {
+      throw new Error("AGENT_DOCKER_IDLE_TIMEOUT_MS must be explicitly configured in production.");
+    }
+    return DEFAULT_AGENT_DOCKER_IDLE_TIMEOUT_MS;
+  }
+  const milliseconds = Number(value);
+  if (
+    !Number.isSafeInteger(milliseconds)
+    || milliseconds < 60_000
+    || milliseconds > MAX_AGENT_DOCKER_IDLE_TIMEOUT_MS
+  ) {
+    throw new Error(
+      `AGENT_DOCKER_IDLE_TIMEOUT_MS must be an integer from 60000 to ${MAX_AGENT_DOCKER_IDLE_TIMEOUT_MS}.`,
+    );
+  }
+  return milliseconds;
+}
 
 export function readAgentDockerResourceLimits(
   environment: Readonly<Record<string, string | undefined>> = process.env,
@@ -419,6 +444,14 @@ export function inspectProductionConfiguration(
           cause instanceof Error ? cause.message : "Invalid Docker sandbox resource limits.",
         );
       }
+      try {
+        readAgentDockerIdleTimeoutMs(environment);
+      } catch (cause) {
+        error(
+          "docker-idle-timeout",
+          cause instanceof Error ? cause.message : "Invalid Docker sandbox idle timeout.",
+        );
+      }
       inspectInteger(
         environment.EVE_SANDBOX_RETENTION_HOURS,
         "EVE_SANDBOX_RETENTION_HOURS",
@@ -431,13 +464,6 @@ export function inspectProductionConfiguration(
         "EVE_SANDBOX_REAPER_MAX_REMOVALS",
         1,
         10_000,
-        error,
-      );
-      inspectInteger(
-        environment.AGENT_SANDBOX_TERMINAL_RETENTION_HOURS,
-        "AGENT_SANDBOX_TERMINAL_RETENTION_HOURS",
-        1,
-        87_600,
         error,
       );
       inspectInteger(
@@ -454,6 +480,20 @@ export function inspectProductionConfiguration(
         10_000,
         error,
       );
+      inspectOptionalInteger(
+        environment.AGENT_HOST_MAX_DOCKER_SANDBOX_CONTAINERS,
+        "AGENT_HOST_MAX_DOCKER_SANDBOX_CONTAINERS",
+        1,
+        1_000_000,
+        error,
+      );
+      inspectOptionalInteger(
+        environment.AGENT_HOST_MAX_RUNNING_DOCKER_SANDBOXES,
+        "AGENT_HOST_MAX_RUNNING_DOCKER_SANDBOXES",
+        1,
+        1_000_000,
+        error,
+      );
       if (deploymentTenancy === "multi-tenant") {
         error(
           "sandbox-backend-docker-multi-tenant",
@@ -462,7 +502,7 @@ export function inspectProductionConfiguration(
       } else if (deploymentTenancy === "single-tenant") {
         warning(
           "sandbox-backend-docker",
-          "Docker is selected for a single-tenant deployment; schedule the sandbox reaper and prove daemon hardening, quotas, and cross-session isolation on the deployed host.",
+          "Docker is selected for a single-tenant deployment; enable idle compute shutdown, schedule the authorization-only sandbox reaper, and prove daemon hardening, quotas, and cross-session isolation on the deployed host.",
         );
       }
     }

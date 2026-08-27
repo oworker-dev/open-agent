@@ -1176,21 +1176,36 @@ export function AgentWorkspace({
       const last = events.at(-1);
       if (knownRuntimeBoundary && runtimeBoundaryReady) {
         if (committedCatchUpTurns.size > 0 || hasPendingServerQueue()) return false;
-        return true;
+        // The runtime inspection is authoritative only for an explicit
+        // settled state. A boolean readiness marker alone must never unlock
+        // the composer after a turn.completed event while Eve is still
+        // deciding whether to park the session.
+        return knownRuntimeBoundary.state === "waiting" || knownRuntimeBoundary.state === "terminal";
       }
       if (!last || !isRecoveryBoundary(last)) return false;
       if (committedCatchUpTurns.size > 0 || hasPendingServerQueue()) return false;
-      // `turn.completed` closes one model turn, not necessarily the session.
-      // When Eve still reports the session as running, keep the recovery loop
-      // open for the following `session.waiting` or next turn boundary.
+      // A turn boundary closes one model turn, not the durable session. Eve can
+      // still be committing tool output, parking the session, or admitting a
+      // queued message. Only session.waiting/session terminal (or the matching
+      // authoritative inspection above) is a recovery-safe handoff boundary.
+      return last.type === "session.waiting" ||
+        last.type === "session.completed" ||
+        last.type === "session.failed";
+    };
+    const recoveryStatus = () => {
+      const status = statusFromEvents(events, currentClosedInputRequestIds());
+      const last = events.at(-1);
+      // `turn.completed` closes one model turn, not the durable Eve session.
+      // Keep the composer in the running state until session.waiting (or a
+      // terminal session boundary) is observed; otherwise a bounded catch-up
+      // page can briefly unlock input and race the still-active run.
       if (
-        runtimeBoundaryState === "running" &&
-        (last.type === "turn.completed" || last.type === "turn.failed" || last.type === "turn.cancelled")
-      ) return false;
-      // A turn boundary is enough for an idle session with no queued work.
-      // When a follow-up is persisted, keep reading until Eve parks the
-      // session so the mailbox dispatcher can admit it at the true boundary.
-      return true;
+        status === "ready" &&
+        runtimeBoundaryState !== "waiting" &&
+        runtimeBoundaryState !== "terminal" &&
+        last?.type === "turn.completed"
+      ) return "streaming" as const;
+      return status;
     };
     const flushRecoverySnapshot = (force = false) => {
       if (!force && !recoverySnapshotDirty && cursor === persistedCursor) return;
@@ -1206,7 +1221,7 @@ export function AgentWorkspace({
         session: { ...session.state, streamIndex: persistedCursor },
         status: cancellationPending
           ? "cancelling"
-          : statusFromEvents(events, currentClosedInputRequestIds()),
+          : recoveryStatus(),
       });
     };
 
@@ -1471,7 +1486,7 @@ export function AgentWorkspace({
           ? "cancelling"
           : knownRuntimeBoundary?.failed
             ? "error"
-            : statusFromEvents(events, currentClosedInputRequestIds()),
+            : recoveryStatus(),
       });
     } catch (error) {
       if (controller.signal.aborted || isAbortError(error)) return;
@@ -1487,7 +1502,7 @@ export function AgentWorkspace({
         return next;
       });
     }
-  }, [client, inspectSession, mailbox, messages.recoveryFailed, onEvent, updateThread]);
+  }, [client, inspectSession, mailbox, messages.recoveryFailed, onEvent, settleThreadHistory, updateThread]);
 
   useEffect(() => () => {
     for (const controller of recoveryControllers.current.values()) controller.abort();

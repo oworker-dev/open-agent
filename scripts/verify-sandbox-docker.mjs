@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import { docker } from "eve/sandbox/docker";
+import { withIdleSandboxShutdown } from "../lib/idle-sandbox-backend.ts";
 
 if (process.env.RUN_SANDBOX_DOCKER_EVAL !== "1") {
   console.log("sandbox docker eval skipped (set RUN_SANDBOX_DOCKER_EVAL=1)");
@@ -14,7 +15,10 @@ const suffix = randomUUID().replaceAll("-", "");
 const templateKey = `open-agent-sandbox-eval-${suffix}`;
 const sessionAKey = `open-agent-sandbox-eval-a-${suffix}`;
 const sessionBKey = `open-agent-sandbox-eval-b-${suffix}`;
-const backend = docker({ networkPolicy: "deny-all", pullPolicy: "never" });
+const backend = withIdleSandboxShutdown(
+  docker({ networkPolicy: "deny-all", pullPolicy: "never" }),
+  100,
+);
 const handles = [];
 
 try {
@@ -51,6 +55,25 @@ try {
   // The same durable sandbox keeps /workspace across separate tool calls.
   assert.equal(await first.session.readTextFile({ path: "notes/result.txt" }), "session-a-secret\n");
 
+  const captured = await first.captureState();
+  const containerName = captured.metadata.containerName;
+  assert.equal(typeof containerName, "string");
+  await waitFor(() => !containerRunning(containerName), 5_000);
+
+  const restored = await backend.create({
+    existingMetadata: captured.metadata,
+    templateKey,
+    sessionKey: sessionAKey,
+    runtimeContext: { appRoot: process.cwd() },
+    tags: { eval: "sandbox-isolation" },
+  });
+  handles.push(restored);
+  assert.equal(
+    await restored.session.readTextFile({ path: "notes/result.txt" }),
+    "session-a-secret\n",
+    "the durable workspace did not survive idle compute shutdown",
+  );
+
   const second = await backend.create({
     templateKey,
     sessionKey: sessionBKey,
@@ -68,7 +91,7 @@ try {
     "seeded by open-agent\n",
   );
 
-  const network = await first.session.run({
+  const network = await restored.session.run({
     command: "set -eu; test -z \"$(getent hosts example.com || true)\"; test -z \"$(cat /proc/net/route | awk 'NR > 1 && $2 != \\\"00000000\\\" { print }')\"",
   });
   assert.equal(network.exitCode, 0, `deny-all egress was not enforced: ${network.stderr}`);
@@ -81,6 +104,7 @@ try {
 
   console.log(JSON.stringify({
     backend: "docker",
+    idleCompute: "stopped-and-restored",
     networkPolicy: "deny-all",
     persistence: "same-session",
     isolation: "cross-session",
@@ -92,7 +116,11 @@ try {
     await handle.shutdown().catch(() => undefined);
     const name = (await handle.captureState().catch(() => undefined))?.metadata?.containerName;
     if (typeof name === "string") {
-      execFileSync("docker", ["rm", "-f", name], { stdio: "ignore" });
+      try {
+        execFileSync("docker", ["rm", "-f", name], { stdio: "ignore" });
+      } catch {
+        // Multiple handles can refer to the same durable session container.
+      }
     }
   }
 }
@@ -102,5 +130,27 @@ function assertDockerAvailable() {
     execFileSync("docker", ["info"], { stdio: "ignore" });
   } catch {
     throw new Error("RUN_SANDBOX_DOCKER_EVAL=1 requires a reachable Docker daemon.");
+  }
+}
+
+function containerRunning(name) {
+  try {
+    return execFileSync(
+      "docker",
+      ["inspect", "--format", "{{.State.Running}}", name],
+      { encoding: "utf8" },
+    ).trim() === "true";
+  } catch {
+    return false;
+  }
+}
+
+async function waitFor(predicate, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) {
+      throw new Error("Timed out waiting for Docker sandbox lifecycle state.");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
   }
 }

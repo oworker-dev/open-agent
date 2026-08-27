@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   inspectProductionConfiguration,
+  readAgentDockerIdleTimeoutMs,
   readAgentDockerResourceLimits,
   readAgentDeploymentTenancy,
   readAgentSandboxBackend,
@@ -20,6 +21,7 @@ const validEnvironment = {
   AGENT_DATABASE_CONNECTION_TIMEOUT_MS: "10000",
   AGENT_DATABASE_IDLE_TIMEOUT_MS: "30000",
   AGENT_DEPLOYMENT_TENANCY: "multi-tenant",
+  AGENT_DOCKER_IDLE_TIMEOUT_MS: "1800000",
   AGENT_EMBED_ALLOWED_ORIGINS: "https://muses.example.com",
   AGENT_HOST_JWT_ALGORITHM: "HS256",
   AGENT_HOST_JWT_AUDIENCE: "open-agent",
@@ -36,7 +38,6 @@ const validEnvironment = {
   AGENT_RUNTIME_URL: "https://agent-runtime.example.com",
   AGENT_SANDBOX_BACKEND: "microsandbox",
   AGENT_SANDBOX_IMAGE: "ghcr.io/oworker/open-agent-sandbox@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-  AGENT_SANDBOX_TERMINAL_RETENTION_HOURS: "168",
   AGENT_SANDBOX_CLEANUP_INTERVAL_MS: "900000",
   AGENT_SANDBOX_CLEANUP_MAX_SESSIONS: "25",
   AGENT_BASH_APPROVAL_MODE: "risky",
@@ -232,6 +233,22 @@ test("parses bounded Docker sandbox resource limits", () => {
   assert.throws(
     () => readAgentDockerResourceLimits({ AGENT_DOCKER_PIDS_LIMIT: "32" }),
     /AGENT_DOCKER_PIDS_LIMIT/u,
+  );
+});
+
+test("bounds Docker idle compute shutdown without expiring the durable session", () => {
+  assert.equal(readAgentDockerIdleTimeoutMs({}), 30 * 60 * 1_000);
+  assert.equal(
+    readAgentDockerIdleTimeoutMs({ AGENT_DOCKER_IDLE_TIMEOUT_MS: "60000" }),
+    60_000,
+  );
+  assert.throws(
+    () => readAgentDockerIdleTimeoutMs({ NODE_ENV: "production" }),
+    /must be explicitly configured/u,
+  );
+  assert.throws(
+    () => readAgentDockerIdleTimeoutMs({ AGENT_DOCKER_IDLE_TIMEOUT_MS: "59999" }),
+    /AGENT_DOCKER_IDLE_TIMEOUT_MS/u,
   );
 });
 

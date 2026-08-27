@@ -3004,6 +3004,93 @@ test("an in-flight turn reconnects after a hard refresh", async ({ page }) => {
   await expect.poll(() => JSON.stringify(threadEvents(page)).includes('"session.waiting"')).toBeTruthy();
 });
 
+test("recovery does not unlock at turn.completed before session.waiting", async ({ page }) => {
+  const sessionId = "mock-turn-boundary-session";
+  const at = new Date().toISOString();
+  const turnId = "turn_recovery_boundary";
+  const prefix = [
+    { data: { runtime: { agentId: "open-agent", agentName: "open-agent", eveVersion: "test", modelId: "mock/model" } }, meta: { at, id: "evt-boundary-session" }, type: "session.started" },
+    { data: { sequence: 0, turnId }, meta: { at, id: "evt-boundary-turn" }, type: "turn.started" },
+    { data: { message: "Wait for the durable boundary", parts: [{ text: "Wait for the durable boundary", type: "text" }], sequence: 0, turnId }, meta: { at, id: "evt-boundary-user" }, type: "message.received" },
+    { data: { sequence: 0, stepIndex: 0, turnId }, meta: { at, id: "evt-boundary-step" }, type: "step.started" },
+  ];
+  const completed = [
+    { data: { finishReason: "stop", message: "The model turn is complete.", sequence: 0, stepIndex: 0, turnId }, meta: { at, id: "evt-boundary-message" }, type: "message.completed" },
+    { data: { finishReason: "stop", sequence: 0, stepIndex: 0, turnId, usage: { inputTokens: 2, outputTokens: 2 } }, meta: { at, id: "evt-boundary-step-complete" }, type: "step.completed" },
+    { data: { sequence: 0, turnId }, meta: { at, id: "evt-boundary-turn-complete" }, type: "turn.completed" },
+  ];
+  const waiting = {
+    data: { wait: "next-user-message" },
+    meta: { at, id: "evt-boundary-waiting" },
+    type: "session.waiting",
+  };
+  let waitingVisible = false;
+  let releaseWaiting: (() => void) | undefined;
+  const waitingReleased = new Promise<void>((resolve) => {
+    releaseWaiting = () => {
+      waitingVisible = true;
+      resolve();
+    };
+  });
+
+  await page.route(`**/api/standalone/sessions/${sessionId}`, async (route) => {
+    await route.fulfill({
+      body: JSON.stringify(waitingVisible
+        ? { ok: true, state: "waiting", tailIndex: prefix.length + completed.length }
+        : { ok: true, state: "running", tailIndex: prefix.length + completed.length - 1 }),
+      contentType: "application/json",
+      status: 200,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
+    const url = new URL(route.request().url());
+    const startIndex = Number(url.searchParams.get("startIndex") ?? "0");
+    const current = [...prefix, ...completed];
+    if (startIndex < current.length) {
+      await route.fulfill({
+        body: ndjson(current.slice(startIndex)),
+        contentType: "application/x-ndjson",
+        headers: { "x-eve-stream-tail-index": String(current.length - 1) },
+        status: 200,
+      });
+      return;
+    }
+    await waitingReleased;
+    await route.fulfill({
+      body: `${JSON.stringify(waiting)}\n`,
+      contentType: "application/x-ndjson",
+      headers: { "x-eve-stream-tail-index": String(current.length) },
+      status: 200,
+    });
+  });
+
+  const now = Date.now();
+  setFakeThreadCollection(page, {
+    activeThreadId: "turn-boundary-thread",
+    threads: [{
+      closedInputRequestIds: [],
+      createdAt: now,
+      events: prefix,
+      id: "turn-boundary-thread",
+      preferences: { executionMode: "standard", modelId: "gpt-5.6-sol", reasoning: "medium" },
+      queuedTurns: [],
+      session: { sessionId, streamIndex: prefix.length },
+      status: "streaming",
+      title: "Durable boundary",
+      updatedAt: now,
+    }],
+    version: 2,
+  });
+
+  await page.goto("/threads/turn-boundary-thread");
+  await expect(page.getByText("The model turn is complete.", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Stop", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Send", exact: true })).toHaveCount(0);
+  releaseWaiting?.();
+  await expect(page.getByRole("button", { name: "Send", exact: true })).toBeVisible({ timeout: 15_000 });
+  await expect.poll(() => threadEvents(page).some((event) => isEventType(event, "session.waiting"))).toBeTruthy();
+});
+
 test("stop keeps the composer locked until the durable cancellation boundary settles", async ({ page }) => {
   const sessionId = "mock-cancel-session";
   let releaseBoundary: (() => void) | undefined;

@@ -1,6 +1,9 @@
 import { execFileSync } from "node:child_process";
 
-import { selectDockerSandboxRetentionCandidates } from "../lib/docker-sandbox-retention.ts";
+import {
+  EVE_DOCKER_SANDBOX_SESSION_LABEL,
+  selectDockerSandboxRetentionCandidates,
+} from "../lib/docker-sandbox-retention.ts";
 import { closeAgentDatabasePools } from "../server/data/agent-database.ts";
 import { createPostgresSandboxDeletionStoreFromEnvironment } from "../server/data/sandbox-deletion-store.ts";
 
@@ -27,6 +30,15 @@ async function main() {
     retentionHours: options.retentionHours,
     sessionId: options.sessionId,
   });
+  const matchingSessionContainers = options.sessionId
+    ? containers
+      .filter((container) => container.labels[EVE_DOCKER_SANDBOX_SESSION_LABEL] === options.sessionId)
+      .map((container) => ({
+        containerId: container.id,
+        containerName: container.name,
+        running: container.running,
+      }))
+    : [];
 
   const deletionStore = options.apply
     ? createPostgresSandboxDeletionStoreFromEnvironment()
@@ -100,6 +112,7 @@ async function main() {
     })),
     inspected: containers.length,
     maxRemovals: options.maxRemovals,
+    matchingSessionContainers,
     removed,
     retentionHours: options.retentionHours,
     skippedByReason,

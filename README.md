@@ -427,13 +427,16 @@ For an explicit Docker deployment, configure finite per-container limits:
 ```bash
 AGENT_DOCKER_MEMORY_LIMIT_BYTES=2GiB \
 AGENT_DOCKER_CPU_LIMIT=2 \
-AGENT_DOCKER_PIDS_LIMIT=512
+AGENT_DOCKER_PIDS_LIMIT=512 \
+AGENT_DOCKER_IDLE_TIMEOUT_MS=1800000
 ```
 
 Open Agent applies these limits with `docker update` after each sandbox is
 created or reattached and fails closed if the daemon reports a mismatch. They
 bound memory, CPU, and process count; disk and inode quotas remain Docker-host
-responsibilities. Production configuration requires all three values.
+responsibilities. The idle timeout stops compute after a durable checkpoint but
+does not expire the session or delete `/workspace`; the next sandbox access
+reattaches it. Production configuration requires all four values.
 
 The operator reaper is conservative and prints a JSON dry-run by default:
 
@@ -454,8 +457,9 @@ and limits every invocation. Emergency deletion of a running sandbox requires
 both `--include-running` and the exact `--session-id`; neither flag alone is
 accepted. `EVE_SANDBOX_PROTECTED_SESSION_IDS` is a comma-separated protection
 list. `--apply` also requires `AGENT_DATABASE_URL` and atomically claims a
-session tombstone written only after Eve was retired; container age alone never
-authorizes deletion. Production operations must schedule this command and ship
+session tombstone written only after Eve was retired; a completed AgentRun and
+container age alone never authorize deletion. Production operations must
+schedule this command and ship
 its JSON plus the persisted tombstone lifecycle to durable audit storage.
 
 ## Host integration

@@ -23,17 +23,20 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
     HOST_AGENT_SCOPE.sessionWrite,
   );
   if (!authenticated.ok) return authenticated.response;
-  if (!store || !store.loadThread || !store.patch) return problem(503, "agent_database_unavailable", "Agent transcript storage is not configured.");
+  if (!store || !store.loadThreadWindow || !store.patch) return problem(503, "agent_database_unavailable", "Agent transcript storage is not configured.");
 
   const { storageKey } = await context.params;
   const threadId = new URL(request.url).searchParams.get("threadId")?.trim();
   if (!threadId || threadId.length > 200) return problem(400, "thread_id_required", "A valid threadId is required.");
 
-  const record = await store.loadThread(
+  // Repair consumes the fixed Eve transcript directly. Read only a bounded
+  // event plus thread metadata here instead of aggregating the old event log.
+  const record = await store.loadThreadWindow(
     authenticated.identity.tenantId,
     authenticated.identity.principalId,
     storageKey,
     threadId,
+    { limit: 1 },
   );
   if (!record) return problem(404, "thread_not_found", "The Agent thread was not found.");
   const parsed = parseStrictThreadCollection({
@@ -47,10 +50,10 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
   if (parsed.transcriptCoverage?.authoritative === true &&
       parsed.transcriptCoverage.complete &&
       parsed.transcriptCoverage.endIndex >= parsed.session.streamIndex) {
-    return Response.json({ revision: record.revision, thread: parsed }, { headers: responseHeaders(record.revision) });
+    return Response.json({ revision: record.revision, thread: null }, { headers: responseHeaders(record.revision) });
   }
   if (!parsed.session.sessionId) {
-    return Response.json({ revision: record.revision, thread: parsed }, { headers: responseHeaders(record.revision) });
+    return Response.json({ revision: record.revision, thread: null }, { headers: responseHeaders(record.revision) });
   }
 
   const runtime = createEveAgentMailboxRuntime();

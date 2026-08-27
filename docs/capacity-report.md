@@ -42,10 +42,11 @@ at this tiny active workload.
 
 The current single-server evidence supports these **verified operating levels**:
 
-- **250 concurrently connected online sessions** (one SSE stream per user),
-  with all connections established and held for five seconds and zero
-  unexpected disconnects. The 500-stream attempt failed its stability SLO, so
-  250 is the current verified lower bound for this exact host/topology.
+- **250 concurrent SSE follower connections**, with all connections established
+  and held for five seconds and zero unexpected disconnects. The historical
+  load reused a small pool of durable sessions, so this is connection/fan-out
+  evidence, not proof of 250 distinct online users. The 500-stream attempt
+  failed its stability SLO.
 - **12 concurrently executing AgentRuns**, with 0% measured errors in the
   controlled run. At 16, one run failed inspection/settlement (6.25% error),
   so production admission should remain at or below 12 until the Provider,
@@ -76,20 +77,37 @@ Workflow history.
 Use `npm run doctor:host` for the broader host preflight. It reports effective
 CPU and cgroup limits, available memory, swap, Docker reachability, and disk
 without changing the host. The default gate requires 2 GiB free disk and 512
-MiB available memory; these are safety margins, not capacity claims.
+MiB available memory; these are safety margins, not capacity claims. It also
+reports running and stopped Eve session sandboxes. Optional
+`AGENT_HOST_MAX_DOCKER_SANDBOX_CONTAINERS` and
+`AGENT_HOST_MAX_RUNNING_DOCKER_SANDBOXES` thresholds turn unexpected workspace
+or compute growth into a failed preflight instead of silently consuming the
+host.
+
+Docker sandboxes are lazy and idle compute is stopped after
+`AGENT_DOCKER_IDLE_TIMEOUT_MS`; stopped containers retain `/workspace` and still
+consume disk/inodes. Long-lived sessions therefore do not imply permanently
+running compute, but they still require an explicit storage budget and
+user-authorized deletion lifecycle. Microsandbox or a remote microVM service is
+the production recommendation for mutually untrusted tenants and elastic
+compute; changing backends does not remove Provider, Workflow, database, or
+object-store bottlenecks.
 
 The next capacity run must use a disk-safe isolated database and report at
-least 1k/5k/10k idle streams plus controlled 10/25/50/100 active turns. Real
+least 100/250/500/1k/5k/10k idle streams, controlled 4/8/12/16/25/50/100 active
+turns, and explicit mixed envelopes. Distinct-user evidence requires one
+durable session per stream; pooled follower tests remain useful but must be
+reported only as connection fan-out. Real
 Provider latency, Provider quota, Workflow queue age, database pool wait,
 sandbox allocation, CPU, RSS, event-loop lag, and reconnect rate must be
-recorded separately. Until that run is completed, use 250 online connections
-and 12 active turns as conservative deployment planning numbers, not marketing
-capacity.
+recorded separately. Until that run is completed, use 250 concurrent follower
+connections and 12 active turns as conservative deployment planning numbers,
+not distinct-user or marketing capacity.
 
-The sequential matrix does not exercise online and active workloads at the same
-time. Use `npm run verify:mixed-capacity` for that envelope: it runs the idle
-stream and AgentRun verifiers concurrently and records both child reports plus
-before/after target metrics. A 20-stream/2-run smoke envelope now passes with
+The capacity matrix now also exercises online and active workloads at the same
+time through `verify:mixed-capacity`: it runs the idle stream and AgentRun
+verifiers concurrently and records both child reports plus target metrics
+throughout the window. A 20-stream/2-run smoke envelope now passes with
 target metrics enabled; this is still only a protocol smoke result, not a large
 mixed-workload capacity claim. The Workflow streamer may log Node's
 `MaxListenersExceededWarning` when more than ten followers intentionally attach
@@ -105,14 +123,22 @@ sessions and Muses host sessions are never selected by that cleanup path.
 
 ## Storage finding
 
-The local Workflow database is storage-heavy: the post-cleanup snapshot is
-roughly 665 MiB, with `workflow_stream_chunks` at about 540 MiB of relation
-storage and 1.04 GiB of uncompressed chunk payload across 63k chunks. The
-snapshot contains 720 runs, of which 80 are still `running` (40 retained
-session roots and their 40 active child/turn records); these are historical
+The 2026-08-27 read-only audit confirms that the local Workflow database is
+storage-heavy: roughly 657 MiB of relation storage, with
+`workflow_stream_chunks` at about 540 MiB and 987 MiB of uncompressed payload
+across 64,093 chunks. The snapshot contains 753 runs, of which 80 are still
+`running` (40 retained session roots and their 40 active child/turn records);
+these are historical
 user or Muses-host sessions and are not safe to infer as abandoned from age
 alone. Earlier capacity runs left additional synthetic roots; the verifier now
 retires those through Eve's reset lifecycle, and the cleanup was confirmed with
-zero `LOAD_READY` roots remaining. `npm run reap:workflow` remains a guarded,
-default-dry-run path for old terminal runs; it never rewrites active sessions
-and direct SQL deletion is not a production reconciliation strategy.
+zero `LOAD_READY` roots remaining. `npm run reap:workflow` is now strictly
+read-only and reports candidates as complete root trees. Direct SQL deletion is
+not a production reconciliation strategy; no hot-history purge is authorized
+until a versioned archive and isolated restore/replay drill exist.
+
+At the same audit point the host had about 1.34 GiB free disk, below the
+capacity runner's 2 GiB default safety margin. The v2 preflight correctly
+refused to start a new matrix. Run the next capacity campaign on an isolated
+database volume with enough headroom; lowering the margin on this host would
+turn the load generator into a production-data availability risk.

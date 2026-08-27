@@ -47,11 +47,12 @@ const accessToken = signToken({
 const providerDebugUrl = process.env.AGENT_LOAD_PROVIDER_DEBUG_URL?.trim();
 const targetMetricsUrl = process.env.AGENT_LOAD_TARGET_METRICS_URL?.trim();
 const targetMetricsToken = process.env.AGENT_LOAD_TARGET_METRICS_TOKEN?.trim();
+const targetMetricsIntervalMs = boundedInteger("AGENT_LOAD_TARGET_METRICS_INTERVAL_MS", 1_000, 250, 60_000);
 const providerBefore = providerDebugUrl
   ? await providerRequestCount(providerDebugUrl)
   : undefined;
-const targetMetricsBefore = targetMetricsUrl
-  ? await readTargetMetrics(targetMetricsUrl)
+const targetMetricsSampler = targetMetricsUrl
+  ? await startTargetMetricsSampler(targetMetricsIntervalMs)
   : undefined;
 const generatedAt = new Date().toISOString();
 const resourceSampler = createResourceSampler();
@@ -97,8 +98,8 @@ const sessionCleanup = await retireSyntheticSessions();
 const providerAfter = providerDebugUrl
   ? await providerRequestCount(providerDebugUrl)
   : undefined;
-const targetMetricsAfter = targetMetricsUrl
-  ? await readTargetMetrics(targetMetricsUrl)
+const targetMetrics = targetMetricsSampler
+  ? await targetMetricsSampler.stop()
   : undefined;
 const providerRequests =
   providerAfter !== undefined && providerBefore !== undefined
@@ -135,12 +136,12 @@ if (
     `Expected ${expectedProviderRequests} Provider requests, received ${providerRequests}.`,
   );
 }
-if (targetMetricsUrl && (targetMetricsBefore?.error || targetMetricsAfter?.error)) {
+if (targetMetricsUrl && (targetMetrics?.samples.length === 0 || targetMetrics?.failures > 0)) {
   violations.push("Target metrics endpoint did not return valid snapshots for the full load window.");
 }
 
 const evidence = {
-  schemaVersion: "open-agent.load-evidence.v1",
+  schemaVersion: "open-agent.load-evidence.v2",
   batchId,
   generatedAt,
   completedAt: new Date().toISOString(),
@@ -166,7 +167,7 @@ const evidence = {
       // collected from the deployment, not inferred from this client.
       loadGenerator: resource,
       target: targetMetricsUrl
-        ? { url: targetMetricsUrl, before: targetMetricsBefore, after: targetMetricsAfter }
+        ? { url: targetMetricsUrl, ...targetMetrics }
         : undefined,
     },
   },
@@ -494,6 +495,39 @@ async function readTargetMetrics(url) {
   } catch (error) {
     return { capturedAt: new Date().toISOString(), error: safeError(error) };
   }
+}
+
+async function startTargetMetricsSampler(intervalMs) {
+  const samples = [];
+  let failures = 0;
+  let stopped = false;
+  let timer;
+  let pending;
+  const capture = async () => {
+    const sample = await readTargetMetrics(targetMetricsUrl);
+    if (sample.error) failures += 1;
+    else samples.push(sample);
+  };
+  await capture();
+  const schedule = () => {
+    timer = setTimeout(async () => {
+      pending = capture();
+      await pending;
+      pending = undefined;
+      if (!stopped) schedule();
+    }, intervalMs);
+    timer.unref();
+  };
+  schedule();
+  return {
+    async stop() {
+      stopped = true;
+      clearTimeout(timer);
+      await pending;
+      await capture();
+      return { intervalMs, samples, failures };
+    },
+  };
 }
 
 async function writeEvidence(value) {

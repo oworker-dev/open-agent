@@ -13,10 +13,6 @@ create table if not exists "__AGENT_SCHEMA__"."agent_thread_events" (
   constraint agent_thread_event_object check (jsonb_typeof(event) = 'object')
 );
 
-create index if not exists agent_thread_events_scope_idx
-  on "__AGENT_SCHEMA__"."agent_thread_events"
-    (tenant_id, principal_id, storage_key, thread_id, event_index);
-
 -- Existing installations keep their metadata row as the source of truth for
 -- thread preferences/status, but move the potentially unbounded event array to
 -- the append-only log. The deterministic legacy key makes this migration

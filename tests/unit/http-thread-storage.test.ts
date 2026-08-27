@@ -290,6 +290,37 @@ test("a server transcript repair advances the revision used by the next metadata
   assert.equal(savedIfMatch, '"5"');
 });
 
+test("a no-op transcript repair advances revision without replacing the loaded thread", async () => {
+  const thread = createAgentThread(100, "Already repaired");
+  let savedIfMatch: string | null = null;
+  const storage = createHttpAgentThreadStorage({
+    fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (init?.method === "POST" && url.includes("/workspace-repair-noop/repair?")) {
+        return Response.json({ revision: 7, thread: null }, { headers: { etag: '"7"' } });
+      }
+      if (init?.method === "PATCH") {
+        savedIfMatch = new Headers(init.headers).get("if-match");
+        return Response.json({ revision: 8 }, { headers: { etag: '"8"' } });
+      }
+      return Response.json({
+        collection: { activeThreadId: thread.id, threads: [thread], version: 2 },
+        revision: 6,
+      }, { headers: { etag: '"6"' } });
+    }) as typeof fetch,
+  });
+
+  const loaded = await storage.load("workspace-repair-noop");
+  const repaired = await storage.repairThread?.("workspace-repair-noop", thread.id);
+  assert.equal(repaired, undefined);
+  await storage.save("workspace-repair-noop", {
+    ...loaded,
+    threads: loaded.threads.map((candidate) => ({ ...candidate, title: "Still complete" })),
+  });
+
+  assert.equal(savedIfMatch, '"7"');
+});
+
 test("does not replace durable events with a shorter reconnect snapshot", async () => {
   const server = fakeThreadServer();
   const storage = createHttpAgentThreadStorage({

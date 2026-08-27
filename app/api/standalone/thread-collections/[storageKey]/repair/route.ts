@@ -22,7 +22,7 @@ type RouteContext = { readonly params: Promise<{ readonly storageKey: string }> 
  */
 export async function POST(request: Request, context: RouteContext): Promise<Response> {
   const authenticated = authenticateStandaloneRequest(request);
-  if (!store || !store.loadThread || !store.patch) {
+  if (!store || !store.loadThreadWindow || !store.patch) {
     return problem(503, "agent_database_unavailable", "Agent transcript storage is not configured.", authenticated.setCookie);
   }
   const { storageKey } = await context.params;
@@ -31,11 +31,15 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
     return problem(400, "thread_id_required", "A valid threadId is required.", authenticated.setCookie);
   }
 
-  const record = await store.loadThread(
+  // Repair reads Eve's authoritative stream itself. Loading the existing
+  // transcript here would aggregate the same unbounded history in PostgreSQL
+  // before repair even starts, so hydrate only one bounded event plus metadata.
+  const record = await store.loadThreadWindow(
     authenticated.identity.tenantId,
     authenticated.identity.principalId,
     storageKey,
     threadId,
+    { limit: 1 },
   );
   if (!record) return problem(404, "thread_not_found", "The Agent thread was not found.", authenticated.setCookie);
   const parsedCollection = parseStrictThreadCollection({
@@ -54,13 +58,13 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
       thread.transcriptCoverage.complete &&
       thread.transcriptCoverage.endIndex >= thread.session.streamIndex) {
     return Response.json(
-      { revision: record.revision, thread },
+      { revision: record.revision, thread: null },
       { headers: responseHeaders(record.revision, authenticated.setCookie) },
     );
   }
   if (!thread.session.sessionId) {
     return Response.json(
-      { revision: record.revision, thread },
+      { revision: record.revision, thread: null },
       { headers: responseHeaders(record.revision, authenticated.setCookie) },
     );
   }

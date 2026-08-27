@@ -206,6 +206,74 @@ test("append-only thread patches keep event indexes contiguous after replay dedu
   ]);
 });
 
+test("replacement appends truncate from their cursor without reading the current tail", async () => {
+  const calls: string[] = [];
+  const client = {
+    async query(sql: string) {
+      calls.push(sql);
+      if (sql === "begin" || sql === "commit" || sql === "rollback") return { rows: [] };
+      if (sql.includes("for update")) {
+        return {
+          rows: [{
+            collection: { threads: [{ id: "thread-1", events: [] }], version: 2 },
+            revision: "3",
+          }],
+        };
+      }
+      if (sql.includes("select event_id")) return { rows: [] };
+      return { rows: [] };
+    },
+    release() {},
+  };
+  const pool = { async connect() { return client; } } as unknown as Pool;
+  const store = createPostgresThreadCollectionStore(config, pool);
+
+  const result = await store.patch?.("tenant-1", "principal-1", "workspace-1", 3, {
+    deletedThreadIds: [],
+    eventAppends: [{
+      events: [{ meta: { id: "evt-replacement" }, type: "message.completed" }],
+      replaceFrom: 12,
+      threadId: "thread-1",
+    }],
+    upsertThreads: [{ events: [], id: "thread-1", status: "ready" }],
+  });
+
+  assert.equal(result?.status, "saved");
+  assert.equal(calls.some((sql) => sql.includes("max(event_index)")), false);
+  assert.equal(calls.some((sql) => sql.includes("event_index >= $5")), true);
+});
+
+test("empty append checkpoints do not query the event log", async () => {
+  const calls: string[] = [];
+  const client = {
+    async query(sql: string) {
+      calls.push(sql);
+      if (sql === "begin" || sql === "commit" || sql === "rollback") return { rows: [] };
+      if (sql.includes("for update")) {
+        return {
+          rows: [{
+            collection: { threads: [{ id: "thread-1", events: [] }], version: 2 },
+            revision: "5",
+          }],
+        };
+      }
+      return { rows: [] };
+    },
+    release() {},
+  };
+  const pool = { async connect() { return client; } } as unknown as Pool;
+  const store = createPostgresThreadCollectionStore(config, pool);
+
+  const result = await store.patch?.("tenant-1", "principal-1", "workspace-1", 5, {
+    deletedThreadIds: [],
+    eventAppends: [{ events: [], threadId: "thread-1" }],
+    upsertThreads: [{ events: [], id: "thread-1", status: "ready" }],
+  });
+
+  assert.equal(result?.status, "saved");
+  assert.equal(calls.some((sql) => sql.includes("agent_thread_events")), false);
+});
+
 test("hydrating one thread removes the index-only summary marker", async () => {
   let loadedSql = "";
   const pool = {
@@ -275,4 +343,24 @@ test("loads a bounded ordered transcript window without aggregating the full eve
   ]);
   assert.equal(calls.length, 1);
   assert.match(calls[0]!, /limit \$6/u);
+  assert.doesNotMatch(calls[0]!, /jsonb_agg\(entry\.event order by entry\.event_index asc\)/u);
+});
+
+test("loads the thread index without joining or aggregating event payloads", async () => {
+  let loadedSql = "";
+  const pool = {
+    async query(sql: string) {
+      loadedSql = sql;
+      return {
+        rows: [{ collection: { threads: [], version: 2 }, revision: "11" }],
+      } as unknown as QueryResult;
+    },
+  } as unknown as Pool;
+  const store = createPostgresThreadCollectionStore(config, pool);
+
+  const result = await store.loadIndex?.("tenant-1", "principal-1", "workspace-1");
+
+  assert.equal(result?.revision, 11);
+  assert.match(loadedSql, /'events', '\[\]'::jsonb/u);
+  assert.doesNotMatch(loadedSql, /agent_thread_events/u);
 });

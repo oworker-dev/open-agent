@@ -10,9 +10,11 @@ import { microsandbox } from "eve/sandbox/microsandbox";
 import { vercel } from "eve/sandbox/vercel";
 import {
   readAgentDockerResourceLimits,
+  readAgentDockerIdleTimeoutMs,
   readAgentSandboxBackend,
   readAgentSandboxImage,
 } from "../lib/production-config.ts";
+import { withIdleSandboxShutdown } from "../lib/idle-sandbox-backend.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -39,11 +41,22 @@ function selectBackend() {
   const selected = readAgentSandboxBackend();
   const image = readAgentSandboxImage();
   if (selected === "docker") {
-    return withDockerResourceLimits(docker({
-      ...(image ? { image } : {}),
-      networkPolicy: "deny-all",
-      pullPolicy: "if-not-present",
-    }), readAgentDockerResourceLimits());
+    return withIdleSandboxShutdown(
+      withDockerResourceLimits(docker({
+        ...(image ? { image } : {}),
+        networkPolicy: "deny-all",
+        pullPolicy: "if-not-present",
+      }), readAgentDockerResourceLimits()),
+      readAgentDockerIdleTimeoutMs(),
+      {
+        onIdleShutdownError(error, sessionKey) {
+          console.warn("Docker sandbox idle shutdown failed", {
+            message: error instanceof Error ? error.message : String(error),
+            sessionKey,
+          });
+        },
+      },
+    );
   }
   if (selected === "microsandbox") {
     return microsandbox({

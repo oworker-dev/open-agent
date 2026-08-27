@@ -16,13 +16,20 @@ const maxErrorRate = boundedNumber("AGENT_STREAM_LOAD_MAX_ERROR_RATE", 0, 0, 1);
 const p95HandshakeMs = boundedInteger("AGENT_STREAM_LOAD_P95_HANDSHAKE_MS", 5_000, 10, 300_000);
 const targetMetricsUrl = process.env.AGENT_STREAM_LOAD_TARGET_METRICS_URL?.trim();
 const targetMetricsToken = process.env.AGENT_STREAM_LOAD_TARGET_METRICS_TOKEN?.trim();
+const targetMetricsIntervalMs = boundedInteger("AGENT_STREAM_LOAD_TARGET_METRICS_INTERVAL_MS", 1_000, 250, 60_000);
 const batchId = `stream-load-${Date.now()}-${randomUUID()}`;
 const tenantId = `stream-load-tenant-${randomUUID()}`;
 const sessionCount = boundedInteger(
   "AGENT_STREAM_LOAD_SESSION_COUNT",
-  Math.max(1, Math.ceil(totalStreams / 128)),
+  Math.min(totalStreams, 100),
   1,
   totalStreams,
+);
+const seedConcurrency = boundedInteger(
+  "AGENT_STREAM_LOAD_SEED_CONCURRENCY",
+  Math.min(sessionCount, 16),
+  1,
+  Math.min(sessionCount, 100),
 );
 
 const marker = `STREAM_LOAD_READY_${batchId}`;
@@ -39,13 +46,13 @@ const cleanupSessionsOnSignal = () => {
 };
 process.once("SIGTERM", cleanupSessionsOnSignal);
 process.once("SIGINT", cleanupSessionsOnSignal);
-const targetMetricsBefore = targetMetricsUrl
-  ? await readTargetMetrics(targetMetricsUrl)
+const targetMetricsSampler = targetMetricsUrl
+  ? await startTargetMetricsSampler(targetMetricsIntervalMs)
   : undefined;
 const seedStartedAt = performance.now();
 const seeds = await mapWithConcurrency(
   Array.from({ length: sessionCount }, (_, index) => index),
-  Math.min(concurrency, sessionCount),
+  seedConcurrency,
   async (index) => await createSeed(index),
 );
 const seedSetupDurationMs = Math.round(performance.now() - seedStartedAt);
@@ -66,8 +73,8 @@ const liveness = await Promise.all(established.map(async (entry) => ({
   alive: await followerIsOpen(entry.reader),
 })));
 const unexpectedDisconnects = liveness.filter((entry) => !entry.alive);
-const targetMetricsAfter = targetMetricsUrl
-  ? await readTargetMetrics(targetMetricsUrl)
+const targetMetrics = targetMetricsSampler
+  ? await targetMetricsSampler.stop()
   : undefined;
 
 for (const entry of established) entry.controller.abort("stream-load-complete");
@@ -102,12 +109,12 @@ if (unexpectedDisconnects.length > 0) {
 if (sessionCleanup.failures.length > 0) {
   violations.push(`${sessionCleanup.failures.length} synthetic Eve sessions could not be retired.`);
 }
-if (targetMetricsUrl && (targetMetricsBefore?.error || targetMetricsAfter?.error)) {
+if (targetMetricsUrl && (targetMetrics?.samples.length === 0 || targetMetrics?.failures > 0)) {
   violations.push("Target metrics endpoint did not return valid snapshots for the full load window.");
 }
 
 const evidence = {
-  schemaVersion: "open-agent.idle-stream-load-evidence.v1",
+  schemaVersion: "open-agent.idle-stream-load-evidence.v2",
   batchId,
   generatedAt: new Date().toISOString(),
   targetOrigin: new URL(baseUrl).origin,
@@ -117,9 +124,20 @@ const evidence = {
     holdMs,
     totalStreams,
     sessionCount,
-    sessionModel: "independent-durable-session-pool",
+    seedConcurrency,
+    followersPerSessionCeiling: Math.ceil(totalStreams / sessionCount),
+    sessionModel: sessionCount === totalStreams ? "one-durable-session-per-stream" : "distributed-follower-pool",
   },
   budgets: { maxErrorRate, p95HandshakeMs },
+  interpretation: {
+    connectionsAttempted: totalStreams,
+    distinctDurableSessions: sessionCount,
+    maxFollowersPerSession: Math.ceil(totalStreams / sessionCount),
+    oneSessionPerConnection: sessionCount === totalStreams,
+    distinctSessionCapacityEvidence:
+      sessionCount === totalStreams && failures.length === 0 && seedFailures.length === 0 && unexpectedDisconnects.length === 0,
+    note: "Connection fan-out over shared durable sessions is valid stream-server load evidence, but it is not a distinct-user capacity claim.",
+  },
   metrics: {
     established: established.length,
     failures: failures.length,
@@ -134,7 +152,7 @@ const evidence = {
     // target-server capacity evidence; collect target metrics separately.
     loadGeneratorMemory: memory.result(),
     target: targetMetricsUrl
-      ? { url: targetMetricsUrl, before: targetMetricsBefore, after: targetMetricsAfter }
+      ? { url: targetMetricsUrl, ...targetMetrics }
       : undefined,
   },
   failures: [
@@ -305,6 +323,39 @@ async function readTargetMetrics(url) {
   } catch (error) {
     return { capturedAt: new Date().toISOString(), error: safeError(error) };
   }
+}
+
+async function startTargetMetricsSampler(intervalMs) {
+  const samples = [];
+  let failures = 0;
+  let stopped = false;
+  let timer;
+  let pending;
+  const capture = async () => {
+    const sample = await readTargetMetrics(targetMetricsUrl);
+    if (sample.error) failures += 1;
+    else samples.push(sample);
+  };
+  await capture();
+  const schedule = () => {
+    timer = setTimeout(async () => {
+      pending = capture();
+      await pending;
+      pending = undefined;
+      if (!stopped) schedule();
+    }, intervalMs);
+    timer.unref();
+  };
+  schedule();
+  return {
+    async stop() {
+      stopped = true;
+      clearTimeout(timer);
+      await pending;
+      await capture();
+      return { intervalMs, samples, failures };
+    },
+  };
 }
 
 function createMemorySampler() {

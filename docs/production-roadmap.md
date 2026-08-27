@@ -33,7 +33,7 @@ for that topology.
 | Result artifacts | Static preview and bounded artifact stores exist | Keep as output projection; do not use it for user uploads |
 | Vision | `view_image` validates signatures, bounds payloads, resizes oversized images, and emits typed file output | Verify provider capability negotiation and visual rendering across hosts |
 | Host SDK and Muses bridge | Contracts, client, host, UI, and MCP packages exist as alpha artifacts | Publish only after cross-host, auth, quota, and failure conformance |
-| Capacity | Deterministic unit/build gates, guarded retention, disk-safe capacity matrix, Provider-observation mode, and resource/event-loop evidence exist | No current real 1k/5k/10k stream run, deployed SLO, sandbox admission evidence, stale-run reconciliation, or ten-thousand-user capacity report |
+| Capacity | Deterministic unit/build gates, non-destructive root-tree retention audit, disk-safe sequential and mixed capacity matrices, continuous target metrics, Workflow storage deltas, and explicit connection-versus-distinct-session evidence exist | No current real 1k/5k/10k distinct-session run, deployed SLO, sandbox admission evidence, archive restore drill, stale-run reconciliation, or ten-thousand-user capacity report |
 
 The current upload and vision contract is specified in
 [Assets, Uploads, And Vision](./assets-and-vision.md). That document is a
@@ -330,6 +330,13 @@ timeouts (`AGENT_DATABASE_CONNECTION_TIMEOUT_MS` and
 indexes on status and tenant, so admission remains cheap as terminal history
 grows. `npm run doctor:host` provides read-only host/cgroup/Docker evidence and
 fails closed for low free disk or memory before a load test starts.
+
+Sandbox allocation remains lazy per durable session. Docker compute is stopped
+after a durable idle boundary and reattached to the preserved `/workspace` on
+the next sandbox call. Physical deletion is never inferred from a terminal
+AgentRun; it requires the owner-authorized session-deletion tombstone. The host
+doctor reports both running and stopped sandbox inventory because stopped
+containers release CPU/RAM but retain disk and inode cost.
 
 The run reconciler closes only stale pre-Eve reservations as
 `submission-ambiguous`; it never resets an active Eve session or blindly

@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   highestPassingLevel,
   parseCapacityLevels,
+  parseMixedCapacityLevels,
 } from "../../lib/capacity-config.ts";
 
 test("capacity levels are sorted, deduplicated, and bounded", () => {
@@ -20,4 +21,14 @@ test("highest passing level ignores failed batches", () => {
     { level: 250, ok: false, evidencePath: "b" },
   ]), 100);
   assert.equal(highestPassingLevel([]), null);
+});
+
+test("mixed capacity levels parse explicit stream and run pairs", () => {
+  assert.deepEqual(parseMixedCapacityLevels("100:4, 250x8,100:4, 500/12", []), [
+    { streams: 100, runs: 4 },
+    { streams: 250, runs: 8 },
+    { streams: 500, runs: 12 },
+  ]);
+  assert.throws(() => parseMixedCapacityLevels("broken,0:2", []), /stream:run/u);
+  assert.throws(() => parseMixedCapacityLevels("100:101", []), /stream:run/u);
 });

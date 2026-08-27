@@ -22,13 +22,16 @@ export type WorkflowRetentionPolicy = {
 export type WorkflowRetentionSelection = {
   readonly cutoff: Date;
   readonly candidates: readonly WorkflowRetentionRun[];
+  readonly candidateRootIds: readonly string[];
   readonly skippedActiveRoots: number;
   readonly skippedProtected: number;
 };
 
 /**
- * Selects only terminal runs whose whole root session is inactive. This is a
- * pure decision boundary so SQL, dry-run output, and tests share one policy.
+ * Selects complete terminal root trees. A retention/archive batch must never
+ * split one Eve session tree: child runs are replay dependencies of the root,
+ * even when each row is terminal by itself. This is a pure decision boundary
+ * so SQL, audit output, and tests share one policy.
  */
 export function selectWorkflowRetentionCandidates(
   runs: readonly WorkflowRetentionRun[],
@@ -45,28 +48,40 @@ export function selectWorkflowRetentionCandidates(
 
   const cutoff = new Date(now.getTime() - policy.olderThanMs);
   const protectedRunIds = policy.protectedRunIds ?? new Set<string>();
-  const activeRoots = new Set(
-    runs
-      .filter((run) => !isTerminalStatus(run.status))
-      .map((run) => run.rootRunId || run.id),
-  );
+  const byRoot = new Map<string, WorkflowRetentionRun[]>();
+  for (const run of runs) {
+    const rootId = run.rootRunId || run.id;
+    const rootRuns = byRoot.get(rootId) ?? [];
+    rootRuns.push(run);
+    byRoot.set(rootId, rootRuns);
+  }
   const terminal = new Set<string>(TERMINAL_WORKFLOW_STATUSES);
-  const eligible = runs
-    .filter((run) => terminal.has(run.status))
-    .filter((run) => run.completedAt !== null && run.completedAt.getTime() <= cutoff.getTime())
-    .filter((run) => !activeRoots.has(run.rootRunId || run.id))
-    .filter((run) => !protectedRunIds.has(run.id) && !protectedRunIds.has(run.rootRunId || run.id))
-    .sort((left, right) => {
-      const byDate = (left.completedAt?.getTime() ?? 0) - (right.completedAt?.getTime() ?? 0);
-      return byDate || left.id.localeCompare(right.id);
-    });
-
-  const candidates = eligible.slice(0, policy.maxRuns);
+  const activeRoots = new Set<string>();
+  const protectedRoots = new Set<string>();
+  const eligibleRoots: { completedAt: number; rootId: string; runs: WorkflowRetentionRun[] }[] = [];
+  for (const [rootId, rootRuns] of byRoot) {
+    if (rootRuns.some((run) => !terminal.has(run.status))) {
+      activeRoots.add(rootId);
+      continue;
+    }
+    if (protectedRunIds.has(rootId) || rootRuns.some((run) => protectedRunIds.has(run.id))) {
+      protectedRoots.add(rootId);
+      continue;
+    }
+    const completedTimes = rootRuns.map((run) => run.completedAt?.getTime() ?? Number.POSITIVE_INFINITY);
+    const newestCompletion = Math.max(...completedTimes);
+    if (newestCompletion > cutoff.getTime()) continue;
+    eligibleRoots.push({ completedAt: newestCompletion, rootId, runs: rootRuns });
+  }
+  eligibleRoots.sort((left, right) => left.completedAt - right.completedAt || left.rootId.localeCompare(right.rootId));
+  const selectedRoots = eligibleRoots.slice(0, policy.maxRuns);
+  const candidates = selectedRoots.flatMap((root) => root.runs);
   return {
     cutoff,
     candidates,
-    skippedActiveRoots: runs.filter((run) => terminal.has(run.status) && activeRoots.has(run.rootRunId || run.id)).length,
-    skippedProtected: runs.filter((run) => terminal.has(run.status) && (protectedRunIds.has(run.id) || protectedRunIds.has(run.rootRunId || run.id))).length,
+    candidateRootIds: selectedRoots.map((root) => root.rootId),
+    skippedActiveRoots: activeRoots.size,
+    skippedProtected: protectedRoots.size,
   };
 }
 

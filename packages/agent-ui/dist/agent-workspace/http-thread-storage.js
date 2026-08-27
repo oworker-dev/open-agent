@@ -43,6 +43,7 @@ export function createHttpAgentThreadStorage(options) {
             if (!Number.isSafeInteger(body.revision) || body.revision < 0) {
                 throw new Error("Agent thread storage returned an invalid revision.");
             }
+            revisions.set(storageKey, body.revision);
             if (body.thread == null)
                 return undefined;
             const parsedThread = parseThreadCollection({
@@ -115,6 +116,7 @@ export function createHttpAgentThreadStorage(options) {
             if (!Number.isSafeInteger(body.revision) || body.revision < 0) {
                 throw new Error("Agent thread storage returned an invalid revision.");
             }
+            revisions.set(storageKey, body.revision);
             if (body.thread == null)
                 return undefined;
             const parsedThread = parseThreadCollection({
@@ -123,7 +125,6 @@ export function createHttpAgentThreadStorage(options) {
             }).threads[0];
             const hydrated = parsedThread ? withoutSummaryHydration(parsedThread) : undefined;
             if (hydrated) {
-                revisions.set(storageKey, body.revision);
                 const baseline = baselines.get(storageKey);
                 baselines.set(storageKey, {
                     ...(baseline?.activeThreadId ? { activeThreadId: baseline.activeThreadId } : {}),

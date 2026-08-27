@@ -18,6 +18,10 @@ const streamHoldMs = positiveInteger("AGENT_MIXED_STREAM_HOLD_MS", 10_000);
 const runTotal = positiveInteger("AGENT_MIXED_RUN_TOTAL", 2);
 const runConcurrency = positiveInteger("AGENT_MIXED_RUN_CONCURRENCY", Math.min(runTotal, 2));
 const runDeadlineMs = positiveInteger("AGENT_MIXED_RUN_DEADLINE_MS", 120_000);
+const configuredStreamSessionCount = optionalPositiveInteger("AGENT_MIXED_STREAM_SESSION_COUNT");
+const streamSessionCount = configuredStreamSessionCount
+  ? Math.min(configuredStreamSessionCount, streamTotal)
+  : undefined;
 const childTimeoutMs = positiveInteger("AGENT_MIXED_CHILD_TIMEOUT_MS", 900_000);
 const evidenceDirectory = resolve(process.env.AGENT_MIXED_EVIDENCE_DIR?.trim() || ".tmp/capacity");
 const evidencePath = resolve(
@@ -28,6 +32,7 @@ const minFreeDiskBytes = parseBytes(
 );
 const targetMetricsUrl = process.env.AGENT_MIXED_TARGET_METRICS_URL?.trim();
 const targetMetricsToken = process.env.AGENT_MIXED_TARGET_METRICS_TOKEN?.trim();
+const targetMetricsIntervalMs = positiveInteger("AGENT_MIXED_TARGET_METRICS_INTERVAL_MS", 1_000);
 const baseUrl = (
   process.env.AGENT_MIXED_BASE_URL?.trim()
     || process.env.AGENT_STREAM_LOAD_BASE_URL?.trim()
@@ -48,7 +53,7 @@ await mkdir(evidenceDirectory, { recursive: true });
 const preflight = await readDiskCapacity();
 if (preflight.availableBytes < minFreeDiskBytes) {
   const evidence = {
-    schemaVersion: "open-agent.mixed-capacity-evidence.v1",
+    schemaVersion: "open-agent.mixed-capacity-evidence.v2",
     batchId,
     generatedAt: new Date().toISOString(),
     completedAt: new Date().toISOString(),
@@ -61,6 +66,7 @@ if (preflight.availableBytes < minFreeDiskBytes) {
       runConcurrency,
       runDeadlineMs,
       childTimeoutMs,
+      streamSessionCount,
     },
     preflight: {
       disk: preflight,
@@ -79,7 +85,9 @@ if (preflight.availableBytes < minFreeDiskBytes) {
   const startedAt = performance.now();
   const streamEvidencePath = resolve(evidenceDirectory, `${batchId}-streams.json`);
   const runEvidencePath = resolve(evidenceDirectory, `${batchId}-agent-runs.json`);
-  const targetBefore = targetMetricsUrl ? await readTargetMetrics(targetMetricsUrl, targetMetricsToken) : undefined;
+  const targetSampler = targetMetricsUrl
+    ? await startTargetMetricsSampler(targetMetricsUrl, targetMetricsToken, targetMetricsIntervalMs)
+    : undefined;
 
   const [streams, agentRuns] = await Promise.all([
     runVerifier("scripts/verify-idle-stream-load.mjs", {
@@ -87,6 +95,7 @@ if (preflight.availableBytes < minFreeDiskBytes) {
       AGENT_STREAM_LOAD_TOTAL: String(streamTotal),
       AGENT_STREAM_LOAD_CONCURRENCY: String(streamConcurrency),
       AGENT_STREAM_LOAD_HOLD_MS: String(streamHoldMs),
+      ...(streamSessionCount ? { AGENT_STREAM_LOAD_SESSION_COUNT: String(streamSessionCount) } : {}),
       AGENT_STREAM_LOAD_EVIDENCE_PATH: streamEvidencePath,
       ...(targetMetricsUrl ? { AGENT_STREAM_LOAD_TARGET_METRICS_URL: targetMetricsUrl } : {}),
       ...(targetMetricsToken ? { AGENT_STREAM_LOAD_TARGET_METRICS_TOKEN: targetMetricsToken } : {}),
@@ -103,7 +112,7 @@ if (preflight.availableBytes < minFreeDiskBytes) {
     }),
   ]);
 
-  const targetAfter = targetMetricsUrl ? await readTargetMetrics(targetMetricsUrl, targetMetricsToken) : undefined;
+  const targetMetrics = targetSampler ? await targetSampler.stop() : undefined;
   const streamEvidence = await readEvidence(streamEvidencePath);
   const runEvidence = await readEvidence(runEvidencePath);
   const violations = [];
@@ -111,13 +120,13 @@ if (preflight.availableBytes < minFreeDiskBytes) {
   if (!agentRuns.ok) violations.push(`AgentRun gate failed: ${agentRuns.error || "unknown error"}`);
   if (!streamEvidence) violations.push("Idle stream gate did not write evidence.");
   if (!runEvidence) violations.push("AgentRun gate did not write evidence.");
-  if (targetMetricsUrl && (targetBefore?.error || targetAfter?.error)) {
+  if (targetMetricsUrl && (targetMetrics?.samples.length === 0 || targetMetrics?.failures > 0)) {
     violations.push("Target metrics endpoint did not return valid snapshots for the full mixed-load window.");
   }
   if (interrupted) violations.push("Mixed capacity run was interrupted.");
 
   const evidence = {
-    schemaVersion: "open-agent.mixed-capacity-evidence.v1",
+    schemaVersion: "open-agent.mixed-capacity-evidence.v2",
     batchId,
     generatedAt: new Date().toISOString(),
     completedAt: new Date().toISOString(),
@@ -130,6 +139,7 @@ if (preflight.availableBytes < minFreeDiskBytes) {
       runConcurrency,
       runDeadlineMs,
       childTimeoutMs,
+      streamSessionCount,
       workload: "idle-streams+agent-runs",
     },
     preflight: { disk: preflight, minFreeDiskBytes, ok: true },
@@ -144,7 +154,7 @@ if (preflight.availableBytes < minFreeDiskBytes) {
       evidence: runEvidence,
     },
     targetMetrics: targetMetricsUrl
-      ? { url: targetMetricsUrl, before: targetBefore, after: targetAfter }
+      ? { url: targetMetricsUrl, ...targetMetrics }
       : undefined,
     durationMs: Math.round(performance.now() - startedAt),
     violations,
@@ -250,6 +260,39 @@ async function readTargetMetrics(url, token) {
   }
 }
 
+async function startTargetMetricsSampler(url, token, intervalMs) {
+  const samples = [];
+  let failures = 0;
+  let stopped = false;
+  let timer;
+  let pending;
+  const capture = async () => {
+    const sample = await readTargetMetrics(url, token);
+    if (sample.error) failures += 1;
+    else samples.push(sample);
+  };
+  await capture();
+  const schedule = () => {
+    timer = setTimeout(async () => {
+      pending = capture();
+      await pending;
+      pending = undefined;
+      if (!stopped) schedule();
+    }, intervalMs);
+    timer.unref();
+  };
+  schedule();
+  return {
+    async stop() {
+      stopped = true;
+      clearTimeout(timer);
+      await pending;
+      await capture();
+      return { intervalMs, samples, failures };
+    },
+  };
+}
+
 async function writeEvidence(value, path) {
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
@@ -268,6 +311,16 @@ function positiveInteger(name, fallback) {
   const value = Number(raw);
   if (!Number.isSafeInteger(value) || value <= 0) {
     throw new Error(`${name} must be a positive safe integer.`);
+  }
+  return value;
+}
+
+function optionalPositiveInteger(name) {
+  const raw = process.env[name]?.trim();
+  if (!raw) return undefined;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value <= 0 || value > 10_000) {
+    throw new Error(`${name} must be an integer from 1 to 10000.`);
   }
   return value;
 }

@@ -1,5 +1,5 @@
 import { eveChannel } from "eve/channels/eve";
-import { POST, type Session } from "eve/channels";
+import { POST } from "eve/channels";
 import type { SessionAuthContext } from "eve/context";
 import {
   type AuthFn,
@@ -27,6 +27,11 @@ import { withSessionOwnership } from "../lib/session-ownership-auth";
 import { parseAgentRunPolicy } from "../lib/run-policy";
 import { parseRemoteTraceParent } from "../lib/observability";
 import { verifyMailboxDispatchRequest } from "../lib/mailbox-dispatch-auth.ts";
+import {
+  inspectMailboxBoundary,
+  MailboxBoundaryInspectionTimeoutError,
+  type MailboxBoundary,
+} from "../lib/mailbox-boundary.ts";
 import type { MessageStreamEvent } from "eve/client";
 
 const MODEL_HEADER = "x-agent-model";
@@ -236,7 +241,14 @@ const mailboxRoute = POST(MAILBOX_ROUTE, async (request, {
   let boundary: MailboxBoundary;
   try {
     boundary = await inspectMailboxBoundary(session);
-  } catch {
+  } catch (error) {
+    if (error instanceof MailboxBoundaryInspectionTimeoutError) {
+      return mailboxProblem(
+        503,
+        "mailbox_inspection_timeout",
+        "The Agent runtime did not expose a mailbox boundary in time. Retry this request.",
+      );
+    }
     return mailboxProblem(404, "mailbox_session_not_found", "The Agent session was not found.");
   }
   if (input.action === "inspect") {
@@ -302,11 +314,6 @@ export default {
   ...channel,
   routes: [...channel.routes, mailboxRoute],
 };
-
-type MailboxBoundary =
-  | { readonly lastEventAt?: string; readonly state: "running"; readonly tailIndex?: number; readonly turnId?: string }
-  | { readonly state: "waiting"; readonly tailIndex?: number }
-  | { readonly state: "terminal"; readonly tailIndex?: number; readonly terminalStatus?: "completed" | "failed" };
 
 type MailboxInspectRequest = {
   readonly action: "inspect";
@@ -484,47 +491,6 @@ function boundedTranscriptStream(
       void reader?.cancel().catch(() => undefined);
     },
   });
-}
-
-async function inspectMailboxBoundary(
-  session: Session,
-): Promise<MailboxBoundary> {
-  const tailIndex = await session.getStreamTailIndex();
-  // Resolve the tail to an absolute cursor before reading it. Tail-relative
-  // streams are intentionally live-following in Eve and can remain open when
-  // a proxy/runtime has no immediately available event. A non-negative tail
-  // read is finite and gives inspection a deterministic lifecycle boundary.
-  if (tailIndex < 0) return { state: "running", tailIndex };
-  const stream = await session.getEventStream({ startIndex: tailIndex });
-  const reader = stream.getReader();
-  try {
-    const latest = await reader.read();
-    if (latest.done || !latest.value) return { state: "running" };
-    if (latest.value.type === "session.waiting") {
-      return { state: "waiting", tailIndex };
-    }
-    if (latest.value.type === "session.completed") {
-      return { state: "terminal", tailIndex, terminalStatus: "completed" };
-    }
-    if (latest.value.type === "session.failed") {
-      return { state: "terminal", tailIndex, terminalStatus: "failed" };
-    }
-    const data: unknown = latest.value.data;
-    const record = isRecord(data) ? data : undefined;
-    const turnId = record && validText(record["turnId"], 512)
-      ? record["turnId"]
-      : undefined;
-    const at = latest.value.meta?.at;
-    return {
-      state: "running",
-      ...(typeof at === "string" ? { lastEventAt: at } : {}),
-      tailIndex,
-      ...(turnId ? { turnId } : {}),
-    };
-  } finally {
-    void reader.cancel().catch(() => undefined);
-    reader.releaseLock();
-  }
 }
 
 function mailboxSessionAuth(input: MailboxDeliverRequest): SessionAuthContext {

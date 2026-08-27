@@ -41,6 +41,11 @@ export interface SandboxDeletionStore {
     readonly sessionId: string;
   }): Promise<SandboxDeletionRecord | undefined>;
   complete(sessionId: string, claimToken: string): Promise<SandboxDeletionRecord>;
+  /**
+   * Settle an authorized deletion whose exact Eve container is already absent.
+   * Active claims and future not-before boundaries are never overridden.
+   */
+  completeMissing(sessionId: string): Promise<SandboxDeletionRecord | undefined>;
   fail(sessionId: string, claimToken: string, message: string): Promise<SandboxDeletionRecord>;
   findOwned(sessionId: string, owner: AgentSessionOwner): Promise<SandboxDeletionRecord | undefined>;
   request(input: {
@@ -184,6 +189,30 @@ function postgresSandboxDeletionStore(
         [sessionId, claimToken],
       );
       return toRecord(requireRow(result.rows[0]));
+    },
+    async completeMissing(sessionId) {
+      assertText(sessionId, "sessionId", 512);
+      const result = await pool.query<SandboxDeletionRow>(
+        `update ${deletionTable}
+            set status = 'completed',
+                claim_token = null,
+                claim_expires_at = null,
+                container_id = null,
+                container_name = null,
+                attempt_count = attempt_count + 1,
+                last_error = null,
+                completed_at = now(),
+                updated_at = now()
+          where session_id = $1
+            and not_before <= now()
+            and (
+              status in ('authorized', 'failed')
+              or (status = 'claimed' and claim_expires_at < now())
+            )
+          returning ${selectColumns()}`,
+        [sessionId],
+      );
+      return result.rows[0] ? toRecord(result.rows[0]) : undefined;
     },
     async fail(sessionId, claimToken, message) {
       assertText(sessionId, "sessionId", 512);

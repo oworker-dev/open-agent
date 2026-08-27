@@ -158,6 +158,9 @@ function deletionStore(
     async complete() {
       return deletionRecord("completed");
     },
+    async completeMissing() {
+      return deletionRecord("completed");
+    },
     async fail() {
       return deletionRecord("failed");
     },

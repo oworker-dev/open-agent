@@ -86,6 +86,7 @@ export function AssistantThreadSurface({
   historyLoading = false,
   inputDisabled,
   isBusy,
+  onCancel,
   locale,
   mentions,
   messages,
@@ -119,6 +120,7 @@ export function AssistantThreadSurface({
   /** Locks the main composer without disabling assistant-ui's edit composer. */
   readonly inputDisabled?: boolean;
   readonly isBusy: boolean;
+  readonly onCancel?: () => void;
   readonly locale: AgentLocale;
   readonly mentions: readonly AgentPromptMenuItem[];
   readonly messages: AgentMessages;
@@ -232,12 +234,14 @@ export function AssistantThreadSurface({
             draftStorageKey={draftStorageKey}
             draftRestore={draftRestore}
             inputDisabled={inputDisabled}
+            isBusy={isBusy}
             locale={locale}
             mentions={mentions}
             messages={messages}
             models={models}
             onPreferencesChange={onPreferencesChange}
             onInputResponses={onInputResponses}
+            onCancel={onCancel}
             onDraftRestoreConsumed={onDraftRestoreConsumed}
             preferences={preferences}
             reasoningLevels={reasoningLevels}

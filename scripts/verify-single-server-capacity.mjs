@@ -2,25 +2,44 @@ import { mkdir, readFile, statfs, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { performance } from "node:perf_hooks";
+import pg from "pg";
 
 import {
   highestPassingLevel,
   parseCapacityLevels,
+  parseMixedCapacityLevels,
 } from "../lib/capacity-config.ts";
+
+const { Pool } = pg;
 
 const root = process.cwd();
 const streamLevels = parseCapacityLevels(
   process.env.AGENT_CAPACITY_STREAM_LEVELS,
-  [1_000, 5_000, 10_000],
+  [100, 250, 500, 1_000, 5_000, 10_000],
 );
 const runLevels = parseCapacityLevels(
   process.env.AGENT_CAPACITY_RUN_LEVELS,
-  [10, 25, 50, 100],
+  [4, 8, 12, 16, 25, 50, 100],
+);
+const mixedLevels = parseMixedCapacityLevels(
+  process.env.AGENT_CAPACITY_MIXED_LEVELS,
+  [
+    { streams: 100, runs: 4 },
+    { streams: 250, runs: 8 },
+    { streams: 250, runs: 12 },
+    { streams: 500, runs: 16 },
+  ],
 );
 const stopOnFailure = process.env.AGENT_CAPACITY_STOP_ON_FAILURE !== "0";
+const requireProductionEvidence = process.env.AGENT_CAPACITY_REQUIRE_PRODUCTION_EVIDENCE === "1";
 const batchTimeoutMs = boundedInteger("AGENT_CAPACITY_BATCH_TIMEOUT_MS", 900_000, 30_000, 3_600_000);
 const evidenceDirectory = resolve(process.env.AGENT_CAPACITY_EVIDENCE_DIR?.trim() || ".tmp/capacity");
 const generatedAt = new Date().toISOString();
+const targetMetricsUrl = process.env.AGENT_CAPACITY_TARGET_METRICS_URL?.trim();
+const targetMetricsToken = process.env.AGENT_CAPACITY_TARGET_METRICS_TOKEN?.trim();
+const workflowConnectionString = process.env.WORKFLOW_POSTGRES_URL?.trim();
+const workflowSchema = identifier(process.env.WORKFLOW_POSTGRES_SCHEMA?.trim() || "workflow");
+const configuredStreamSessions = optionalBoundedInteger("AGENT_CAPACITY_STREAM_SESSION_COUNT", 1, 10_000);
 const minFreeDiskBytes = boundedBytes(
   "AGENT_CAPACITY_MIN_FREE_DISK_BYTES",
   2 * 1024 ** 3,
@@ -36,7 +55,7 @@ await mkdir(evidenceDirectory, { recursive: true });
 const disk = await readDiskCapacity();
 if (disk.availableBytes < minFreeDiskBytes) {
   const evidence = {
-    schemaVersion: "open-agent.single-server-capacity-evidence.v1",
+    schemaVersion: "open-agent.single-server-capacity-evidence.v2",
     generatedAt,
     completedAt: new Date().toISOString(),
     policy: {
@@ -44,12 +63,15 @@ if (disk.availableBytes < minFreeDiskBytes) {
       batchTimeoutMs,
       streamLevels,
       runLevels,
+      mixedLevels,
       minFreeDiskBytes,
+      requireProductionEvidence,
       note: "Capacity load was not started because the host did not have the configured free-disk safety margin.",
     },
     preflight: { disk, ok: false },
     streams: { highestPassingLevel: null, results: [] },
     agentRuns: { highestPassingLevel: null, results: [] },
+    mixed: { highestPassingLevel: null, results: [] },
     ok: false,
   };
   await writeEvidence(evidence, aggregateEvidencePath);
@@ -58,10 +80,16 @@ if (disk.availableBytes < minFreeDiskBytes) {
   process.exit();
 }
 
+const workflowStorageBefore = workflowConnectionString
+  ? await readWorkflowStorageSnapshot(workflowConnectionString, workflowSchema)
+  : undefined;
+
 const streamResults = await runCapacityLevels("streams", streamLevels, {
   AGENT_STREAM_LOAD_BASE_URL: process.env.AGENT_STREAM_LOAD_BASE_URL,
   AGENT_STREAM_LOAD_HOLD_MS: process.env.AGENT_STREAM_LOAD_HOLD_MS || "10000",
   AGENT_STREAM_LOAD_HANDSHAKE_DEADLINE_MS: process.env.AGENT_STREAM_LOAD_HANDSHAKE_DEADLINE_MS || "30000",
+  AGENT_STREAM_LOAD_TARGET_METRICS_URL: targetMetricsUrl,
+  AGENT_STREAM_LOAD_TARGET_METRICS_TOKEN: targetMetricsToken,
 });
 const runResults = await runCapacityLevels("agent-runs", runLevels, {
   AGENT_LOAD_BASE_URL: process.env.AGENT_LOAD_BASE_URL,
@@ -70,10 +98,21 @@ const runResults = await runCapacityLevels("agent-runs", runLevels, {
   // admission/error gate. A slow upstream must be visible in evidence without
   // being misclassified as local saturation.
   AGENT_LOAD_COMPLETION_SLO_MODE: "observe",
+  AGENT_LOAD_TARGET_METRICS_URL: targetMetricsUrl,
+  AGENT_LOAD_TARGET_METRICS_TOKEN: targetMetricsToken,
 });
+const mixedResults = await runMixedCapacityLevels(mixedLevels);
+const workflowStorageAfter = workflowConnectionString
+  ? await readWorkflowStorageSnapshot(workflowConnectionString, workflowSchema)
+  : undefined;
+const productionEvidenceComplete = Boolean(
+  targetMetricsUrl && workflowStorageBefore && workflowStorageAfter && mixedResults.some((result) => result.ok),
+);
+const protocolOk = streamResults.some((result) => result.ok) &&
+  runResults.some((result) => result.ok) && mixedResults.some((result) => result.ok);
 
 const evidence = {
-  schemaVersion: "open-agent.single-server-capacity-evidence.v1",
+  schemaVersion: "open-agent.single-server-capacity-evidence.v2",
   generatedAt,
   completedAt: new Date().toISOString(),
   policy: {
@@ -81,8 +120,10 @@ const evidence = {
     batchTimeoutMs,
     streamLevels,
     runLevels,
+    mixedLevels,
     minFreeDiskBytes,
-    note: "Levels are sequential and each batch must pass its configured SLO. This is not evidence of ten-thousand or one-hundred-thousand user capacity.",
+    requireProductionEvidence,
+    note: "Levels ramp from a safe baseline and stop at the first failed SLO. Stream levels are connections, not inferred users; distinct durable-session counts are preserved in child evidence.",
   },
   preflight: { disk, ok: true },
   streams: {
@@ -93,8 +134,24 @@ const evidence = {
     highestPassingLevel: highestPassingLevel(runResults),
     results: runResults,
   },
-  ok: streamResults.length > 0 && runResults.length > 0 &&
-    streamResults.some((result) => result.ok) && runResults.some((result) => result.ok),
+  mixed: {
+    highestPassingLevel: [...mixedResults].reverse().find((result) => result.ok)?.level ?? null,
+    results: mixedResults,
+  },
+  workflowStorage: workflowStorageBefore && workflowStorageAfter
+    ? {
+        before: workflowStorageBefore,
+        after: workflowStorageAfter,
+        delta: subtractStorage(workflowStorageAfter, workflowStorageBefore),
+      }
+    : undefined,
+  evidenceCompleteness: {
+    productionEvidenceComplete,
+    targetMetricsConfigured: Boolean(targetMetricsUrl),
+    workflowStorageConfigured: Boolean(workflowConnectionString),
+  },
+  protocolOk,
+  ok: protocolOk && (!requireProductionEvidence || productionEvidenceComplete),
 };
 
 await writeEvidence(evidence, aggregateEvidencePath);
@@ -112,6 +169,9 @@ async function runCapacityLevels(kind, levels, extraEnvironment) {
         ? {
             AGENT_STREAM_LOAD_TOTAL: String(level),
             AGENT_STREAM_LOAD_CONCURRENCY: String(Math.min(level, boundedInteger("AGENT_CAPACITY_STREAM_WORKERS", 100, 1, 1_000))),
+            ...(configuredStreamSessions
+              ? { AGENT_STREAM_LOAD_SESSION_COUNT: String(Math.min(level, configuredStreamSessions)) }
+              : {}),
             AGENT_STREAM_LOAD_EVIDENCE_PATH: evidencePath,
           }
         : {
@@ -133,17 +193,63 @@ async function runCapacityLevels(kind, levels, extraEnvironment) {
       });
       if (report?.ok !== true && stopOnFailure) break;
     } catch (error) {
+      const report = await readEvidenceFile(evidencePath);
       results.push({
         level,
         ok: false,
         evidencePath,
         error: safeError(error),
+        metrics: report?.metrics,
         durationMs: Math.round(performance.now() - startedAt),
       });
       if (stopOnFailure) break;
     }
   }
   return results;
+}
+
+async function runMixedCapacityLevels(levels) {
+  const results = [];
+  for (const level of levels) {
+    const label = `${level.streams}-streams-${level.runs}-runs`;
+    const evidencePath = resolve(evidenceDirectory, `mixed-${label}.json`);
+    const environment = omitUndefined({
+      ...process.env,
+      AGENT_MIXED_STREAM_TOTAL: String(level.streams),
+      AGENT_MIXED_STREAM_CONCURRENCY: String(Math.min(level.streams, boundedInteger("AGENT_CAPACITY_STREAM_WORKERS", 100, 1, 1_000))),
+      ...(configuredStreamSessions
+        ? { AGENT_MIXED_STREAM_SESSION_COUNT: String(Math.min(level.streams, configuredStreamSessions)) }
+        : {}),
+      AGENT_MIXED_RUN_TOTAL: String(level.runs),
+      AGENT_MIXED_RUN_CONCURRENCY: String(level.runs),
+      AGENT_MIXED_EVIDENCE_PATH: evidencePath,
+      AGENT_MIXED_RUN_COMPLETION_SLO_MODE: "observe",
+      AGENT_MIXED_TARGET_METRICS_URL: targetMetricsUrl,
+      AGENT_MIXED_TARGET_METRICS_TOKEN: targetMetricsToken,
+    });
+    const startedAt = performance.now();
+    try {
+      await runVerifier("scripts/verify-mixed-capacity.mjs", environment);
+      const report = await readEvidenceFile(evidencePath);
+      results.push({ level, ok: report?.ok === true, evidencePath, metrics: mixedMetrics(report), durationMs: Math.round(performance.now() - startedAt) });
+      if (report?.ok !== true && stopOnFailure) break;
+    } catch (error) {
+      const report = await readEvidenceFile(evidencePath);
+      results.push({ level, ok: false, evidencePath, error: safeError(error), metrics: mixedMetrics(report), durationMs: Math.round(performance.now() - startedAt) });
+      if (stopOnFailure) break;
+    }
+  }
+  return results;
+}
+
+function mixedMetrics(report) {
+  if (!report) return undefined;
+  return {
+    durationMs: report.durationMs,
+    streams: report.streams?.evidence?.metrics,
+    agentRuns: report.agentRuns?.evidence?.metrics,
+    targetMetrics: report.targetMetrics,
+  };
 }
 
 function omitUndefined(environment) {
@@ -160,7 +266,7 @@ function runVerifier(script, environment) {
     });
     let stderr = "";
     let settled = false;
-    child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+    child.stderr.on("data", (chunk) => { stderr = `${stderr}${String(chunk)}`.slice(-16_000); });
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
@@ -237,6 +343,51 @@ async function readDiskCapacity() {
   return { availableBytes, totalBytes, usedBytes: totalBytes - availableBytes };
 }
 
+async function readWorkflowStorageSnapshot(connectionString, schema) {
+  const pool = new Pool({
+    application_name: "open-agent-capacity-storage-snapshot",
+    connectionString,
+    connectionTimeoutMillis: 10_000,
+    idleTimeoutMillis: 10_000,
+    max: 1,
+  });
+  try {
+    const [relations, streams, runs] = await Promise.all([
+      pool.query(
+        `select coalesce(sum(pg_total_relation_size(c.oid)), 0)::bigint as relation_bytes
+           from pg_class c
+           join pg_namespace n on n.oid = c.relnamespace
+          where n.nspname = $1 and c.relkind = 'r'`,
+        [schema],
+      ),
+      pool.query(
+        `select count(*)::bigint as chunks,
+                coalesce(sum(octet_length(data)), 0)::bigint as stream_payload_bytes
+           from "${schema}".workflow_stream_chunks`,
+      ),
+      pool.query(`select count(*)::bigint as runs from "${schema}".workflow_runs`),
+    ]);
+    return {
+      capturedAt: new Date().toISOString(),
+      relationBytes: Number(relations.rows[0]?.relation_bytes ?? 0),
+      streamPayloadBytes: Number(streams.rows[0]?.stream_payload_bytes ?? 0),
+      streamChunks: Number(streams.rows[0]?.chunks ?? 0),
+      runs: Number(runs.rows[0]?.runs ?? 0),
+    };
+  } finally {
+    await pool.end();
+  }
+}
+
+function subtractStorage(after, before) {
+  return {
+    relationBytes: after.relationBytes - before.relationBytes,
+    streamPayloadBytes: after.streamPayloadBytes - before.streamPayloadBytes,
+    streamChunks: after.streamChunks - before.streamChunks,
+    runs: after.runs - before.runs,
+  };
+}
+
 function boundedBytes(name, fallback, minimum, maximum) {
   const raw = process.env[name]?.trim();
   if (!raw) return fallback;
@@ -255,5 +406,20 @@ function boundedBytes(name, fallback, minimum, maximum) {
   if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
     throw new Error(`${name} must be between ${minimum} and ${maximum} bytes.`);
   }
+  return value;
+}
+
+function optionalBoundedInteger(name, minimum, maximum) {
+  const raw = process.env[name]?.trim();
+  if (!raw) return undefined;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`${name} must be an integer from ${minimum} to ${maximum}.`);
+  }
+  return value;
+}
+
+function identifier(value) {
+  if (!/^[a-z_][a-z0-9_]*$/iu.test(value)) throw new Error("WORKFLOW_POSTGRES_SCHEMA is invalid.");
   return value;
 }

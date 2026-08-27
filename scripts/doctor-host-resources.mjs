@@ -19,6 +19,16 @@ const minFreeMemoryBytes = boundedBytes(
 );
 const requireDockerLimits = process.env.AGENT_HOST_REQUIRE_DOCKER_LIMITS === "1";
 const configuredDockerLimits = requireDockerLimits ? readConfiguredDockerLimits() : null;
+const maxDockerSandboxContainers = optionalBoundedInteger(
+  process.env.AGENT_HOST_MAX_DOCKER_SANDBOX_CONTAINERS,
+  1,
+  1_000_000,
+);
+const maxRunningDockerSandboxes = optionalBoundedInteger(
+  process.env.AGENT_HOST_MAX_RUNNING_DOCKER_SANDBOXES,
+  1,
+  1_000_000,
+);
 
 const disk = await readDisk();
 const cgroup = await readCgroupLimits();
@@ -33,6 +43,12 @@ const checks = {
       || (docker.sandbox?.unlimitedCount === 0 && docker.sandbox?.mismatchCount === 0),
     required: requireDockerLimits,
   },
+  dockerSandboxInventory: {
+    maxRunning: maxRunningDockerSandboxes,
+    maxTotal: maxDockerSandboxContainers,
+    ok: (maxDockerSandboxContainers === null || (docker.sandbox?.total ?? Infinity) <= maxDockerSandboxContainers)
+      && (maxRunningDockerSandboxes === null || (docker.sandbox?.running ?? Infinity) <= maxRunningDockerSandboxes),
+  },
 };
 const report = {
   schemaVersion: "open-agent.host-resource-diagnostics.v1",
@@ -44,7 +60,7 @@ const report = {
   disk,
   docker,
   checks,
-  ok: checks.freeDisk.ok && checks.freeMemory.ok && checks.dockerLimits.ok,
+  ok: checks.freeDisk.ok && checks.freeMemory.ok && checks.dockerLimits.ok && checks.dockerSandboxInventory.ok,
   note: "Read-only diagnostics. Values are host observations, not a capacity or user-count guarantee.",
 };
 console.log(JSON.stringify(report, null, 2));
@@ -176,11 +192,23 @@ async function readDockerSandboxLimits(expected) {
   try {
     const { stdout } = await execFileAsync(
       process.env.EVE_DOCKER_PATH?.trim() || "docker",
-      ["ps", "--filter", "label=eve.sandbox", "--filter", "status=running", "--format", "{{.ID}}"],
+      [
+        "ps", "-a", "--filter", "label=eve.sandbox=1",
+        "--format", "{{.ID}}\t{{.State}}\t{{.Label \"eve.sandbox.role\"}}",
+      ],
       { timeout: 5_000, maxBuffer: 2 * 1024 * 1024 },
     );
-    const ids = stdout.trim().split(/\s+/u).filter(Boolean);
-    if (ids.length === 0) return {
+    const containers = stdout.trim().split("\n").filter(Boolean).map((line) => {
+      const [id = "", state = "", role = ""] = line.split("\t");
+      return { id, role, running: state === "running" };
+    });
+    const sessionContainers = containers.filter((container) => container.role === "session");
+    const runningIds = sessionContainers.filter((container) => container.running).map((container) => container.id);
+    if (runningIds.length === 0) return {
+      total: containers.length,
+      sessions: sessionContainers.length,
+      stopped: sessionContainers.filter((container) => !container.running).length,
+      templates: containers.filter((container) => container.role !== "session").length,
       running: 0,
       inspected: 0,
       unlimitedCount: 0,
@@ -190,7 +218,7 @@ async function readDockerSandboxLimits(expected) {
     };
     const { stdout: inspected } = await execFileAsync(
       process.env.EVE_DOCKER_PATH?.trim() || "docker",
-      ["inspect", "--format", "{{json .HostConfig}}", ...ids],
+      ["inspect", "--format", "{{json .HostConfig}}", ...runningIds],
       { timeout: 10_000, maxBuffer: 32 * 1024 * 1024 },
     );
     const sample = inspected.trim().split("\n").filter(Boolean).map((line) => {
@@ -210,7 +238,11 @@ async function readDockerSandboxLimits(expected) {
       || entry.pidsLimit !== expected.pidsLimit,
     ).length;
     return {
-      running: ids.length,
+      total: containers.length,
+      sessions: sessionContainers.length,
+      stopped: sessionContainers.filter((container) => !container.running).length,
+      templates: containers.filter((container) => container.role !== "session").length,
+      running: runningIds.length,
       inspected: sample.length,
       unlimitedCount,
       mismatchCount,
@@ -228,6 +260,15 @@ async function readDockerSandboxLimits(expected) {
       error: (error instanceof Error ? error.message : String(error)).slice(0, 240),
     };
   }
+}
+
+function optionalBoundedInteger(raw, minimum, maximum) {
+  if (!raw?.trim()) return null;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`Host resource integer threshold must be between ${minimum} and ${maximum}.`);
+  }
+  return value;
 }
 
 function readConfiguredDockerLimits() {

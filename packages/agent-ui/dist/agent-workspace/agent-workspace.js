@@ -971,10 +971,9 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                 return false;
             if (committedCatchUpTurns.size > 0 || hasPendingServerQueue())
                 return false;
-            if (runtimeBoundaryState === "running" &&
-                (last.type === "turn.completed" || last.type === "turn.failed" || last.type === "turn.cancelled"))
-                return false;
-            return true;
+            return last.type === "session.waiting" ||
+                last.type === "session.completed" ||
+                last.type === "session.failed";
         };
         const flushRecoverySnapshot = (force = false) => {
             if (!force && !recoverySnapshotDirty && cursor === persistedCursor)
@@ -1234,7 +1233,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                 return next;
             });
         }
-    }, [client, inspectSession, mailbox, messages.recoveryFailed, onEvent, updateThread]);
+    }, [client, inspectSession, mailbox, messages.recoveryFailed, onEvent, settleThreadHistory, updateThread]);
     useEffect(() => () => {
         for (const controller of recoveryControllers.current.values())
             controller.abort();

@@ -137,12 +137,14 @@ the tail did not move, and then marks the thread covered. Subsequent opens do
 not inspect or follow the settled Eve stream.
 
 The Postgres World does not provide general run retention. Open Agent therefore
-ships `reap:workflow` as a separate, default-dry-run operator boundary. It only
-selects terminal runs whose root is inactive and whose Hook retention has ended;
-the apply path requires an explicit confirmation token and deletes child rows in
-one transaction. It is intentionally independent from UI transcript compaction:
-no retention task may delete or rewrite the authoritative event projection used
-for session recovery without a verified root/session mapping.
+ships `reap:workflow` as a read-only operator boundary. It audits complete root
+trees, relation bytes, stream payload bytes, chunk distribution, active roots,
+and retained Hooks. It has no destructive apply path. Hot rows may only be
+purged by a future archive lifecycle after the complete root tree has a
+versioned manifest and checksum and an isolated restore/replay drill has passed.
+It is intentionally independent from UI transcript compaction: no retention
+task may delete or rewrite the authoritative event projection used for session
+recovery, and no event or payload-size ceiling substitutes for archival.
 
 Agent product queries use a bounded PostgreSQL pool. Connection checkout and
 idle-client timeouts are configurable per deployment, while AgentRun admission
@@ -334,7 +336,9 @@ that catalog for a Provider with different limits.
 Eve provides one sandbox per durable session. Locally, `defaultBackend()` selected
 Docker in verification; `/workspace` persisted across turns of that session.
 Different durable sessions do not intentionally share a workspace. Subagents use
-independent sandboxes.
+independent sandboxes. A session that only chats does not allocate a sandbox:
+Eve opens it lazily when a built-in sandbox tool or authored `ctx.getSandbox()`
+first runs.
 
 Local development may use Eve's availability-aware backend selection. Production
 must set `AGENT_SANDBOX_BACKEND` to `docker`, `microsandbox`, or `vercel`; the
@@ -356,24 +360,31 @@ isolation tests there. Single-tenant Docker deployments also require
 `EVE_SANDBOX_RETENTION_HOURS` and
 `EVE_SANDBOX_REAPER_MAX_REMOVALS`, plus explicit finite
 `AGENT_DOCKER_MEMORY_LIMIT_BYTES`, `AGENT_DOCKER_CPU_LIMIT`, and
-`AGENT_DOCKER_PIDS_LIMIT` values. Eve does not expose these flags directly;
+`AGENT_DOCKER_PIDS_LIMIT` values and a finite
+`AGENT_DOCKER_IDLE_TIMEOUT_MS`. Eve does not expose these flags directly;
 Open Agent applies them with `docker update` immediately after each session is
 created or reattached and fails closed if Docker reports different values.
-These are per-container limits, not a host-wide capacity guarantee; configure
-daemon-level disk/inode quotas separately. The operator reaper is dry-run by default,
+After each durable sandbox checkpoint, the idle timer stops Docker compute but
+preserves the container filesystem and reconnect metadata. A later sandbox call
+reattaches the same `/workspace`. These are per-container limits, not a host-wide
+capacity guarantee; configure daemon-level disk/inode quotas separately. The
+operator reaper is dry-run by default,
 owns only stopped containers carrying Eve's exact session labels and naming
 convention, honors a protected-session list, revalidates a candidate before
 deletion, and caps each invocation. A running container can be selected only by
 an explicit exact session id plus `--include-running`. This makes cleanup
 available without changing Eve's durable reattachment semantics.
 
-Physical deletion is authorized by the Agent product database, not by a Docker
-label or age alone. The authenticated Web session deletion route verifies the
+Physical deletion is authorized by the Agent product database, not by a
+completed AgentRun, Docker label, or age alone. The authenticated Web session
+deletion route verifies the
 immutable session owner, terminally retires Eve by its stable session ID, and
 then creates one idempotent `agent_sandbox_deletions` record. The reaper claims
 that record with a short lease, revalidates the container, removes it, and marks
 the record completed; failures return to a retryable state. Missing ownership,
-cross-tenant requests, or a failed Eve reset leave the sandbox intact.
+cross-tenant requests, or a failed Eve reset leave the sandbox intact. The
+cleanup worker consumes only these existing tombstones; it never resets a
+resumable session as a side effect of retention.
 
 Production still requires evidence on the selected deployment backend. Remaining gates are:
 

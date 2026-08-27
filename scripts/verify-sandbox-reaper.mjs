@@ -27,10 +27,14 @@ const protectedContainer = createContainer(`eve-sbx-ses-docker-reaper-protected-
 const wrongRole = createContainer(`eve-sbx-ses-docker-reaper-template-${suffix}`, `reaper-template-${suffix}`, "template");
 const running = createContainer(`eve-sbx-ses-docker-reaper-running-${suffix}`, `reaper-running-${suffix}`, "session", true);
 const unauthorized = createContainer(`eve-sbx-ses-docker-reaper-unauthorized-${suffix}`, `reaper-unauthorized-${suffix}`);
+const missingSessionId = `reaper-missing-${suffix}`;
+const claimedMissingSessionId = `reaper-claimed-missing-${suffix}`;
 const created = [eligible, protectedContainer, wrongRole, running, unauthorized];
 
 try {
   for (const container of created) await claimOwnership(container.sessionId);
+  await claimOwnership(missingSessionId);
+  await claimOwnership(claimedMissingSessionId);
   for (const container of [eligible, protectedContainer, wrongRole, running]) {
     const requested = await deletionStore.request({
       owner,
@@ -40,6 +44,39 @@ try {
     });
     assert.equal(requested.status, "created");
   }
+
+  const missingRequest = await deletionStore.request({
+    owner,
+    reason: "sandbox-reaper-missing-verification",
+    requestedBy: "verification",
+    sessionId: missingSessionId,
+  });
+  assert.equal(missingRequest.status, "created");
+  const missingCompletion = await deletionStore.completeMissing(missingSessionId);
+  assert.equal(missingCompletion?.status, "completed");
+  assert.equal(missingCompletion?.containerId, undefined);
+  assert.equal(missingCompletion?.containerName, undefined);
+  assert.equal(await deletionStore.completeMissing(missingSessionId), undefined);
+
+  const claimedMissingRequest = await deletionStore.request({
+    owner,
+    reason: "sandbox-reaper-claimed-missing-verification",
+    requestedBy: "verification",
+    sessionId: claimedMissingSessionId,
+  });
+  assert.equal(claimedMissingRequest.status, "created");
+  const activeClaim = await deletionStore.claim({
+    containerId: "already-gone-container",
+    containerName: "already-gone-container",
+    sessionId: claimedMissingSessionId,
+  });
+  assert.ok(activeClaim?.claimToken);
+  assert.equal(await deletionStore.completeMissing(claimedMissingSessionId), undefined);
+  await deletionStore.fail(claimedMissingSessionId, activeClaim.claimToken, "fixture claim released");
+  const recoveredMissingCompletion = await deletionStore.completeMissing(claimedMissingSessionId);
+  assert.equal(recoveredMissingCompletion?.status, "completed");
+  assert.equal(recoveredMissingCompletion?.containerId, undefined);
+  assert.equal(recoveredMissingCompletion?.containerName, undefined);
 
   const dryRun = runReaper([
     "--session-id", eligible.sessionId,
@@ -108,9 +145,11 @@ try {
 
   console.log(JSON.stringify({
     authorizationLedger: "completed",
+    activeMissingClaim: "preserved",
     dryRun: "preserved",
     exactRunningSession: "removed",
     ownershipBoundary: "enforced",
+    missingContainer: "completed-idempotently",
     protectedSession: "preserved",
     stoppedExpiredSession: "removed",
     unauthorizedSession: "preserved",

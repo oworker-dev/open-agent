@@ -710,13 +710,19 @@ async function appendThreadEvents(
   append: ThreadCollectionPatchRecord["eventAppends"][number],
 ): Promise<void> {
   const replaceFrom = append.replaceFrom;
-  const countResult = await connection.query<{ next_index: string }>(
-    `select coalesce(max(event_index) + 1, 0)::text as next_index
-       from ${eventTable}
-      where tenant_id = $1 and principal_id = $2 and storage_key = $3 and thread_id = $4`,
-    [tenantId, principalId, storageKey, append.threadId],
-  );
-  const nextIndex = replaceFrom ?? parseRevision(countResult.rows[0]?.next_index ?? "0");
+  const validEvents = append.events.filter(isRecordValue);
+  if (validEvents.length === 0 && replaceFrom === undefined) return;
+
+  let nextIndex = replaceFrom;
+  if (nextIndex === undefined) {
+    const countResult = await connection.query<{ next_index: string }>(
+      `select coalesce(max(event_index) + 1, 0)::text as next_index
+         from ${eventTable}
+        where tenant_id = $1 and principal_id = $2 and storage_key = $3 and thread_id = $4`,
+      [tenantId, principalId, storageKey, append.threadId],
+    );
+    nextIndex = parseRevision(countResult.rows[0]?.next_index ?? "0");
+  }
   if (replaceFrom !== undefined) {
     await connection.query(
       `delete from ${eventTable}
@@ -724,13 +730,12 @@ async function appendThreadEvents(
       [tenantId, principalId, storageKey, append.threadId, replaceFrom],
     );
   }
-  const candidates = append.events.flatMap((rawEvent, offset) => {
-    if (!isRecordValue(rawEvent)) return [];
+  const candidates = validEvents.map((rawEvent, offset) => {
     const meta = isRecordValue(rawEvent.meta) ? rawEvent.meta : {};
     const eventId = typeof meta.id === "string" && meta.id
       ? meta.id
       : `legacy:${append.threadId}:${nextIndex + offset}`;
-    return [{ event: rawEvent, eventId }];
+    return { event: rawEvent, eventId };
   });
   if (candidates.length === 0) return;
 
