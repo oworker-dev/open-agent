@@ -58,6 +58,7 @@ export const DEFAULT_AGENT_RUNTIME_CONFIG: AgentRuntimeConfigSnapshot = {
 export type AgentRuntimeDefinitionLimits = {
   readonly maxInputTokensPerSession?: number | false;
   readonly maxOutputTokensPerSession?: number | false;
+  readonly sessionTimeoutMs?: number | false;
 };
 
 export function runtimeDefinitionLimits(
@@ -66,6 +67,10 @@ export function runtimeDefinitionLimits(
   return {
     maxInputTokensPerSession: config.limits.maxInputTokens ?? 40_000_000,
     maxOutputTokensPerSession: config.limits.maxOutputTokens ?? 10_000_000,
+    // A durable Web thread is explicitly retired by its owner/host. Eve's
+    // default 30-day age timeout would otherwise split a long-lived thread
+    // even though context compaction and paged history remain healthy.
+    sessionTimeoutMs: false,
   };
 }
 

@@ -1,5 +1,6 @@
 export const PRODUCTION_PREVIEW_PORTS = Object.freeze({
   eve: 4275,
+  next: 3101,
   web: 3100,
 });
 

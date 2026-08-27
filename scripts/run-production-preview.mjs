@@ -12,8 +12,13 @@ import {
   resolveProductionPreviewHostJwtSecret,
   resolveProductionPreviewSigningSecret,
 } from "./production-preview-secret.mjs";
+import {
+  readPreviewProxyMaxSockets,
+  startProductionPreviewGateway,
+} from "./production-preview-gateway.mjs";
 
 const WEB_PORT = PRODUCTION_PREVIEW_PORTS.web;
+const NEXT_PORT = PRODUCTION_PREVIEW_PORTS.next;
 const EVE_PORT = configureEveNextProductionPort();
 const SANDBOX_IMAGE = "ghcr.io/oworker-dev/open-agent-sandbox@sha256:44e675839b0e4e16a97e5aceb86ef001fd379ae2642efe4d3bbead9d333f14d9";
 const previewNodeEnv = process.env.OPEN_AGENT_PREVIEW_NODE_ENV?.trim() || "production";
@@ -100,6 +105,7 @@ const runtimeEnvironment = {
   EVE_SANDBOX_REAPER_MAX_REMOVALS: process.env.EVE_SANDBOX_REAPER_MAX_REMOVALS || "50",
   EVE_NEXT_PRODUCTION_PORT: String(EVE_PORT),
   NODE_ENV: previewNodeEnv,
+  OPEN_AGENT_PREVIEW_PROXY_MAX_SOCKETS: String(readPreviewProxyMaxSockets()),
   OTEL_EXPORTER_OTLP_PROTOCOL: process.env.OTEL_EXPORTER_OTLP_PROTOCOL || "http/json",
   OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT || "http://127.0.0.1:4318/v1/traces",
   WORKFLOW_POSTGRES_JOB_PREFIX: "open_agent_",
@@ -109,7 +115,7 @@ const runtimeEnvironment = {
   WORKFLOW_TARGET_WORLD: "@workflow/world-postgres",
 };
 
-await assertPortsAvailable([WEB_PORT, EVE_PORT, 4318]);
+await assertPortsAvailable([WEB_PORT, NEXT_PORT, EVE_PORT, 4318]);
 
 const migration = spawnSync(process.execPath, ["scripts/migrate-agent-data.mjs"], {
   env: runtimeEnvironment,
@@ -136,10 +142,18 @@ await waitForHealth(`http://127.0.0.1:${EVE_PORT}/eve/v1/health`, eve);
 
 const web = spawn(
   process.execPath,
-  ["node_modules/next/dist/bin/next", "start", "--hostname", "0.0.0.0", "--port", String(WEB_PORT)],
+  ["node_modules/next/dist/bin/next", "start", "--hostname", "127.0.0.1", "--port", String(NEXT_PORT)],
   { env: runtimeEnvironment, stdio: "inherit" },
 );
 
+await waitForHealth(`http://127.0.0.1:${NEXT_PORT}`, web);
+const gateway = await startProductionPreviewGateway({
+  eveOrigin: `http://127.0.0.1:${EVE_PORT}`,
+  host: "0.0.0.0",
+  maxSockets: readPreviewProxyMaxSockets(runtimeEnvironment),
+  port: WEB_PORT,
+  webOrigin: `http://127.0.0.1:${NEXT_PORT}`,
+});
 await waitForHealth(`http://127.0.0.1:${WEB_PORT}`, web);
 
 const mailboxWorker = spawn(process.execPath, ["scripts/run-agent-mailbox-worker.mjs"], {
@@ -179,6 +193,7 @@ const stop = (signal = "SIGTERM") => {
   sandboxCleanupWorker.kill(signal);
   runReconciler.kill(signal);
   collector.kill(signal);
+  void gateway.close();
 };
 for (const signal of ["SIGINT", "SIGTERM"]) {
   process.on(signal, () => {
@@ -198,6 +213,7 @@ const outcome = await Promise.race([
 ]);
 stop();
 await Promise.allSettled([
+  gateway.close(),
   childExit("eve", eve),
   childExit("web", web),
   childExit("mailbox-worker", mailboxWorker),

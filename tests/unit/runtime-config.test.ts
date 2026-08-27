@@ -22,6 +22,7 @@ test("standalone session budgets are independent from the model context window",
   assert.deepEqual(runtimeDefinitionLimits(DEFAULT_AGENT_RUNTIME_CONFIG), {
     maxInputTokensPerSession: 40_000_000,
     maxOutputTokensPerSession: 10_000_000,
+    sessionTimeoutMs: false,
   });
 });
 
