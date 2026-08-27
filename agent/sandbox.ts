@@ -27,14 +27,6 @@ export default defineSandbox({
   description:
     "One isolated workspace per durable Agent session with deny-by-default egress.",
   backend: selectBackend(),
-  async onSession({ use, ctx }) {
-    const sandbox = await use();
-    await sandbox.setNetworkPolicy("deny-all");
-    await sandbox.writeTextFile({
-      path: "/workspace/.open-agent-session",
-      content: `${ctx.session.id}\n`,
-    });
-  },
 });
 
 function selectBackend() {
