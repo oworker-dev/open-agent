@@ -127,8 +127,10 @@ fallbacks and must not be used by a production deployment; `AGENT_DATABASE_URL`
 is required. For the built-in asset path set
 `AGENT_ASSET_STORAGE_BACKEND=s3` and provide the S3-compatible endpoint,
 bucket, access key, and secret. Asset metadata and multipart state stay in the
-Agent PostgreSQL schema; object bytes stay in S3/MinIO/R2. A custom `host`
-adapter remains supported for deployments that use a different object store.
+Agent PostgreSQL schema; uploads, artifacts, and preview-file bytes stay in
+S3/MinIO/R2. Legacy inline artifact/preview rows remain readable during
+migration. A custom `host` adapter remains supported for deployments that use
+a different object store.
 Configure bucket CORS to allow browser-origin `PUT` from every intended Web
 origin and expose the `ETag` response header. Production S3 uploads are direct:
 Next.js signs and acknowledges parts but must not proxy their bytes. Keep
@@ -195,15 +197,19 @@ AGENT_RUN_SUBMISSION_STALE_MS=120000 \
   npm run start:run-reconciler
 ```
 
-For the Docker backend, configure idle compute shutdown and run the authorized
-sandbox deletion worker. Eve creates a session sandbox only when a sandbox tool
-or authored `ctx.getSandbox()` first needs it. After a durable checkpoint, Open
-Agent stops an inactive Docker container after the configured timeout. The
-container filesystem and Eve session remain intact; the next sandbox access
-starts the same container and resumes `/workspace`.
+Configure sandbox admission and idle compute shutdown for every backend. Eve
+creates a session sandbox only when a sandbox tool or authored
+`ctx.getSandbox()` first needs it. A single Eve process admits at most
+`AGENT_SANDBOX_MAX_ACTIVE` live handles in FIFO order and returns a capacity
+timeout instead of oversubscribing the host. The idle timer releases that permit
+after a durable checkpoint without retiring the session. For Docker, also run
+the authorized sandbox deletion worker; a stopped container keeps its filesystem
+and the next sandbox access resumes the same `/workspace`.
 
 ```bash
-AGENT_DOCKER_IDLE_TIMEOUT_MS=1800000 \
+AGENT_SANDBOX_IDLE_TIMEOUT_MS=1800000 \
+AGENT_SANDBOX_MAX_ACTIVE=2 \
+AGENT_SANDBOX_ADMISSION_TIMEOUT_MS=30000 \
 AGENT_SANDBOX_CLEANUP_INTERVAL_MS=900000 \
 AGENT_SANDBOX_CLEANUP_MAX_SESSIONS=25 \
   npm run start:sandbox-cleanup
@@ -217,6 +223,11 @@ completion or a retryable failure. This keeps long conversations resumable
 without paying CPU/RAM for every idle Docker session. Microsandbox snapshots at
 durable capture boundaries and Vercel Sandbox supplies its own idle/resume
 lifecycle, so neither uses this Docker-specific worker.
+
+The built-in admission queue is deliberately process-scoped. Run one Eve
+runtime per host when using it. Multi-replica or multi-host deployments must
+inject a scheduler-backed sandbox adapter with global and per-tenant admission;
+do not infer a durable session owner by parsing Eve's derived sandbox key.
 
 Inspection and busy-session failures are deferred with bounded backoff. A
 transport failure after admission begins is marked `submission-ambiguous` and

@@ -113,8 +113,9 @@ reports running and stopped Eve session sandboxes. Optional
 or compute growth into a failed preflight instead of silently consuming the
 host.
 
-Docker sandboxes are lazy and idle compute is stopped after
-`AGENT_DOCKER_IDLE_TIMEOUT_MS`; stopped containers retain `/workspace` and still
+Sandboxes are lazy, live handles are admitted through a bounded FIFO gate, and
+idle compute is stopped after `AGENT_SANDBOX_IDLE_TIMEOUT_MS`; stopped Docker
+containers retain `/workspace` and still
 consume disk/inodes. Long-lived sessions therefore do not imply permanently
 running compute, but they still require an explicit storage budget and
 user-authorized deletion lifecycle. Microsandbox or a remote microVM service is

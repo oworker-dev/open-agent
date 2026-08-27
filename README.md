@@ -260,8 +260,9 @@ build-time CSP/port values are missing, or Host credentials are partial.
 setting them only when `next start` runs cannot repair an already built image.
 `AGENT_PUBLIC_BASE_URL` and `AGENT_PREVIEW_SIGNING_SECRET` are also mandatory
 production inputs. They make preview and artifact links absolute, signed, and
-time-limited. Production requires PostgreSQL, so `.eve/previews` and
-`.eve/artifacts` are development fallbacks only.
+time-limited. Production stores preview/artifact metadata in PostgreSQL and
+their bytes in the configured host-replaceable `AssetStore`; `.eve/previews`
+and `.eve/artifacts` are development fallbacks only.
 Production also requires `AGENT_SANDBOX_IMAGE` pinned by OCI sha256 digest.
 [`sandbox/Dockerfile`](sandbox/Dockerfile) defines the reviewed Node, Python,
 Git, FFmpeg, ImageMagick, and Playwright/Chromium runtime. Build and publish it
@@ -428,15 +429,19 @@ For an explicit Docker deployment, configure finite per-container limits:
 AGENT_DOCKER_MEMORY_LIMIT_BYTES=2GiB \
 AGENT_DOCKER_CPU_LIMIT=2 \
 AGENT_DOCKER_PIDS_LIMIT=512 \
-AGENT_DOCKER_IDLE_TIMEOUT_MS=1800000
+AGENT_SANDBOX_IDLE_TIMEOUT_MS=1800000 \
+AGENT_SANDBOX_MAX_ACTIVE=2 \
+AGENT_SANDBOX_ADMISSION_TIMEOUT_MS=30000
 ```
 
 Open Agent applies these limits with `docker update` after each sandbox is
 created or reattached and fails closed if the daemon reports a mismatch. They
 bound memory, CPU, and process count; disk and inode quotas remain Docker-host
-responsibilities. The idle timeout stops compute after a durable checkpoint but
+responsibilities. The process-wide FIFO gate bounds live sandbox handles on a
+single Eve server. The idle timeout stops compute after a durable checkpoint but
 does not expire the session or delete `/workspace`; the next sandbox access
-reattaches it. Production configuration requires all four values.
+reattaches it and reacquires capacity. Multi-replica deployments must replace
+the process gate with a host scheduler that enforces the same contract globally.
 
 The operator reaper is conservative and prints a JSON dry-run by default:
 

@@ -364,13 +364,17 @@ isolation tests there. Single-tenant Docker deployments also require
 `EVE_SANDBOX_REAPER_MAX_REMOVALS`, plus explicit finite
 `AGENT_DOCKER_MEMORY_LIMIT_BYTES`, `AGENT_DOCKER_CPU_LIMIT`, and
 `AGENT_DOCKER_PIDS_LIMIT` values and a finite
-`AGENT_DOCKER_IDLE_TIMEOUT_MS`. Eve does not expose these flags directly;
+`AGENT_SANDBOX_IDLE_TIMEOUT_MS`. Eve does not expose the Docker resource flags directly;
 Open Agent applies them with `docker update` immediately after each session is
 created or reattached and fails closed if Docker reports different values.
-After each durable sandbox checkpoint, the idle timer stops Docker compute but
+Every backend also uses `AGENT_SANDBOX_MAX_ACTIVE` and
+`AGENT_SANDBOX_ADMISSION_TIMEOUT_MS` to bound live handles in one Eve process.
+After each durable sandbox checkpoint, the idle timer stops compute but
 preserves the container filesystem and reconnect metadata. A later sandbox call
-reattaches the same `/workspace`. These are per-container limits, not a host-wide
-capacity guarantee; configure daemon-level disk/inode quotas separately. The
+reattaches the same `/workspace` and reacquires a FIFO permit. These are
+single-process/per-container limits, not a distributed capacity guarantee;
+multi-replica hosts require an external scheduler adapter, and Docker hosts
+must configure daemon-level disk/inode quotas separately. The
 operator reaper is dry-run by default,
 owns only stopped containers carrying Eve's exact session labels and naming
 convention, honors a protected-session list, revalidates a candidate before

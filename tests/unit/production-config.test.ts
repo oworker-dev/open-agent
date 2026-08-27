@@ -3,10 +3,11 @@ import test from "node:test";
 
 import {
   inspectProductionConfiguration,
-  readAgentDockerIdleTimeoutMs,
   readAgentDockerResourceLimits,
+  readAgentSandboxAdmissionConfig,
   readAgentDeploymentTenancy,
   readAgentSandboxBackend,
+  readAgentSandboxIdleTimeoutMs,
   readAgentSandboxWorkspaceQuota,
 } from "../../lib/production-config.ts";
 import { readAgentDatabaseConfig } from "../../server/data/agent-database.ts";
@@ -21,7 +22,7 @@ const validEnvironment = {
   AGENT_DATABASE_CONNECTION_TIMEOUT_MS: "10000",
   AGENT_DATABASE_IDLE_TIMEOUT_MS: "30000",
   AGENT_DEPLOYMENT_TENANCY: "multi-tenant",
-  AGENT_DOCKER_IDLE_TIMEOUT_MS: "1800000",
+  AGENT_SANDBOX_IDLE_TIMEOUT_MS: "1800000",
   AGENT_EMBED_ALLOWED_ORIGINS: "https://muses.example.com",
   AGENT_HOST_JWT_ALGORITHM: "HS256",
   AGENT_HOST_JWT_AUDIENCE: "open-agent",
@@ -37,6 +38,8 @@ const validEnvironment = {
   AGENT_PROVIDER_HTTP_TIMEOUT_MS: "120000",
   AGENT_RUNTIME_URL: "https://agent-runtime.example.com",
   AGENT_SANDBOX_BACKEND: "microsandbox",
+  AGENT_SANDBOX_MAX_ACTIVE: "16",
+  AGENT_SANDBOX_ADMISSION_TIMEOUT_MS: "30000",
   AGENT_SANDBOX_IMAGE: "ghcr.io/oworker/open-agent-sandbox@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   AGENT_SANDBOX_CLEANUP_INTERVAL_MS: "900000",
   AGENT_SANDBOX_CLEANUP_MAX_SESSIONS: "25",
@@ -236,19 +239,39 @@ test("parses bounded Docker sandbox resource limits", () => {
   );
 });
 
-test("bounds Docker idle compute shutdown without expiring the durable session", () => {
-  assert.equal(readAgentDockerIdleTimeoutMs({}), 30 * 60 * 1_000);
+test("bounds idle compute shutdown without expiring the durable session", () => {
+  assert.equal(readAgentSandboxIdleTimeoutMs({}), 30 * 60 * 1_000);
   assert.equal(
-    readAgentDockerIdleTimeoutMs({ AGENT_DOCKER_IDLE_TIMEOUT_MS: "60000" }),
+    readAgentSandboxIdleTimeoutMs({ AGENT_SANDBOX_IDLE_TIMEOUT_MS: "60000" }),
     60_000,
   );
   assert.throws(
-    () => readAgentDockerIdleTimeoutMs({ NODE_ENV: "production" }),
+    () => readAgentSandboxIdleTimeoutMs({ NODE_ENV: "production" }),
     /must be explicitly configured/u,
   );
   assert.throws(
-    () => readAgentDockerIdleTimeoutMs({ AGENT_DOCKER_IDLE_TIMEOUT_MS: "59999" }),
-    /AGENT_DOCKER_IDLE_TIMEOUT_MS/u,
+    () => readAgentSandboxIdleTimeoutMs({ AGENT_SANDBOX_IDLE_TIMEOUT_MS: "59999" }),
+    /AGENT_SANDBOX_IDLE_TIMEOUT_MS/u,
+  );
+  assert.equal(
+    readAgentSandboxIdleTimeoutMs({ AGENT_DOCKER_IDLE_TIMEOUT_MS: "60000" }),
+    60_000,
+  );
+});
+
+test("requires bounded host-wide sandbox admission in production", () => {
+  assert.deepEqual(readAgentSandboxAdmissionConfig({}), { maxActive: 2, timeoutMs: 30_000 });
+  assert.deepEqual(readAgentSandboxAdmissionConfig({
+    AGENT_SANDBOX_MAX_ACTIVE: "8",
+    AGENT_SANDBOX_ADMISSION_TIMEOUT_MS: "45000",
+  }), { maxActive: 8, timeoutMs: 45_000 });
+  assert.throws(
+    () => readAgentSandboxAdmissionConfig({ NODE_ENV: "production" }),
+    /must be explicitly configured/u,
+  );
+  assert.throws(
+    () => readAgentSandboxAdmissionConfig({ AGENT_SANDBOX_MAX_ACTIVE: "0" }),
+    /AGENT_SANDBOX_MAX_ACTIVE/u,
   );
 });
 

@@ -45,3 +45,33 @@ test("filesystem artifact store persists owner metadata and bytes", async () => 
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("filesystem artifact cleanup removes only expired publication metadata and bytes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "open-agent-artifacts-"));
+  try {
+    const store = createArtifactStoreFromEnvironment({ AGENT_ARTIFACT_STORAGE_PATH: root });
+    const expired = await store.create({
+      content: new TextEncoder().encode("old"),
+      expiresAt: new Date("2030-01-01T00:00:00.000Z"),
+      filename: "old.txt",
+      mediaType: "text/plain",
+      principalId: "user-1",
+      sessionId: "session-1",
+      tenantId: "tenant-1",
+    });
+    const retained = await store.create({
+      content: new TextEncoder().encode("new"),
+      expiresAt: new Date("2031-01-01T00:00:00.000Z"),
+      filename: "new.txt",
+      mediaType: "text/plain",
+      principalId: "user-1",
+      sessionId: "session-1",
+      tenantId: "tenant-1",
+    });
+    assert.equal(await store.cleanupExpired?.({ now: new Date("2030-06-01T00:00:00.000Z") }), 1);
+    assert.equal(await store.find(expired.artifactId), undefined);
+    assert.ok(await store.find(retained.artifactId));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

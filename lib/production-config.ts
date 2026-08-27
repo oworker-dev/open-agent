@@ -28,8 +28,10 @@ export const DEFAULT_AGENT_DOCKER_CPU_LIMIT = 2;
 export const MAX_AGENT_DOCKER_CPU_LIMIT = 64;
 export const DEFAULT_AGENT_DOCKER_PIDS_LIMIT = 512;
 export const MAX_AGENT_DOCKER_PIDS_LIMIT = 32_768;
-export const DEFAULT_AGENT_DOCKER_IDLE_TIMEOUT_MS = 30 * 60 * 1_000;
-export const MAX_AGENT_DOCKER_IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
+export const DEFAULT_AGENT_SANDBOX_IDLE_TIMEOUT_MS = 30 * 60 * 1_000;
+export const MAX_AGENT_SANDBOX_IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
+export const DEFAULT_AGENT_SANDBOX_MAX_ACTIVE = 2;
+export const DEFAULT_AGENT_SANDBOX_ADMISSION_TIMEOUT_MS = 30_000;
 
 export type AgentDockerResourceLimits = {
   readonly memoryBytes: number;
@@ -37,28 +39,58 @@ export type AgentDockerResourceLimits = {
   readonly pidsLimit: number;
 };
 
-export function readAgentDockerIdleTimeoutMs(
+export type AgentSandboxAdmissionConfig = {
+  readonly maxActive: number;
+  readonly timeoutMs: number;
+};
+
+export function readAgentSandboxAdmissionConfig(
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+): AgentSandboxAdmissionConfig {
+  const maxActiveRaw = environment.AGENT_SANDBOX_MAX_ACTIVE?.trim();
+  const timeoutRaw = environment.AGENT_SANDBOX_ADMISSION_TIMEOUT_MS?.trim();
+  if (environment.NODE_ENV === "production" && (!maxActiveRaw || !timeoutRaw)) {
+    throw new Error(
+      "AGENT_SANDBOX_MAX_ACTIVE and AGENT_SANDBOX_ADMISSION_TIMEOUT_MS must be explicitly configured in production.",
+    );
+  }
+  const maxActive = maxActiveRaw ? Number(maxActiveRaw) : DEFAULT_AGENT_SANDBOX_MAX_ACTIVE;
+  const timeoutMs = timeoutRaw ? Number(timeoutRaw) : DEFAULT_AGENT_SANDBOX_ADMISSION_TIMEOUT_MS;
+  if (!Number.isSafeInteger(maxActive) || maxActive < 1 || maxActive > 10_000) {
+    throw new Error("AGENT_SANDBOX_MAX_ACTIVE must be an integer from 1 to 10000.");
+  }
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 300_000) {
+    throw new Error("AGENT_SANDBOX_ADMISSION_TIMEOUT_MS must be an integer from 1000 to 300000.");
+  }
+  return { maxActive, timeoutMs };
+}
+
+export function readAgentSandboxIdleTimeoutMs(
   environment: Readonly<Record<string, string | undefined>> = process.env,
 ): number {
-  const value = environment.AGENT_DOCKER_IDLE_TIMEOUT_MS?.trim();
+  const value = environment.AGENT_SANDBOX_IDLE_TIMEOUT_MS?.trim()
+    || environment.AGENT_DOCKER_IDLE_TIMEOUT_MS?.trim();
   if (!value) {
     if (environment.NODE_ENV === "production") {
-      throw new Error("AGENT_DOCKER_IDLE_TIMEOUT_MS must be explicitly configured in production.");
+      throw new Error("AGENT_SANDBOX_IDLE_TIMEOUT_MS must be explicitly configured in production.");
     }
-    return DEFAULT_AGENT_DOCKER_IDLE_TIMEOUT_MS;
+    return DEFAULT_AGENT_SANDBOX_IDLE_TIMEOUT_MS;
   }
   const milliseconds = Number(value);
   if (
     !Number.isSafeInteger(milliseconds)
     || milliseconds < 60_000
-    || milliseconds > MAX_AGENT_DOCKER_IDLE_TIMEOUT_MS
+    || milliseconds > MAX_AGENT_SANDBOX_IDLE_TIMEOUT_MS
   ) {
     throw new Error(
-      `AGENT_DOCKER_IDLE_TIMEOUT_MS must be an integer from 60000 to ${MAX_AGENT_DOCKER_IDLE_TIMEOUT_MS}.`,
+      `AGENT_SANDBOX_IDLE_TIMEOUT_MS must be an integer from 60000 to ${MAX_AGENT_SANDBOX_IDLE_TIMEOUT_MS}.`,
     );
   }
   return milliseconds;
 }
+
+/** @deprecated Use readAgentSandboxIdleTimeoutMs for every backend. */
+export const readAgentDockerIdleTimeoutMs = readAgentSandboxIdleTimeoutMs;
 
 export function readAgentDockerResourceLimits(
   environment: Readonly<Record<string, string | undefined>> = process.env,
@@ -429,6 +461,19 @@ export function inspectProductionConfiguration(
     } catch (cause) {
       error("sandbox-workspace-quota", cause instanceof Error ? cause.message : "Invalid sandbox workspace quota.");
     }
+    try {
+      readAgentSandboxAdmissionConfig(environment);
+    } catch (cause) {
+      error("sandbox-admission", cause instanceof Error ? cause.message : "Invalid sandbox admission limits.");
+    }
+    try {
+      readAgentSandboxIdleTimeoutMs(environment);
+    } catch (cause) {
+      error(
+        "sandbox-idle-timeout",
+        cause instanceof Error ? cause.message : "Invalid sandbox idle timeout.",
+      );
+    }
     if (image && !/@sha256:[a-f0-9]{64}$/u.test(image)) {
       error(
         "sandbox-image",
@@ -442,14 +487,6 @@ export function inspectProductionConfiguration(
         error(
           "docker-resource-limits",
           cause instanceof Error ? cause.message : "Invalid Docker sandbox resource limits.",
-        );
-      }
-      try {
-        readAgentDockerIdleTimeoutMs(environment);
-      } catch (cause) {
-        error(
-          "docker-idle-timeout",
-          cause instanceof Error ? cause.message : "Invalid Docker sandbox idle timeout.",
         );
       }
       inspectInteger(

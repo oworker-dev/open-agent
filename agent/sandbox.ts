@@ -10,11 +10,13 @@ import { microsandbox } from "eve/sandbox/microsandbox";
 import { vercel } from "eve/sandbox/vercel";
 import {
   readAgentDockerResourceLimits,
-  readAgentDockerIdleTimeoutMs,
+  readAgentSandboxAdmissionConfig,
   readAgentSandboxBackend,
+  readAgentSandboxIdleTimeoutMs,
   readAgentSandboxImage,
 } from "../lib/production-config.ts";
 import { withIdleSandboxShutdown } from "../lib/idle-sandbox-backend.ts";
+import { withSandboxAdmission } from "../lib/sandbox-admission-backend.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -32,41 +34,36 @@ export default defineSandbox({
 function selectBackend() {
   const selected = readAgentSandboxBackend();
   const image = readAgentSandboxImage();
+  const admission = readAgentSandboxAdmissionConfig();
+  const idleTimeoutMs = readAgentSandboxIdleTimeoutMs();
   if (selected === "docker") {
-    return withIdleSandboxShutdown(
+    return withManagedSandboxCapacity(
       withDockerResourceLimits(docker({
         ...(image ? { image } : {}),
         networkPolicy: "deny-all",
         pullPolicy: "if-not-present",
       }), readAgentDockerResourceLimits()),
-      readAgentDockerIdleTimeoutMs(),
-      {
-        onIdleShutdownError(error, sessionKey) {
-          console.warn("Docker sandbox idle shutdown failed", {
-            message: error instanceof Error ? error.message : String(error),
-            sessionKey,
-          });
-        },
-      },
+      admission,
+      idleTimeoutMs,
     );
   }
   if (selected === "microsandbox") {
-    return microsandbox({
+    return withManagedSandboxCapacity(microsandbox({
       ...(image ? { image } : {}),
       cpus: 2,
       memoryMiB: 2048,
       networkPolicy: "deny-all",
       pullPolicy: "if-missing",
-    });
+    }), admission, idleTimeoutMs);
   }
   if (selected === "vercel") {
-    return vercel({
+    return withManagedSandboxCapacity(vercel({
       ...(image ? { image } : {}),
       networkPolicy: "deny-all",
       resources: { vcpus: 2 },
-    });
+    }), admission, idleTimeoutMs);
   }
-  return defaultBackend({
+  return withManagedSandboxCapacity(defaultBackend({
     docker: { ...(image ? { image } : {}), networkPolicy: "deny-all", pullPolicy: "if-not-present" },
     microsandbox: {
       ...(image ? { image } : {}),
@@ -76,7 +73,26 @@ function selectBackend() {
       pullPolicy: "if-missing",
     },
     vercel: { ...(image ? { image } : {}), resources: { vcpus: 2 } },
-  });
+  }), admission, idleTimeoutMs);
+}
+
+function withManagedSandboxCapacity<BO, SO>(
+  backend: SandboxBackend<BO, SO>,
+  admission: ReturnType<typeof readAgentSandboxAdmissionConfig>,
+  idleTimeoutMs: number,
+): SandboxBackend<BO, SO> {
+  return withIdleSandboxShutdown(
+    withSandboxAdmission(backend, admission.maxActive, admission.timeoutMs),
+    idleTimeoutMs,
+    {
+      onIdleShutdownError(error, sessionKey) {
+        console.warn("Sandbox idle shutdown failed", {
+          message: error instanceof Error ? error.message : String(error),
+          sessionKey,
+        });
+      },
+    },
+  );
 }
 
 /**

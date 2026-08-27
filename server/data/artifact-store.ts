@@ -1,6 +1,7 @@
 import type { Pool } from "pg";
+import type { AssetStore } from "@oworker/open-agent-contracts/asset";
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
   getAgentDatabasePool,
@@ -8,6 +9,12 @@ import {
   readAgentDatabaseConfig,
   type AgentDatabaseConfig,
 } from "./agent-database.ts";
+import { createAssetStoreFromEnvironment } from "./asset-store.ts";
+import {
+  deletePublicationObjects,
+  readPublicationObject,
+  writePublicationObject,
+} from "./publication-object.ts";
 
 export const MAX_ARTIFACT_BYTES = 25 * 1024 * 1024;
 
@@ -48,49 +55,74 @@ export interface ArtifactStore {
   find(artifactId: string): Promise<ArtifactRecord | undefined>;
   list(sessionId: string, owner: PublicationOwner): Promise<readonly ArtifactRecord[]>;
   read(artifactId: string): Promise<ArtifactFile | undefined>;
+  cleanupExpired?(options?: { readonly limit?: number; readonly now?: Date }): Promise<number>;
 }
 
 export function createArtifactStoreFromEnvironment(
   environment: Readonly<Record<string, string | undefined>> = process.env,
 ): ArtifactStore {
   const config = readAgentDatabaseConfig(environment);
-  if (config) return createPostgresArtifactStore(config);
+  if (config) return createPostgresArtifactStore(config, createAssetStoreFromEnvironment(environment));
   const configuredRoot = environment.AGENT_ARTIFACT_STORAGE_PATH?.trim();
   return createFilesystemArtifactStore(
     configuredRoot ? resolve(configuredRoot) : resolve(process.cwd(), ".eve", "artifacts"),
   );
 }
 
-export function createPostgresArtifactStore(config: AgentDatabaseConfig): ArtifactStore {
+export function createPostgresArtifactStore(
+  config: AgentDatabaseConfig,
+  assetStore?: AssetStore,
+): ArtifactStore {
   const pool = getAgentDatabasePool(config);
   const table = `${quoteIdentifier(config.schema)}."agent_artifacts"`;
-  return postgresArtifactStore(pool, table);
+  return postgresArtifactStore(pool, table, assetStore);
 }
 
-function postgresArtifactStore(pool: Pool, table: string): ArtifactStore {
+function postgresArtifactStore(pool: Pool, table: string, assetStore?: AssetStore): ArtifactStore {
   return {
     async create(input) {
       assertArtifactInput(input);
       const artifactId = input.artifactId ?? `art_${randomUUID()}`;
-      const result = await pool.query<ArtifactRow>(
-        `insert into ${table}
-          (artifact_id, session_id, tenant_id, principal_id, filename, media_type, content, expires_at, total_bytes)
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-         returning artifact_id, session_id, tenant_id, principal_id, filename,
-           media_type, expires_at, created_at, total_bytes`,
-        [
-          artifactId,
-          input.sessionId,
-          input.tenantId,
-          input.principalId,
-          input.filename,
-          input.mediaType,
-          Buffer.from(input.content),
-          input.expiresAt,
-          input.content.byteLength,
-        ],
-      );
-      return toRecord(result.rows[0]);
+      const owner = { principalId: input.principalId, tenantId: input.tenantId };
+      const assetId = assetStore
+        ? await writePublicationObject({
+            assetStore,
+            content: input.content,
+            expiresAt: input.expiresAt,
+            filename: input.filename,
+            mediaType: input.mediaType,
+            owner,
+            sessionId: input.sessionId,
+          })
+        : undefined;
+      try {
+        const result = await pool.query<ArtifactRow>(
+          `insert into ${table}
+            (artifact_id, session_id, tenant_id, principal_id, filename, media_type,
+             content, asset_id, expires_at, total_bytes)
+           values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+           returning artifact_id, session_id, tenant_id, principal_id, filename,
+             media_type, expires_at, created_at, total_bytes`,
+          [
+            artifactId,
+            input.sessionId,
+            input.tenantId,
+            input.principalId,
+            input.filename,
+            input.mediaType,
+            assetId ? null : Buffer.from(input.content),
+            assetId ?? null,
+            input.expiresAt,
+            input.content.byteLength,
+          ],
+        );
+        return toRecord(result.rows[0]);
+      } catch (error) {
+        if (assetStore && assetId) {
+          await deletePublicationObjects(assetStore, [assetId], owner).catch(() => undefined);
+        }
+        throw error;
+      }
     },
     async find(artifactId) {
       const result = await pool.query<ArtifactRow>(
@@ -115,16 +147,43 @@ function postgresArtifactStore(pool: Pool, table: string): ArtifactStore {
       return result.rows.map(toRecord);
     },
     async read(artifactId) {
-      const result = await pool.query<ArtifactRow & { content: Buffer }>(
+      const result = await pool.query<ArtifactRow>(
         `select artifact_id, session_id, tenant_id, principal_id, filename,
-           media_type, expires_at, created_at, total_bytes, content
+           media_type, expires_at, created_at, total_bytes, content, asset_id
          from ${table} where artifact_id = $1`,
         [artifactId],
       );
       const row = result.rows[0];
-      return row
-        ? { content: row.content, filename: row.filename, mediaType: row.media_type }
+      if (!row) return undefined;
+      const content = row.asset_id && assetStore
+        ? await readPublicationObject({
+            assetId: row.asset_id,
+            assetStore,
+            maximumBytes: MAX_ARTIFACT_BYTES,
+            owner: { principalId: row.principal_id, tenantId: row.tenant_id },
+          })
+        : row.content ?? undefined;
+      return content
+        ? { content, filename: row.filename, mediaType: row.media_type }
         : undefined;
+    },
+    async cleanupExpired(options) {
+      const limit = normalizeCleanupLimit(options?.limit);
+      const now = options?.now ?? new Date();
+      const result = await pool.query(
+        `with expired as (
+            select artifact_id from ${table}
+             where expires_at <= $1
+             order by expires_at, artifact_id
+             limit $2
+             for update skip locked
+          )
+          delete from ${table} artifact
+          using expired
+          where artifact.artifact_id = expired.artifact_id`,
+        [now, limit],
+      );
+      return result.rowCount ?? 0;
     },
   };
 }
@@ -193,10 +252,30 @@ function createFilesystemArtifactStore(root: string): ArtifactStore {
         return undefined;
       }
     },
+    async cleanupExpired(options) {
+      const limit = normalizeCleanupLimit(options?.limit);
+      const now = options?.now?.getTime() ?? Date.now();
+      let deleted = 0;
+      let entries;
+      try {
+        entries = await readdir(root, { withFileTypes: true });
+      } catch {
+        return 0;
+      }
+      for (const entry of entries) {
+        if (deleted >= limit || !entry.isDirectory()) continue;
+        const record = await this.find(entry.name);
+        if (!record || Date.parse(record.expiresAt) > now) continue;
+        await rm(join(root, entry.name), { force: true, recursive: true });
+        deleted += 1;
+      }
+      return deleted;
+    },
   };
 }
 
 type ArtifactRow = {
+  asset_id?: string | null;
   artifact_id: string;
   created_at: Date | string;
   expires_at: Date | string;
@@ -206,7 +285,7 @@ type ArtifactRow = {
   session_id: string;
   tenant_id: string;
   total_bytes: number;
-  content?: Buffer;
+  content?: Buffer | null;
 };
 
 function toRecord(row: ArtifactRow): ArtifactRecord {
@@ -260,6 +339,14 @@ function safeFilename(value: string): boolean {
     && !value.includes("/")
     && !value.includes("\\")
     && !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
+function normalizeCleanupLimit(value: number | undefined): number {
+  const limit = value ?? 100;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10_000) {
+    throw new Error("Artifact cleanup limit must be an integer from 1 to 10000.");
+  }
+  return limit;
 }
 
 function isArtifactRecord(value: unknown): value is ArtifactRecord {

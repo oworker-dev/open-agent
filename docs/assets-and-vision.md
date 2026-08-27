@@ -371,7 +371,8 @@ re-request file permission through its injected upload adapter.
   model-token and sandbox CPU quotas.
 - Range reads and streaming mounts prevent a 100 MiB file from becoming a
   single Node buffer. Database rows contain metadata and pointers, never the
-  primary object bytes.
+  primary upload, artifact, or preview-file bytes. Legacy inline publication
+  rows remain readable until normal retention removes them.
 - Expiry and deletion are idempotent. A deleted asset invalidates all new URLs;
   existing downloads are allowed to finish only according to the host's
   retention policy.

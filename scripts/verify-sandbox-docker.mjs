@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import { docker } from "eve/sandbox/docker";
 import { withIdleSandboxShutdown } from "../lib/idle-sandbox-backend.ts";
+import { withSandboxAdmission } from "../lib/sandbox-admission-backend.ts";
 
 if (process.env.RUN_SANDBOX_DOCKER_EVAL !== "1") {
   console.log("sandbox docker eval skipped (set RUN_SANDBOX_DOCKER_EVAL=1)");
@@ -16,8 +17,12 @@ const templateKey = `open-agent-sandbox-eval-${suffix}`;
 const sessionAKey = `open-agent-sandbox-eval-a-${suffix}`;
 const sessionBKey = `open-agent-sandbox-eval-b-${suffix}`;
 const backend = withIdleSandboxShutdown(
-  docker({ networkPolicy: "deny-all", pullPolicy: "never" }),
-  100,
+  withSandboxAdmission(
+    docker({ networkPolicy: "deny-all", pullPolicy: "never" }),
+    1,
+    5_000,
+  ),
+  250,
 );
 const handles = [];
 
@@ -74,14 +79,30 @@ try {
     "the durable workspace did not survive idle compute shutdown",
   );
 
-  const second = await backend.create({
+  const network = await restored.session.run({
+    command: "set -eu; test -z \"$(getent hosts example.com || true)\"; test -z \"$(cat /proc/net/route | awk 'NR > 1 && $2 != \\\"00000000\\\" { print }')\"",
+  });
+  assert.equal(network.exitCode, 0, `deny-all egress was not enforced: ${network.stderr}`);
+
+  let secondResolved = false;
+  const secondPromise = backend.create({
     templateKey,
     sessionKey: sessionBKey,
     runtimeContext: { appRoot: process.cwd() },
     tags: { eval: "sandbox-isolation" },
+  }).then((handle) => {
+    secondResolved = true;
+    return handle;
   });
-  handles.push(second);
+  await delay(50);
+  assert.equal(secondResolved, false, "sandbox admission did not queue the second live session");
+  const restoredState = await restored.captureState();
+  const restoredContainerName = restoredState.metadata.containerName;
+  assert.equal(typeof restoredContainerName, "string");
+  await waitFor(() => !containerRunning(restoredContainerName), 5_000);
 
+  const second = await secondPromise;
+  handles.push(second);
   const crossSession = await second.session.run({
     command: "test ! -e notes/result.txt && test -f seed/README.txt",
   });
@@ -91,12 +112,7 @@ try {
     "seeded by open-agent\n",
   );
 
-  const network = await restored.session.run({
-    command: "set -eu; test -z \"$(getent hosts example.com || true)\"; test -z \"$(cat /proc/net/route | awk 'NR > 1 && $2 != \\\"00000000\\\" { print }')\"",
-  });
-  assert.equal(network.exitCode, 0, `deny-all egress was not enforced: ${network.stderr}`);
-
-  const containerNames = execFileSync("docker", ["ps", "--filter", "label=eve.sandbox=1", "--format", "{{.Names}}"], {
+  const containerNames = execFileSync("docker", ["ps", "-a", "--filter", "label=eve.sandbox=1", "--format", "{{.Names}}"], {
     encoding: "utf8",
   });
   assert.match(containerNames, new RegExp(sessionAKey));
@@ -104,6 +120,7 @@ try {
 
   console.log(JSON.stringify({
     backend: "docker",
+    admission: "fifo-single-live-session",
     idleCompute: "stopped-and-restored",
     networkPolicy: "deny-all",
     persistence: "same-session",
@@ -153,4 +170,8 @@ async function waitFor(predicate, timeoutMs) {
     }
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
+}
+
+async function delay(milliseconds) {
+  await new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
