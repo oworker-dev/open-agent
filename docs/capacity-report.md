@@ -33,6 +33,14 @@ simultaneous Agent execution.
 | 20 idle streams + 2 live AgentRuns (mixed smoke with target metrics) | Pass | 0 errors, stream handshake p95 83ms, AgentRun completion p95 6.4s, target Web RSS 230->258MiB, event-loop p95 <=21ms, Agent DB pool wait 0 |
 | 100 MiB multipart upload | Pass | 1 upload, 38.72 MiB/s, ownership isolation passed |
 
+The current production process was rechecked on 2026-08-27 with a disk-safe
+smoke campaign. One hundred independent durable-session SSE followers passed
+with 0 errors and 0 unexpected disconnects (handshake p95 156ms); one live
+AgentRun passed in 3.25s, and a mixed 20-stream/1-run envelope also passed.
+All synthetic Eve sessions were reset and removed by the verifier. These
+results confirm the current deployment path, but remain operating points rather
+than a maximum-capacity claim.
+
 The AgentRun result is not classified as a server saturation limit: the run
 was error-free and the latency includes the live Provider. It does mean the
 current deployment does not meet the configured 20-second completion SLO even
@@ -73,6 +81,11 @@ The runner performs a filesystem preflight and refuses to start load when free
 space is below `AGENT_CAPACITY_MIN_FREE_DISK_BYTES` (2 GiB by default). This is
 a safety stop, not a data-retention policy: it does not delete or rewrite
 Workflow history.
+
+It also requires `AGENT_HOST_JWT_SECRET`, `AGENT_HOST_JWT_ISSUER`, and
+`AGENT_HOST_JWT_AUDIENCE` before launching any child load generator. Missing
+credentials produce a failed preflight evidence record without opening a single
+stream or AgentRun.
 
 Use `npm run doctor:host` for the broader host preflight. It reports effective
 CPU and cgroup limits, available memory, swap, Docker reachability, and disk
