@@ -19,6 +19,12 @@ test.beforeEach(async ({ page }) => {
     ) {
       await route.fulfill({
         body: JSON.stringify({
+          eventWindow: {
+            endIndex: (store.collection.threads.find((thread) => thread.id === requestedThreadId)?.events ?? []).length,
+            hasMoreBefore: false,
+            startIndex: 0,
+            total: (store.collection.threads.find((thread) => thread.id === requestedThreadId)?.events ?? []).length,
+          },
           revision: store.revision,
           thread: store.collection.threads.find((thread) => thread.id === requestedThreadId) ?? null,
         }),

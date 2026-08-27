@@ -80,6 +80,48 @@ if (disk.availableBytes < minFreeDiskBytes) {
   process.exit();
 }
 
+const missingPrerequisites = [
+  "AGENT_HOST_JWT_SECRET",
+  "AGENT_HOST_JWT_ISSUER",
+  "AGENT_HOST_JWT_AUDIENCE",
+].filter((name) => !process.env[name]?.trim());
+if (missingPrerequisites.length > 0) {
+  const evidence = {
+    schemaVersion: "open-agent.single-server-capacity-evidence.v2",
+    generatedAt,
+    completedAt: new Date().toISOString(),
+    policy: {
+      stopOnFailure,
+      batchTimeoutMs,
+      streamLevels,
+      runLevels,
+      mixedLevels,
+      minFreeDiskBytes,
+      requireProductionEvidence,
+      note: "Capacity load was not started because the authenticated Host JWT signing configuration was incomplete.",
+    },
+    preflight: {
+      disk,
+      prerequisites: { ok: false, missing: missingPrerequisites },
+      ok: false,
+    },
+    streams: { highestPassingLevel: null, results: [] },
+    agentRuns: { highestPassingLevel: null, results: [] },
+    mixed: { highestPassingLevel: null, results: [] },
+    evidenceCompleteness: {
+      productionEvidenceComplete: false,
+      targetMetricsConfigured: Boolean(targetMetricsUrl),
+      workflowStorageConfigured: Boolean(workflowConnectionString),
+    },
+    protocolOk: false,
+    ok: false,
+  };
+  await writeEvidence(evidence, aggregateEvidencePath);
+  console.error(JSON.stringify(evidence));
+  process.exitCode = 1;
+  process.exit();
+}
+
 const workflowStorageBefore = workflowConnectionString
   ? await readWorkflowStorageSnapshot(workflowConnectionString, workflowSchema)
   : undefined;
