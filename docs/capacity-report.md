@@ -49,12 +49,12 @@ legacy proxy instantiated a fixed `maxSockets: 256` HTTP agent and applied a
 30-second proxy timeout. That combination explains the wave-shaped 256/768
 disconnect counts and roughly 30-second handshakes at 500/1,000 followers.
 After the routing change, pooled 500- and 1,000-follower gates both passed. The
-1,000-follower sample used one durable Eve session to isolate network/stream fan-out from
-Provider and session-creation load. Sampled gateway RSS rose from about 131 MiB
-to 160 MiB, Eve RSS from about 250 MiB to 389 MiB, and Next remained near 224
-MiB. Peak one-second CPU samples were 32% for the gateway and 127% for Eve on
-the four-vCPU host. These are useful stream-server measurements, but are not
-distinct-session or distinct-user evidence.
+1,000-follower sample used one durable Eve session to isolate network/stream
+fan-out from Provider and session-creation load. Sampled gateway RSS rose from
+about 131 MiB to 160 MiB, Eve RSS from about 250 MiB to 389 MiB, and Next
+remained near 224 MiB. Peak one-second CPU samples were 32% for the gateway and
+127% for Eve on the four-vCPU host. These are useful stream-server
+measurements, but are not distinct-session or distinct-user evidence.
 
 The AgentRun result is not classified as a server saturation limit: the run
 was error-free and the latency includes the live Provider. It does mean the
@@ -76,7 +76,7 @@ The current single-server evidence supports these **verified operating levels**:
   so production admission should remain at or below 12 until the Provider,
   Workflow, and database pools are isolated and retested.
 
-These figures are measured separately. They do **not** mean that 500 users can
+These figures are measured separately. They do **not** mean that 1,000 users can
 all run Agent tasks at once. A user with an idle open session consumes an SSE
 connection; an executing task additionally consumes workflow/database capacity,
 Provider quota/latency, and usually a sandbox. The maximum stable mixed workload
