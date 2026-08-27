@@ -57,6 +57,12 @@ type FilesystemAssetStoreOptions = {
 };
 
 let configuredHostAssetStore: AssetStore | undefined;
+let configuredScannerGeneration = 0;
+let cachedS3AssetStore: {
+  readonly client: S3Client;
+  readonly fingerprint: string;
+  readonly store: AssetStore;
+} | undefined;
 // Requests construct the filesystem adapter lazily, so this lock registry
 // must live at module scope. A per-store map would not protect two concurrent
 // HTTP requests that each resolve the environment into a fresh adapter.
@@ -68,6 +74,7 @@ const filesystemQuotaLocks = new Map<string, Promise<void>>();
  * import that host's SDK or credential vault.
  */
 export function configureAssetStore(store: AssetStore): void {
+  closeBuiltInS3AssetStore();
   configuredHostAssetStore = store;
 }
 
@@ -399,29 +406,61 @@ export function createAssetStoreFromEnvironment(
   if (backend === "s3" || backend === "object-store" || backend === "object_store") {
     const database = readAgentDatabaseConfig(environment);
     if (!database) throw new Error("S3 AssetStore requires AGENT_DATABASE_URL for metadata.");
-    return createS3AssetStore({
-      bucket: requiredAssetValue(environment.AGENT_ASSET_S3_BUCKET || environment.S3_BUCKET, "AGENT_ASSET_S3_BUCKET"),
-      client: new S3Client({
-        credentials: {
-          accessKeyId: requiredAssetValue(environment.AGENT_ASSET_S3_ACCESS_KEY_ID || environment.S3_ACCESS_KEY_ID, "AGENT_ASSET_S3_ACCESS_KEY_ID"),
-          secretAccessKey: requiredAssetValue(environment.AGENT_ASSET_S3_SECRET_ACCESS_KEY || environment.S3_SECRET_ACCESS_KEY, "AGENT_ASSET_S3_SECRET_ACCESS_KEY"),
-        },
-        endpoint: environment.AGENT_ASSET_S3_ENDPOINT?.trim() || environment.S3_ENDPOINT?.trim(),
-        forcePathStyle: parseBoolean(environment.AGENT_ASSET_S3_FORCE_PATH_STYLE, true),
-        region: environment.AGENT_ASSET_S3_REGION?.trim() || environment.S3_REGION?.trim() || "us-east-1",
-        // Presigned UploadPart commands have no body at signing time. Disable
-        // optional SDK checksum synthesis or it signs the empty-body CRC32 and
-        // every non-empty browser upload is rejected by S3.
-        requestChecksumCalculation: "WHEN_REQUIRED",
-      }),
+    const bucket = requiredAssetValue(environment.AGENT_ASSET_S3_BUCKET || environment.S3_BUCKET, "AGENT_ASSET_S3_BUCKET");
+    const accessKeyId = requiredAssetValue(environment.AGENT_ASSET_S3_ACCESS_KEY_ID || environment.S3_ACCESS_KEY_ID, "AGENT_ASSET_S3_ACCESS_KEY_ID");
+    const secretAccessKey = requiredAssetValue(environment.AGENT_ASSET_S3_SECRET_ACCESS_KEY || environment.S3_SECRET_ACCESS_KEY, "AGENT_ASSET_S3_SECRET_ACCESS_KEY");
+    const endpoint = environment.AGENT_ASSET_S3_ENDPOINT?.trim() || environment.S3_ENDPOINT?.trim();
+    const forcePathStyle = parseBoolean(environment.AGENT_ASSET_S3_FORCE_PATH_STYLE, true);
+    const region = environment.AGENT_ASSET_S3_REGION?.trim() || environment.S3_REGION?.trim() || "us-east-1";
+    const maxBytes = parseAssetMaxBytes(environment.AGENT_ASSET_MAX_BYTES, MAX_ASSET_BYTES);
+    const quotaBytes = parseOptionalAssetQuota(environment.AGENT_ASSET_QUOTA_BYTES);
+    const prefix = environment.AGENT_ASSET_S3_PREFIX;
+    const scanMode = readAssetScanMode(environment);
+    const uploadUrlExpiresSeconds = parseUploadUrlExpiry(environment.AGENT_ASSET_UPLOAD_URL_TTL_SECONDS);
+    const fingerprint = createHash("sha256").update(JSON.stringify({
+      accessKeyId,
+      bucket,
       database,
-      maxBytes: parseAssetMaxBytes(environment.AGENT_ASSET_MAX_BYTES, MAX_ASSET_BYTES),
-      quotaBytes: parseOptionalAssetQuota(environment.AGENT_ASSET_QUOTA_BYTES),
-      prefix: environment.AGENT_ASSET_S3_PREFIX,
-      scanner,
-      scanMode: readAssetScanMode(environment),
-      uploadUrlExpiresSeconds: parseUploadUrlExpiry(environment.AGENT_ASSET_UPLOAD_URL_TTL_SECONDS),
+      endpoint,
+      forcePathStyle,
+      maxBytes,
+      prefix,
+      quotaBytes,
+      region,
+      scannerGeneration: configuredScannerGeneration,
+      scannerHost: environment.AGENT_ASSET_CLAMAV_HOST?.trim(),
+      scannerPort: environment.AGENT_ASSET_CLAMAV_PORT?.trim(),
+      scannerTimeoutMs: environment.AGENT_ASSET_CLAMAV_TIMEOUT_MS?.trim(),
+      scanMode,
+      secretAccessKey,
+      uploadUrlExpiresSeconds,
+    })).digest("hex");
+    if (cachedS3AssetStore?.fingerprint === fingerprint) return cachedS3AssetStore.store;
+
+    closeBuiltInS3AssetStore();
+    const client = new S3Client({
+      credentials: { accessKeyId, secretAccessKey },
+      endpoint,
+      forcePathStyle,
+      region,
+      // Presigned UploadPart commands have no body at signing time. Disable
+      // optional SDK checksum synthesis or it signs the empty-body CRC32 and
+      // every non-empty browser upload is rejected by S3.
+      requestChecksumCalculation: "WHEN_REQUIRED",
     });
+    const store = createS3AssetStore({
+      bucket,
+      client,
+      database,
+      maxBytes,
+      quotaBytes,
+      prefix,
+      scanner,
+      scanMode,
+      uploadUrlExpiresSeconds,
+    });
+    cachedS3AssetStore = { client, fingerprint, store };
+    return store;
   }
   if (environment.NODE_ENV === "production" && backend !== "host" && backend !== "external") {
     throw new Error("Production assets require AGENT_ASSET_STORAGE_BACKEND=s3 or a configured host AssetStore adapter; filesystem storage is development-only.");
@@ -446,7 +485,20 @@ let configuredHostAssetScanner: AssetScanner | undefined;
 
 /** Register a host-owned scanner for the built-in S3/filesystem adapters. */
 export function configureAssetScanner(scanner: AssetScanner | undefined): void {
+  closeBuiltInS3AssetStore();
+  configuredScannerGeneration += 1;
   configuredHostAssetScanner = scanner;
+}
+
+/** Close the built-in S3 transport pool during host shutdown or test cleanup. */
+export function closeAssetStoreResources(): void {
+  closeBuiltInS3AssetStore();
+}
+
+function closeBuiltInS3AssetStore(): void {
+  const cached = cachedS3AssetStore;
+  cachedS3AssetStore = undefined;
+  cached?.client.destroy();
 }
 
 function readAssetScanMode(environment: Readonly<Record<string, string | undefined>>): AssetScanMode {

@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { AssetMetadata } from "@oworker/open-agent-contracts/asset";
 import { scanAsset } from "../../server/data/asset-store-core.ts";
-import { configureAssetScanner, createAssetStoreFromEnvironment } from "../../server/data/asset-store.ts";
+import {
+  closeAssetStoreResources,
+  configureAssetScanner,
+  createAssetStoreFromEnvironment,
+} from "../../server/data/asset-store.ts";
 
 const metadata: AssetMetadata = {
   assetId: "asset-1",
@@ -70,4 +74,31 @@ test("every process resolves the environment ClamAV scanner through the AssetSto
     AGENT_ASSET_STORAGE_BACKEND: "s3",
     AGENT_DATABASE_URL: "postgresql://fixture:fixture@127.0.0.1:5432/fixture",
   }));
+  closeAssetStoreResources();
+});
+
+test("S3 asset requests reuse one transport pool until production configuration changes", () => {
+  configureAssetScanner(undefined);
+  const environment = {
+    AGENT_ASSET_CLAMAV_HOST: "127.0.0.1",
+    AGENT_ASSET_SCAN_MODE: "required",
+    AGENT_ASSET_S3_ACCESS_KEY_ID: "fixture-access",
+    AGENT_ASSET_S3_BUCKET: "fixture-bucket",
+    AGENT_ASSET_S3_SECRET_ACCESS_KEY: "fixture-secret",
+    AGENT_ASSET_STORAGE_BACKEND: "s3",
+    AGENT_DATABASE_URL: "postgresql://fixture:fixture@127.0.0.1:5432/fixture",
+  } as const;
+  try {
+    const first = createAssetStoreFromEnvironment(environment);
+    const second = createAssetStoreFromEnvironment({ ...environment });
+    assert.equal(second, first);
+
+    const rotated = createAssetStoreFromEnvironment({
+      ...environment,
+      AGENT_ASSET_S3_SECRET_ACCESS_KEY: "rotated-secret",
+    });
+    assert.notEqual(rotated, first);
+  } finally {
+    closeAssetStoreResources();
+  }
 });
