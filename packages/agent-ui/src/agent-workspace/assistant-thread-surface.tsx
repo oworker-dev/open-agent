@@ -536,12 +536,14 @@ export function AssistantComposer({
   draftStorageKey,
   draftRestore,
   inputDisabled = false,
+  isBusy = false,
   locale,
   mentions,
   messages,
   models,
   onPreferencesChange,
   onInputResponses,
+  onCancel,
   onDraftRestoreConsumed,
   preferences,
   reasoningLevels,
@@ -554,12 +556,14 @@ export function AssistantComposer({
   readonly draftStorageKey: string;
   readonly draftRestore?: AgentComposerDraftRestore;
   readonly inputDisabled?: boolean;
+  readonly isBusy?: boolean;
   readonly locale: AgentLocale;
   readonly mentions: readonly AgentPromptMenuItem[];
   readonly messages: AgentMessages;
   readonly models: readonly AgentModelOption[];
   readonly onPreferencesChange: (preferences: AgentThreadPreferences) => void;
   readonly onInputResponses: (responses: readonly AgentInputResponse[]) => void | Promise<void>;
+  readonly onCancel?: () => void;
   readonly onDraftRestoreConsumed: (id: string) => void;
   readonly preferences: AgentThreadPreferences;
   readonly reasoningLevels: readonly string[];
@@ -571,6 +575,7 @@ export function AssistantComposer({
   const composerText = useAuiState((state) => state.composer.text);
   const runtimeInputDisabled = useAuiState((state) => state.thread.isDisabled);
   const stopping = cancellationState !== "idle";
+  const runtimeBusy = isRunning || isBusy;
   const composerDisabled = inputDisabled || runtimeInputDisabled || stopping;
   const composerInputRef = useRef<HTMLDivElement>(null);
   const auiRef = useRef(aui);
@@ -758,12 +763,15 @@ export function AssistantComposer({
                */}
               <ComposerPrimitive.Cancel asChild>
                 <Button
-                  aria-hidden={!(stopping || (isRunning && composerIsEmpty))}
+                  aria-hidden={!(stopping || (runtimeBusy && composerIsEmpty))}
                   aria-label={cancellationState === "idle" ? messages.cancel : messages.stopping}
-                  className={cn("size-9 shrink-0 rounded-full sm:size-8", !(stopping || (isRunning && composerIsEmpty)) && "hidden")}
-                  disabled={cancellationState !== "idle" || !(stopping || (isRunning && composerIsEmpty))}
+                  className={cn("size-9 shrink-0 rounded-full sm:size-8", !(stopping || (runtimeBusy && composerIsEmpty)) && "hidden")}
+                  disabled={cancellationState !== "idle" || !(stopping || (runtimeBusy && composerIsEmpty))}
+                  onClick={() => {
+                    if (!isRunning) onCancel?.();
+                  }}
                   size="icon-sm"
-                  tabIndex={stopping || (isRunning && composerIsEmpty) ? 0 : -1}
+                  tabIndex={stopping || (runtimeBusy && composerIsEmpty) ? 0 : -1}
                   type="button"
                 >
                   {cancellationState === "idle" ? (
@@ -774,16 +782,16 @@ export function AssistantComposer({
                 </Button>
               </ComposerPrimitive.Cancel>
               <Button
-                aria-hidden={stopping || (isRunning && composerIsEmpty)}
-                aria-label={isRunning ? messages.queueFollowUp : messages.send}
-                className={cn("size-9 shrink-0 rounded-full sm:size-8", (stopping || (isRunning && composerIsEmpty)) && "hidden")}
-                disabled={composerDisabled || stopping || (isRunning && composerIsEmpty)}
+                aria-hidden={stopping || (runtimeBusy && composerIsEmpty)}
+                aria-label={runtimeBusy ? messages.queueFollowUp : messages.send}
+                className={cn("size-9 shrink-0 rounded-full sm:size-8", (stopping || (runtimeBusy && composerIsEmpty)) && "hidden")}
+                disabled={composerDisabled || stopping || (runtimeBusy && composerIsEmpty)}
                 onClick={() => {
                   aui.composer.send();
                   blurComposerOnTouch(composerInputRef);
                 }}
                 size="icon-sm"
-                tabIndex={stopping || (isRunning && composerIsEmpty) ? -1 : 0}
+                tabIndex={stopping || (runtimeBusy && composerIsEmpty) ? -1 : 0}
                 type="button"
               >
                 <ArrowUpIcon className="size-4" />

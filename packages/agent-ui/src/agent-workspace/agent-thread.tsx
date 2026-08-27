@@ -1546,6 +1546,7 @@ export function AgentThreadView({
           fallbackStartedAt={thread.pendingTurn?.submittedAt}
           inputDisabled={inputLocked}
           isBusy={isBusy}
+          onCancel={requestCancellation}
           locale={locale}
           mentions={mentions}
           messages={messages}

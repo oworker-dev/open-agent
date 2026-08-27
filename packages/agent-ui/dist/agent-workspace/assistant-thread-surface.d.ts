@@ -12,7 +12,7 @@ export type AgentApprovalTakeover = {
     readonly prompt: string;
     readonly toolName: string;
 };
-export declare function AssistantThreadSurface({ assetUrl, approvalTakeover, cancellationState, closedInputRequestIds, commands, composerTop, draftStorageKey, draftRestore, events, eveMessages, fallbackStartedAt, historyHasMore, historyLoading, inputDisabled, isBusy, locale, mentions, messages, models, onInputResponses, onCloseInputRequest, onDraftRestoreConsumed, onOpenDeliverable, onOpenSubagent, onLoadEarlier, onPreferencesChange, onRetryRuntimeError, preferences, reasoningLevels, runtimeError, usage, }: {
+export declare function AssistantThreadSurface({ assetUrl, approvalTakeover, cancellationState, closedInputRequestIds, commands, composerTop, draftStorageKey, draftRestore, events, eveMessages, fallbackStartedAt, historyHasMore, historyLoading, inputDisabled, isBusy, onCancel, locale, mentions, messages, models, onInputResponses, onCloseInputRequest, onDraftRestoreConsumed, onOpenDeliverable, onOpenSubagent, onLoadEarlier, onPreferencesChange, onRetryRuntimeError, preferences, reasoningLevels, runtimeError, usage, }: {
     readonly assetUrl?: (assetId: string) => string;
     readonly approvalTakeover?: AgentApprovalTakeover;
     readonly cancellationState: AgentCancellationState;
@@ -28,6 +28,7 @@ export declare function AssistantThreadSurface({ assetUrl, approvalTakeover, can
     readonly historyLoading?: boolean;
     readonly inputDisabled?: boolean;
     readonly isBusy: boolean;
+    readonly onCancel?: () => void;
     readonly locale: AgentLocale;
     readonly mentions: readonly AgentPromptMenuItem[];
     readonly messages: AgentMessages;
@@ -45,7 +46,7 @@ export declare function AssistantThreadSurface({ assetUrl, approvalTakeover, can
     readonly runtimeError?: string;
     readonly usage: AgentUsageSummary;
 }): import("react/jsx-runtime").JSX.Element;
-export declare function AssistantComposer({ approvalTakeover, cancellationState, commands, composerTop, draftStorageKey, draftRestore, inputDisabled, locale, mentions, messages, models, onPreferencesChange, onInputResponses, onDraftRestoreConsumed, preferences, reasoningLevels, usage, }: {
+export declare function AssistantComposer({ approvalTakeover, cancellationState, commands, composerTop, draftStorageKey, draftRestore, inputDisabled, isBusy, locale, mentions, messages, models, onPreferencesChange, onInputResponses, onCancel, onDraftRestoreConsumed, preferences, reasoningLevels, usage, }: {
     readonly approvalTakeover?: AgentApprovalTakeover;
     readonly cancellationState: AgentCancellationState;
     readonly commands: readonly AgentPromptMenuItem[];
@@ -53,12 +54,14 @@ export declare function AssistantComposer({ approvalTakeover, cancellationState,
     readonly draftStorageKey: string;
     readonly draftRestore?: AgentComposerDraftRestore;
     readonly inputDisabled?: boolean;
+    readonly isBusy?: boolean;
     readonly locale: AgentLocale;
     readonly mentions: readonly AgentPromptMenuItem[];
     readonly messages: AgentMessages;
     readonly models: readonly AgentModelOption[];
     readonly onPreferencesChange: (preferences: AgentThreadPreferences) => void;
     readonly onInputResponses: (responses: readonly AgentInputResponse[]) => void | Promise<void>;
+    readonly onCancel?: () => void;
     readonly onDraftRestoreConsumed: (id: string) => void;
     readonly preferences: AgentThreadPreferences;
     readonly reasoningLevels: readonly string[];

@@ -965,7 +965,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
             if (knownRuntimeBoundary && runtimeBoundaryReady) {
                 if (committedCatchUpTurns.size > 0 || hasPendingServerQueue())
                     return false;
-                return true;
+                return knownRuntimeBoundary.state === "waiting" || knownRuntimeBoundary.state === "terminal";
             }
             if (!last || !isRecoveryBoundary(last))
                 return false;
@@ -974,6 +974,16 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
             return last.type === "session.waiting" ||
                 last.type === "session.completed" ||
                 last.type === "session.failed";
+        };
+        const recoveryStatus = () => {
+            const status = statusFromEvents(events, currentClosedInputRequestIds());
+            const last = events.at(-1);
+            if (status === "ready" &&
+                runtimeBoundaryState !== "waiting" &&
+                runtimeBoundaryState !== "terminal" &&
+                last?.type === "turn.completed")
+                return "streaming";
+            return status;
         };
         const flushRecoverySnapshot = (force = false) => {
             if (!force && !recoverySnapshotDirty && cursor === persistedCursor)
@@ -990,7 +1000,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                 session: { ...session.state, streamIndex: persistedCursor },
                 status: cancellationPending
                     ? "cancelling"
-                    : statusFromEvents(events, currentClosedInputRequestIds()),
+                    : recoveryStatus(),
             });
         };
         try {
@@ -1214,7 +1224,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                     ? "cancelling"
                     : knownRuntimeBoundary?.failed
                         ? "error"
-                        : statusFromEvents(events, currentClosedInputRequestIds()),
+                        : recoveryStatus(),
             });
         }
         catch (error) {
