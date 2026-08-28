@@ -70,6 +70,12 @@ export async function GET(request: Request, context: RouteContext): Promise<Resp
       );
   const collection = record?.collection ?? { threads: [], version: 2 };
   const revision = record?.revision ?? 0;
+  if (matchesRevision(request.headers.get("if-none-match"), revision)) {
+    return new Response(null, {
+      status: 304,
+      headers: responseHeaders(revision),
+    });
+  }
   const responseCollection = indexView
     ? summarizeThreadCollection(collection, threadId ?? undefined)
     : collection;
@@ -223,6 +229,14 @@ function parseExpectedRevision(value: string | null): number | undefined {
   if (!match?.[1]) return undefined;
   const revision = Number(match[1]);
   return Number.isSafeInteger(revision) ? revision : undefined;
+}
+
+function matchesRevision(value: string | null, revision: number): boolean {
+  if (!value) return false;
+  return value
+    .split(",")
+    .map((candidate) => candidate.trim())
+    .some((candidate) => candidate === `"${revision}"` || candidate === `W/"${revision}"`);
 }
 
 function responseHeaders(revision: number): HeadersInit {

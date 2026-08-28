@@ -4,6 +4,8 @@ export type HttpAgentThreadStorageOptions = {
     readonly fetch?: typeof globalThis.fetch;
     readonly getAccessToken?: () => string | Promise<string>;
     readonly initialThreadId?: string;
+    readonly requestTimeoutMs?: number;
+    readonly readRetryLimit?: number;
 };
 export declare class AgentThreadStorageConflictError extends Error {
     readonly currentRevision?: number;

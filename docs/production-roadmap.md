@@ -34,6 +34,7 @@ for that topology.
 | Vision | `view_image` validates signatures, bounds payloads, resizes oversized images, and emits typed file output | Verify provider capability negotiation and visual rendering across hosts |
 | Host SDK and Muses bridge | Contracts, client, host, UI, and MCP packages exist as alpha artifacts | Publish only after cross-host, auth, quota, and failure conformance |
 | Capacity | Deterministic unit/build gates, non-destructive root-tree retention audit, versioned Workflow archive export/checksum validation, guarded streaming restore into a pre-migrated isolated World, disk-safe sequential and mixed capacity matrices, continuous target metrics, Workflow storage deltas, explicit connection-versus-distinct-session evidence, and real Docker sandbox admission/lifecycle evidence exist | No current real 1k/5k/10k distinct-session run, deployed SLO, target-backend sandbox evidence at scale, external deployment archive replay, or ten-thousand-user capacity report |
+| Web storage transport | Reference clients use bounded request deadlines, retry only idempotent reads, and send revision validators for 304 responses | Hosts should expose the same bounded-read and conditional-cache behavior when replacing the reference storage adapter |
 
 The current upload and vision contract is specified in
 [Assets, Uploads, And Vision](./assets-and-vision.md). That document is a

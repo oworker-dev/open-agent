@@ -1,4 +1,8 @@
 import { AGENT_THREAD_STORAGE_VERSION, eventIdentity, parseThreadCollection, } from "./thread-storage.js";
+const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
+const MAX_REQUEST_TIMEOUT_MS = 120_000;
+const DEFAULT_READ_RETRY_LIMIT = 2;
+const MAX_READ_RETRY_LIMIT = 3;
 export class AgentThreadStorageConflictError extends Error {
     currentRevision;
     expectedRevision;
@@ -20,15 +24,28 @@ export class AgentThreadStorageHttpError extends Error {
 export function createHttpAgentThreadStorage(options) {
     const endpoint = (options.endpoint ?? "/api/agent/thread-collections").replace(/\/$/, "");
     const fetchImplementation = options.fetch ?? globalThis.fetch;
+    const requestTimeoutMs = boundedInteger(options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS, 1_000, MAX_REQUEST_TIMEOUT_MS, "requestTimeoutMs");
+    const readRetryLimit = boundedInteger(options.readRetryLimit ?? DEFAULT_READ_RETRY_LIMIT, 0, MAX_READ_RETRY_LIMIT, "readRetryLimit");
     const revisions = new Map();
     const baselines = new Map();
     let preferredThreadId = options.initialThreadId;
     return {
         async load(storageKey) {
+            const knownRevision = revisions.get(storageKey);
             const response = await request(fetchImplementation, options, collectionUrl(endpoint, storageKey, {
                 ...(preferredThreadId ? { threadId: preferredThreadId } : {}),
                 view: "index",
-            }));
+            }), {
+                ...(knownRevision === undefined ? {} : { headers: { "if-none-match": `"${knownRevision}"` } }),
+                requestTimeoutMs,
+                readRetryLimit,
+            });
+            if (response.status === 304) {
+                const cached = baselines.get(storageKey);
+                if (cached && knownRevision !== undefined)
+                    return cached;
+                throw new AgentThreadStorageHttpError(304, "The Agent thread index cache is unavailable.");
+            }
             await requireOk(response);
             const body = await readCollectionResponse(response);
             revisions.set(storageKey, body.revision);
@@ -37,7 +54,7 @@ export function createHttpAgentThreadStorage(options) {
         },
         async loadThread(storageKey, threadId) {
             preferredThreadId = threadId;
-            const response = await request(fetchImplementation, options, collectionUrl(endpoint, storageKey, { threadId }));
+            const response = await request(fetchImplementation, options, collectionUrl(endpoint, storageKey, { threadId }), { requestTimeoutMs, readRetryLimit });
             await requireOk(response);
             const body = await response.json();
             if (!Number.isSafeInteger(body.revision) || body.revision < 0) {
@@ -71,7 +88,7 @@ export function createHttpAgentThreadStorage(options) {
                 query.eventBefore = String(windowOptions.before);
             if (windowOptions.limit !== undefined)
                 query.eventLimit = String(windowOptions.limit);
-            const response = await request(fetchImplementation, options, collectionUrl(endpoint, storageKey, query));
+            const response = await request(fetchImplementation, options, collectionUrl(endpoint, storageKey, query), { requestTimeoutMs, readRetryLimit });
             await requireOk(response);
             const body = await response.json();
             if (!Number.isSafeInteger(body.revision) || body.revision < 0) {
@@ -108,6 +125,8 @@ export function createHttpAgentThreadStorage(options) {
             const response = await request(fetchImplementation, options, repairCollectionUrl(endpoint, storageKey, { threadId }), {
                 headers: { "content-type": "application/json" },
                 method: "POST",
+                requestTimeoutMs,
+                readRetryLimit: 0,
             });
             if (response.status === 404)
                 return undefined;
@@ -153,6 +172,8 @@ export function createHttpAgentThreadStorage(options) {
                     "if-match": `"${expectedRevision}"`,
                 },
                 method: "PATCH",
+                requestTimeoutMs,
+                readRetryLimit: 0,
             });
             if (response.status === 409) {
                 throw new AgentThreadStorageConflictError(expectedRevision, revisionFromEtag(response.headers.get("etag")));
@@ -246,14 +267,65 @@ async function request(fetchImplementation, options, url, init) {
     if (accessToken !== undefined && !accessToken.trim()) {
         throw new Error("Agent thread storage access token is empty.");
     }
-    return await fetchImplementation(url, {
-        ...init,
-        credentials: "same-origin",
-        headers: {
-            ...init?.headers,
-            ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}),
-        },
-    });
+    const method = (init?.method ?? "GET").toUpperCase();
+    const retryLimit = method === "GET"
+        ? init?.readRetryLimit ?? options.readRetryLimit ?? DEFAULT_READ_RETRY_LIMIT
+        : 0;
+    const timeoutMs = init?.requestTimeoutMs ?? options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    const { readRetryLimit: _readRetryLimit, requestTimeoutMs: _requestTimeoutMs, ...requestInit } = init ?? {};
+    let attempt = 0;
+    for (;;) {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+            const response = await fetchImplementation(url, {
+                ...requestInit,
+                credentials: "same-origin",
+                headers: {
+                    ...requestInit.headers,
+                    ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}),
+                },
+                signal: controller.signal,
+            });
+            if (attempt >= retryLimit || !isRetryableReadStatus(response.status))
+                return response;
+            await response.body?.cancel().catch(() => undefined);
+            attempt += 1;
+            await sleepWithRetryAfter(response.headers.get("retry-after"), attempt);
+        }
+        catch (error) {
+            if (attempt >= retryLimit || !isRetryableReadError(error))
+                throw error;
+            attempt += 1;
+            await sleepWithRetryAfter(undefined, attempt);
+        }
+        finally {
+            clearTimeout(timeout);
+        }
+    }
+}
+function boundedInteger(value, minimum, maximum, name) {
+    if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+        throw new Error(`${name} must be an integer from ${minimum} to ${maximum}.`);
+    }
+    return value;
+}
+function isRetryableReadStatus(status) {
+    return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+function isRetryableReadError(error) {
+    if (!(error instanceof Error))
+        return false;
+    return error instanceof TypeError || error.name === "AbortError" || error.name === "TimeoutError";
+}
+async function sleepWithRetryAfter(header, attempt) {
+    const retryAfterSeconds = header ? Number(header) : NaN;
+    const serverDelay = Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0
+        ? Math.min(5_000, retryAfterSeconds * 1_000)
+        : 0;
+    const exponential = Math.min(2_000, 250 * 2 ** Math.max(0, attempt - 1));
+    const delay = Math.max(serverDelay, exponential) + Math.floor(Math.random() * 100);
+    await new Promise((resolve) => setTimeout(resolve, delay));
 }
 async function requireOk(response) {
     if (response.ok)

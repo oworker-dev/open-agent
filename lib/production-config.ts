@@ -413,6 +413,13 @@ export function inspectProductionConfiguration(
     300_000,
     error,
   );
+  inspectOptionalInteger(
+    environment.AGENT_DATABASE_QUERY_TIMEOUT_MS,
+    "AGENT_DATABASE_QUERY_TIMEOUT_MS",
+    100,
+    300_000,
+    error,
+  );
 
   const algorithm = environment.AGENT_HOST_JWT_ALGORITHM?.trim() || "HS256";
   if (algorithm !== "HS256") {

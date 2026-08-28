@@ -127,6 +127,50 @@ test("supports same-origin cookie authentication without an authorization header
   assert.equal(authorization, null);
 });
 
+test("retries transient GET failures without replaying writes", async () => {
+  let calls = 0;
+  const storage = createHttpAgentThreadStorage({
+    fetch: (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      calls += 1;
+      assert.equal(init?.method, undefined);
+      if (calls === 1) return Response.json({ error: "busy" }, { status: 503 });
+      return Response.json({
+        collection: { threads: [], version: AGENT_THREAD_STORAGE_VERSION },
+        revision: 2,
+      }, { headers: { etag: '"2"' } });
+    }) as typeof fetch,
+    readRetryLimit: 1,
+  });
+
+  const loaded = await storage.load("retry-read");
+  assert.equal(loaded.threads.length, 0);
+  assert.equal(calls, 2);
+});
+
+test("uses a cached collection after a matching 304 response", async () => {
+  let calls = 0;
+  let conditional: string | null = null;
+  const storage = createHttpAgentThreadStorage({
+    fetch: (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      calls += 1;
+      conditional = new Headers(init?.headers).get("if-none-match");
+      if (calls === 1) {
+        return Response.json({
+          collection: { threads: [], version: AGENT_THREAD_STORAGE_VERSION },
+          revision: 7,
+        }, { headers: { etag: '"7"' } });
+      }
+      return new Response(null, { status: 304, headers: { etag: '"7"' } });
+    }) as typeof fetch,
+  });
+
+  const first = await storage.load("etag-read");
+  const second = await storage.load("etag-read");
+  assert.deepEqual(second, first);
+  assert.equal(conditional, '"7"');
+  assert.equal(calls, 2);
+});
+
 test("loads a lightweight thread index before fetching one transcript", async () => {
   const thread = createAgentThread(100, "Lazy thread");
   const requestedUrls: string[] = [];

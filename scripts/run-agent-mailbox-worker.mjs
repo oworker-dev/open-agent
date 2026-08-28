@@ -1,3 +1,5 @@
+import { dispatchMailboxTick } from "./lib/mailbox-worker.mjs";
+
 const endpoint = new URL(
   "/api/internal/agent-mailbox/dispatch?limit=20",
   required("AGENT_WEB_INTERNAL_URL"),
@@ -15,14 +17,7 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
 
 while (!stopped) {
   try {
-    const response = await fetch(endpoint, {
-      headers: { authorization: `Bearer ${secret}` },
-      method: "POST",
-      signal: AbortSignal.timeout(30_000),
-    });
-    if (!response.ok) {
-      throw new Error(`Mailbox dispatcher returned HTTP ${response.status}.`);
-    }
+    await dispatchMailboxTick(endpoint, secret);
     failureDelayMs = intervalMs;
     await delay(intervalMs);
   } catch (error) {

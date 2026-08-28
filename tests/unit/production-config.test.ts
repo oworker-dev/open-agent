@@ -114,6 +114,16 @@ test("database pool timeouts are bounded and defaulted", () => {
   );
 });
 
+test("production doctor validates the database query timeout", () => {
+  const diagnostics = inspectProductionConfiguration({
+    ...validEnvironment,
+    AGENT_DATABASE_QUERY_TIMEOUT_MS: "99",
+  }, "24.18.1");
+  assert.ok(diagnostics.some((item) =>
+    item.code === "integer-range" && item.message.includes("AGENT_DATABASE_QUERY_TIMEOUT_MS"),
+  ));
+});
+
 test("run reconciliation settings reject unsafe ranges", () => {
   const diagnostics = inspectProductionConfiguration({
     ...validEnvironment,
