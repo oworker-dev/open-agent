@@ -134,7 +134,7 @@ test("bounds an access-token getter that never settles", async () => {
   });
 
   await assert.rejects(
-    storage.load("token-timeout"),
+    async () => await storage.load("token-timeout"),
     /access token timed out/u,
   );
 });
