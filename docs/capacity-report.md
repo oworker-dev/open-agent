@@ -344,3 +344,18 @@ After the production rebuild, the full capacity runner performed its
 filesystem preflight at 1.92 GiB free and correctly started zero load batches.
 This fail-closed result is retained as evidence; the 2 GiB threshold was not
 lowered and no shared Workflow history was touched.
+
+## 2026-08-29 runtime budget and polling hardening
+
+The neutral runtime snapshot now publishes explicit uncapped Eve lifetime token
+limits (`false` for input and output). This removes the previous 40M/10M
+renewable session windows from the standalone default; it does not remove
+per-request duration, model-call, tool-call, or host billing limits. Context
+compaction and bounded transcript windows remain active, and an integrator can
+publish numeric lifetime budgets when its quota policy requires them.
+
+The AgentRun polling path now reuses the bounded event page already read during
+projection when the public cursor is current, avoiding a redundant second Eve
+stream request. Older cursors still use the explicit finite read path. The
+standalone child-session status and control requests have bounded client
+deadlines so an unavailable child cannot block the main workspace indefinitely.
