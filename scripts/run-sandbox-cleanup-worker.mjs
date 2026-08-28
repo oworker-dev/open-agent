@@ -1,7 +1,7 @@
-import { execFileSync } from "node:child_process";
 import { closeAgentDatabasePools, getAgentDatabasePool, readAgentDatabaseConfig } from "../server/data/agent-database.ts";
 import { createPostgresSandboxDeletionStoreFromEnvironment } from "../server/data/sandbox-deletion-store.ts";
 import { buildReadySandboxDeletionQuery } from "../lib/sandbox-cleanup-query.ts";
+import { runBoundedJsonProcess } from "../lib/bounded-json-process.ts";
 
 const config = readConfig(process.env);
 const database = getAgentDatabasePool(config.database);
@@ -12,8 +12,10 @@ let stopped = false;
 let running = false;
 let failureDelayMs = config.intervalMs;
 let wake;
+const stopController = new AbortController();
 for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, () => {
   stopped = true;
+  stopController.abort();
   wake?.();
 });
 
@@ -22,7 +24,7 @@ try {
     if (!running) {
       running = true;
       try {
-        const result = await cleanupPass({ config, database, deletionStore });
+        const result = await cleanupPass({ config, database, deletionStore, signal: stopController.signal });
         failureDelayMs = config.intervalMs;
         if (result.considered > 0 || result.removed > 0 || result.failed > 0) {
           console.log(JSON.stringify({ at: new Date().toISOString(), ...result }));
@@ -41,7 +43,7 @@ try {
   await closeAgentDatabasePools();
 }
 
-async function cleanupPass({ config, database, deletionStore }) {
+async function cleanupPass({ config, database, deletionStore, signal }) {
   const sessions = await findAuthorizedDeletions(database, config);
   let completedMissing = 0;
   let removed = 0;
@@ -51,7 +53,7 @@ async function cleanupPass({ config, database, deletionStore }) {
   for (const session of sessions) {
     if (stopped) break;
     try {
-      const reaped = runExactReaper(session.sessionId, config.environment);
+      const reaped = await runExactReaper(session.sessionId, config.environment, config.reaperTimeoutMs, signal);
       if (reaped.removed.length > 0) {
         removed += reaped.removed.length;
       } else if (reaped.unauthorized.length > 0) {
@@ -87,10 +89,9 @@ async function findAuthorizedDeletions(pool, config) {
   }));
 }
 
-function runExactReaper(sessionId, environment) {
-  const output = execFileSync(
-    process.execPath,
-    [
+function runExactReaper(sessionId, environment, timeoutMs, signal) {
+  return runBoundedJsonProcess({
+    args: [
       "scripts/reap-docker-sandboxes.mjs",
       "--apply",
       "--include-running",
@@ -98,13 +99,12 @@ function runExactReaper(sessionId, environment) {
       "--retention-hours", "0",
       "--max-removals", "1",
     ],
-    { cwd: process.cwd(), encoding: "utf8", env: environment },
-  );
-  try {
-    return JSON.parse(output);
-  } catch {
-    throw new Error("Sandbox reaper returned invalid JSON.");
-  }
+    command: process.execPath,
+    cwd: process.cwd(),
+    environment,
+    signal,
+    timeoutMs,
+  });
 }
 
 function readConfig(environment) {
@@ -119,6 +119,7 @@ function readConfig(environment) {
     environment,
     intervalMs: boundedInteger(environment.AGENT_SANDBOX_CLEANUP_INTERVAL_MS, 900_000, 1_000, 86_400_000),
     maxSessions: boundedInteger(environment.AGENT_SANDBOX_CLEANUP_MAX_SESSIONS, 25, 1, 10_000),
+    reaperTimeoutMs: boundedInteger(environment.AGENT_SANDBOX_CLEANUP_REAPER_TIMEOUT_MS, 60_000, 1_000, 300_000),
   };
 }
 
