@@ -222,6 +222,14 @@ are unavailable, the row remains active and is reported as deferred rather than
 being released blindly. This prevents an accepted Eve turn from becoming an
 untracked workload after a process restart.
 
+The protected metrics route was checked after the 2026-08-28 rebuild and
+reported `workflowRuns.running=83` (oldest active update
+`2026-08-17T05:53:54.648Z`) while the product AgentRun table reported one active
+run. The Workflow records are durable session roots and child/turn records;
+their age alone is not evidence that they are abandoned. The metrics surface
+exists to make this backlog visible for owner-scoped reconciliation, while the
+retention audit continues to refuse active-root deletion.
+
 ## Storage finding
 
 The 2026-08-27 read-only audit confirms that the local Workflow database is
