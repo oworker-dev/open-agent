@@ -357,14 +357,37 @@ export function appendThreadEventIndexed(events, eventIds, event) {
     eventIds.add(identity);
     const cumulativeKey = cumulativeEventKey(event);
     if (cumulativeKey) {
-        const existingIndex = findLastCumulativeEventIndex(events, cumulativeKey);
+        const cumulativeIndexes = cumulativeIndexFor(events);
+        const existingIndex = cumulativeIndexes.get(cumulativeKey);
         if (existingIndex !== undefined && canReplaceCumulativeEvent(events, existingIndex, event)) {
             events[existingIndex] = event;
             return true;
         }
+        cumulativeIndexes.set(cumulativeKey, events.length);
     }
     events.push(event);
     return true;
+}
+const cumulativeIndexesByEvents = new WeakMap();
+function cumulativeIndexFor(events) {
+    const existing = cumulativeIndexesByEvents.get(events);
+    if (existing)
+        return existing;
+    const indexes = new Map();
+    for (let index = 0; index < events.length; index += 1) {
+        const key = cumulativeEventKey(events[index]);
+        if (key)
+            indexes.set(key, index);
+    }
+    cumulativeIndexesByEvents.set(events, indexes);
+    return indexes;
+}
+function findLastCumulativeEventIndex(events, key) {
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+        if (cumulativeEventKey(events[index]) === key)
+            return index;
+    }
+    return undefined;
 }
 export function eventIdentity(event) {
     if (typeof event.meta?.id === "string" && event.meta.id.length > 0) {
@@ -404,13 +427,6 @@ function cumulativeEventKey(event) {
     }
     if (event.type === "action.input.partial") {
         return `${event.type}:${event.data.turnId}:${event.data.stepIndex}:${event.data.callId}`;
-    }
-    return undefined;
-}
-function findLastCumulativeEventIndex(events, key) {
-    for (let index = events.length - 1; index >= 0; index -= 1) {
-        if (cumulativeEventKey(events[index]) === key)
-            return index;
     }
     return undefined;
 }

@@ -51,6 +51,13 @@ export interface AgentThreadCollectionStore<TCollection = unknown> {
     principalId: string,
     storageKey: string,
   ): Promise<StoredThreadCollection<TCollection> | undefined>;
+  /** Reads only the collection revision. Used to answer conditional GETs
+   * without materializing the thread index when the caller is already current. */
+  readRevision?(
+    tenantId: string,
+    principalId: string,
+    storageKey: string,
+  ): Promise<number | undefined>;
   /** Reads only thread metadata for the sidebar; event payloads stay in Postgres. */
   loadIndex?(
     tenantId: string,
@@ -285,6 +292,17 @@ function postgresThreadCollectionStore<TCollection>(
 
   return {
     load,
+    async readRevision(tenantId, principalId, storageKey) {
+      assertScope(tenantId, principalId, storageKey);
+      const result = await pool.query<{ revision: string }>(
+        `select revision::text
+           from ${table}
+          where tenant_id = $1 and principal_id = $2 and storage_key = $3`,
+        [tenantId, principalId, storageKey],
+      );
+      const row = result.rows[0];
+      return row ? parseRevision(row.revision) : undefined;
+    },
     loadIndex,
     loadThread,
     loadThreadWindow,

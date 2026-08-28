@@ -442,17 +442,49 @@ export function appendThreadEventIndexed(
 
   const cumulativeKey = cumulativeEventKey(event);
   if (cumulativeKey) {
-    const existingIndex = findLastCumulativeEventIndex(events, cumulativeKey);
+    const cumulativeIndexes = cumulativeIndexFor(events);
+    const existingIndex = cumulativeIndexes.get(cumulativeKey);
     if (existingIndex !== undefined && canReplaceCumulativeEvent(events, existingIndex, event)) {
       events[existingIndex] = event;
       return true;
     }
+    cumulativeIndexes.set(cumulativeKey, events.length);
   }
   // Completion is a separate lifecycle boundary. Retain it after the
   // cumulative incremental anchor so the reducer can render the final state
   // while the presenter can still recover the original visual position.
   events.push(event);
   return true;
+}
+
+// A live Eve stream can contain thousands of cumulative text/tool snapshots.
+// Keep the latest snapshot index beside the mutable event array so each
+// append is amortized O(1) instead of scanning the entire transcript. WeakMap
+// ownership lets discarded transcripts be collected normally.
+const cumulativeIndexesByEvents = new WeakMap<MessageStreamEvent[], Map<CumulativeEventKey, number>>();
+
+function cumulativeIndexFor(
+  events: MessageStreamEvent[],
+): Map<CumulativeEventKey, number> {
+  const existing = cumulativeIndexesByEvents.get(events);
+  if (existing) return existing;
+  const indexes = new Map<CumulativeEventKey, number>();
+  for (let index = 0; index < events.length; index += 1) {
+    const key = cumulativeEventKey(events[index]!);
+    if (key) indexes.set(key, index);
+  }
+  cumulativeIndexesByEvents.set(events, indexes);
+  return indexes;
+}
+
+function findLastCumulativeEventIndex(
+  events: readonly MessageStreamEvent[],
+  key: CumulativeEventKey,
+): number | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    if (cumulativeEventKey(events[index]!) === key) return index;
+  }
+  return undefined;
 }
 
 /**
@@ -512,16 +544,6 @@ function cumulativeEventKey(event: MessageStreamEvent): CumulativeEventKey | und
   }
   if (event.type === "action.input.partial") {
     return `${event.type}:${event.data.turnId}:${event.data.stepIndex}:${event.data.callId}`;
-  }
-  return undefined;
-}
-
-function findLastCumulativeEventIndex(
-  events: readonly MessageStreamEvent[],
-  key: CumulativeEventKey,
-): number | undefined {
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    if (cumulativeEventKey(events[index]!) === key) return index;
   }
   return undefined;
 }

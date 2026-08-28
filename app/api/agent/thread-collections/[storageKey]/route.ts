@@ -61,6 +61,23 @@ export async function GET(request: Request, context: RouteContext): Promise<Resp
       { headers: responseHeaders(record?.revision ?? 0) },
     );
   }
+  // The index response is immutable for a given collection revision when no
+  // selected thread is embedded. Resolve the cheap primary-key revision first
+  // so a polling client with a matching ETag never pays for JSONB expansion,
+  // sorting, and serialization of every thread.
+  if (indexView && !threadId && store.readRevision && request.headers.get("if-none-match")) {
+    const currentRevision = await store.readRevision(
+      authenticated.identity.tenantId,
+      authenticated.identity.principalId,
+      storageKey,
+    );
+    if (currentRevision !== undefined && matchesRevision(request.headers.get("if-none-match"), currentRevision)) {
+      return new Response(null, {
+        status: 304,
+        headers: responseHeaders(currentRevision),
+      });
+    }
+  }
   const record = indexView && store.loadIndex
     ? await store.loadIndex(
         authenticated.identity.tenantId,

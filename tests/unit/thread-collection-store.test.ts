@@ -369,3 +369,20 @@ test("loads the thread index without joining or aggregating event payloads", asy
   assert.match(loadedSql, /'events', '\[\]'::jsonb/u);
   assert.doesNotMatch(loadedSql, /agent_thread_events/u);
 });
+
+test("reads only a collection revision for conditional index requests", async () => {
+  let loadedSql = "";
+  const pool = {
+    async query(sql: string) {
+      loadedSql = sql;
+      return { rows: [{ revision: "12" }] } as unknown as QueryResult;
+    },
+  } as unknown as Pool;
+  const store = createPostgresThreadCollectionStore(config, pool);
+
+  const revision = await store.readRevision?.("tenant-1", "principal-1", "workspace-1");
+
+  assert.equal(revision, 12);
+  assert.match(loadedSql, /select revision::text/u);
+  assert.doesNotMatch(loadedSql, /jsonb_array_elements|jsonb_agg|agent_thread_events/u);
+});
