@@ -6,6 +6,17 @@ export type SandboxAdmissionStats = {
   readonly queuedSessions: number;
 };
 
+let latestSandboxAdmissionStats: SandboxAdmissionStats | undefined;
+
+/**
+ * Read the latest process-local admission snapshot for protected diagnostics.
+ * The value is intentionally aggregate-only and is never used for admission;
+ * PostgreSQL/Workflow remain the authoritative cross-process controls.
+ */
+export function getSandboxAdmissionStats(): SandboxAdmissionStats | undefined {
+  return latestSandboxAdmissionStats;
+}
+
 export class SandboxAdmissionError extends Error {
   readonly code = "SANDBOX_CAPACITY_TIMEOUT";
 
@@ -169,6 +180,8 @@ export function withSandboxAdmission<BO, SO>(
   }
 
   function publishStats(): void {
-    options.onStats?.({ activeSessions: permitsInUse, limit, queuedSessions: waiters.length });
+    const stats = { activeSessions: permitsInUse, limit, queuedSessions: waiters.length };
+    latestSandboxAdmissionStats = stats;
+    options.onStats?.(stats);
   }
 }

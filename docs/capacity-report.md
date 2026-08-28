@@ -131,6 +131,11 @@ latency remains a separately reported SLO. This separation prevents a slow
 model response from being “fixed” by arbitrary event or payload limits and
 prevents a passing Provider call from being mistaken for a saturated host.
 
+Protected target metrics also expose aggregate sandbox admission activity once
+the backend has served a sandbox request. These values are process-local
+diagnostics, not a second admission controller; they distinguish queued
+sandbox demand from database or Provider pressure during a capacity run.
+
 The runner performs a filesystem preflight and refuses to start load when free
 space is below `AGENT_CAPACITY_MIN_FREE_DISK_BYTES` (2 GiB by default). This is
 a safety stop, not a data-retention policy: it does not delete or rewrite

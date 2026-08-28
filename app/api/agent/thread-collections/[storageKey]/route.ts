@@ -8,6 +8,10 @@ import {
   parseThreadCollectionPatch,
   summarizeThreadCollection,
 } from "@/server/http/thread-collection-contract";
+import {
+  RequestBodyTooLargeError,
+  readRequestTextWithinLimit,
+} from "@/server/http/bounded-request-body";
 
 export const runtime = "nodejs";
 
@@ -113,8 +117,11 @@ export async function PUT(request: Request, context: RouteContext): Promise<Resp
 
   let input: unknown;
   try {
-    input = await request.json();
-  } catch {
+    input = JSON.parse(await readRequestTextWithinLimit(request, MAX_LEGACY_SNAPSHOT_BYTES)) as unknown;
+  } catch (error) {
+    if (error instanceof RequestBodyTooLargeError) {
+      return problem(413, "collection_too_large", "The legacy thread snapshot exceeds 64 MiB.");
+    }
     return problem(400, "invalid_json", "The request body must be valid JSON.");
   }
   if (!isRecord(input) || !("collection" in input)) {
@@ -213,12 +220,11 @@ async function readJsonWithinLimit(request: Request, limit = MAX_PATCH_BYTES): P
     return problem(413, "collection_too_large", `The thread collection patch exceeds ${Math.round(limit / 1024 / 1024)} MiB.`);
   }
   try {
-    const text = await request.text();
-    if (Buffer.byteLength(text) > limit) {
+    return JSON.parse(await readRequestTextWithinLimit(request, limit)) as unknown;
+  } catch (error) {
+    if (error instanceof RequestBodyTooLargeError) {
       return problem(413, "collection_too_large", `The thread collection patch exceeds ${Math.round(limit / 1024 / 1024)} MiB.`);
     }
-    return JSON.parse(text) as unknown;
-  } catch {
     return problem(400, "invalid_json", "The request body must be valid JSON.");
   }
 }

@@ -10,6 +10,7 @@ import {
   getWorkflowRuntimeStats,
   readWorkflowDatabaseConfig,
 } from "@/server/data/workflow-database";
+import { getSandboxAdmissionStats } from "@/lib/sandbox-admission-backend";
 
 export const runtime = "nodejs";
 
@@ -79,6 +80,7 @@ export async function GET(request: Request): Promise<Response> {
       agentRuns,
       workflowDatabasePools: getWorkflowDatabasePoolStats(),
       workflowRuns,
+      sandboxAdmission: getSandboxAdmissionStats() ?? { available: false as const },
     },
     { headers: { "cache-control": "no-store" } },
   );

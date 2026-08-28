@@ -60,6 +60,10 @@ can return `304 Not Modified` without serializing the collection again.
 The protected internal metrics route also samples Workflow active-run counts
 through a separate bounded pool when `WORKFLOW_POSTGRES_URL` is configured;
 database errors are reported as `available: false`, never as zero backlog.
+After the sandbox backend has served a request, the same protected response
+also includes aggregate admission activity (`activeSessions`, `limit`, and
+`queuedSessions`). This is process-local diagnostics only; the PostgreSQL
+AgentRun gate remains authoritative across Web replicas.
 
 Use a unique `WORKFLOW_POSTGRES_JOB_PREFIX` for every World. The supported Eve
 prefix is `open_agent_`; the Muses host uses `muses_` in its own database.

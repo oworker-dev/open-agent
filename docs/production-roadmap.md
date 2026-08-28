@@ -330,10 +330,12 @@ idle-client timeouts (`AGENT_DATABASE_CONNECTION_TIMEOUT_MS`,
 `AGENT_DATABASE_QUERY_TIMEOUT_MS`, and `AGENT_DATABASE_IDLE_TIMEOUT_MS`). The
 active-run query is backed by partial indexes on status and tenant, so admission
 remains cheap as terminal history grows. Protected metrics expose active-run
-counts and the oldest active timestamp, while reporting `available: false` if
-the database cannot answer in time. `npm run doctor:host` provides read-only
-host/cgroup/Docker evidence and fails closed for low free disk or memory before
-a load test starts.
+counts and the oldest active timestamp, plus process-local sandbox admission
+activity (active and queued sessions), while reporting `available: false` if
+the database cannot answer in time. Thread snapshot/PATCH routes stream their
+request bodies through a byte limit and cancel oversized chunked uploads before
+materializing them. `npm run doctor:host` provides read-only host/cgroup/Docker
+evidence and fails closed for low free disk or memory before a load test starts.
 
 Sandbox allocation remains lazy per durable session. Docker compute is stopped
 after a durable idle boundary and reattached to the preserved `/workspace` on
