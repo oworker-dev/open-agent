@@ -287,10 +287,13 @@ changing the durable-history policy:
 - One 100 MiB direct multipart upload completed at 34.44 MiB/s with one
   interrupted-part retry. Cross-tenant and cross-principal reads returned 403;
   the object was removed by the verifier.
-- The AgentRun API completed a structured result with a live Provider, preserved
-  idempotent replay and event cursors, and accepted cancellation. Usage is
-  checked as non-negative integer counters because live Provider token counts
-  are not the deterministic fixture values.
+- The AgentRun API completed a deterministic text result with a live Provider,
+  preserved idempotent replay and event cursors, and accepted cancellation.
+  Usage is checked as non-negative integer counters because live Provider token
+  counts are not deterministic fixture values. Structured-output projection
+  remains available as an explicit `AGENT_RUN_TEST_OUTPUT_SCHEMA=1` contract
+  check; it is not used as the live-provider capacity smoke because a model may
+  legitimately decline a requested schema and return a typed failure.
 - The dedicated gateway established 1,000 pooled SSE followers over eight
   durable sessions with zero errors or unexpected disconnects; handshake p95 was
   209 ms and target Web RSS remained about 217 MiB. This is connection fan-out
