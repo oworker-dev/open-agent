@@ -5,6 +5,11 @@ import {
   getAgentRunAdmissionStats,
   readAgentDatabaseConfig,
 } from "@/server/data/agent-database";
+import {
+  getWorkflowDatabasePoolStats,
+  getWorkflowRuntimeStats,
+  readWorkflowDatabaseConfig,
+} from "@/server/data/workflow-database";
 
 export const runtime = "nodejs";
 
@@ -42,6 +47,17 @@ export async function GET(request: Request): Promise<Response> {
   } else {
     agentRuns = { available: false as const };
   }
+  const workflowDatabaseConfig = readWorkflowDatabaseConfig();
+  let workflowRuns;
+  if (workflowDatabaseConfig) {
+    try {
+      workflowRuns = await getWorkflowRuntimeStats(workflowDatabaseConfig);
+    } catch {
+      workflowRuns = { available: false as const };
+    }
+  } else {
+    workflowRuns = { available: false as const };
+  }
   return Response.json(
     {
       ok: true,
@@ -61,6 +77,8 @@ export async function GET(request: Request): Promise<Response> {
       },
       agentDatabasePools: getAgentDatabasePoolStats(),
       agentRuns,
+      workflowDatabasePools: getWorkflowDatabasePoolStats(),
+      workflowRuns,
     },
     { headers: { "cache-control": "no-store" } },
   );

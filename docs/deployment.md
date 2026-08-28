@@ -57,6 +57,9 @@ client also bounds asynchronous access-token resolution and aborts a read after
 are never automatically replayed. Keep
 the storage endpoint's revision ETag behavior enabled so repeated index reads
 can return `304 Not Modified` without serializing the collection again.
+The protected internal metrics route also samples Workflow active-run counts
+through a separate bounded pool when `WORKFLOW_POSTGRES_URL` is configured;
+database errors are reported as `available: false`, never as zero backlog.
 
 Use a unique `WORKFLOW_POSTGRES_JOB_PREFIX` for every World. The supported Eve
 prefix is `open_agent_`; the Muses host uses `muses_` in its own database.
