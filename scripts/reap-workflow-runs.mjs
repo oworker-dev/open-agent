@@ -44,7 +44,7 @@ const pool = new Pool({
 });
 const now = new Date();
 try {
-  const runs = await loadRootTrees(pool, schema, scanLimit, now, olderThanMs);
+  const runs = await loadRootTrees(pool, schema, scanLimit);
   const protectedRunIds = await loadProtectedRuns(pool, schema, now);
   const selection = selectWorkflowRetentionCandidates(runs, now, {
     maxRuns: maxRoots,
@@ -76,6 +76,8 @@ try {
       candidateRoots: candidateRoots.length,
       candidateRuns: candidateRunIds.length,
       candidatePayloadBytes: candidateBytes,
+      activeRootIds: selection.activeRootIds,
+      protectedRootIds: selection.protectedRootIds,
       skippedActiveRoots: selection.skippedActiveRoots,
       skippedProtectedRoots: selection.skippedProtected,
       deletedRuns: 0,
@@ -91,16 +93,17 @@ try {
   await pool.end();
 }
 
-async function loadRootTrees(pool, schema, limit, now, olderThanMs) {
-  const cutoff = new Date(now.getTime() - olderThanMs);
+async function loadRootTrees(pool, schema, limit) {
+  // Scan every root kind, including active roots. The selection policy still
+  // refuses active trees, but omitting them here made the audit falsely report
+  // zero active roots and hid long-lived sessions from operators.
   const seeds = await pool.query(
-    `select distinct coalesce(attributes->>'$rootRunId', id) as root_run_id
+    `select coalesce(attributes->>'$rootRunId', id) as root_run_id
        from ${schema}.workflow_runs
-      where status::text in ('completed', 'failed', 'cancelled')
-        and completed_at <= $1
-      order by coalesce(attributes->>'$rootRunId', id) asc
-      limit $2`,
-    [cutoff, limit],
+      group by coalesce(attributes->>'$rootRunId', id)
+      order by min(created_at), coalesce(attributes->>'$rootRunId', id) asc
+      limit $1`,
+    [limit],
   );
   const rootIds = seeds.rows.map((row) => String(row.root_run_id));
   if (rootIds.length === 0) return [];

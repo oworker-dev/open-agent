@@ -359,3 +359,30 @@ projection when the public cursor is current, avoiding a redundant second Eve
 stream request. Older cursors still use the explicit finite read path. The
 standalone child-session status and control requests have bounded client
 deadlines so an unavailable child cannot block the main workspace indefinitely.
+
+## 2026-08-29 active Workflow audit
+
+The read-only retention audit was rerun after the rollback baseline was pushed.
+It scanned 1,745 Workflow run members and found 48 active root trees (88 active
+root/child run members). The active roots include ordinary waiting Eve session
+roots, Muses host verification sessions, and historical user sessions; the
+product AgentRun table had no active admission rows at the same point. This is
+expected for a durable Eve session: its root remains `running` while it waits
+for a later message, even when its last AgentRun is `completed`, `cancelled`,
+or `failed`. No row was changed.
+
+The same audit measured 1,041,615,222 bytes of uncompressed Workflow stream
+payload across 81,096 chunks. The largest retained active roots were about
+329 MiB (9,928 chunks) and 176 MiB (12,803 chunks). These are storage and
+retention signals, not evidence that a stream should be reopened from index
+zero or that a session is executing. The audit now reports `activeRootIds` and
+`protectedRootIds` explicitly so operators can distinguish active durable roots
+from terminal archival candidates. Destructive cleanup remains disabled until a
+complete root-tree archive has passed checksum validation and an isolated
+restore/replay drill.
+
+The same host preflight reported 1.75 GiB free disk after the production build,
+below the configured 2 GiB safety margin, so the large capacity matrix started
+zero load batches and exited safely. This is a deliberate fail-closed result;
+the threshold was not lowered and the shared Workflow database was not used for
+load generation.

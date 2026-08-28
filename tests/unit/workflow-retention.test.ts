@@ -16,6 +16,8 @@ test("retention selects only old terminal runs", () => {
   ], now, { maxRuns: 10, olderThanMs: 7 * 24 * 60 * 60 * 1_000 });
   assert.deepEqual(result.candidates.map((run) => run.id), ["old"]);
   assert.deepEqual(result.candidateRootIds, ["old"]);
+  assert.deepEqual(result.activeRootIds, ["active"]);
+  assert.deepEqual(result.protectedRootIds, []);
 });
 
 test("retention protects terminal children of an active root", () => {
@@ -25,6 +27,7 @@ test("retention protects terminal children of an active root", () => {
   ], now, { maxRuns: 10, olderThanMs: 7 * 24 * 60 * 60 * 1_000 });
   assert.equal(result.candidates.length, 0);
   assert.equal(result.skippedActiveRoots, 1);
+  assert.deepEqual(result.activeRootIds, ["root"]);
 });
 
 test("retention selects or rejects a root tree as one unit", () => {

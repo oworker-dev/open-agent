@@ -23,6 +23,10 @@ export type WorkflowRetentionSelection = {
   readonly cutoff: Date;
   readonly candidates: readonly WorkflowRetentionRun[];
   readonly candidateRootIds: readonly string[];
+  /** Root trees skipped because at least one member is still active. */
+  readonly activeRootIds: readonly string[];
+  /** Root trees skipped because an operator or live hook protects them. */
+  readonly protectedRootIds: readonly string[];
   readonly skippedActiveRoots: number;
   readonly skippedProtected: number;
 };
@@ -80,6 +84,8 @@ export function selectWorkflowRetentionCandidates(
     cutoff,
     candidates,
     candidateRootIds: selectedRoots.map((root) => root.rootId),
+    activeRootIds: [...activeRoots].sort((left, right) => left.localeCompare(right)),
+    protectedRootIds: [...protectedRoots].sort((left, right) => left.localeCompare(right)),
     skippedActiveRoots: activeRoots.size,
     skippedProtected: protectedRoots.size,
   };
