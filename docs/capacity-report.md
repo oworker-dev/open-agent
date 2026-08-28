@@ -81,6 +81,16 @@ unexpected disconnects, and zero cleanup failures; all 100 synthetic sessions
 were retired. These are regression and conservative operating-point results,
 not a maximum-capacity claim.
 
+After the `906fab8` database-timeout hardening and production-preview restart,
+the recovery gate was rerun on 2026-08-28. It observed 48 canonical events,
+forced two disconnects at cursor 4, recovered the remaining 44 events with one
+reconnect, matched the complete stable-event-id sequence, and retired its
+temporary sandbox. A 20-follower pooled stream smoke on the same build
+established all 20 connections with a 64 ms p95 handshake and zero unexpected
+disconnects; the single seeded session was reset and removed. The full capacity
+matrix was intentionally refused by its 2 GiB free-disk preflight (1.54 GiB
+available), so no large load was started against the shared Workflow database.
+
 The public preview now terminates traffic in a dedicated loopback-only gateway
 instead of asking Next's compiled rewrite proxy to carry Eve streams. The
 legacy proxy instantiated a fixed `maxSockets: 256` HTTP agent and applied a
