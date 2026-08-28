@@ -339,3 +339,8 @@ p95 43 ms); the AgentRun completed without error in 21.9 s and the load
 generator event-loop p95 was 20.5 ms. The stream fixtures and AgentRun session
 were retired after the run. Provider completion latency is reported separately
 and is not treated as a host-saturation measurement.
+
+After the production rebuild, the full capacity runner performed its
+filesystem preflight at 1.92 GiB free and correctly started zero load batches.
+This fail-closed result is retained as evidence; the 2 GiB threshold was not
+lowered and no shared Workflow history was touched.
