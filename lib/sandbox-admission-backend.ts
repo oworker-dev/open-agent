@@ -135,7 +135,16 @@ export function withSandboxAdmission<BO, SO>(
       ...handle,
       shutdown() {
         if (shutdown) return shutdown;
-        shutdown = handle.shutdown().finally(() => release(sessionKey, session));
+        shutdown = handle.shutdown().then(
+          () => release(sessionKey, session),
+          (error) => {
+            // A failed stop can leave compute running. Keep its permit held and
+            // allow a later lifecycle pass to retry instead of admitting more
+            // compute than the configured hard limit.
+            shutdown = undefined;
+            throw error;
+          },
+        );
         return shutdown;
       },
     };

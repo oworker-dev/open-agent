@@ -33,6 +33,7 @@ simultaneous Agent execution.
 | 16 live AgentRuns, concurrency 16 | Fail | 1/16 failed during inspection/settlement (502), error rate 6.25%; successful admission p95 1.05s, completion p95 14.3s |
 | 20 idle streams + 2 live AgentRuns (mixed smoke) | Pass | 0 errors, stream handshake p95 52ms, AgentRun completion p95 4.7s |
 | 20 idle streams + 2 live AgentRuns (mixed smoke with target metrics) | Pass | 0 errors, stream handshake p95 83ms, AgentRun completion p95 6.4s, target Web RSS 230->258MiB, event-loop p95 <=21ms, Agent DB pool wait 0 |
+| 20 pooled streams + 1 live AgentRun after resource hardening | Pass | 20/20 streams, 0 unexpected disconnects, handshake p95 72ms; 1/1 run, admission 211ms, completion 3.73s; target RSS peaked at 238.45 MiB, event-loop sample max 26.1ms, Agent DB pool wait 0 |
 | 100 MiB multipart upload | Pass | 1 upload, 38.72 MiB/s, ownership isolation passed |
 
 The current production process was rechecked on 2026-08-27 with a disk-safe
@@ -42,6 +43,14 @@ AgentRun passed in 3.25s, and a mixed 20-stream/1-run envelope also passed.
 All synthetic Eve sessions were reset and removed by the verifier. These
 results confirm the current deployment path, but remain operating points rather
 than a maximum-capacity claim.
+
+After the sandbox-admission, publication-storage, and client-projection changes,
+a second disk-gated mixed smoke passed on 2026-08-27. It used 20 concurrent SSE
+followers over one synthetic durable session plus one live AgentRun, collected
+target metrics for the whole 24.5-second window, and retired both synthetic
+sessions through Eve reset. This is deployment-regression evidence only: the
+shared stream session deliberately minimizes durable writes and does not raise
+the distinct-session or active-run planning numbers below.
 
 The public preview now terminates traffic in a dedicated loopback-only gateway
 instead of asking Next's compiled rewrite proxy to carry Eve streams. The
@@ -115,13 +124,25 @@ host.
 
 Sandboxes are lazy, live handles are admitted through a bounded FIFO gate, and
 idle compute is stopped after `AGENT_SANDBOX_IDLE_TIMEOUT_MS`; stopped Docker
-containers retain `/workspace` and still
-consume disk/inodes. Long-lived sessions therefore do not imply permanently
-running compute, but they still require an explicit storage budget and
-user-authorized deletion lifecycle. Microsandbox or a remote microVM service is
+containers retain `/workspace` and still consume disk/inodes. The real Docker
+gate verified a one-session live limit, FIFO admission of the next session,
+permit release after idle shutdown, same-session workspace restoration,
+cross-session isolation, and deny-all egress. Long-lived sessions therefore do
+not imply permanently running compute, but they still require an explicit
+storage budget and user-authorized deletion lifecycle. Microsandbox or a remote microVM service is
 the production recommendation for mutually untrusted tenants and elastic
 compute; changing backends does not remove Provider, Workflow, database, or
 object-store bottlenecks.
+
+The deterministic Provider failure gate now includes two sequential sessions
+that each execute a real Docker `bash` call while the sandbox admission limit is
+one. Resetting the first session closes only its own process-wide tracked
+handle, releases the permit, and lets the second session proceed. Same-session
+reattachment reuses one live backend handle, including concurrent first access,
+so an idle-timer handoff cannot leak an admission reference. The same gate also
+keeps 429, 408, 500, interrupted-stream, and timeout recovery separate from
+terminal retry exhaustion; HTTP 524 remains classified as a gateway timeout
+rather than a generic server response.
 
 The lazy-allocation boundary was rechecked against the live production build:
 two no-tool seed sessions completed and were retired while the Eve session
@@ -147,11 +168,15 @@ time through `verify:mixed-capacity`: it runs the idle stream and AgentRun
 verifiers concurrently and records both child reports plus target metrics
 throughout the window. A 20-stream/2-run smoke envelope now passes with
 target metrics enabled; this is still only a protocol smoke result, not a large
-mixed-workload capacity claim. The Workflow streamer may log Node's
-`MaxListenersExceededWarning` when more than ten followers intentionally attach
-to one stream; this is a warning threshold, not evidence of a leak. The
-streamer patch removes listeners on EOF, errors, and cancellation, and should be
-monitored under repeated same-stream follower tests.
+mixed-workload capacity claim. The Workflow stream fan-out emitter now removes
+listeners on EOF, errors, and cancellation and disables Node's generic
+ten-listener warning only on that private emitter. Three repeated rounds of 20
+same-stream followers returned the listener count to zero after cancellation.
+Historical catch-up is keyset-paginated and uses a bounded exact-ID window plus
+the exact buffered/history overlap instead of an ever-growing set of delivered
+chunk IDs. It never rejects a distinct live chunk based on cross-worker ULID
+ordering; a deliberately delayed duplicate outside the bounded window is safer
+than losing a valid event and remains identifiable by Eve's stable event ID.
 
 The AgentRun verifier retires every synthetic Eve session it creates after the
 measurement (and records attempted, retired, and failed cleanup counts in the
@@ -174,6 +199,14 @@ zero `LOAD_READY` roots remaining. `npm run reap:workflow` is now strictly
 read-only and reports candidates as complete root trees. Direct SQL deletion is
 not a production reconciliation strategy; no hot-history purge is authorized
 until a versioned archive and isolated restore/replay drill exist.
+
+Publication bytes no longer add new PostgreSQL pressure. Migration `0016`
+keeps artifact and website-preview metadata in PostgreSQL but writes their
+bytes through the host-replaceable `AssetStore`; legacy inline rows remain
+readable. A real PostgreSQL + MinIO + ClamAV gate verified direct transfer,
+malware rejection, aggregate quota reservation, externalized publication
+objects, ready-object expiry, and stale multipart abortion. This does not
+reduce the existing Workflow event history described above.
 
 At the same audit point the host had about 1.34 GiB free disk, below the
 capacity runner's 2 GiB default safety margin. The v2 preflight correctly

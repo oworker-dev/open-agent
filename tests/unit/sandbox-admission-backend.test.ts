@@ -116,12 +116,46 @@ test("releases a permit when backend creation fails", async () => {
   await second.shutdown();
 });
 
+test("keeps admission occupied until a failed shutdown is retried successfully", async () => {
+  const fixture = shutdownFailsOnceBackend();
+  const backend = withSandboxAdmission(fixture.backend, 1, 20);
+  const first = await backend.create(createInput("session-a"));
+
+  await assert.rejects(first.shutdown(), /stop failed/u);
+  await assert.rejects(
+    backend.create(createInput("session-b")),
+    (error) => error instanceof SandboxAdmissionError,
+  );
+
+  await first.shutdown();
+  const second = await backend.create(createInput("session-b"));
+  await second.shutdown();
+  assert.equal(fixture.shutdownAttempts(), 3);
+});
+
 test("releases admission when an idle durable sandbox stops", async () => {
   const fixture = fakeBackend();
   const admitted = withSandboxAdmission(fixture.backend, 1, 1_000);
   const backend = withIdleSandboxShutdown(admitted, 10);
   const first = await backend.create(createInput("session-a"));
   await first.captureState();
+  await delay(30);
+
+  const second = await backend.create(createInput("session-b"));
+  assert.deepEqual(fixture.creates, ["session-a", "session-b"]);
+  await second.shutdown();
+});
+
+test("reattach before idle shutdown reuses one admitted backend handle", async () => {
+  const fixture = fakeBackend();
+  const admitted = withSandboxAdmission(fixture.backend, 1, 1_000);
+  const backend = withIdleSandboxShutdown(admitted, 10);
+  const first = await backend.create(createInput("session-a"));
+  await first.captureState();
+
+  const reattached = await backend.create(createInput("session-a"));
+  await reattached.captureState();
+  assert.deepEqual(fixture.creates, ["session-a"]);
   await delay(30);
 
   const second = await backend.create(createInput("session-b"));
@@ -187,6 +221,33 @@ function intermittentlyFailingBackend(sessionKey: string): {
         return { reused: true };
       },
     },
+  };
+}
+
+function shutdownFailsOnceBackend(): {
+  readonly backend: SandboxBackend;
+  readonly shutdownAttempts: () => number;
+} {
+  let attempts = 0;
+  return {
+    backend: {
+      name: "shutdown-retry",
+      async create(input) {
+        return {
+          session: {} as never,
+          useSessionFn: async () => ({} as never),
+          async captureState() {
+            return { backendName: "shutdown-retry", metadata: {}, sessionKey: input.sessionKey };
+          },
+          async shutdown() {
+            attempts += 1;
+            if (attempts === 1) throw new Error("stop failed");
+          },
+        };
+      },
+      async prewarm() { return { reused: true }; },
+    },
+    shutdownAttempts: () => attempts,
   };
 }
 

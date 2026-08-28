@@ -1,8 +1,20 @@
 diff --git a/node_modules/@workflow/world-postgres/dist/streamer.js b/node_modules/@workflow/world-postgres/dist/streamer.js
-index adb21a0..0f543cd 100644
+index adb21a0..f49de77 100644
 --- a/node_modules/@workflow/world-postgres/dist/streamer.js
 +++ b/node_modules/@workflow/world-postgres/dist/streamer.js
-@@ -249,19 +249,38 @@ export function createStreamer(pool, drizzle) {
+@@ -64,6 +64,11 @@ export const listenChannel = async (pool, channel, onPayload) => {
+ export function createStreamer(pool, drizzle) {
+     const ulid = monotonicFactory();
+     const events = new EventEmitter();
++    // One durable stream can legitimately have many browser followers. This
++    // emitter is private to stream fan-out, and every listener is removed on
++    // cancellation, EOF, or read failure below. Avoid Node's generic ten-
++    // listener warning without changing the process-wide EventEmitter policy.
++    events.setMaxListeners(0);
+     const { streams } = Schema;
+     const genChunkId = () => `chnk_${ulid()}`;
+     const mutexes = new Map();
+@@ -249,19 +254,47 @@ export function createStreamer(pool, drizzle) {
                  };
              },
              async get(_runId, name, startIndex) {
@@ -25,7 +37,17 @@ index adb21a0..0f543cd 100644
                          // an empty string is always < than any string,
                          // so `'' < ulid()` and `ulid() < ulid()` (maintaining order)
 -                        let lastChunkId = '';
-+                        const seenChunkIds = new Set();
++                        // Keep exact de-duplication bounded. Chunk ULIDs are
++                        // generated independently by every writer, so an ID
++                        // ordering watermark can drop a valid live chunk after
++                        // worker failover or clock skew. A bounded exact window
++                        // may conservatively pass a very late duplicate, but it
++                        // never drops a distinct chunk and cannot grow for the
++                        // lifetime of a long session.
++                        const RECENT_CHUNK_LIMIT = PAGE_SIZE * 4;
++                        const recentChunkIds = new Set();
++                        const bufferedChunkIds = new Set();
++                        const historicalBufferOverlap = new Set();
                          let offset = startIndex ?? 0;
                          let buffer = [];
                          function enqueue(msg) {
@@ -33,18 +55,17 @@ index adb21a0..0f543cd 100644
 -                                // already sent or out of order
 +                            if (closed)
 +                                return;
-+                            if (seenChunkIds.has(msg.id)) {
-+                                // A replayed notification can race the
-+                                // historical page. De-duplicate exact chunks
-+                                // without comparing ULIDs: Eve IDs are stable
-+                                // but are not a cross-process total order.
++                            if (recentChunkIds.has(msg.id)) {
                                  return;
                              }
-+                            seenChunkIds.add(msg.id);
++                            recentChunkIds.add(msg.id);
++                            if (recentChunkIds.size > RECENT_CHUNK_LIMIT) {
++                                recentChunkIds.delete(recentChunkIds.values().next().value);
++                            }
                              if (offset > 0) {
                                  offset--;
                                  return;
-@@ -270,9 +289,10 @@ export function createStreamer(pool, drizzle) {
+@@ -270,13 +303,16 @@ export function createStreamer(pool, drizzle) {
                                  controller.enqueue(new Uint8Array(msg.data));
                              }
                              if (msg.eof) {
@@ -56,7 +77,13 @@ index adb21a0..0f543cd 100644
                          }
                          function onData(data) {
                              if (buffer) {
-@@ -285,30 +305,94 @@ export function createStreamer(pool, drizzle) {
+                                 buffer.push(data);
++                                bufferedChunkIds.add(data.id);
++                                if (recentChunkIds.has(data.id)) historicalBufferOverlap.add(data.id);
+                                 return;
+                             }
+                             enqueue(data);
+@@ -285,30 +321,103 @@ export function createStreamer(pool, drizzle) {
                          cleanups.push(() => {
                              events.off(`strm:${name}`, onData);
                          });
@@ -138,7 +165,12 @@ index adb21a0..0f543cd 100644
 +                                    }
 +                                    break;
 +                                }
-+                                for (const chunk of chunks) enqueue(chunk);
++                                for (const chunk of chunks) {
++                                    if (bufferedChunkIds.has(chunk.id)) {
++                                        historicalBufferOverlap.add(chunk.id);
++                                    }
++                                    enqueue(chunk);
++                                }
 +                                if (closed)
 +                                    break;
 +                                afterChunkId = chunks.at(-1)?.id ?? afterChunkId;
@@ -149,9 +181,13 @@ index adb21a0..0f543cd 100644
 +                                if (chunks.length < PAGE_SIZE) break;
 +                            }
 +                            if (!closed) {
-+                                for (const chunk of buffer ?? []) enqueue(chunk);
++                                for (const chunk of buffer ?? []) {
++                                    if (!historicalBufferOverlap.has(chunk.id)) enqueue(chunk);
++                                }
 +                            }
 +                            buffer = null;
++                            bufferedChunkIds.clear();
++                            historicalBufferOverlap.clear();
                          }
 -                        for (const chunk of [...chunks, ...(buffer ?? [])]) {
 -                            enqueue(chunk);

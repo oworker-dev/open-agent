@@ -22,6 +22,7 @@ test("reattach cancels the previous idle stop and hands off to the new handle", 
   await first.captureState();
 
   const second = await backend.create(createInput("session-a"));
+  assert.deepEqual(fixture.creates, ["session-a"]);
   await delay(30);
   assert.equal(fixture.shutdowns.get("session-a") ?? 0, 0);
 
@@ -42,19 +43,58 @@ test("explicit shutdown cancels the idle timer and remains idempotent", async ()
   assert.equal(fixture.shutdowns.get("session-a"), 1);
 });
 
+test("coalesces concurrent creation for the same live session", async () => {
+  const fixture = fakeBackend();
+  const backend = withIdleSandboxShutdown(fixture.backend, 10);
+  const [first, second] = await Promise.all([
+    backend.create(createInput("session-a")),
+    backend.create(createInput("session-a")),
+  ]);
+
+  assert.deepEqual(fixture.creates, ["session-a"]);
+  await Promise.all([first.shutdown(), second.shutdown()]);
+  assert.equal(fixture.shutdowns.get("session-a"), 1);
+});
+
+test("retains and reuses a live handle when idle shutdown fails", async () => {
+  let shutdownAttempts = 0;
+  const fixture = fakeBackend({
+    async shutdown() {
+      shutdownAttempts += 1;
+      if (shutdownAttempts === 1) throw new Error("stop failed");
+    },
+  });
+  const errors: unknown[] = [];
+  const backend = withIdleSandboxShutdown(fixture.backend, 10, {
+    onIdleShutdownError(error) { errors.push(error); },
+  });
+  const first = await backend.create(createInput("session-a"));
+  await first.captureState();
+  await delay(30);
+
+  assert.equal(errors.length, 1);
+  const reattached = await backend.create(createInput("session-a"));
+  assert.deepEqual(fixture.creates, ["session-a"]);
+  await reattached.shutdown();
+  assert.equal(shutdownAttempts, 2);
+});
+
 test("rejects an invalid idle timeout", () => {
   const fixture = fakeBackend();
   assert.throws(() => withIdleSandboxShutdown(fixture.backend, 0), /positive integer/u);
 });
 
-function fakeBackend(): {
+function fakeBackend(overrides: { shutdown?: () => Promise<void> } = {}): {
   backend: SandboxBackend;
+  creates: string[];
   shutdowns: Map<string, number>;
 } {
+  const creates: string[] = [];
   const shutdowns = new Map<string, number>();
   const backend: SandboxBackend = {
     name: "fake",
     async create(input) {
+      creates.push(input.sessionKey);
       const handle: SandboxBackendHandle = {
         session: {} as never,
         useSessionFn: async () => ({} as never),
@@ -62,6 +102,7 @@ function fakeBackend(): {
           return { backendName: "fake", metadata: {}, sessionKey: input.sessionKey };
         },
         async shutdown() {
+          await overrides.shutdown?.();
           shutdowns.set(input.sessionKey, (shutdowns.get(input.sessionKey) ?? 0) + 1);
         },
       };
@@ -71,7 +112,7 @@ function fakeBackend(): {
       return { reused: true };
     },
   };
-  return { backend, shutdowns };
+  return { backend, creates, shutdowns };
 }
 
 function createInput(sessionKey: string) {

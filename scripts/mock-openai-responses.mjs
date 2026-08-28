@@ -137,6 +137,17 @@ server.listen(port, "127.0.0.1", () => {
 async function planResponse(body) {
   const input = Array.isArray(body.input) ? body.input : [];
   const raw = JSON.stringify(body);
+  if (raw.includes("SANDBOX_LIFECYCLE_E2E")) {
+    const bashCalls = input.filter(
+      (item) => item?.type === "function_call" && item.name === "bash",
+    );
+    if (bashCalls.length === 0) {
+      return toolCall("bash", {
+        command: "printf 'sandbox lifecycle verified\\n' > /workspace/lifecycle.txt && cat /workspace/lifecycle.txt",
+      });
+    }
+    return { kind: "text", text: exactReply(input) || "SANDBOX_LIFECYCLE_READY" };
+  }
   if (hasJsonSchema(body) || hasFinalOutputTool(body)) {
     return toolCall("final_output", { answer: "STRUCTURED_READY" });
   }

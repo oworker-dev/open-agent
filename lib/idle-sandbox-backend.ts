@@ -1,9 +1,19 @@
 import type { SandboxBackend, SandboxBackendHandle } from "eve/sandbox";
 
 type IdleTimer = ReturnType<typeof setTimeout>;
+const SANDBOX_HANDLE_IDENTITY = Symbol.for("eve.sandbox.handle-identity.v1");
+const SANDBOX_SHUTDOWN_LISTENER = Symbol.for("eve.sandbox.shutdown-listener.v1");
 
-type IdleEntry = {
+type LifecycleAwareSandboxHandle<SO> = SandboxBackendHandle<SO> & {
+  readonly [SANDBOX_HANDLE_IDENTITY]: object;
+  readonly [SANDBOX_SHUTDOWN_LISTENER]: (listener: () => void) => () => void;
+};
+
+type IdleEntry<SO> = {
   generation: number;
+  handle: SandboxBackendHandle<SO>;
+  readonly identity: object;
+  readonly shutdownListeners: Set<() => void>;
   operation?: Promise<void>;
   timer?: IdleTimer;
 };
@@ -41,7 +51,8 @@ export function withIdleSandboxShutdown<BO, SO>(
   if (!Number.isSafeInteger(idleTimeoutMs) || idleTimeoutMs <= 0) {
     throw new Error("idleTimeoutMs must be a positive integer.");
   }
-  const entries = new Map<string, IdleEntry>();
+  const entries = new Map<string, IdleEntry<SO>>();
+  const creations = new Map<string, Promise<IdleEntry<SO>>>();
   const scheduler = options.scheduler ?? defaultScheduler;
   let nextGeneration = 0;
 
@@ -49,51 +60,88 @@ export function withIdleSandboxShutdown<BO, SO>(
     ...backend,
     async create(input) {
       const previous = entries.get(input.sessionKey);
-      if (previous?.timer) scheduler.clear(previous.timer);
+      if (previous?.timer) {
+        scheduler.clear(previous.timer);
+        previous.timer = undefined;
+      }
       if (previous?.operation) {
-        await previous.operation.catch(() => undefined);
+        try {
+          await previous.operation;
+        } catch {
+          // Failed shutdown means the previous compute may still be live.
+          // Reattach to it so admission remains balanced and shutdown can be
+          // retried through the returned handle.
+          return wrapHandle(previous, input.sessionKey);
+        }
+      } else if (previous) {
+        // A durable step can reattach before the idle timer fires. Reuse the
+        // live backend handle instead of creating a second lease for the same
+        // compute. This also keeps session-scoped admission permits balanced.
+        return wrapHandle(previous, input.sessionKey);
       }
 
-      const handle = await backend.create(input);
-      const generation = ++nextGeneration;
-      entries.set(input.sessionKey, { generation });
-      return wrapHandle(handle, input.sessionKey, generation);
+      let creation = creations.get(input.sessionKey);
+      if (!creation) {
+        creation = backend.create(input).then((handle) => {
+          const entry: IdleEntry<SO> = {
+            generation: ++nextGeneration,
+            handle,
+            identity: {},
+            shutdownListeners: new Set(),
+          };
+          entries.set(input.sessionKey, entry);
+          return entry;
+        });
+        creations.set(input.sessionKey, creation);
+        void creation.finally(() => {
+          if (creations.get(input.sessionKey) === creation) creations.delete(input.sessionKey);
+        }).catch(() => undefined);
+      }
+      const entry = await creation;
+      return wrapHandle(entry, input.sessionKey);
     },
   };
 
   function wrapHandle(
-    handle: SandboxBackendHandle<SO>,
+    entry: IdleEntry<SO>,
     sessionKey: string,
-    generation: number,
-  ): SandboxBackendHandle<SO> {
-    let shutdown: Promise<void> | undefined;
-
+  ): LifecycleAwareSandboxHandle<SO> {
     const stop = (): Promise<void> => {
-      if (shutdown) return shutdown;
-      const entry = entries.get(sessionKey);
-      if (entry?.generation === generation && entry.timer) {
+      if (entry.operation) return entry.operation;
+      const current = entries.get(sessionKey);
+      if (current === entry && entry.timer) {
         scheduler.clear(entry.timer);
         entry.timer = undefined;
       }
-      shutdown = handle.shutdown();
-      if (entry?.generation === generation) entry.operation = shutdown;
-      void shutdown.finally(() => {
-        if (entries.get(sessionKey)?.generation === generation) entries.delete(sessionKey);
-      }).catch(() => undefined);
-      return shutdown;
+      const operation = entry.handle.shutdown();
+      entry.operation = operation;
+      void operation.then(
+        () => {
+          if (entries.get(sessionKey) === entry) entries.delete(sessionKey);
+          for (const listener of entry.shutdownListeners) listener();
+          entry.shutdownListeners.clear();
+        },
+        () => {
+          if (entry.operation === operation) entry.operation = undefined;
+        },
+      );
+      return operation;
     };
 
-    return {
-      ...handle,
+    const handle: LifecycleAwareSandboxHandle<SO> = {
+      ...entry.handle,
+      [SANDBOX_HANDLE_IDENTITY]: entry.identity,
+      [SANDBOX_SHUTDOWN_LISTENER](listener: () => void) {
+        entry.shutdownListeners.add(listener);
+        return () => entry.shutdownListeners.delete(listener);
+      },
       async captureState() {
-        const state = await handle.captureState();
-        if (shutdown) return state;
-        const entry = entries.get(sessionKey);
-        if (entry?.generation !== generation) return state;
+        const state = await entry.handle.captureState();
+        if (entry.operation || entries.get(sessionKey) !== entry) return state;
         if (entry.timer) scheduler.clear(entry.timer);
         entry.timer = scheduler.schedule(() => {
           const current = entries.get(sessionKey);
-          if (current?.generation !== generation) return;
+          if (current !== entry) return;
           current.timer = undefined;
           void stop().catch((error) => options.onIdleShutdownError?.(error, sessionKey));
         }, idleTimeoutMs);
@@ -101,5 +149,6 @@ export function withIdleSandboxShutdown<BO, SO>(
       },
       shutdown: stop,
     };
+    return handle;
   }
 }

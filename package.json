@@ -59,6 +59,7 @@
     "verify:live-autonomy": "node scripts/verify-live-autonomy.mjs",
     "verify:load": "node scripts/verify-agent-run-load.mjs",
     "verify:mixed-capacity": "node scripts/verify-mixed-capacity.mjs",
+    "verify:stream-recovery": "node scripts/verify-stream-recovery.mjs",
     "verify:stream-load": "node scripts/verify-idle-stream-load.mjs",
     "verify:mcp-conformance": "node scripts/verify-mcp-conformance.mjs",
     "verify:provider-failures": "node scripts/verify-provider-failures.mjs",

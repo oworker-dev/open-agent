@@ -372,6 +372,19 @@ deterministic pass is only a regression baseline. Production capacity evidence
 must use the target Provider, database, queue, sandbox backend, autoscaling, and
 collector configuration, and must be repeated after material topology changes.
 
+Run `npm run verify:stream-recovery` against the production gateway before
+promotion and after proxy, Workflow World, or stream-storage changes. The gate
+creates one uniquely owned synthetic session, disconnects after the first live
+model-step boundary, reconnects and deliberately drops the active SSE socket a
+second time, then resumes from the exact absolute event cursor. Once the task
+reaches `session.waiting`, it performs a finite replay from index zero and
+requires the recovered and canonical stable event-id sequences to match exactly
+in count and order. Missing, duplicate, or reordered events fail the gate. The
+session is always retired through Eve reset; any local Docker sandbox carrying
+that exact synthetic session label is removed only after reset succeeds. Set
+`AGENT_STREAM_RECOVERY_EVIDENCE_PATH` to retain the credential-free JSON proof.
+This is a one-session correctness gate, not a capacity test.
+
 Run `npm run verify:asset-load` against the staged Agent Web when validating the
 object-store path. The bounded gate defaults to two concurrent 100 MiB uploads
 (eight uploads are the maximum configured concurrency), uses the server-advertised

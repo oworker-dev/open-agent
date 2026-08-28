@@ -1,9 +1,10 @@
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { copyFile, cp, mkdtemp, rm, symlink } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolve } from "node:path";
+import { promisify } from "node:util";
 import { Client } from "eve/client";
 
 const projectRoot = process.cwd();
@@ -14,6 +15,8 @@ const providerUrl = `http://127.0.0.1:${providerPort}`;
 const eveUrl = `http://127.0.0.1:${evePort}`;
 const childLogs = new Map();
 const children = [];
+const syntheticSessionIds = new Set();
+const execFileAsync = promisify(execFile);
 
 try {
   children.push(spawnLogged("provider", process.execPath, [resolve("scripts/mock-openai-responses.mjs")], {
@@ -35,6 +38,9 @@ try {
     AGENT_HOST_TOOLS_SECRET: "",
     AGENT_HOST_TOOLS_URL: "",
     AGENT_PROVIDER_HTTP_TIMEOUT_MS: "3000",
+    AGENT_SANDBOX_ADMISSION_TIMEOUT_MS: "30000",
+    AGENT_SANDBOX_IDLE_TIMEOUT_MS: "60000",
+    AGENT_SANDBOX_MAX_ACTIVE: "1",
     AGENT_SANDBOX_BACKEND: "docker",
     NODE_ENV: "development",
     OPENAI_API_KEY: "mock-provider-key",
@@ -71,6 +77,31 @@ try {
   assert(completedMessageText(interrupted) === "STREAM_RECOVERED",
     "The pre-tool stream interruption did not recover automatically.");
 
+  // Exercise the real Eve sandbox lifecycle with a single permit. A reset
+  // must close the active handle and release that permit before the next
+  // session can execute its bash tool; otherwise this deterministic check
+  // would hang until the admission timeout.
+  const firstSandbox = await createAndConsume(
+    eveUrl,
+    "SANDBOX_LIFECYCLE_E2E. Use the requested sandbox tool, then reply exactly: SANDBOX_FIRST",
+  );
+  assertCompleted(firstSandbox.events, "first sandbox lifecycle turn");
+  assert(
+    firstSandbox.events.some((event) => event.type === "action.result" && event.data?.status === "completed"),
+    "The first sandbox lifecycle turn did not complete its action.",
+  );
+  await firstSandbox.session.reset({ reason: "sandbox-lifecycle-first" });
+  const secondSandbox = await createAndConsume(
+    eveUrl,
+    "SANDBOX_LIFECYCLE_E2E. Use the requested sandbox tool, then reply exactly: SANDBOX_SECOND",
+  );
+  assertCompleted(secondSandbox.events, "second sandbox lifecycle turn");
+  assert(
+    secondSandbox.events.some((event) => event.type === "action.result" && event.data?.status === "completed"),
+    "The second sandbox lifecycle turn did not complete its action after reset.",
+  );
+  await secondSandbox.session.reset({ reason: "sandbox-lifecycle-second" });
+
   const { events: exhausted, session: exhaustedSession } = await createAndConsume(
     eveUrl,
     "PROVIDER_STALL_THREE. Reply exactly: STALE",
@@ -106,6 +137,7 @@ try {
       streamInterruptionAttempts: state.scenarioAttempts.PROVIDER_STREAM_INTERRUPT_ONCE,
       timeoutAttempts: state.scenarioAttempts.PROVIDER_STALL_ONCE,
     },
+    sandboxLifecycle: { permitReuse: true, sequentialSessions: 2 },
     ok: true,
     recoverableFailures: ["provider-timeout-retry-budget-exhausted"],
     sameSessionContinuation: true,
@@ -115,6 +147,7 @@ try {
   throw error;
 } finally {
   await Promise.all(children.map(stopChild));
+  await removeSyntheticSandboxContainers();
   await rm(isolatedAppRoot, { force: true, recursive: true });
 }
 
@@ -126,7 +159,25 @@ async function completedTurn(host, message) {
 
 async function createAndConsume(host, message) {
   const { response, session } = await new Client({ host }).sessions.create({ message });
+  syntheticSessionIds.add(response.sessionId);
   return { events: await collect(response), session };
+}
+
+async function removeSyntheticSandboxContainers() {
+  const docker = process.env.EVE_DOCKER_PATH?.trim() || "docker";
+  for (const sessionId of syntheticSessionIds) {
+    if (!/^wrun_[A-Za-z0-9_-]+$/u.test(sessionId)) continue;
+    try {
+      const { stdout } = await execFileAsync(docker, [
+        "ps", "-aq", "--filter", "label=eve.sandbox=1",
+        "--filter", `label=eve.sandbox.tag.sessionId=${sessionId}`,
+      ]);
+      const containerIds = stdout.split(/\s+/u).filter(Boolean);
+      if (containerIds.length > 0) await execFileAsync(docker, ["rm", "-f", ...containerIds]);
+    } catch {
+      // Verification cleanup is best effort and is scoped to synthetic IDs.
+    }
+  }
 }
 
 async function consume(session, message) {
@@ -199,7 +250,13 @@ async function stopChild(child) {
     new Promise((resolveExit) => child.once("exit", resolveExit)),
     new Promise((resolveTimeout) => setTimeout(resolveTimeout, 2_000)),
   ]);
-  if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  if (child.exitCode === null && child.signalCode === null) {
+    child.kill("SIGKILL");
+    await Promise.race([
+      new Promise((resolveExit) => child.once("exit", resolveExit)),
+      new Promise((resolveTimeout) => setTimeout(resolveTimeout, 2_000)),
+    ]);
+  }
 }
 
 async function waitFor(url, timeoutMs = 20_000) {

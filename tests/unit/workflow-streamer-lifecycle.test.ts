@@ -1,5 +1,6 @@
 // @ts-nocheck
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import test from "node:test";
 
 // world-postgres keeps its own pg dependency. Patch only that test-local
@@ -109,6 +110,104 @@ test("uses an absolute offset once before continuing with keyset pages", async (
     assert.deepEqual(drizzle.offsetCalls, [100]);
   } finally {
     await streamer.close();
+  }
+});
+
+test("does not discard a distinct live chunk whose id sorts below history", async () => {
+  const releaseFirstPage = deferred();
+  const drizzle = fakeDrizzle(
+    [chunk("chnk_9000", "history")],
+    { firstDataPage: releaseFirstPage.promise },
+  );
+  let emitter;
+  const originalOn = EventEmitter.prototype.on;
+  EventEmitter.prototype.on = function captureEmitter(eventName, listener) {
+    if (eventName === "strm:stream") emitter = this;
+    return originalOn.call(this, eventName, listener);
+  };
+  const streamer = createStreamer(fakePool(), drizzle);
+  try {
+    const reader = (await streamer.streams.get("run", "stream", 0)).getReader();
+    await waitFor(() => drizzle.dataQueries === 1 && emitter !== undefined);
+    emitter.emit("strm:stream", chunk("chnk_0001", "live"));
+    releaseFirstPage.resolve();
+
+    const values = [];
+    values.push(Buffer.from((await reader.read()).value).toString());
+    values.push(Buffer.from((await reader.read()).value).toString());
+    assert.deepEqual(values, ["history", "live"]);
+    await reader.cancel();
+  } finally {
+    EventEmitter.prototype.on = originalOn;
+    await streamer.close();
+  }
+});
+
+test("de-duplicates the exact notification that overlaps historical catch-up", async () => {
+  const releaseFirstPage = deferred();
+  const drizzle = fakeDrizzle(
+    [chunk("chnk_9000", "history")],
+    { firstDataPage: releaseFirstPage.promise },
+  );
+  let emitter;
+  const originalOn = EventEmitter.prototype.on;
+  EventEmitter.prototype.on = function captureEmitter(eventName, listener) {
+    if (eventName === "strm:stream") emitter = this;
+    return originalOn.call(this, eventName, listener);
+  };
+  const streamer = createStreamer(fakePool(), drizzle);
+  try {
+    const reader = (await streamer.streams.get("run", "stream", 0)).getReader();
+    await waitFor(() => drizzle.dataQueries === 1 && emitter !== undefined);
+    emitter.emit("strm:stream", chunk("chnk_9000", "history"));
+    releaseFirstPage.resolve();
+
+    assert.equal(Buffer.from((await reader.read()).value).toString(), "history");
+    const pending = reader.read();
+    const state = await Promise.race([
+      pending.then(() => "resolved"),
+      new Promise((resolve) => setTimeout(() => resolve("pending"), 10)),
+    ]);
+    assert.equal(state, "pending");
+    await reader.cancel();
+    await pending.catch(() => undefined);
+  } finally {
+    EventEmitter.prototype.on = originalOn;
+    await streamer.close();
+  }
+});
+
+test("supports repeated same-stream fan-out without retaining cancelled listeners", async () => {
+  const listenerCounts = new Map<EventEmitter, number>();
+  const originalOn = EventEmitter.prototype.on;
+  const originalOff = EventEmitter.prototype.off;
+  EventEmitter.prototype.on = function trackedOn(eventName, listener) {
+    const result = originalOn.call(this, eventName, listener);
+    if (eventName === "strm:shared") listenerCounts.set(this, this.listenerCount(eventName));
+    return result;
+  };
+  EventEmitter.prototype.off = function trackedOff(eventName, listener) {
+    const result = originalOff.call(this, eventName, listener);
+    if (eventName === "strm:shared") listenerCounts.set(this, this.listenerCount(eventName));
+    return result;
+  };
+
+  const streamer = createStreamer(fakePool(), fakeDrizzle([]));
+  try {
+    for (let round = 0; round < 3; round += 1) {
+      const readers = await Promise.all(
+        Array.from({ length: 20 }, async () => (
+          await streamer.streams.get("run", "shared", 0)
+        ).getReader()),
+      );
+      assert.equal(Math.max(...listenerCounts.values()), 20);
+      await Promise.all(readers.map((reader) => reader.cancel()));
+      assert.equal(Math.max(...listenerCounts.values()), 0);
+    }
+  } finally {
+    await streamer.close();
+    EventEmitter.prototype.on = originalOn;
+    EventEmitter.prototype.off = originalOff;
   }
 });
 

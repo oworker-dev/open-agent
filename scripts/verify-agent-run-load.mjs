@@ -37,10 +37,11 @@ const deadlineMs = boundedInteger(
 const completionSloMode = process.env.AGENT_LOAD_COMPLETION_SLO_MODE?.trim() === "observe"
   ? "observe"
   : "enforce";
+const requireSandbox = process.env.AGENT_LOAD_REQUIRE_SANDBOX?.trim() === "1";
 const batchId = `load-${Date.now()}-${randomUUID()}`;
 const accessToken = signToken({
   actorType: "service",
-  scope: ["agent:runs"],
+  scope: ["agent:runs", "agent:sessions:delete"],
   sub: `load-runner-${randomUUID()}`,
   tenantId: `load-tenant-${randomUUID()}`,
 });
@@ -106,7 +107,11 @@ const providerRequests =
     ? providerAfter - providerBefore
     : undefined;
 const resource = resourceSampler.result();
-const expectedProviderRequests = warmupRuns + totalRuns;
+// A sandbox case has one model call that requests the tool and a second call
+// that consumes its result. Keep the deterministic mock assertion aligned
+// with the actual Agent loop instead of treating valid tool use as a retry.
+const providerRequestsPerRun = requireSandbox ? 2 : 1;
+const expectedProviderRequests = (warmupRuns + totalRuns) * providerRequestsPerRun;
 const metrics = {
   admission: summarizeLatencies(succeeded.map((entry) => entry.admissionMs)),
   completion: summarizeLatencies(succeeded.map((entry) => entry.completionMs)),
@@ -152,6 +157,8 @@ const evidence = {
     totalRuns,
     warmupRuns,
     completionSloMode,
+    providerRequestsPerRun,
+    requireSandbox,
   },
   budgets,
   metrics: {
@@ -246,6 +253,12 @@ async function runPhase(phase, count) {
       stage = "events";
       const events = await readAllEvents(runId);
       assert(events.length > 0, `AgentRun ${runId} returned no events.`);
+      if (requireSandbox) {
+        assert(
+          events.some((event) => event.type === "tool.completed"),
+          `AgentRun ${runId} did not complete the required sandbox tool call.`,
+        );
+      }
       events.forEach((event, index) => {
         assert(event.runId === runId, `AgentRun ${runId} received a foreign event.`);
         assert(event.sequence === index + 1, `AgentRun ${runId} has a broken event sequence.`);
@@ -282,34 +295,32 @@ async function runPhase(phase, count) {
 async function retireSyntheticSessions() {
   const sessionIds = [...testSessionIds];
   const failures = [];
+  const retiredSessionIds = [];
   let retired = 0;
   await mapWithConcurrency(sessionIds, Math.min(concurrency, 16), async (sessionId) => {
     try {
       const response = await fetch(
-        `${baseUrl}/eve/v1/session/${encodeURIComponent(sessionId)}/reset`,
+        `${baseUrl}/api/agent/sessions/${encodeURIComponent(sessionId)}`,
         {
-          body: JSON.stringify({ reason: `agent-run-load:${batchId}` }),
-          headers: {
-            authorization: `Bearer ${accessToken}`,
-            "content-type": "application/json",
-          },
-          method: "POST",
+          headers: { authorization: `Bearer ${accessToken}` },
+          method: "DELETE",
           redirect: "error",
           signal: AbortSignal.timeout(Math.min(deadlineMs, 120_000)),
         },
       );
       const payload = await response.json().catch(() => undefined);
-      if (!response.ok || payload?.status !== "reset" && payload?.status !== "no_active_session") {
+      if (response.status !== 202 || payload?.ok !== true) {
         throw new Error(
-          `session reset returned HTTP ${response.status}: ${payload?.error || payload?.code || "unknown error"}`,
+          `session deletion returned HTTP ${response.status}: ${payload?.error || payload?.code || "unknown error"}`,
         );
       }
       retired += 1;
-      testSessionIds.delete(sessionId);
+      retiredSessionIds.push(sessionId);
     } catch (cause) {
       failures.push({ sessionId, error: safeError(cause) });
     }
   });
+  await removeOwnedTestSandboxes(retiredSessionIds);
   return { attempted: sessionIds.length, failures, retired };
 }
 
@@ -344,9 +355,9 @@ async function cancelAndWait(runId) {
   await removeOwnedTestSandboxes();
 }
 
-async function removeOwnedTestSandboxes() {
+async function removeOwnedTestSandboxes(sessionIds = [...testSessionIds]) {
   const docker = process.env.EVE_DOCKER_PATH?.trim() || "docker";
-  for (const sessionId of testSessionIds) {
+  for (const sessionId of sessionIds) {
     if (!/^wrun_[A-Za-z0-9_-]+$/u.test(sessionId)) continue;
     try {
       const { stdout } = await execFileAsync(docker, [
@@ -402,7 +413,9 @@ function createCase(phase, index) {
     index,
     request: {
       idempotencyKey: `${batchId}:${phase}:${index}`,
-      message: `Do not use tools. Reply exactly: ${expected}`,
+      message: requireSandbox
+        ? `SANDBOX_LIFECYCLE_E2E. Use the requested sandbox tool, then reply exactly: ${expected}`
+        : `Do not use tools. Reply exactly: ${expected}`,
       metadata: { loadBatch: batchId, loadIndex: index, loadPhase: phase },
       policy: {
         limits: {
