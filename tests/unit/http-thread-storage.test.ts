@@ -127,6 +127,18 @@ test("supports same-origin cookie authentication without an authorization header
   assert.equal(authorization, null);
 });
 
+test("bounds an access-token getter that never settles", async () => {
+  const storage = createHttpAgentThreadStorage({
+    getAccessToken: () => new Promise<string>(() => undefined),
+    requestTimeoutMs: 1_000,
+  });
+
+  await assert.rejects(
+    storage.load("token-timeout"),
+    /access token timed out/u,
+  );
+});
+
 test("retries transient GET failures without replaying writes", async () => {
   let calls = 0;
   const storage = createHttpAgentThreadStorage({

@@ -388,15 +388,15 @@ async function request(
     readonly requestTimeoutMs?: number;
   },
 ): Promise<Response> {
-  const accessToken = await options.getAccessToken?.();
-  if (accessToken !== undefined && !accessToken.trim()) {
-    throw new Error("Agent thread storage access token is empty.");
-  }
   const method = (init?.method ?? "GET").toUpperCase();
   const retryLimit = method === "GET"
     ? init?.readRetryLimit ?? options.readRetryLimit ?? DEFAULT_READ_RETRY_LIMIT
     : 0;
   const timeoutMs = init?.requestTimeoutMs ?? options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  const accessToken = await resolveAccessToken(options.getAccessToken, timeoutMs);
+  if (accessToken !== undefined && !accessToken.trim()) {
+    throw new Error("Agent thread storage access token is empty.");
+  }
   const { readRetryLimit: _readRetryLimit, requestTimeoutMs: _requestTimeoutMs, ...requestInit } = init ?? {};
   let attempt = 0;
   for (;;) {
@@ -423,6 +423,24 @@ async function request(
     } finally {
       clearTimeout(timeout);
     }
+  }
+}
+
+async function resolveAccessToken(
+  getter: HttpAgentThreadStorageOptions["getAccessToken"],
+  timeoutMs: number,
+): Promise<string | undefined> {
+  if (!getter) return undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(getter),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Agent thread storage access token timed out.")), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
 

@@ -52,8 +52,9 @@ values are validated between 100 ms and 5 minutes. A database outage should
 surface as a recoverable error, not leave an HTTP request waiting forever.
 `AGENT_DATABASE_QUERY_TIMEOUT_MS` bounds statements at 15 seconds by default
 and is validated by the production doctor. The reference Web thread-storage
-client also aborts a read after 15 seconds and retries only transient GET
-failures with bounded backoff; writes are never automatically replayed. Keep
+client also bounds asynchronous access-token resolution and aborts a read after
+15 seconds, retrying only transient GET failures with bounded backoff; writes
+are never automatically replayed. Keep
 the storage endpoint's revision ETag behavior enabled so repeated index reads
 can return `304 Not Modified` without serializing the collection again.
 
