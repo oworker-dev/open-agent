@@ -1,7 +1,7 @@
 import type { Pool } from "pg";
 import type { AssetStore } from "@oworker/open-agent-contracts/asset";
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import {
   getAgentDatabasePool,
@@ -16,6 +16,7 @@ import {
   readPublicationObject,
   writePublicationObject,
 } from "./publication-object.ts";
+import { iterateDirectoryEntries } from "./filesystem-directory.ts";
 
 const MAX_PREVIEW_BYTES = 25 * 1024 * 1024;
 
@@ -310,16 +311,13 @@ function createFilesystemPreviewStore(root: string): PreviewStore {
     },
     async list(sessionId, owner) {
       assertListInput(sessionId, owner);
-      let entries;
-      try {
-        entries = await readdir(root, { withFileTypes: true });
-      } catch {
-        return [];
+      const entries = [];
+      for await (const entry of iterateDirectoryEntries(root)) {
+        if (!entry.isDirectory() || !/^prv_[a-f0-9-]{36}$/u.test(entry.name)) continue;
+        entries.push(entry);
+        if (entries.length >= 2_000) break;
       }
-      const records = await Promise.all(entries
-        .filter((entry) => entry.isDirectory() && /^prv_[a-f0-9-]{36}$/u.test(entry.name))
-        .slice(0, 2_000)
-        .map((entry) => this.find(entry.name)));
+      const records = await Promise.all(entries.map((entry) => this.find(entry.name)));
       const now = Date.now();
       return records
         .filter((record): record is PreviewRecord => Boolean(
@@ -347,14 +345,9 @@ function createFilesystemPreviewStore(root: string): PreviewStore {
       const limit = normalizeCleanupLimit(options?.limit);
       const now = options?.now?.getTime() ?? Date.now();
       let deleted = 0;
-      let entries;
-      try {
-        entries = await readdir(root, { withFileTypes: true });
-      } catch {
-        return 0;
-      }
-      for (const entry of entries) {
-        if (deleted >= limit || !entry.isDirectory()) continue;
+      for await (const entry of iterateDirectoryEntries(root)) {
+        if (deleted >= limit) break;
+        if (!entry.isDirectory()) continue;
         const record = await this.find(entry.name);
         if (!record || Date.parse(record.expiresAt) > now) continue;
         await rm(join(root, entry.name), { force: true, recursive: true });

@@ -75,3 +75,26 @@ test("filesystem artifact cleanup removes only expired publication metadata and 
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("filesystem artifact cleanup stops directory processing at the requested batch limit", async () => {
+  const root = await mkdtemp(join(tmpdir(), "open-agent-artifacts-"));
+  try {
+    const store = createArtifactStoreFromEnvironment({ AGENT_ARTIFACT_STORAGE_PATH: root });
+    const common = {
+      content: new TextEncoder().encode("expired"),
+      filename: "expired.txt",
+      mediaType: "text/plain",
+      principalId: "user-1",
+      sessionId: "session-batch",
+      tenantId: "tenant-1",
+    } as const;
+    const first = await store.create({ ...common, expiresAt: new Date("2030-01-01T00:00:00.000Z") });
+    const second = await store.create({ ...common, expiresAt: new Date("2030-01-01T00:00:00.000Z") });
+
+    assert.equal(await store.cleanupExpired?.({ limit: 1, now: new Date("2030-06-01T00:00:00.000Z") }), 1);
+    assert.equal((await store.find(first.artifactId)) === undefined || (await store.find(second.artifactId)) === undefined, true);
+    assert.equal(await store.cleanupExpired?.({ limit: 1, now: new Date("2030-06-01T00:00:00.000Z") }), 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
