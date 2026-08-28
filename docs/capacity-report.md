@@ -52,6 +52,15 @@ sessions through Eve reset. This is deployment-regression evidence only: the
 shared stream session deliberately minimizes durable writes and does not raise
 the distinct-session or active-run planning numbers below.
 
+After the accepted-session recovery hardening, a disk-safe post-hardening
+regression ran on 2026-08-28. It passed 20 pooled SSE followers (0 errors, 0
+unexpected disconnects, handshake p95 80 ms), one live AgentRun (0 errors,
+completion 3.02 s), and a concurrent 20-stream/1-run envelope (0 errors,
+stream handshake p95 51 ms, AgentRun completion 4.47 s). The run started with
+2,164,293,632 bytes free and stopped after this small envelope by policy; it is
+protocol/regression evidence only and does not increase the distinct-session,
+active-turn, or maximum-capacity claims below.
+
 The public preview now terminates traffic in a dedicated loopback-only gateway
 instead of asking Next's compiled rewrite proxy to carry Eve streams. The
 legacy proxy instantiated a fixed `maxSockets: 256` HTTP agent and applied a
