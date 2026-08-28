@@ -61,6 +61,16 @@ stream handshake p95 51 ms, AgentRun completion 4.47 s). The run started with
 protocol/regression evidence only and does not increase the distinct-session,
 active-turn, or maximum-capacity claims below.
 
+On 2026-08-28, a completed two-run Workflow root was exported as a v2 archive
+(92 records, SHA-256
+`ba294db2891b02453952e01a067194c7b4f57d098785eec644e708ae836a70d8`). The
+archive was validated, restored transactionally into a separately migrated
+PostgreSQL database, and opened by a temporary Eve process. The restored
+session returned its durable tail index (38) and the expected session/turn/
+message events. This proves the local archive restore/replay path; an external
+deployment drill with the exact production image and credentials is still
+required before any hot-history deletion policy is approved.
+
 The public preview now terminates traffic in a dedicated loopback-only gateway
 instead of asking Next's compiled rewrite proxy to carry Eve streams. The
 legacy proxy instantiated a fixed `maxSockets: 256` HTTP agent and applied a
@@ -216,7 +226,8 @@ retires those through Eve's reset lifecycle, and the cleanup was confirmed with
 zero `LOAD_READY` roots remaining. `npm run reap:workflow` is now strictly
 read-only and reports candidates as complete root trees. Direct SQL deletion is
 not a production reconciliation strategy; no hot-history purge is authorized
-until a versioned archive and isolated restore/replay drill exist.
+until the archive is copied to the deployment's durable object store and the
+external deployment replay drill has passed.
 
 Publication bytes no longer add new PostgreSQL pressure. Migration `0016`
 keeps artifact and website-preview metadata in PostgreSQL but writes their
