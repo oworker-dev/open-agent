@@ -20,8 +20,32 @@ test("standalone defaults match the Codex GPT-5.6 context policy", () => {
 
 test("standalone session budgets are independent from the model context window", () => {
   assert.deepEqual(runtimeDefinitionLimits(DEFAULT_AGENT_RUNTIME_CONFIG), {
-    maxInputTokensPerSession: 40_000_000,
-    maxOutputTokensPerSession: 10_000_000,
+    maxInputTokensPerSession: false,
+    maxOutputTokensPerSession: false,
+    sessionTimeoutMs: false,
+  });
+});
+
+test("host snapshots can explicitly uncap lifetime token budgets", () => {
+  const config = parseAgentRuntimeConfigSnapshot({
+    ...DEFAULT_AGENT_RUNTIME_CONFIG,
+    limits: { maxInputTokens: false, maxOutputTokens: false },
+  });
+  assert.deepEqual(runtimeDefinitionLimits(config), {
+    maxInputTokensPerSession: false,
+    maxOutputTokensPerSession: false,
+    sessionTimeoutMs: false,
+  });
+});
+
+test("numeric host lifetime budgets remain available for billing policies", () => {
+  const config = parseAgentRuntimeConfigSnapshot({
+    ...DEFAULT_AGENT_RUNTIME_CONFIG,
+    limits: { maxInputTokens: 2_000_000, maxOutputTokens: 200_000 },
+  });
+  assert.deepEqual(runtimeDefinitionLimits(config), {
+    maxInputTokensPerSession: 2_000_000,
+    maxOutputTokensPerSession: 200_000,
     sessionTimeoutMs: false,
   });
 });

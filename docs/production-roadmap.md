@@ -40,6 +40,13 @@ The current upload and vision contract is specified in
 [Assets, Uploads, And Vision](./assets-and-vision.md). That document is a
 dependency of the milestones below.
 
+The standalone runtime publishes `false` for its lifetime input/output token
+limits. This is an explicit Eve uncapped-session setting, not an unbounded
+HTTP body or event response: context compaction, paged transcript storage,
+per-request policy limits, and object-storage references still apply. A host
+may replace either value with a numeric budget for billing or tenant policy;
+the value is pinned in the session's runtime snapshot.
+
 ## Non-negotiable invariants
 
 1. Every durable operation has a stable server identity, an idempotency key,

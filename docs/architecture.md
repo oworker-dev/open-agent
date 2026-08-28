@@ -97,16 +97,14 @@ Oversized observations preserve both head and tail with an omission marker.
 The full durable event remains stored separately and is never replaced by this
 model-facing checkpoint.
 
-The standalone runtime no longer uses the earlier 2M input / 200K output
-session budgets. Its default renewable safety windows are 40M input and 10M
-output provider-reported tokens, while the 272K model context window is kept
-usable by compaction. Reaching a window raises Eve's durable continuation
-approval instead of deleting the thread, and Open Agent disables Eve's default
-30-day session-age timeout. A thread is retired only through the explicit
-owner/Host lifecycle. These budgets are independent of HTTP payload size and
-event-log size; a large or long-lived thread is handled through the compact
-append-only transcript rather than by sending the complete conversation on
-every checkpoint.
+The standalone runtime explicitly disables lifetime input/output token caps
+(`false` in the runtime snapshot). The 272K model context window remains
+usable through compaction, and Open Agent disables Eve's default 30-day
+session-age timeout. Hosts that meter usage may publish numeric lifetime
+budgets without changing the kernel or storage protocol. These budgets are
+independent of HTTP payload size and event-log size; a large or long-lived
+thread is handled through the compact append-only transcript rather than by
+sending the complete conversation on every checkpoint.
 
 The reference app stores thread data in `localStorage` through the default
 `AgentThreadStorage`. That is a UX cache, not production persistence. Hosts can

@@ -292,6 +292,32 @@ test("projects usage, result, status, and incremental event cursors", async () =
   assert.deepEqual(runtime.calls.readStartIndexes, [0, 2]);
 });
 
+test("reuses the bounded synchronization page when the public cursor is current", async () => {
+  const store = new MemoryAgentRunStore();
+  const runtime = fakeRuntime({ events: completedEvents() });
+  const started = await startAgentRun({
+    accessToken: "token",
+    identity: user,
+    request: parseRequest({ idempotencyKey: "request-reuse-sync-page", message: "Run" }),
+    runtime,
+    store,
+  });
+
+  const result = await readAgentRunEvents({
+    accessToken: "token",
+    after: 0,
+    identity: user,
+    runId: started.record.runId,
+    runtime,
+    store,
+  });
+
+  assert.ok(result);
+  assert.equal(result.events.length, completedEvents().length);
+  assert.equal(result.nextCursor, completedEvents().length);
+  assert.deepEqual(runtime.calls.readStartIndexes, [0]);
+});
+
 test("projects durable provider argument snapshots as typed AgentRun events", () => {
   const [event] = projectAgentEvents("arun-stream", [{
     data: {

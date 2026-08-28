@@ -62,6 +62,7 @@ export function StandaloneAgentWorkspace({
       credentials: "same-origin",
       headers: { accept: "application/json" },
       cache: "no-store",
+      signal: AbortSignal.timeout(5_000),
     });
     if (!response.ok) throw new Error(`Subagent status request failed (${response.status}).`);
     const body = await response.json() as { children?: unknown };
@@ -96,6 +97,7 @@ export function StandaloneAgentWorkspace({
       headers: { "content-type": "application/json", accept: "application/json" },
       method: "POST",
       cache: "no-store",
+      signal: AbortSignal.timeout(15_000),
     });
     if (!response.ok) throw new Error(`Subagent control request failed (${response.status}).`);
     const body = await response.json() as { subagent?: unknown };

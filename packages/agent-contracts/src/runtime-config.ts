@@ -16,6 +16,16 @@ export type AgentRuntimeModel = {
   readonly defaultReasoning: AgentReasoningLevel;
 };
 
+/**
+ * Framework session limits published by a host. Token lifetime limits may be
+ * explicitly disabled with `false`; this maps directly to Eve's
+ * uncapped-session semantics and is distinct from an omitted field.
+ */
+export type AgentRuntimeLimits = Omit<AgentRunLimits, "maxInputTokens" | "maxOutputTokens"> & {
+  readonly maxInputTokens?: number | false;
+  readonly maxOutputTokens?: number | false;
+};
+
 export type AgentRuntimeProfile = {
   readonly id: string;
   readonly version: string;
@@ -60,7 +70,7 @@ export type AgentRuntimeConfigSnapshot = {
   readonly compaction: {
     readonly thresholdPercent: number;
   };
-  readonly limits: AgentRunLimits;
+  readonly limits: AgentRuntimeLimits;
   readonly extensions?: readonly AgentRuntimeExtension[];
   readonly metadata?: Readonly<Record<string, JsonValue>>;
 };
@@ -301,7 +311,7 @@ function assertDefaultsAllowed(
   }
 }
 
-function parseLimits(value: unknown): AgentRunLimits {
+function parseLimits(value: unknown): AgentRuntimeLimits {
   if (!isRecord(value)) throw invalid("limits must be an object");
   const maximums = {
     maxDurationMs: 24 * 60 * 60 * 1_000,
@@ -312,12 +322,17 @@ function parseLimits(value: unknown): AgentRunLimits {
     maxTurns: 10_000,
   } as const;
   assertOnlyKeys(value, Object.keys(maximums), "limits");
-  const limits: Record<string, number> = {};
+  const limits: Record<string, number | false> = {};
   for (const [name, maximum] of Object.entries(maximums)) {
     const item = value[name];
-    if (item !== undefined) limits[name] = integer(item, `limits.${name}`, 1, maximum);
+    if (item === undefined) continue;
+    if ((name === "maxInputTokens" || name === "maxOutputTokens") && item === false) {
+      limits[name] = false;
+      continue;
+    }
+    limits[name] = integer(item, `limits.${name}`, 1, maximum);
   }
-  return limits;
+  return limits as AgentRuntimeLimits;
 }
 
 function reasoning(value: unknown, owner: string): AgentReasoningLevel {

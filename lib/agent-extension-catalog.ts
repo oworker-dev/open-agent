@@ -7,6 +7,7 @@ import type {
 import type {
   AgentRuntimeConfigSnapshot,
   AgentRuntimeExtension,
+  AgentRuntimeLimits,
 } from "@oworker/open-agent-contracts/runtime-config";
 import { DEFAULT_AGENT_RUNTIME_CONFIG } from "./agent-runtime-config.ts";
 
@@ -117,7 +118,7 @@ export function resolveAgentRunPolicy(
 }
 
 export function mergeAgentRunLimits(
-  configured: AgentRunLimits | undefined,
+  configured: AgentRuntimeLimits | AgentRunLimits | undefined,
   requested: AgentRunLimits | undefined,
 ): AgentRunLimits | undefined {
   if (!configured && !requested) return undefined;
@@ -132,10 +133,14 @@ export function mergeAgentRunLimits(
   ] as const) {
     const configuredValue = configured?.[name];
     const requestedValue = requested?.[name];
-    if (configuredValue !== undefined && requestedValue !== undefined) {
-      merged[name] = Math.min(configuredValue, requestedValue);
-    } else if (configuredValue !== undefined) {
-      merged[name] = configuredValue;
+    // `false` is the explicit uncapped value used by the runtime snapshot.
+    // It contributes no request-policy limit; a numeric host or caller limit
+    // still applies normally.
+    const configuredNumber = typeof configuredValue === "number" ? configuredValue : undefined;
+    if (configuredNumber !== undefined && requestedValue !== undefined) {
+      merged[name] = Math.min(configuredNumber, requestedValue);
+    } else if (configuredNumber !== undefined) {
+      merged[name] = configuredNumber;
     } else if (requestedValue !== undefined) {
       merged[name] = requestedValue;
     }

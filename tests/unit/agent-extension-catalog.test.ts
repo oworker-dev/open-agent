@@ -11,7 +11,6 @@ import { parseStartAgentRun } from "../../server/agent-runs/input.ts";
 
 const profile = { profileId: "general-purpose", version: "0.1.0" } as const;
 const softwareTask = { id: "software-task", version: "1.0.0" } as const;
-const defaultLimits = { maxInputTokens: 40_000_000, maxOutputTokens: 10_000_000 } as const;
 const softwareConfig = {
   ...DEFAULT_AGENT_RUNTIME_CONFIG,
   id: "software-host",
@@ -25,7 +24,6 @@ const softwareConfig = {
 
 test("the standalone profile has no product-specific extension grant", () => {
   assert.deepEqual(resolveAgentRunPolicy(profile, {}), {
-    limits: defaultLimits,
     mcpConnections: [],
     skills: [],
   });
@@ -33,7 +31,6 @@ test("the standalone profile has no product-specific extension grant", () => {
 
 test("a run can narrow but cannot expand its profile extension grant", () => {
   assert.deepEqual(resolveAgentRunPolicy(profile, { skills: [] }, undefined, softwareConfig), {
-    limits: defaultLimits,
     mcpConnections: [],
     skills: [],
   });
@@ -88,7 +85,6 @@ test("the public AgentRun boundary persists the resolved grant", () => {
   assert.equal(parsed.ok, true);
   if (parsed.ok) {
     assert.deepEqual(parsed.value.policy, {
-      limits: defaultLimits,
       mcpConnections: [],
       skills: [],
     });
@@ -100,7 +96,7 @@ test("runtime limits cannot be expanded by an AgentRun request", () => {
     resolveAgentRunPolicy(profile, {
       limits: { maxInputTokens: 4_000_000, maxToolCalls: 12 },
     }).limits,
-    { maxInputTokens: 4_000_000, maxOutputTokens: 10_000_000, maxToolCalls: 12 },
+    { maxInputTokens: 4_000_000, maxToolCalls: 12 },
   );
 });
 

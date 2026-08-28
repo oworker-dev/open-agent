@@ -11,6 +11,15 @@ export type AgentRuntimeModel = {
     readonly reasoningLevels: readonly AgentReasoningLevel[];
     readonly defaultReasoning: AgentReasoningLevel;
 };
+/**
+ * Framework session limits published by a host. Token lifetime limits may be
+ * explicitly disabled with `false`; this maps directly to Eve's
+ * uncapped-session semantics and is distinct from an omitted field.
+ */
+export type AgentRuntimeLimits = Omit<AgentRunLimits, "maxInputTokens" | "maxOutputTokens"> & {
+    readonly maxInputTokens?: number | false;
+    readonly maxOutputTokens?: number | false;
+};
 export type AgentRuntimeProfile = {
     readonly id: string;
     readonly version: string;
@@ -53,7 +62,7 @@ export type AgentRuntimeConfigSnapshot = {
     readonly compaction: {
         readonly thresholdPercent: number;
     };
-    readonly limits: AgentRunLimits;
+    readonly limits: AgentRuntimeLimits;
     readonly extensions?: readonly AgentRuntimeExtension[];
     readonly metadata?: Readonly<Record<string, JsonValue>>;
 };

@@ -47,11 +47,12 @@ export const DEFAULT_AGENT_RUNTIME_CONFIG: AgentRuntimeConfigSnapshot = {
   },
   compaction: { thresholdPercent: 0.9 },
   limits: {
-    // Match Eve's root-session defaults. Context-window compaction remains
-    // the mechanism that keeps a long conversation usable; these are lifetime
-    // safety budgets, not the model context window.
-    maxInputTokens: 40_000_000,
-    maxOutputTokens: 10_000_000,
+    // Context-window compaction is the mechanism that keeps a long
+    // conversation usable. Eve's lifetime token caps are explicitly disabled
+    // for the neutral standalone default; hosts may publish numeric budgets
+    // when their billing policy requires them.
+    maxInputTokens: false,
+    maxOutputTokens: false,
   },
 };
 
@@ -65,8 +66,8 @@ export function runtimeDefinitionLimits(
   config: AgentRuntimeConfigSnapshot,
 ): AgentRuntimeDefinitionLimits {
   return {
-    maxInputTokensPerSession: config.limits.maxInputTokens ?? 40_000_000,
-    maxOutputTokensPerSession: config.limits.maxOutputTokens ?? 10_000_000,
+    maxInputTokensPerSession: config.limits.maxInputTokens ?? false,
+    maxOutputTokensPerSession: config.limits.maxOutputTokens ?? false,
     // A durable Web thread is explicitly retired by its owner/host. Eve's
     // default 30-day age timeout would otherwise split a long-lived thread
     // even though context compaction and paged history remain healthy.

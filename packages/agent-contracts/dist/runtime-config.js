@@ -250,8 +250,13 @@ function parseLimits(value) {
     const limits = {};
     for (const [name, maximum] of Object.entries(maximums)) {
         const item = value[name];
-        if (item !== undefined)
-            limits[name] = integer(item, `limits.${name}`, 1, maximum);
+        if (item === undefined)
+            continue;
+        if ((name === "maxInputTokens" || name === "maxOutputTokens") && item === false) {
+            limits[name] = false;
+            continue;
+        }
+        limits[name] = integer(item, `limits.${name}`, 1, maximum);
     }
     return limits;
 }

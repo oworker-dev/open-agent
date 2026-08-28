@@ -373,6 +373,20 @@ export async function readAgentRunEvents(options: {
       record: synchronized.record,
     };
   }
+  // Synchronization starts at the persisted projection cursor. When the
+  // caller asks for that exact cursor, the bounded page it just fetched is
+  // already the authoritative response payload. Reusing it avoids opening a
+  // second Eve stream for every poll while preserving the public 200-event
+  // page size and absolute cursor contract. A caller reading older history
+  // still takes the dedicated read path below.
+  if (options.after === record.eventCount) {
+    const events = synchronized.events.slice(0, AGENT_EVENT_PAGE_SIZE);
+    return {
+      events,
+      nextCursor: options.after + events.length,
+      record: synchronized.record,
+    };
+  }
   const events = await (options.runtime ?? eveAgentRunRuntime).readEvents(
     synchronized.record.runId,
     synchronized.record.correlationId,
