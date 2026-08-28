@@ -72,6 +72,11 @@ export type AgentRunProjection = {
 };
 
 export interface AgentRunStore {
+  /**
+   * Idempotently binds the exact Eve session to a reserved run. Hosts should
+   * return the existing running record when a retry observes that the same
+   * session was already attached after a lost database response.
+   */
   attachSession(runId: string, sessionId: string): Promise<AgentRunRecord>;
   findOwned(tenantId: string, principalId: string, runId: string): Promise<AgentRunRecord | undefined>;
   /**
@@ -226,7 +231,20 @@ function postgresAgentRunStore(pool: Pool, table: string, config: AgentDatabaseC
           returning ${selectColumns()}`,
         [runId, sessionId],
       );
-      return toRecord(requireRow(result.rows[0]));
+      if (result.rows[0]) return toRecord(result.rows[0]);
+      // The UPDATE may have committed even if the client lost the response.
+      // Make retries idempotent by accepting the already-attached exact
+      // session instead of treating it as a failed attach and resetting a
+      // live Eve turn.
+      const existing = await pool.query<AgentRunRow>(
+        `select ${selectColumns()} from ${table}
+          where run_id = $1
+          limit 1`,
+        [runId],
+      );
+      const row = requireRow(existing.rows[0]);
+      if (row.sessionId === sessionId && row.status === "running") return toRecord(row);
+      throw new Error("AgentRun session attachment was already settled with a different state.");
     },
     async findOwned(tenantId, principalId, runId) {
       const result = await pool.query<AgentRunRow>(

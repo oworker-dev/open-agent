@@ -130,6 +130,9 @@ that exact Eve session before releasing the reservation as ambiguous. If reset
 or settlement cannot be confirmed, the reservation remains `submitting` and
 continues to consume an admission slot; this prevents an accepted Eve turn and
 its sandbox from becoming an untracked orphan.
+The attachment operation is idempotent for the exact `(runId, sessionId)` pair,
+so a lost database response can be retried without resetting a session that was
+already durably bound.
 Writes are serialized `PATCH` requests that
 carry changed threads and deleted IDs rather than every conversation history.
 Pending messages, accepted session IDs, input pauses, errors, and turn/session
