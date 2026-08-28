@@ -274,7 +274,7 @@ test("empty append checkpoints do not query the event log", async () => {
   assert.equal(calls.some((sql) => sql.includes("agent_thread_events")), false);
 });
 
-test("hydrating one thread removes the index-only summary marker", async () => {
+test("legacy thread hydration returns a bounded tail instead of aggregating full history", async () => {
   let loadedSql = "";
   const pool = {
     async query(sql: string) {
@@ -287,6 +287,10 @@ test("hydrating one thread removes the index-only summary marker", async () => {
             status: "ready",
           },
           revision: "9",
+          total: "500",
+          start_index: "244",
+          end_index: "500",
+          has_more_before: true,
         }],
       } as unknown as QueryResult;
     },
@@ -296,8 +300,9 @@ test("hydrating one thread removes the index-only summary marker", async () => {
   const result = await store.loadThread?.("tenant-1", "principal-1", "workspace-1", "thread-1");
 
   assert.equal((result?.thread as { readonly id?: unknown } | undefined)?.id, "thread-1");
-  assert.equal(loadedSql.includes("thread - 'events' - 'hydration'"), true);
-  assert.equal(loadedSql.includes("jsonb_build_object(\n            'events'"), true);
+  assert.match(loadedSql, /with target as/u);
+  assert.match(loadedSql, /limit \$6/u);
+  assert.doesNotMatch(loadedSql, /jsonb_agg\(entry\.event order by entry\.event_index asc\)/u);
 });
 
 test("loads a bounded ordered transcript window without aggregating the full event log", async () => {

@@ -679,6 +679,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                 return undefined;
             if (threadStorage.repairThread &&
                 hydrated.session.sessionId &&
+                !hydrated.transcriptWindow &&
                 shouldRepairServerTranscript(hydrated)) {
                 try {
                     const repaired = await threadStorage.repairThread(storageKey, thread.id);

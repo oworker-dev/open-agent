@@ -425,6 +425,16 @@ terminal history in PostgreSQL and use the audit for storage forecasting. Never
 delete individual child runs or stream chunks, and never use an event-count,
 payload-size, or conversation-length threshold as retention policy.
 
+The repository provides the non-destructive first half of that lifecycle:
+`npm run archive:workflow -- --root-run-id <id> --output <file>` exports a
+complete terminal root tree as bounded, line-oriented records with binary fields
+encoded explicitly, and `npm run verify:workflow-archive -- <file>` validates
+record counts, per-table counts, and the SHA-256 manifest without loading the
+archive into memory. Copy the output to the deployment's host-controlled object
+store and restore it into an isolated Workflow World with a reviewed adapter
+before enabling any purge. These commands never delete hot rows or infer
+ownership.
+
 ### Single-server capacity matrix
 
 Run `npm run verify:capacity` against an isolated deployment. It sequentially

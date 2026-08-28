@@ -842,6 +842,7 @@ export function AgentWorkspace({
       if (
         threadStorage.repairThread &&
         hydrated.session.sessionId &&
+        !hydrated.transcriptWindow &&
         shouldRepairServerTranscript(hydrated)
       ) {
         try {

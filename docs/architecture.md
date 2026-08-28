@@ -116,6 +116,9 @@ bundled PostgreSQL adapter scopes every collection by verified
 thread metadata; selecting another thread hydrates only a bounded tail window.
 Older history is fetched with an absolute event window cursor, so opening a
 long conversation never materializes its entire event log in one SQL aggregate.
+The legacy single-thread endpoint is likewise bounded to a recent tail window
+and returns a window marker; older hosts cannot accidentally trigger an
+unbounded JSON aggregation.
 Child-agent views use the same contract and storage adapter as root threads;
 they do not call Eve `snapshot()` when a bounded host adapter is available.
 This keeps parent and child navigation consistent while ensuring a long-lived

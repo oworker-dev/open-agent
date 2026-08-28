@@ -57,7 +57,10 @@ export interface AgentThreadCollectionStore<TCollection = unknown> {
     principalId: string,
     storageKey: string,
   ): Promise<StoredThreadCollection<TCollection> | undefined>;
-  /** Reads one thread JSON value without materializing the whole collection in Node. */
+  /** Reads one bounded tail window for legacy callers. Older pages are loaded
+   * through loadThreadWindow; this method must never aggregate an unbounded
+   * event log into one JSON response. The returned thread carries its
+   * transcriptWindow marker when more history exists. */
   loadThread?(
     tenantId: string,
     principalId: string,
@@ -175,34 +178,14 @@ function postgresThreadCollectionStore<TCollection>(
     storageKey: string,
     threadId: string,
   ): Promise<StoredThread | undefined> => {
-    assertScope(tenantId, principalId, storageKey);
-    assertText(threadId, "threadId", 200);
-    const result = await pool.query<{ thread: unknown; revision: string }>(
-      `select
-          -- hydration=summary is an index-only transport marker. Once
-          -- this query joins the append-only event log, the returned thread
-          -- is complete and must not cause the browser to hydrate it again.
-          (thread - 'events' - 'hydration') || jsonb_build_object(
-            'events', coalesce((
-              select jsonb_agg(entry.event order by entry.event_index asc)
-                from ${eventTable} entry
-               where entry.tenant_id = $1
-                 and entry.principal_id = $2
-                 and entry.storage_key = $3
-                 and entry.thread_id = thread->>'id'
-            ), coalesce(thread->'events', '[]'::jsonb))
-          ) as thread,
-          collection_row.revision::text
-         from ${table} collection_row,
-              lateral jsonb_array_elements(coalesce(collection_row.collection->'threads', '[]'::jsonb)) as thread
-        where collection_row.tenant_id = $1 and collection_row.principal_id = $2 and collection_row.storage_key = $3
-          and thread->>'id' = $4
-        limit 1`,
-      [tenantId, principalId, storageKey, threadId],
-    );
-    const row = result.rows[0];
-    return row
-      ? { thread: row.thread, revision: parseRevision(row.revision) }
+    const bounded = await loadThreadWindow(tenantId, principalId, storageKey, threadId, { limit: 256 });
+    return bounded
+      ? {
+          revision: bounded.revision,
+          thread: isRecordValue(bounded.thread)
+            ? { ...bounded.thread, transcriptWindow: bounded.window }
+            : bounded.thread,
+        }
       : undefined;
   };
 
