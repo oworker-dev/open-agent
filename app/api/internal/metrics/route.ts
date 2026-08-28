@@ -32,6 +32,8 @@ export async function GET(request: Request): Promise<Response> {
   }
   const usage = process.memoryUsage();
   const cpu = process.cpuUsage();
+  const activeResources = process.getActiveResourcesInfo?.() ?? [];
+  const activeResourceCounts = countActiveResources(activeResources);
   const eventLoopP95Ms = Number((eventLoop.percentile(95) / 1e6).toFixed(2));
   const eventLoopMaxMs = Number((eventLoop.max / 1e6).toFixed(2));
   eventLoop.reset();
@@ -74,7 +76,13 @@ export async function GET(request: Request): Promise<Response> {
         cpuSystemMicros: cpu.system,
         eventLoopP95Ms,
         eventLoopMaxMs,
-        activeResources: process.getActiveResourcesInfo?.() ?? [],
+        // Keep diagnostics O(number of resource types), not O(number of open
+        // sockets/timers). A raw resource list becomes a large response under
+        // a stream fan-out load and can distort the very measurement it serves.
+        activeResources: {
+          total: activeResources.length,
+          byType: activeResourceCounts,
+        },
       },
       agentDatabasePools: getAgentDatabasePoolStats(),
       agentRuns,
@@ -84,6 +92,15 @@ export async function GET(request: Request): Promise<Response> {
     },
     { headers: { "cache-control": "no-store" } },
   );
+}
+
+function countActiveResources(resources: readonly string[]): Readonly<Record<string, number>> {
+  const counts = new Map<string, number>();
+  for (const resource of resources) {
+    if (typeof resource !== "string" || resource.length === 0) continue;
+    counts.set(resource, (counts.get(resource) ?? 0) + 1);
+  }
+  return Object.fromEntries([...counts.entries()].sort(([left], [right]) => left.localeCompare(right)));
 }
 
 function authorized(request: Request): boolean {

@@ -347,11 +347,12 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
         }
     }, [client, onStorageError, storageKey, threadStorage, updateThread]);
     const inspectThreadRuntime = useCallback(async (thread) => {
+        const runtimeCheckKey = runtimeInspectionKey(thread);
         if (!thread.session.sessionId ||
             !threadNeedsRuntimeInspection(thread) ||
-            runtimeChecksStarted.current.has(thread.id))
+            runtimeChecksStarted.current.has(runtimeCheckKey))
             return;
-        runtimeChecksStarted.current.add(thread.id);
+        runtimeChecksStarted.current.add(runtimeCheckKey);
         if (!inspectSession) {
             setRecoveringIds((current) => new Set(current).add(thread.id));
             return;
@@ -366,7 +367,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
             await settleThreadHistory(thread, boundary);
         }
         catch {
-            runtimeChecksStarted.current.delete(thread.id);
+            runtimeChecksStarted.current.delete(runtimeCheckKey);
             setRecoveringIds((current) => new Set(current).add(thread.id));
         }
     }, [inspectSession, settleThreadHistory]);
@@ -1624,6 +1625,20 @@ function threadNeedsRuntimeInspection(thread) {
     return thread.pendingTurn?.state === "clearing" ||
         thread.pendingTurn?.state === "resubmitting" ||
         thread.pendingTurn?.state === "submitting";
+}
+function runtimeInspectionKey(thread) {
+    const pending = thread.pendingTurn;
+    const queued = thread.queuedTurns
+        .map((turn) => `${turn.id}:${turn.state}`)
+        .join(",");
+    return [
+        thread.id,
+        thread.session.sessionId ?? "",
+        thread.status,
+        pending?.id ?? "",
+        pending?.state ?? "",
+        queued,
+    ].join("|");
 }
 function transcriptCoversSession(thread) {
     return hasCompleteTranscriptCoverage(thread) || thread.session.streamIndex <= thread.events.length;

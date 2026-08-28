@@ -496,12 +496,13 @@ export function AgentWorkspace({
   }, [client, onStorageError, storageKey, threadStorage, updateThread]);
 
   const inspectThreadRuntime = useCallback(async (thread: AgentThread) => {
+    const runtimeCheckKey = runtimeInspectionKey(thread);
     if (
       !thread.session.sessionId ||
       !threadNeedsRuntimeInspection(thread) ||
-      runtimeChecksStarted.current.has(thread.id)
+      runtimeChecksStarted.current.has(runtimeCheckKey)
     ) return;
-    runtimeChecksStarted.current.add(thread.id);
+    runtimeChecksStarted.current.add(runtimeCheckKey);
     if (!inspectSession) {
       setRecoveringIds((current) => new Set(current).add(thread.id));
       return;
@@ -521,7 +522,7 @@ export function AgentWorkspace({
       // running, so recovery will start with bounded catch-up only. This also
       // keeps hosts that do not expose an inspector usable during a transient
       // control-plane outage without opening an unsafe live-follow stream.
-      runtimeChecksStarted.current.delete(thread.id);
+      runtimeChecksStarted.current.delete(runtimeCheckKey);
       setRecoveringIds((current) => new Set(current).add(thread.id));
     }
   }, [inspectSession, settleThreadHistory]);
@@ -2277,6 +2278,28 @@ function threadNeedsRuntimeInspection(thread: AgentThread): boolean {
   return thread.pendingTurn?.state === "clearing" ||
     thread.pendingTurn?.state === "resubmitting" ||
     thread.pendingTurn?.state === "submitting";
+}
+
+/**
+ * Runtime inspection is idempotent for one session/admission snapshot, but a
+ * thread can later receive a new Eve session or a new pending admission. A
+ * thread-id-only guard would incorrectly suppress that check after an earlier
+ * settled inspection. Keep the key scoped to the state that can change the
+ * decision to attach a recovery stream.
+ */
+function runtimeInspectionKey(thread: AgentThread): string {
+  const pending = thread.pendingTurn;
+  const queued = thread.queuedTurns
+    .map((turn) => `${turn.id}:${turn.state}`)
+    .join(",");
+  return [
+    thread.id,
+    thread.session.sessionId ?? "",
+    thread.status,
+    pending?.id ?? "",
+    pending?.state ?? "",
+    queued,
+  ].join("|");
 }
 
 function transcriptCoversSession(thread: AgentThread): boolean {
