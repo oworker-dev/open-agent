@@ -16,7 +16,8 @@ import {
  * never creates tables or purges rows: a target must already be an isolated
  * Workflow database prepared with the exact runtime version under test.
  */
-const archivePath = process.argv[2] || process.env.WORKFLOW_ARCHIVE_INPUT?.trim();
+const positionalArchivePath = process.argv.slice(2).find((argument) => !argument.startsWith("--"));
+const archivePath = positionalArchivePath || process.env.WORKFLOW_ARCHIVE_INPUT?.trim();
 if (!archivePath) throw new Error("Provide an archive path or WORKFLOW_ARCHIVE_INPUT.");
 const execute = process.argv.includes("--execute");
 if (execute && process.env.WORKFLOW_ARCHIVE_RESTORE_CONFIRM !== "1") {
