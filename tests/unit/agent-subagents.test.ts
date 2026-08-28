@@ -30,7 +30,15 @@ test("sync derives idempotent child metadata and stable nickname from Eve events
     { type: "subagent.called", data: { childSessionId: "ses_child_1", callId: "call_1", name: "researcher", input: { message: "Investigate" } } },
     { type: "subagent.completed", data: { childSessionId: "ses_child_1", callId: "call_1", result: { output: "done" } } },
   ] as const;
-  const options = { accessToken: "token", events, identity: owner, ownershipStore, parentSessionId: "ses_parent", store };
+  // Keep this projection test hermetic. When the full CI gate inherits an
+  // AGENT_RUNTIME_URL, the supervisor would otherwise probe a real Eve
+  // session for the synthetic child id and make the expected fallback status
+  // depend on external process timing.
+  const runtime = {
+    async inspect() { throw new Error("runtime unavailable"); },
+    async cancel() { return "no_active_turn" as const; },
+  };
+  const options = { accessToken: "token", events, identity: owner, ownershipStore, parentSessionId: "ses_parent", runtime, store };
   const first = await syncAgentSubagentsFromEvents(options);
   const second = await syncAgentSubagentsFromEvents(options);
   assert.equal(first.length, 1);
