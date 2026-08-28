@@ -1,6 +1,6 @@
 "use client";
 import { jsx as _jsx, jsxs as _jsxs } from "react/jsx-runtime";
-import { defaultMessageReducer, isCurrentTurnBoundaryEvent } from "eve/client";
+import { ClientError, defaultMessageReducer, isCurrentTurnBoundaryEvent } from "eve/client";
 import { useEveAgent } from "eve/react";
 import { AssistantRuntimeProvider, unstable_defaultDirectiveFormatter, useExternalStoreRuntime } from "@assistant-ui/react";
 import { Clock3Icon, HammerIcon, RotateCcwIcon, SearchIcon, ShieldCheckIcon, SparklesIcon, XIcon } from "lucide-react";
@@ -15,12 +15,13 @@ import { sanitizeAgentError } from "./error-presentation.js";
 import { AgentMailboxHttpError } from "./http-agent-mailbox.js";
 import { messagesFor } from "./i18n.js";
 import { interruptedTurnContextFromEvents, interruptedTurnContextsFromEvents, rewriteContextFromEvents, } from "./retained-context.js";
-import { appendThreadEventIndexed, dedupeThreadEvents, eventIdentity, titleFromPrompt } from "./thread-storage.js";
+import { appendThreadEventIndexed, dedupeThreadEvents, eventIdentity, reconcilePendingTurnWithEvents, titleFromPrompt } from "./thread-storage.js";
 import { eventsBeforeLastUserTurn, hasSettledLatestTurn, isProxiedInputOnlyMessage, normalizeSettledAgentMessages, projectAgentDisplayTimeline, shouldSuppressInterruptedTurnDisplayEvent, shouldSuppressInterruptedTurnStreamEvent, unresolvedInputRequests, } from "./turn-presentation.js";
 import { summarizeUsage } from "./usage.js";
 const activeEditedTurnOperations = new Set();
 const pendingEditedTurnOperations = new Set();
 const CANCELLATION_STREAM_REATTACH_AFTER_MS = 5_000;
+const MAX_PROVIDER_SUBMISSION_RETRIES = 3;
 const LONG_RUNNING_STREAM_RECONNECT_POLICY = {
     retryableErrorStatuses: [404, 408, 409, 425, 429, 500, 502, 503, 504],
     streamIdleReconnectPolicy: {
@@ -80,6 +81,11 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     const [cancellationError, setCancellationError] = useState();
     const [queueError, setQueueError] = useState();
     const [turnError, setTurnError] = useState(() => latestTurnFailure(thread.events));
+    const [providerRetry, setProviderRetry] = useState(undefined);
+    const [optimisticPendingTurn, setOptimisticPendingTurn] = useState(undefined);
+    const providerRetryKeyRef = useRef(undefined);
+    const providerRetryAttemptRef = useRef(0);
+    const providerRetryTimerRef = useRef(undefined);
     const messages = messagesFor(locale);
     const recoveryContextWindowTokens = models.find((model) => model.id === thread.preferences.modelId)?.contextWindowTokens ?? models[0]?.contextWindowTokens ?? 272_000;
     const settleCancellationUi = useCallback(() => {
@@ -98,6 +104,9 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         if (cancellationIdleTimerRef.current !== undefined) {
             window.clearTimeout(cancellationIdleTimerRef.current);
         }
+        if (providerRetryTimerRef.current !== undefined) {
+            window.clearTimeout(providerRetryTimerRef.current);
+        }
     }, []);
     useEffect(() => {
         preferencesRef.current = thread.preferences;
@@ -108,6 +117,14 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     useEffect(() => {
         pendingTurnRef.current = thread.pendingTurn;
     }, [thread.pendingTurn]);
+    useEffect(() => {
+        if (!optimisticPendingTurn)
+            return;
+        const durable = thread.pendingTurn;
+        if (durable && (durable.id !== optimisticPendingTurn.id || durable.state === "delivery-failed")) {
+            setOptimisticPendingTurn(undefined);
+        }
+    }, [optimisticPendingTurn, thread.pendingTurn]);
     useEffect(() => {
         interruptedTurnsRef.current = thread.interruptedTurns ?? [];
     }, [thread.interruptedTurns]);
@@ -192,11 +209,30 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             if (durableSession)
                 requestDurableCancellation(durableSession, event.data.turnId);
         }
+        if (event.type === "message.received" && providerRetryKeyRef.current) {
+            providerRetryKeyRef.current = undefined;
+            providerRetryAttemptRef.current = 0;
+            setProviderRetry(undefined);
+        }
+        if (event.type === "message.received") {
+            setOptimisticPendingTurn((current) => {
+                if (!current)
+                    return current;
+                if (event.data.clientMessageId === current.id)
+                    return undefined;
+                if (event.data.clientMessageId)
+                    return current;
+                return event.data.message.trim() === current.text.trim() ? undefined : current;
+            });
+        }
         if (event.type === "turn.failed" || event.type === "session.failed") {
             setTurnError(event.data.message);
         }
         if (event.type === "turn.completed" || event.type === "turn.cancelled") {
             setTurnError(undefined);
+        }
+        if (event.type === "session.waiting" || event.type === "session.completed" || event.type === "session.failed") {
+            turnAdmissionBusyRef.current = false;
         }
         if (event.type === "turn.cancelled") {
             const settledInterruptedTurns = settleInterruptedTurn(interruptedTurnsRef.current, event.data.turnId, sourceIndex + 1);
@@ -296,13 +332,14 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     const effectiveRenderEvents = isRecovering ? recoveryRenderEvents : renderEvents;
     const effectiveRenderMessages = isRecovering ? recoveryRenderMessages : renderMessages;
     const runtimeIsBusy = agent.status === "submitted" || agent.status === "streaming";
+    const displayPendingTurn = optimisticPendingTurn ?? thread.pendingTurn;
     latestEventsRef.current = agent.events;
     const durableSessionSettled = hasSettledSessionBoundary(thread.events);
     const localSessionSettled = hasSettledSessionBoundary(agent.events);
     const authoritativeEvents = isRecovering || (durableSessionSettled && !localSessionSettled)
         ? thread.events
         : agent.events;
-    const pendingTurnInFlight = isPendingTurnInFlight(thread.pendingTurn) &&
+    const pendingTurnInFlight = isPendingTurnInFlight(displayPendingTurn) &&
         !hasSettledLatestTurn(authoritativeEvents);
     const durableTurnSettled = !pendingTurnInFlight &&
         hasSettledLatestTurn(authoritativeEvents) &&
@@ -460,8 +497,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         let acceptedPendingTurn = false;
         let acceptedQueuedTurn = false;
         const persistedPendingTurn = pendingTurnRef.current;
-        if (persistedPendingTurn && compactedEventsRef.current.some((event) => event.type === "message.received" && (event.data.clientMessageId === persistedPendingTurn.id ||
-            event.data.message.trim() === persistedPendingTurn.text.trim()))) {
+        if (persistedPendingTurn && !reconcilePendingTurnWithEvents(persistedPendingTurn, compactedEventsRef.current)) {
             pendingTurnRef.current = undefined;
             acceptedPendingTurn = true;
         }
@@ -518,14 +554,82 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         : undefined;
     const runtimeError = recoveryError
         ? sanitizeAgentError(recoveryError)
-        : !hasTurnFailure && (turnError || errorMessage)
-            ? sanitizeAgentError(turnError ?? errorMessage ?? "The Agent request failed.")
+        : !hasTurnFailure && (providerRetry || turnError || errorMessage)
+            ? sanitizeAgentError(providerRetry?.error.message ?? turnError ?? errorMessage ?? "The Agent request failed.")
             : undefined;
+    const runtimeFailure = recoveryError
+        ? { code: "agent_recovery_failed", message: recoveryError }
+        : agent.error
+            ? toAgentFailure(agent.error)
+            : turnError
+                ? { code: "agent_turn_failed", message: turnError }
+                : undefined;
     const usage = summarizeUsage(agent.events);
+    useEffect(() => {
+        const error = agent.error;
+        const pending = thread.pendingTurn ?? pendingTurnRef.current;
+        if (!error ||
+            !pending ||
+            pending.state !== "submitting" ||
+            !providerReady ||
+            agent.session?.sessionId ||
+            !isRetryableSubmissionError(error) ||
+            providerRetry?.exhausted)
+            return;
+        const failure = toAgentFailure(error);
+        const key = pending.id;
+        if (providerRetryKeyRef.current !== key) {
+            providerRetryKeyRef.current = key;
+            providerRetryAttemptRef.current = 0;
+            setProviderRetry(undefined);
+        }
+        if (providerRetryTimerRef.current !== undefined)
+            return;
+        const nextAttempt = providerRetryAttemptRef.current + 1;
+        if (nextAttempt > MAX_PROVIDER_SUBMISSION_RETRIES) {
+            const failedPendingTurn = { ...pending, state: "delivery-failed" };
+            pendingTurnRef.current = failedPendingTurn;
+            turnAdmissionBusyRef.current = false;
+            setProviderRetry({
+                attempt: MAX_PROVIDER_SUBMISSION_RETRIES,
+                error: failure,
+                exhausted: true,
+                maximum: MAX_PROVIDER_SUBMISSION_RETRIES,
+            });
+            setTurnError(failure.message);
+            onChange({ pendingTurn: failedPendingTurn, status: "error", updatedAt: Date.now() });
+            return;
+        }
+        providerRetryAttemptRef.current = nextAttempt;
+        setProviderRetry({
+            attempt: nextAttempt,
+            error: failure,
+            maximum: MAX_PROVIDER_SUBMISSION_RETRIES,
+        });
+        providerRetryTimerRef.current = window.setTimeout(() => {
+            providerRetryTimerRef.current = undefined;
+            if (pendingTurnRef.current?.id !== pending.id)
+                return;
+            void sendPrompt(agent.send, {
+                files: pending.files ?? [],
+                text: pending.text,
+            }, thread.retainedContext).then(() => {
+                if (pendingTurnRef.current?.id === pending.id)
+                    turnAdmissionBusyRef.current = false;
+            }).catch((retryError) => {
+                setTurnError(retryError instanceof Error ? retryError.message : "Agent request failed.");
+            });
+        }, providerRetryDelay(nextAttempt));
+    }, [agent.error, agent.send, agent.session?.sessionId, onChange, providerReady, providerRetry?.exhausted, thread.pendingTurn, thread.retainedContext]);
     useEffect(() => {
         if (agent.status === "error" &&
             thread.pendingTurn?.state === "submitting") {
             const dispatchedId = dispatchingQueuedTurnIdRef.current;
+            const transientSubmission = isRetryableSubmissionError(agent.error) &&
+                !agent.session?.sessionId &&
+                !providerRetry?.exhausted;
+            if (transientSubmission)
+                return;
             if (dispatchedId) {
                 const queuedTurns = queuedTurnsRef.current.map((turn) => turn.id === dispatchedId ? { ...turn, state: "delivery-failed" } : turn);
                 queuedTurnsRef.current = queuedTurns;
@@ -540,7 +644,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
                 setTurnError(agent.error?.message ?? messages.queueDeliveryFailed);
             }
         }
-    }, [agent.error, agent.session?.sessionId, agent.status, messages.queueDeliveryFailed, onChange, thread.pendingTurn]);
+    }, [agent.error, agent.session?.sessionId, agent.status, messages.queueDeliveryFailed, onChange, providerRetry?.exhausted, thread.pendingTurn]);
     const prepareTurn = () => {
         recoveryRequestedRef.current = false;
         if (cancellationIdleTimerRef.current !== undefined) {
@@ -552,6 +656,13 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         setCancellationError(undefined);
         setCancellationState("idle");
         setTurnError(undefined);
+        providerRetryKeyRef.current = undefined;
+        providerRetryAttemptRef.current = 0;
+        if (providerRetryTimerRef.current !== undefined) {
+            window.clearTimeout(providerRetryTimerRef.current);
+            providerRetryTimerRef.current = undefined;
+        }
+        setProviderRetry(undefined);
     };
     useEffect(() => {
         if (!cancellationRef.current.requested)
@@ -776,6 +887,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
                 text,
             };
             pendingTurnRef.current = pendingTurn;
+            setOptimisticPendingTurn(pendingTurn);
             onChange({ pendingTurn });
         }
         if (text.length > 0 && agent.data.messages.length === 0) {
@@ -783,6 +895,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         }
         try {
             await sendPrompt(agent.send, { files: message.files, text }, thread.retainedContext);
+            turnAdmissionBusyRef.current = false;
         }
         catch (error) {
             const sessionId = sessionRef.current?.state.sessionId ?? agent.session?.sessionId;
@@ -792,6 +905,10 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
                 !recoveryRequestedRef.current) {
                 setTurnError(undefined);
                 requestRecovery();
+                return;
+            }
+            if (!sessionId && isRetryableSubmissionError(error)) {
+                setTurnError(undefined);
                 return;
             }
             const pending = pendingTurnRef.current;
@@ -832,7 +949,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             : effectiveRenderMessages;
         return normalizeSettledAgentMessages(source, interruptedDisplayEvents);
     }, [displayInterruptedTurns.length, effectiveRenderMessages, interruptedDisplayEvents]);
-    const projectedMessages = projectStagedUserMessages(ensureActiveAssistantMessage(projectedRuntimeMessages, interruptedDisplayEvents, isBusy || thread.pendingTurn?.state === "resubmitting" || Boolean(latestTurnFailure(interruptedDisplayEvents)), thread.pendingTurn), thread.queuedTurns.filter((turn) => turn.intent === "post-cancellation"));
+    const projectedMessages = projectStagedUserMessages(ensureActiveAssistantMessage(projectedRuntimeMessages, interruptedDisplayEvents, isBusy || displayPendingTurn?.state === "resubmitting" || Boolean(latestTurnFailure(interruptedDisplayEvents)), displayPendingTurn), thread.queuedTurns.filter((turn) => turn.intent === "post-cancellation"));
     const ungroupedVisibleMessages = projectedMessages.filter((message) => !isProxiedInputOnlyMessage(message, effectiveRenderEvents));
     const ungroupedDisplayEvents = interruptedDisplayEvents;
     const displayTimeline = useMemo(() => projectAgentDisplayTimeline(ungroupedVisibleMessages, ungroupedDisplayEvents), [ungroupedDisplayEvents, ungroupedVisibleMessages]);
@@ -1130,6 +1247,10 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             text: next.text,
         };
         void agent.send(next.text, retainedContextOptions(thread.retainedContext)).catch((error) => {
+            if (!agent.session?.sessionId && isRetryableSubmissionError(error)) {
+                setTurnError(undefined);
+                return;
+            }
             dispatchingQueuedTurnIdRef.current = undefined;
             turnAdmissionBusyRef.current = false;
             pendingTurnRef.current = undefined;
@@ -1149,10 +1270,10 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     };
     const closeInputRequest = (requestId) => closeInputRequests([requestId]);
     const visibleQueuedTurns = thread.queuedTurns.filter((turn) => turn.intent !== "post-cancellation");
-    return (_jsx(AssistantRuntimeProvider, { runtime: assistantRuntime, children: _jsx("main", { className: "flex min-h-0 flex-1 flex-col overflow-hidden", children: _jsx(AssistantThreadSurface, { assetUrl: client?.assetUrl, approvalTakeover: approvalTakeover, cancellationState: cancellationState, commands: commands, composerTop: visibleQueuedTurns.length > 0 || queueError ? (_jsx(FollowUpQueue, { error: queueError, messages: messages, onRemove: removeQueuedTurn, onRetry: markQueuedTurnForRetry, turns: visibleQueuedTurns })) : undefined, draftStorageKey: draftStorageKey, historyHasMore: historyHasMore, historyLoading: historyLoading, events: displayEvents, eveMessages: visibleMessages, fallbackStartedAt: thread.pendingTurn?.submittedAt, inputDisabled: inputLocked, isBusy: isBusy, sessionSettled: durableTurnSettled, onCancel: requestCancellation, locale: locale, mentions: mentions, messages: messages, models: models, onInputResponses: respond, onCloseInputRequest: closeInputRequest, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, onLoadEarlier: onLoadEarlier, onPreferencesChange: (preferences) => onChange({ preferences }), onDraftRestoreConsumed: (id) => {
+    return (_jsx(AssistantRuntimeProvider, { runtime: assistantRuntime, children: _jsx("main", { className: "flex min-h-0 flex-1 flex-col overflow-hidden", children: _jsx(AssistantThreadSurface, { assetUrl: client?.assetUrl, approvalTakeover: approvalTakeover, cancellationState: cancellationState, commands: commands, composerTop: visibleQueuedTurns.length > 0 || queueError ? (_jsx(FollowUpQueue, { error: queueError, messages: messages, onRemove: removeQueuedTurn, onRetry: markQueuedTurnForRetry, turns: visibleQueuedTurns })) : undefined, draftStorageKey: draftStorageKey, historyHasMore: historyHasMore, historyLoading: historyLoading, events: displayEvents, eveMessages: visibleMessages, fallbackStartedAt: displayPendingTurn?.submittedAt, inputDisabled: inputLocked, isBusy: isBusy, sessionSettled: durableTurnSettled, onCancel: requestCancellation, locale: locale, mentions: mentions, messages: messages, models: models, onInputResponses: respond, onCloseInputRequest: closeInputRequest, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, onLoadEarlier: onLoadEarlier, onPreferencesChange: (preferences) => onChange({ preferences }), onDraftRestoreConsumed: (id) => {
                     if (thread.draftRestore?.id === id)
                         onChange({ draftRestore: undefined });
-                }, onRetryRuntimeError: recoveryError ? onRetryRecovery : undefined, closedInputRequestIds: closedInputRequestIdsRef.current, preferences: thread.preferences, reasoningLevels: reasoningLevels, draftRestore: thread.draftRestore, runtimeError: runtimeError, usage: usage }) }) }));
+                }, onRetryRuntimeError: recoveryError ? onRetryRecovery : undefined, closedInputRequestIds: closedInputRequestIdsRef.current, preferences: thread.preferences, reasoningLevels: reasoningLevels, draftRestore: thread.draftRestore, runtimeFailure: runtimeFailure, runtimeError: runtimeError, runtimeRetry: providerRetry, usage: usage }) }) }));
 }
 function expandPromptDirectives(value, commands, mentions) {
     const segments = unstable_defaultDirectiveFormatter.parse(value);
@@ -1467,10 +1588,41 @@ function isTransientProbeError(error) {
     return error instanceof Error && /fetch|network|socket|stream/i.test(error.message);
 }
 function isRecoverableStreamError(error) {
+    if (isRetryableSubmissionError(error))
+        return true;
     if (!(error instanceof Error))
         return false;
     const description = `${error.name} ${error.message}`.toLowerCase();
     return /network|fetch|stream|socket|chunk|terminated|incomplete|connection|timeout/u.test(description);
+}
+function isRetryableSubmissionError(error) {
+    if (error instanceof ClientError) {
+        return error.status === 0 || error.status === 408 || error.status === 409 ||
+            error.status === 425 || error.status === 429 || error.status >= 500;
+    }
+    if (!(error instanceof Error) || error.name === "AbortError")
+        return false;
+    const status = "status" in error && typeof error.status === "number" ? error.status : undefined;
+    if (status !== undefined && (status === 408 || status === 409 || status === 425 || status === 429 || status >= 500))
+        return true;
+    const description = `${error.name} ${error.message}`.toLowerCase();
+    return /network|fetch|socket|chunk|terminated|incomplete|connection|timeout|\b(?:408|409|425|429|5\d{2})\b/u.test(description);
+}
+function toAgentFailure(error) {
+    if (error instanceof ClientError) {
+        return {
+            code: error.code ?? `http_${error.status}`,
+            message: error.message,
+        };
+    }
+    if (error instanceof Error) {
+        const code = "code" in error && typeof error.code === "string" ? error.code : "agent_request_failed";
+        return { code, message: error.message };
+    }
+    return { code: "agent_request_failed", message: String(error) };
+}
+function providerRetryDelay(attempt) {
+    return Math.min(4_000, 500 * 2 ** Math.max(0, attempt - 1));
 }
 function useThrottledSnapshot(value, delayMs) {
     const latestRef = useRef(value);

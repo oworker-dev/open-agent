@@ -1,7 +1,7 @@
 "use client";
 
 import type { UserContent } from "ai";
-import { defaultMessageReducer, isCurrentTurnBoundaryEvent, type ClientSession, type MessageStreamEvent } from "eve/client";
+import { ClientError, defaultMessageReducer, isCurrentTurnBoundaryEvent, type ClientSession, type MessageStreamEvent } from "eve/client";
 import { useEveAgent, type EveMessage } from "eve/react";
 import { AssistantRuntimeProvider, unstable_defaultDirectiveFormatter, useExternalStoreRuntime, type AppendMessage, type ExternalThreadQueueAdapter } from "@assistant-ui/react";
 import { AlertCircleIcon, Clock3Icon, HammerIcon, RotateCcwIcon, SearchIcon, ShieldCheckIcon, SparklesIcon, XIcon } from "lucide-react";
@@ -13,7 +13,7 @@ import { createBrowserAttachmentAdapter, createHttpAgentAssetUploadAdapter } fro
 import { convertEveMessages, getEveMessageContent } from "./eve-message-adapter.js";
 import type { AgentInputResponse } from "./agent-message.js";
 import { AssistantThreadSurface, type AgentApprovalTakeover } from "./assistant-thread-surface.js";
-import type { AgentInterruptedTurn, AgentModelOption, AgentPromptMenuItem, AgentQueuedTurn, AgentSessionDeliverable, AgentThread, AgentThreadPatch, AgentTranscriptCoverage, AgentWorkspaceClientConfig, AgentWorkspaceMailbox, PromptInputMessage } from "./contracts.js";
+import type { AgentInterruptedTurn, AgentModelOption, AgentPendingTurn, AgentPromptMenuItem, AgentQueuedTurn, AgentSessionDeliverable, AgentThread, AgentThreadPatch, AgentTranscriptCoverage, AgentWorkspaceClientConfig, AgentWorkspaceMailbox, PromptInputMessage } from "./contracts.js";
 import { sanitizeAgentError } from "./error-presentation.js";
 import { AgentMailboxHttpError } from "./http-agent-mailbox.js";
 import { messagesFor, type AgentLocale, type AgentMessages } from "./i18n.js";
@@ -22,7 +22,7 @@ import {
   interruptedTurnContextsFromEvents,
   rewriteContextFromEvents,
 } from "./retained-context.js";
-import { appendThreadEvent, appendThreadEventIndexed, dedupeThreadEvents, eventIdentity, titleFromPrompt } from "./thread-storage.js";
+import { appendThreadEvent, appendThreadEventIndexed, dedupeThreadEvents, eventIdentity, reconcilePendingTurnWithEvents, titleFromPrompt } from "./thread-storage.js";
 import {
   eventsBeforeLastUserTurn,
   hasSettledLatestTurn,
@@ -32,6 +32,7 @@ import {
   shouldSuppressInterruptedTurnDisplayEvent,
   shouldSuppressInterruptedTurnStreamEvent,
   unresolvedInputRequests,
+  type AgentTurnFailure,
 } from "./turn-presentation.js";
 import { summarizeUsage } from "./usage.js";
 
@@ -58,6 +59,14 @@ const activeEditedTurnOperations = new Set<string>();
 // set, so stale checkpoints remain retryable instead of auto-submitting.
 const pendingEditedTurnOperations = new Set<string>();
 const CANCELLATION_STREAM_REATTACH_AFTER_MS = 5_000;
+const MAX_PROVIDER_SUBMISSION_RETRIES = 3;
+
+type ProviderRetryState = {
+  readonly attempt: number;
+  readonly error: AgentTurnFailure;
+  readonly exhausted?: boolean;
+  readonly maximum: number;
+};
 
 // Long tool calls can outlive a browser/proxy connection. Eve resumes from
 // its durable cursor, but the default client policy is intentionally short for
@@ -177,6 +186,11 @@ export function AgentThreadView({
   const [cancellationError, setCancellationError] = useState<string>();
   const [queueError, setQueueError] = useState<string>();
   const [turnError, setTurnError] = useState<string | undefined>(() => latestTurnFailure(thread.events));
+  const [providerRetry, setProviderRetry] = useState<ProviderRetryState | undefined>(undefined);
+  const [optimisticPendingTurn, setOptimisticPendingTurn] = useState<AgentPendingTurn | undefined>(undefined);
+  const providerRetryKeyRef = useRef<string | undefined>(undefined);
+  const providerRetryAttemptRef = useRef(0);
+  const providerRetryTimerRef = useRef<number | undefined>(undefined);
   const messages = messagesFor(locale);
   const recoveryContextWindowTokens = models.find((model) =>
     model.id === thread.preferences.modelId
@@ -201,6 +215,9 @@ export function AgentThreadView({
     if (cancellationIdleTimerRef.current !== undefined) {
       window.clearTimeout(cancellationIdleTimerRef.current);
     }
+    if (providerRetryTimerRef.current !== undefined) {
+      window.clearTimeout(providerRetryTimerRef.current);
+    }
   }, []);
 
   useEffect(() => {
@@ -214,6 +231,18 @@ export function AgentThreadView({
   useEffect(() => {
     pendingTurnRef.current = thread.pendingTurn;
   }, [thread.pendingTurn]);
+
+  // The external Eve store publishes its optimistic message only after the
+  // async submission preparation phase. Keep the browser-only pending copy
+  // visible during that gap; it is removed as soon as the durable thread
+  // acknowledges or terminally settles the same admission.
+  useEffect(() => {
+    if (!optimisticPendingTurn) return;
+    const durable = thread.pendingTurn;
+    if (durable && (durable.id !== optimisticPendingTurn.id || durable.state === "delivery-failed")) {
+      setOptimisticPendingTurn(undefined);
+    }
+  }, [optimisticPendingTurn, thread.pendingTurn]);
 
   useEffect(() => {
     interruptedTurnsRef.current = thread.interruptedTurns ?? [];
@@ -333,11 +362,38 @@ export function AgentThreadView({
         const durableSession = sessionRef.current;
         if (durableSession) requestDurableCancellation(durableSession, event.data.turnId);
       }
+      // A message receipt is the durable acknowledgement for the optimistic
+      // submission. Clear only the pre-session retry banner here; stream
+      // recovery for an existing session has its own lifecycle and must not
+      // be hidden by an unrelated receipt.
+      if (event.type === "message.received" && providerRetryKeyRef.current) {
+        providerRetryKeyRef.current = undefined;
+        providerRetryAttemptRef.current = 0;
+        setProviderRetry(undefined);
+      }
+      if (event.type === "message.received") {
+        // Eve's receipt is authoritative for the browser-side optimistic
+        // projection too. Clear it at the same boundary as the durable
+        // pending turn so the submitted message cannot be rendered twice
+        // while the parent checkpoint is still propagating.
+        setOptimisticPendingTurn((current) => {
+          if (!current) return current;
+          if (event.data.clientMessageId === current.id) return undefined;
+          if (event.data.clientMessageId) return current;
+          return event.data.message.trim() === current.text.trim() ? undefined : current;
+        });
+      }
       if (event.type === "turn.failed" || event.type === "session.failed") {
         setTurnError(event.data.message);
       }
       if (event.type === "turn.completed" || event.type === "turn.cancelled") {
         setTurnError(undefined);
+      }
+      if (event.type === "session.waiting" || event.type === "session.completed" || event.type === "session.failed") {
+        // The send promise resolves at the durable session boundary. Keep the
+        // imperative admission gate in sync as well; a stale `true` here
+        // would queue every later user message forever.
+        turnAdmissionBusyRef.current = false;
       }
       if (event.type === "turn.cancelled") {
         const settledInterruptedTurns = settleInterruptedTurn(
@@ -484,6 +540,7 @@ export function AgentThreadView({
   const effectiveRenderMessages = isRecovering ? recoveryRenderMessages : renderMessages;
 
   const runtimeIsBusy = agent.status === "submitted" || agent.status === "streaming";
+  const displayPendingTurn = optimisticPendingTurn ?? thread.pendingTurn;
   latestEventsRef.current = agent.events;
   const durableSessionSettled = hasSettledSessionBoundary(thread.events);
   const localSessionSettled = hasSettledSessionBoundary(agent.events);
@@ -496,7 +553,7 @@ export function AgentThreadView({
     : agent.events;
   // A durable turn boundary is authoritative. React stream state can remain
   // stale after a reconnect even though Eve has already parked the session.
-  const pendingTurnInFlight = isPendingTurnInFlight(thread.pendingTurn) &&
+  const pendingTurnInFlight = isPendingTurnInFlight(displayPendingTurn) &&
     !hasSettledLatestTurn(authoritativeEvents);
   const durableTurnSettled = !pendingTurnInFlight &&
     hasSettledLatestTurn(authoritativeEvents) &&
@@ -714,12 +771,7 @@ export function AgentThreadView({
     // carries `pendingTurn: submitting`. Clear that stale admission even when
     // no new `message.received` event arrives in this mount.
     const persistedPendingTurn = pendingTurnRef.current;
-    if (persistedPendingTurn && compactedEventsRef.current.some((event) =>
-      event.type === "message.received" && (
-        event.data.clientMessageId === persistedPendingTurn.id ||
-        event.data.message.trim() === persistedPendingTurn.text.trim()
-      )
-    )) {
+    if (persistedPendingTurn && !reconcilePendingTurnWithEvents(persistedPendingTurn, compactedEventsRef.current)) {
       pendingTurnRef.current = undefined;
       acceptedPendingTurn = true;
     }
@@ -785,10 +837,85 @@ export function AgentThreadView({
     : undefined;
   const runtimeError = recoveryError
     ? sanitizeAgentError(recoveryError)
-    : !hasTurnFailure && (turnError || errorMessage)
-      ? sanitizeAgentError(turnError ?? errorMessage ?? "The Agent request failed.")
+    : !hasTurnFailure && (providerRetry || turnError || errorMessage)
+      ? sanitizeAgentError(providerRetry?.error.message ?? turnError ?? errorMessage ?? "The Agent request failed.")
       : undefined;
+  const runtimeFailure: AgentTurnFailure | undefined = recoveryError
+    ? { code: "agent_recovery_failed", message: recoveryError }
+    : agent.error
+      ? toAgentFailure(agent.error)
+      : turnError
+        ? { code: "agent_turn_failed", message: turnError }
+        : undefined;
   const usage = summarizeUsage(agent.events);
+
+  // Eve owns retries inside a durable model step. A failed HTTP submission is
+  // outside that loop, however, so a transient gateway response before a
+  // session id exists needs one small client-side admission retry. Once Eve
+  // has assigned a session, recovery owns the stream and we never resend a
+  // potentially accepted request.
+  useEffect(() => {
+    const error = agent.error;
+    const pending = thread.pendingTurn ?? pendingTurnRef.current;
+    if (
+      !error ||
+      !pending ||
+      pending.state !== "submitting" ||
+      !providerReady ||
+      agent.session?.sessionId ||
+      !isRetryableSubmissionError(error) ||
+      providerRetry?.exhausted
+    ) return;
+
+    const failure = toAgentFailure(error);
+    // Retry budget belongs to one admission, not to one diagnostic string.
+    // Providers often change the message/code between attempts; including
+    // those fields in the key reset the counter and could retry forever.
+    const key = pending.id;
+    if (providerRetryKeyRef.current !== key) {
+      providerRetryKeyRef.current = key;
+      providerRetryAttemptRef.current = 0;
+      setProviderRetry(undefined);
+    }
+    if (providerRetryTimerRef.current !== undefined) return;
+
+    const nextAttempt = providerRetryAttemptRef.current + 1;
+    if (nextAttempt > MAX_PROVIDER_SUBMISSION_RETRIES) {
+      const failedPendingTurn = { ...pending, state: "delivery-failed" as const };
+      pendingTurnRef.current = failedPendingTurn;
+      turnAdmissionBusyRef.current = false;
+      setProviderRetry({
+        attempt: MAX_PROVIDER_SUBMISSION_RETRIES,
+        error: failure,
+        exhausted: true,
+        maximum: MAX_PROVIDER_SUBMISSION_RETRIES,
+      });
+      setTurnError(failure.message);
+      onChange({ pendingTurn: failedPendingTurn, status: "error", updatedAt: Date.now() });
+      return;
+    }
+
+    providerRetryAttemptRef.current = nextAttempt;
+    setProviderRetry({
+      attempt: nextAttempt,
+      error: failure,
+      maximum: MAX_PROVIDER_SUBMISSION_RETRIES,
+    });
+    providerRetryTimerRef.current = window.setTimeout(() => {
+      providerRetryTimerRef.current = undefined;
+      if (pendingTurnRef.current?.id !== pending.id) return;
+      void sendPrompt(agent.send, {
+        files: pending.files ?? [],
+        text: pending.text,
+      }, thread.retainedContext).then(() => {
+        if (pendingTurnRef.current?.id === pending.id) turnAdmissionBusyRef.current = false;
+      }).catch((retryError: unknown) => {
+        // send() normally reports errors through useEveAgent's error state;
+        // this catch covers host adapters that reject before reaching Eve.
+        setTurnError(retryError instanceof Error ? retryError.message : "Agent request failed.");
+      });
+    }, providerRetryDelay(nextAttempt));
+  }, [agent.error, agent.send, agent.session?.sessionId, onChange, providerReady, providerRetry?.exhausted, thread.pendingTurn, thread.retainedContext]);
 
   useEffect(() => {
     if (
@@ -796,6 +923,10 @@ export function AgentThreadView({
       thread.pendingTurn?.state === "submitting"
     ) {
       const dispatchedId = dispatchingQueuedTurnIdRef.current;
+      const transientSubmission = isRetryableSubmissionError(agent.error) &&
+        !agent.session?.sessionId &&
+        !providerRetry?.exhausted;
+      if (transientSubmission) return;
       if (dispatchedId) {
         const queuedTurns = queuedTurnsRef.current.map((turn) =>
           turn.id === dispatchedId ? { ...turn, state: "delivery-failed" as const } : turn,
@@ -811,7 +942,7 @@ export function AgentThreadView({
         setTurnError(agent.error?.message ?? messages.queueDeliveryFailed);
       }
     }
-  }, [agent.error, agent.session?.sessionId, agent.status, messages.queueDeliveryFailed, onChange, thread.pendingTurn]);
+  }, [agent.error, agent.session?.sessionId, agent.status, messages.queueDeliveryFailed, onChange, providerRetry?.exhausted, thread.pendingTurn]);
 
   const prepareTurn = () => {
     recoveryRequestedRef.current = false;
@@ -824,6 +955,13 @@ export function AgentThreadView({
     setCancellationError(undefined);
     setCancellationState("idle");
     setTurnError(undefined);
+    providerRetryKeyRef.current = undefined;
+    providerRetryAttemptRef.current = 0;
+    if (providerRetryTimerRef.current !== undefined) {
+      window.clearTimeout(providerRetryTimerRef.current);
+      providerRetryTimerRef.current = undefined;
+    }
+    setProviderRetry(undefined);
   };
 
   // Recovery is owned by the workspace and therefore does not invoke the
@@ -1087,6 +1225,7 @@ export function AgentThreadView({
         text,
       };
       pendingTurnRef.current = pendingTurn;
+      setOptimisticPendingTurn(pendingTurn);
       onChange({ pendingTurn });
     }
     if (text.length > 0 && agent.data.messages.length === 0) {
@@ -1095,6 +1234,10 @@ export function AgentThreadView({
 
     try {
       await sendPrompt(agent.send, { files: message.files, text }, thread.retainedContext);
+      // `sendPrompt` resolves only after Eve reaches its durable session
+      // boundary. Release the synchronous admission gate after that point so
+      // the next user turn is not incorrectly parked in the follow-up queue.
+      turnAdmissionBusyRef.current = false;
     } catch (error: unknown) {
       const sessionId = sessionRef.current?.state.sessionId ?? agent.session?.sessionId;
       // A stream can fail after Eve has accepted the turn. In that case the
@@ -1108,6 +1251,16 @@ export function AgentThreadView({
       ) {
         setTurnError(undefined);
         requestRecovery();
+        return;
+      }
+
+      // A submission rejected before Eve assigned a session cannot have been
+      // durably accepted. Keep the pending admission intact so the bounded
+      // provider-retry effect below can retry the exact same request. Marking
+      // it delivery-failed here races that effect and makes a transient 503
+      // look like a permanent failure with no retry affordance.
+      if (!sessionId && isRetryableSubmissionError(error)) {
+        setTurnError(undefined);
         return;
       }
 
@@ -1158,8 +1311,8 @@ export function AgentThreadView({
     ensureActiveAssistantMessage(
       projectedRuntimeMessages,
       interruptedDisplayEvents,
-      isBusy || thread.pendingTurn?.state === "resubmitting" || Boolean(latestTurnFailure(interruptedDisplayEvents)),
-      thread.pendingTurn,
+      isBusy || displayPendingTurn?.state === "resubmitting" || Boolean(latestTurnFailure(interruptedDisplayEvents)),
+      displayPendingTurn,
     ),
     thread.queuedTurns.filter((turn) => turn.intent === "post-cancellation"),
   );
@@ -1504,6 +1657,13 @@ export function AgentThreadView({
       text: next.text,
     };
     void agent.send(next.text, retainedContextOptions(thread.retainedContext)).catch((error: unknown) => {
+      if (!agent.session?.sessionId && isRetryableSubmissionError(error)) {
+        // Keep this queued admission pending so the same bounded provider
+        // retry path can deliver it. Failing the queue item here would race
+        // the retry effect and drop a message after a transient gateway error.
+        setTurnError(undefined);
+        return;
+      }
       dispatchingQueuedTurnIdRef.current = undefined;
       turnAdmissionBusyRef.current = false;
       pendingTurnRef.current = undefined;
@@ -1553,7 +1713,7 @@ export function AgentThreadView({
           historyLoading={historyLoading}
           events={displayEvents}
           eveMessages={visibleMessages}
-          fallbackStartedAt={thread.pendingTurn?.submittedAt}
+          fallbackStartedAt={displayPendingTurn?.submittedAt}
           inputDisabled={inputLocked}
           isBusy={isBusy}
           sessionSettled={durableTurnSettled}
@@ -1576,7 +1736,9 @@ export function AgentThreadView({
           preferences={thread.preferences}
           reasoningLevels={reasoningLevels}
           draftRestore={thread.draftRestore}
+          runtimeFailure={runtimeFailure}
           runtimeError={runtimeError}
+          runtimeRetry={providerRetry}
           usage={usage}
         />
       </main>
@@ -2006,9 +2168,42 @@ function isTransientProbeError(error: unknown): boolean {
 }
 
 function isRecoverableStreamError(error: unknown): boolean {
+  if (isRetryableSubmissionError(error)) return true;
   if (!(error instanceof Error)) return false;
   const description = `${error.name} ${error.message}`.toLowerCase();
   return /network|fetch|stream|socket|chunk|terminated|incomplete|connection|timeout/u.test(description);
+}
+
+function isRetryableSubmissionError(error: unknown): boolean {
+  if (error instanceof ClientError) {
+    return error.status === 0 || error.status === 408 || error.status === 409 ||
+      error.status === 425 || error.status === 429 || error.status >= 500;
+  }
+  if (!(error instanceof Error) || error.name === "AbortError") return false;
+  const status = "status" in error && typeof error.status === "number" ? error.status : undefined;
+  if (status !== undefined && (status === 408 || status === 409 || status === 425 || status === 429 || status >= 500)) return true;
+  const description = `${error.name} ${error.message}`.toLowerCase();
+  return /network|fetch|socket|chunk|terminated|incomplete|connection|timeout|\b(?:408|409|425|429|5\d{2})\b/u.test(description);
+}
+
+function toAgentFailure(error: unknown): AgentTurnFailure {
+  if (error instanceof ClientError) {
+    return {
+      code: error.code ?? `http_${error.status}`,
+      message: error.message,
+    };
+  }
+  if (error instanceof Error) {
+    const code = "code" in error && typeof error.code === "string" ? error.code : "agent_request_failed";
+    return { code, message: error.message };
+  }
+  return { code: "agent_request_failed", message: String(error) };
+}
+
+function providerRetryDelay(attempt: number): number {
+  // Keep the first retry responsive while giving an overloaded gateway a
+  // little time to recover. Eve remains responsible for model-step retries.
+  return Math.min(4_000, 500 * 2 ** Math.max(0, attempt - 1));
 }
 
 /**

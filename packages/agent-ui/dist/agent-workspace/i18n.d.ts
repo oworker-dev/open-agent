@@ -62,6 +62,8 @@ declare const translations: {
         readonly removeAttachment: "Remove attachment";
         readonly requestFailed: "This turn failed";
         readonly requestPreserved: "Your original request is preserved in this session.";
+        readonly retryingRequest: "Retrying request";
+        readonly retryFailed: "Retry failed";
         readonly retry: "Reconnect";
         readonly resizeNavigation: "Resize session list";
         readonly runningTools: "Running tools";
@@ -180,6 +182,8 @@ declare const translations: {
         readonly removeAttachment: "移除附件";
         readonly requestFailed: "本轮执行失败";
         readonly requestPreserved: "原始请求已保留在当前会话中。";
+        readonly retryingRequest: "正在重试请求";
+        readonly retryFailed: "重试失败";
         readonly retry: "重新连接";
         readonly resizeNavigation: "调整会话列表宽度";
         readonly runningTools: "正在运行工具";

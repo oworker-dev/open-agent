@@ -56,7 +56,7 @@ import {
   DropdownMenuTrigger,
 } from "../ui/dropdown-menu.js";
 import { AgentMessage, type AgentInputResponse } from "./agent-message.js";
-import { presentAgentTurn } from "./turn-presentation.js";
+import { classifyAgentFailure, presentAgentTurn, type AgentTurnFailure } from "./turn-presentation.js";
 import type { AgentComposerDraftRestore, AgentExecutionMode, AgentModelOption, AgentPromptMenuItem, AgentSessionDeliverable, AgentThreadPreferences } from "./contracts.js";
 import type { AgentLocale, AgentMessages } from "./i18n.js";
 import type { AgentUsageSummary } from "./usage.js";
@@ -103,6 +103,8 @@ export function AssistantThreadSurface({
   preferences,
   reasoningLevels,
   runtimeError,
+  runtimeFailure,
+  runtimeRetry,
   usage,
 }: {
   readonly assetUrl?: (assetId: string) => string;
@@ -139,6 +141,13 @@ export function AssistantThreadSurface({
   readonly preferences: AgentThreadPreferences;
   readonly reasoningLevels: readonly string[];
   readonly runtimeError?: string;
+  readonly runtimeFailure?: AgentTurnFailure;
+  readonly runtimeRetry?: {
+    readonly attempt: number;
+    readonly error: AgentTurnFailure;
+    readonly exhausted?: boolean;
+    readonly maximum: number;
+  };
   readonly usage: AgentUsageSummary;
 }) {
   const eveMessagesById = useMemo(
@@ -211,6 +220,8 @@ export function AssistantThreadSurface({
               message={runtimeError}
               messages={messages}
               onRetry={onRetryRuntimeError}
+              failure={runtimeFailure}
+              retry={runtimeRetry}
             />
           ) : null}
         </div>
@@ -281,26 +292,52 @@ function isSteeringContinuationMessage(message: {
 }
 
 function RuntimeErrorMessage({
+  failure,
   locale,
   message,
   messages,
   onRetry,
+  retry,
 }: {
+  readonly failure?: AgentTurnFailure;
   readonly locale: AgentLocale;
   readonly message: string;
   readonly messages: AgentMessages;
   readonly onRetry?: () => void;
+  readonly retry?: {
+    readonly attempt: number;
+    readonly error: AgentTurnFailure;
+    readonly exhausted?: boolean;
+    readonly maximum: number;
+  };
 }) {
+  const category = classifyAgentFailure(failure ?? { code: "", message });
+  const transient = category !== "unknown";
+  const title = retry?.exhausted
+    ? messages.retryFailed
+    : retry
+      ? `${messages.retryingRequest} (${retry.attempt}/${retry.maximum})`
+      : transient
+        ? messages.retryFailed
+        : locale === "zh-CN" ? "本轮执行失败" : messages.requestFailed;
   return (
     <article className="mx-auto flex w-full max-w-(--thread-max-width) flex-col" data-agent-message-error role="alert">
       <div className="flex items-start gap-3 px-1 text-sm">
         <CircleXIcon className="mt-0.5 size-4 shrink-0 text-destructive" />
         <div className="min-w-0 flex-1">
           <p className="font-medium text-foreground">
-            {locale === "zh-CN" ? "本轮执行失败" : messages.requestFailed}
+            {title}
           </p>
-          <p className="mt-1 break-words text-muted-foreground">{message}</p>
-          <p className="mt-1 text-muted-foreground">{messages.requestPreserved}</p>
+          {!retry?.exhausted ? <p className="mt-1 break-words text-muted-foreground">{message}</p> : null}
+          {retry?.exhausted ? (
+            <>
+              <p className="mt-1 break-words text-muted-foreground">{retry.error.message}</p>
+              <code className="mt-1 block break-all text-xs text-muted-foreground">
+                {retry.error.code || "provider_request_failed"}
+              </code>
+            </>
+          ) : null}
+          {!retry?.exhausted && !retry && !transient ? <p className="mt-1 text-muted-foreground">{messages.requestPreserved}</p> : null}
           {onRetry ? (
             <Button className="mt-2 h-7 px-2.5 text-xs" onClick={onRetry} size="sm" variant="outline">
               <RotateCcwIcon className="size-3.5" />

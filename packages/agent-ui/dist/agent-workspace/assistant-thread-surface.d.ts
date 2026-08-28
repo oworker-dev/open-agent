@@ -2,6 +2,7 @@ import type { MessageStreamEvent } from "eve/client";
 import type { EveMessage } from "eve/react";
 import { type ReactNode } from "react";
 import { type AgentInputResponse } from "./agent-message.js";
+import { type AgentTurnFailure } from "./turn-presentation.js";
 import type { AgentComposerDraftRestore, AgentModelOption, AgentPromptMenuItem, AgentSessionDeliverable, AgentThreadPreferences } from "./contracts.js";
 import type { AgentLocale, AgentMessages } from "./i18n.js";
 import type { AgentUsageSummary } from "./usage.js";
@@ -12,7 +13,7 @@ export type AgentApprovalTakeover = {
     readonly prompt: string;
     readonly toolName: string;
 };
-export declare function AssistantThreadSurface({ assetUrl, approvalTakeover, cancellationState, closedInputRequestIds, commands, composerTop, draftStorageKey, draftRestore, events, eveMessages, fallbackStartedAt, historyHasMore, historyLoading, inputDisabled, isBusy, sessionSettled, onCancel, locale, mentions, messages, models, onInputResponses, onCloseInputRequest, onDraftRestoreConsumed, onOpenDeliverable, onOpenSubagent, onLoadEarlier, onPreferencesChange, onRetryRuntimeError, preferences, reasoningLevels, runtimeError, usage, }: {
+export declare function AssistantThreadSurface({ assetUrl, approvalTakeover, cancellationState, closedInputRequestIds, commands, composerTop, draftStorageKey, draftRestore, events, eveMessages, fallbackStartedAt, historyHasMore, historyLoading, inputDisabled, isBusy, sessionSettled, onCancel, locale, mentions, messages, models, onInputResponses, onCloseInputRequest, onDraftRestoreConsumed, onOpenDeliverable, onOpenSubagent, onLoadEarlier, onPreferencesChange, onRetryRuntimeError, preferences, reasoningLevels, runtimeError, runtimeFailure, runtimeRetry, usage, }: {
     readonly assetUrl?: (assetId: string) => string;
     readonly approvalTakeover?: AgentApprovalTakeover;
     readonly cancellationState: AgentCancellationState;
@@ -45,6 +46,13 @@ export declare function AssistantThreadSurface({ assetUrl, approvalTakeover, can
     readonly preferences: AgentThreadPreferences;
     readonly reasoningLevels: readonly string[];
     readonly runtimeError?: string;
+    readonly runtimeFailure?: AgentTurnFailure;
+    readonly runtimeRetry?: {
+        readonly attempt: number;
+        readonly error: AgentTurnFailure;
+        readonly exhausted?: boolean;
+        readonly maximum: number;
+    };
     readonly usage: AgentUsageSummary;
 }): import("react/jsx-runtime").JSX.Element;
 export declare function AssistantComposer({ approvalTakeover, cancellationState, commands, composerTop, draftStorageKey, draftRestore, inputDisabled, isBusy, sessionSettled, locale, mentions, messages, models, onPreferencesChange, onInputResponses, onCancel, onDraftRestoreConsumed, preferences, reasoningLevels, usage, }: {
