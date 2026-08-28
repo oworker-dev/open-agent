@@ -4,6 +4,8 @@ export const PRODUCTION_PREVIEW_PORTS = Object.freeze({
   web: 3100,
 });
 
+export const PRODUCTION_PREVIEW_DEFAULT_ACTIVE_RUNS = 12;
+
 export function configureEveNextProductionPort(environment = process.env) {
   const configured = environment.EVE_NEXT_PRODUCTION_PORT?.trim();
   const port = configured ? Number(configured) : PRODUCTION_PREVIEW_PORTS.eve;

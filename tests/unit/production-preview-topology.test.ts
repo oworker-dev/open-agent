@@ -4,9 +4,14 @@ import {
   assertBuiltEveProxy,
   assertBuiltEveWorkflowWorld,
   configureEveNextProductionPort,
+  PRODUCTION_PREVIEW_DEFAULT_ACTIVE_RUNS,
   productionPreviewExitCode,
   PRODUCTION_PREVIEW_PORTS,
 } from "../../scripts/production-preview-topology.mjs";
+
+test("keeps preview AgentRun admission within the measured passing level", () => {
+  assert.equal(PRODUCTION_PREVIEW_DEFAULT_ACTIVE_RUNS, 12);
+});
 
 test("uses one default Eve port for the production web build and runtime", () => {
   const environment: Record<string, string | undefined> = {};

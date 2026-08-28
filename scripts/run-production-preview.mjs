@@ -6,6 +6,7 @@ import {
   assertBuiltEveProxy,
   assertBuiltEveWorkflowWorld,
   configureEveNextProductionPort,
+  PRODUCTION_PREVIEW_DEFAULT_ACTIVE_RUNS,
   productionPreviewExitCode,
   PRODUCTION_PREVIEW_PORTS,
 } from "./production-preview-topology.mjs";
@@ -87,8 +88,10 @@ const runtimeEnvironment = {
   // Admission is persisted in PostgreSQL so multiple Web replicas cannot
   // oversubscribe this small single-host preview. Hosts with a scheduler may
   // override both values with their measured safe limits.
-  AGENT_MAX_ACTIVE_RUNS_TOTAL: process.env.AGENT_MAX_ACTIVE_RUNS_TOTAL || "16",
-  AGENT_MAX_ACTIVE_RUNS_PER_TENANT: process.env.AGENT_MAX_ACTIVE_RUNS_PER_TENANT || "16",
+  AGENT_MAX_ACTIVE_RUNS_TOTAL: process.env.AGENT_MAX_ACTIVE_RUNS_TOTAL
+    || String(PRODUCTION_PREVIEW_DEFAULT_ACTIVE_RUNS),
+  AGENT_MAX_ACTIVE_RUNS_PER_TENANT: process.env.AGENT_MAX_ACTIVE_RUNS_PER_TENANT
+    || String(PRODUCTION_PREVIEW_DEFAULT_ACTIVE_RUNS),
   AGENT_RUN_RECONCILE_INTERVAL_MS: process.env.AGENT_RUN_RECONCILE_INTERVAL_MS || "60000",
   AGENT_RUN_RECONCILE_LIMIT: process.env.AGENT_RUN_RECONCILE_LIMIT || "100",
   AGENT_RUN_SUBMISSION_STALE_MS: process.env.AGENT_RUN_SUBMISSION_STALE_MS || "120000",

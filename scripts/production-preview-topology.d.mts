@@ -4,6 +4,8 @@ export const PRODUCTION_PREVIEW_PORTS: Readonly<{
   readonly web: 3100;
 }>;
 
+export const PRODUCTION_PREVIEW_DEFAULT_ACTIVE_RUNS: 12;
+
 export function configureEveNextProductionPort(
   environment?: Record<string, string | undefined>,
 ): number;
