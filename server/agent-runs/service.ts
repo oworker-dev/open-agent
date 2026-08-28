@@ -43,6 +43,20 @@ export type AgentRunCancellationPolicy = {
   readonly sleep: (milliseconds: number) => Promise<void>;
 };
 
+export type AgentRunSubmissionPolicy = {
+  /** Number of bounded database attach attempts after Eve accepts a session. */
+  readonly attachAttempts: number;
+  /** Number of bounded cleanup attempts for an accepted, unbound session. */
+  readonly cleanupAttempts: number;
+  readonly sleep: (milliseconds: number) => Promise<void>;
+};
+
+const DEFAULT_SUBMISSION_POLICY: AgentRunSubmissionPolicy = {
+  attachAttempts: 3,
+  cleanupAttempts: 3,
+  sleep,
+};
+
 export const eveAgentRunRuntime: AgentRunRuntime = {
   cancel: cancelEveAgentRun,
   readEvents: readEveAgentEvents,
@@ -107,8 +121,10 @@ export async function startAgentRun(options: {
   readonly request: ParsedStartAgentRun;
   readonly runtime?: AgentRunRuntime;
   readonly store: AgentRunStore;
+  readonly submissionPolicy?: Partial<AgentRunSubmissionPolicy>;
 }): Promise<StartAgentRunOutcome> {
   const runtime = options.runtime ?? eveAgentRunRuntime;
+  const submissionPolicy = resolveSubmissionPolicy(options.submissionPolicy);
   await validateParent(options.store, options.identity, options.request);
 
   const reservation = await options.store.reserve({
@@ -145,17 +161,13 @@ export async function startAgentRun(options: {
     return { disposition: "replayed", record: reservation.record };
   }
 
+  let session: Awaited<ReturnType<AgentRunRuntime["start"]>>;
   try {
-    const session = await runtime.start(
+    session = await runtime.start(
       options.request,
       reservation.record.runId,
       options.accessToken,
     );
-    const record = await options.store.attachSession(
-      reservation.record.runId,
-      session.sessionId,
-    );
-    return { disposition: "started", record };
   } catch (error) {
     if (error instanceof ClientError && error.status >= 400 && error.status < 500) {
       const record = await options.store.markSubmissionFailed(
@@ -170,6 +182,113 @@ export async function startAgentRun(options: {
     );
     return { disposition: "ambiguous", record };
   }
+
+  try {
+    const record = await attachSessionWithRetry(
+      options.store,
+      reservation.record.runId,
+      session.sessionId,
+      submissionPolicy,
+    );
+    return { disposition: "started", record };
+  } catch {
+    // Eve has accepted the session, so a failed database attach must never
+    // silently release the admission slot while the runtime keeps working.
+    // Reset the exact accepted session before terminally marking the request
+    // ambiguous. If reset cannot be confirmed, keep the reservation in its
+    // submitting state; it remains counted and can be reconciled by an
+    // operator/runtime recovery path instead of becoming an orphan.
+    const cleaned = await resetAcceptedSessionWithRetry(
+      runtime,
+      reservation.record.runId,
+      reservation.record.correlationId,
+      session.sessionId,
+      options.accessToken,
+      submissionPolicy,
+    );
+    if (!cleaned) {
+      const current = await options.store.findOwned(
+        options.identity.tenantId,
+        options.identity.principalId,
+        reservation.record.runId,
+      );
+      return { disposition: "ambiguous", record: current ?? reservation.record };
+    }
+    try {
+      const record = await options.store.markSubmissionAmbiguous(
+        reservation.record.runId,
+        "The Agent runtime accepted a session, but durable attachment failed. The accepted session was reset and the request was not retried.",
+      );
+      return { disposition: "ambiguous", record };
+    } catch {
+      // Cleanup was confirmed, but the terminal write was not. Keep the
+      // reservation visible as submitting so a later reconciliation can
+      // settle it without pretending that the request was safely released.
+      const current = await options.store.findOwned(
+        options.identity.tenantId,
+        options.identity.principalId,
+        reservation.record.runId,
+      );
+      return { disposition: "ambiguous", record: current ?? reservation.record };
+    }
+  }
+}
+
+async function attachSessionWithRetry(
+  store: AgentRunStore,
+  runId: string,
+  sessionId: string,
+  policy: AgentRunSubmissionPolicy,
+): Promise<AgentRunRecord> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= policy.attachAttempts; attempt += 1) {
+    try {
+      return await store.attachSession(runId, sessionId);
+    } catch (error) {
+      lastError = error;
+      if (attempt < policy.attachAttempts) await policy.sleep(submissionRetryDelay(attempt));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("Agent session attachment failed.");
+}
+
+async function resetAcceptedSessionWithRetry(
+  runtime: AgentRunRuntime,
+  runId: string,
+  correlationId: string,
+  sessionId: string,
+  accessToken: string,
+  policy: AgentRunSubmissionPolicy,
+): Promise<boolean> {
+  for (let attempt = 1; attempt <= policy.cleanupAttempts; attempt += 1) {
+    try {
+      await runtime.reset(runId, correlationId, sessionId, accessToken);
+      return true;
+    } catch {
+      if (attempt < policy.cleanupAttempts) await policy.sleep(submissionRetryDelay(attempt));
+    }
+  }
+  return false;
+}
+
+function resolveSubmissionPolicy(input: Partial<AgentRunSubmissionPolicy> | undefined): AgentRunSubmissionPolicy {
+  const attachAttempts = input?.attachAttempts ?? DEFAULT_SUBMISSION_POLICY.attachAttempts;
+  const cleanupAttempts = input?.cleanupAttempts ?? DEFAULT_SUBMISSION_POLICY.cleanupAttempts;
+  if (!Number.isSafeInteger(attachAttempts) || attachAttempts < 1 || attachAttempts > 5) {
+    throw new RangeError("Agent submission attachAttempts must be an integer from 1 to 5.");
+  }
+  if (!Number.isSafeInteger(cleanupAttempts) || cleanupAttempts < 1 || cleanupAttempts > 5) {
+    throw new RangeError("Agent submission cleanupAttempts must be an integer from 1 to 5.");
+  }
+  return {
+    attachAttempts,
+    cleanupAttempts,
+    sleep: input?.sleep ?? DEFAULT_SUBMISSION_POLICY.sleep,
+  };
+}
+
+function submissionRetryDelay(attempt: number): number {
+  return Math.min(1_000, 100 * 2 ** Math.max(0, attempt - 1));
 }
 
 export async function inspectAgentRun(options: {

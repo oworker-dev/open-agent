@@ -4,6 +4,7 @@ import test from "node:test";
 import type { SandboxBackend, SandboxBackendHandle } from "eve/sandbox";
 import {
   SandboxAdmissionError,
+  SandboxAdmissionQueueFullError,
   withSandboxAdmission,
 } from "../../lib/sandbox-admission-backend.ts";
 import { withIdleSandboxShutdown } from "../../lib/idle-sandbox-backend.ts";
@@ -107,6 +108,22 @@ test("times out before allocating a backend when capacity stays full", async () 
   await first.shutdown();
 });
 
+test("bounds the waiting queue before allocating more backend work", async () => {
+  const fixture = fakeBackend();
+  const backend = withSandboxAdmission(fixture.backend, 1, 1_000, { maxQueued: 1 });
+  const first = await backend.create(createInput("session-a"));
+  const waiting = backend.create(createInput("session-b"));
+
+  await assert.rejects(
+    backend.create(createInput("session-c")),
+    (error) => error instanceof SandboxAdmissionQueueFullError && error.code === "SANDBOX_CAPACITY_QUEUE_FULL",
+  );
+  assert.deepEqual(fixture.creates, ["session-a"]);
+
+  await first.shutdown();
+  await (await waiting).shutdown();
+});
+
 test("releases a permit when backend creation fails", async () => {
   const fixture = fakeBackend(new Set(["session-a"]));
   const backend = withSandboxAdmission(fixture.backend, 1, 1_000);
@@ -167,6 +184,7 @@ test("validates admission configuration", () => {
   const fixture = fakeBackend();
   assert.throws(() => withSandboxAdmission(fixture.backend, 0, 1_000), /positive integer/u);
   assert.throws(() => withSandboxAdmission(fixture.backend, 1, 0), /positive integer/u);
+  assert.throws(() => withSandboxAdmission(fixture.backend, 1, 1_000, { maxQueued: 0 }), /maxQueued/u);
 });
 
 function fakeBackend(failures = new Set<string>()): {

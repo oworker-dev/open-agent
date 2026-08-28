@@ -32,6 +32,7 @@ export const DEFAULT_AGENT_SANDBOX_IDLE_TIMEOUT_MS = 30 * 60 * 1_000;
 export const MAX_AGENT_SANDBOX_IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
 export const DEFAULT_AGENT_SANDBOX_MAX_ACTIVE = 2;
 export const DEFAULT_AGENT_SANDBOX_ADMISSION_TIMEOUT_MS = 30_000;
+export const DEFAULT_AGENT_SANDBOX_MAX_QUEUED = 1_024;
 
 export type AgentDockerResourceLimits = {
   readonly memoryBytes: number;
@@ -41,6 +42,7 @@ export type AgentDockerResourceLimits = {
 
 export type AgentSandboxAdmissionConfig = {
   readonly maxActive: number;
+  readonly maxQueued: number;
   readonly timeoutMs: number;
 };
 
@@ -48,21 +50,26 @@ export function readAgentSandboxAdmissionConfig(
   environment: Readonly<Record<string, string | undefined>> = process.env,
 ): AgentSandboxAdmissionConfig {
   const maxActiveRaw = environment.AGENT_SANDBOX_MAX_ACTIVE?.trim();
+  const maxQueuedRaw = environment.AGENT_SANDBOX_MAX_QUEUED?.trim();
   const timeoutRaw = environment.AGENT_SANDBOX_ADMISSION_TIMEOUT_MS?.trim();
-  if (environment.NODE_ENV === "production" && (!maxActiveRaw || !timeoutRaw)) {
+  if (environment.NODE_ENV === "production" && (!maxActiveRaw || !maxQueuedRaw || !timeoutRaw)) {
     throw new Error(
-      "AGENT_SANDBOX_MAX_ACTIVE and AGENT_SANDBOX_ADMISSION_TIMEOUT_MS must be explicitly configured in production.",
+      "AGENT_SANDBOX_MAX_ACTIVE, AGENT_SANDBOX_MAX_QUEUED, and AGENT_SANDBOX_ADMISSION_TIMEOUT_MS must be explicitly configured in production.",
     );
   }
   const maxActive = maxActiveRaw ? Number(maxActiveRaw) : DEFAULT_AGENT_SANDBOX_MAX_ACTIVE;
+  const maxQueued = maxQueuedRaw ? Number(maxQueuedRaw) : DEFAULT_AGENT_SANDBOX_MAX_QUEUED;
   const timeoutMs = timeoutRaw ? Number(timeoutRaw) : DEFAULT_AGENT_SANDBOX_ADMISSION_TIMEOUT_MS;
   if (!Number.isSafeInteger(maxActive) || maxActive < 1 || maxActive > 10_000) {
     throw new Error("AGENT_SANDBOX_MAX_ACTIVE must be an integer from 1 to 10000.");
   }
+  if (!Number.isSafeInteger(maxQueued) || maxQueued < 1 || maxQueued > 100_000) {
+    throw new Error("AGENT_SANDBOX_MAX_QUEUED must be an integer from 1 to 100000.");
+  }
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 300_000) {
     throw new Error("AGENT_SANDBOX_ADMISSION_TIMEOUT_MS must be an integer from 1000 to 300000.");
   }
-  return { maxActive, timeoutMs };
+  return { maxActive, maxQueued, timeoutMs };
 }
 
 export function readAgentSandboxIdleTimeoutMs(

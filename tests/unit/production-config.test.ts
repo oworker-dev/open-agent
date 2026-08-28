@@ -39,6 +39,7 @@ const validEnvironment = {
   AGENT_RUNTIME_URL: "https://agent-runtime.example.com",
   AGENT_SANDBOX_BACKEND: "microsandbox",
   AGENT_SANDBOX_MAX_ACTIVE: "16",
+  AGENT_SANDBOX_MAX_QUEUED: "1024",
   AGENT_SANDBOX_ADMISSION_TIMEOUT_MS: "30000",
   AGENT_SANDBOX_IMAGE: "ghcr.io/oworker/open-agent-sandbox@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   AGENT_SANDBOX_CLEANUP_INTERVAL_MS: "900000",
@@ -260,11 +261,12 @@ test("bounds idle compute shutdown without expiring the durable session", () => 
 });
 
 test("requires bounded host-wide sandbox admission in production", () => {
-  assert.deepEqual(readAgentSandboxAdmissionConfig({}), { maxActive: 2, timeoutMs: 30_000 });
+  assert.deepEqual(readAgentSandboxAdmissionConfig({}), { maxActive: 2, maxQueued: 1_024, timeoutMs: 30_000 });
   assert.deepEqual(readAgentSandboxAdmissionConfig({
     AGENT_SANDBOX_MAX_ACTIVE: "8",
+    AGENT_SANDBOX_MAX_QUEUED: "64",
     AGENT_SANDBOX_ADMISSION_TIMEOUT_MS: "45000",
-  }), { maxActive: 8, timeoutMs: 45_000 });
+  }), { maxActive: 8, maxQueued: 64, timeoutMs: 45_000 });
   assert.throws(
     () => readAgentSandboxAdmissionConfig({ NODE_ENV: "production" }),
     /must be explicitly configured/u,
@@ -272,6 +274,10 @@ test("requires bounded host-wide sandbox admission in production", () => {
   assert.throws(
     () => readAgentSandboxAdmissionConfig({ AGENT_SANDBOX_MAX_ACTIVE: "0" }),
     /AGENT_SANDBOX_MAX_ACTIVE/u,
+  );
+  assert.throws(
+    () => readAgentSandboxAdmissionConfig({ AGENT_SANDBOX_MAX_QUEUED: "0" }),
+    /AGENT_SANDBOX_MAX_QUEUED/u,
   );
 });
 

@@ -201,7 +201,9 @@ Configure sandbox admission and idle compute shutdown for every backend. Eve
 creates a session sandbox only when a sandbox tool or authored
 `ctx.getSandbox()` first needs it. A single Eve process admits at most
 `AGENT_SANDBOX_MAX_ACTIVE` live handles in FIFO order and returns a capacity
-timeout instead of oversubscribing the host. The idle timer releases that permit
+timeout instead of oversubscribing the host. The bounded
+`AGENT_SANDBOX_MAX_QUEUED` queue rejects an overload immediately rather than
+retaining unbounded timers and promises. The idle timer releases that permit
 after a durable checkpoint without retiring the session. For Docker, also run
 the authorized sandbox deletion worker; a stopped container keeps its filesystem
 and the next sandbox access resumes the same `/workspace`.
@@ -209,6 +211,7 @@ and the next sandbox access resumes the same `/workspace`.
 ```bash
 AGENT_SANDBOX_IDLE_TIMEOUT_MS=1800000 \
 AGENT_SANDBOX_MAX_ACTIVE=2 \
+AGENT_SANDBOX_MAX_QUEUED=1024 \
 AGENT_SANDBOX_ADMISSION_TIMEOUT_MS=30000 \
 AGENT_SANDBOX_CLEANUP_INTERVAL_MS=900000 \
 AGENT_SANDBOX_CLEANUP_MAX_SESSIONS=25 \
@@ -434,6 +437,13 @@ archive into memory. Copy the output to the deployment's host-controlled object
 store and restore it into an isolated Workflow World with a reviewed adapter
 before enabling any purge. These commands never delete hot rows or infer
 ownership.
+
+AgentRun startup has a post-acceptance cleanup guard. A transient database
+failure while binding Eve's accepted session is retried, and an unbound session
+is reset before its admission slot is released. A cleanup failure is reported
+as recovery-pending while the `submitting` reservation remains active; restore
+the runtime/database path and let the reconciler settle it instead of retrying
+the same idempotency key.
 
 ### Single-server capacity matrix
 

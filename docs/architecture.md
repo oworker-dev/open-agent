@@ -123,6 +123,13 @@ Child-agent views use the same contract and storage adapter as root threads;
 they do not call Eve `snapshot()` when a bounded host adapter is available.
 This keeps parent and child navigation consistent while ensuring a long-lived
 child cannot trigger an index-zero replay or a second unbounded SSE reader.
+AgentRun startup treats runtime acceptance and durable attachment as separate
+boundaries. After Eve accepts a session, the service retries the database
+attachment with a small bounded budget. If attachment still fails, it resets
+that exact Eve session before releasing the reservation as ambiguous. If reset
+or settlement cannot be confirmed, the reservation remains `submitting` and
+continues to consume an admission slot; this prevents an accepted Eve turn and
+its sandbox from becoming an untracked orphan.
 Writes are serialized `PATCH` requests that
 carry changed threads and deleted IDs rather than every conversation history.
 Pending messages, accepted session IDs, input pauses, errors, and turn/session
@@ -371,7 +378,10 @@ isolation tests there. Single-tenant Docker deployments also require
 Open Agent applies them with `docker update` immediately after each session is
 created or reattached and fails closed if Docker reports different values.
 Every backend also uses `AGENT_SANDBOX_MAX_ACTIVE` and
-`AGENT_SANDBOX_ADMISSION_TIMEOUT_MS` to bound live handles in one Eve process.
+`AGENT_SANDBOX_ADMISSION_TIMEOUT_MS` to bound live handles in one Eve process,
+plus `AGENT_SANDBOX_MAX_QUEUED` to bound waiting sessions and memory during a
+burst. A full queue fails before a backend is allocated; it is not a
+conversation or event-history limit.
 After each durable sandbox checkpoint, the idle timer stops compute but
 preserves the container filesystem and reconnect metadata. A later sandbox call
 reattaches the same `/workspace` and reacquires a FIFO permit. These are

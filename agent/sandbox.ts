@@ -82,7 +82,7 @@ function withManagedSandboxCapacity<BO, SO>(
   idleTimeoutMs: number,
 ): SandboxBackend<BO, SO> {
   return withIdleSandboxShutdown(
-    withSandboxAdmission(backend, admission.maxActive, admission.timeoutMs),
+    withSandboxAdmission(backend, admission.maxActive, admission.timeoutMs, { maxQueued: admission.maxQueued }),
     idleTimeoutMs,
     {
       onIdleShutdownError(error, sessionKey) {

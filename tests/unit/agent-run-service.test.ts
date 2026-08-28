@@ -707,6 +707,58 @@ test("submission ambiguity is persisted and never automatically resubmitted", as
   assert.equal(runtime.calls.start, 1);
 });
 
+test("retries durable Eve session attachment before cleaning up", async () => {
+  const store = new AttachFailureStore(2);
+  const runtime = fakeRuntime();
+  const outcome = await startAgentRun({
+    accessToken: "token",
+    identity: user,
+    request: parseRequest({ idempotencyKey: "request-attach-retry", message: "Retry attach" }),
+    runtime,
+    store,
+    submissionPolicy: { attachAttempts: 3, cleanupAttempts: 1, sleep: async () => undefined },
+  });
+
+  assert.equal(outcome.disposition, "started");
+  assert.equal(outcome.record.status, "running");
+  assert.equal(store.attachAttempts, 3);
+  assert.equal(runtime.calls.reset, 0);
+});
+
+test("resets an accepted Eve session before releasing a failed attachment", async () => {
+  const store = new AttachFailureStore(3);
+  const runtime = fakeRuntime();
+  const outcome = await startAgentRun({
+    accessToken: "token",
+    identity: user,
+    request: parseRequest({ idempotencyKey: "request-attach-cleanup", message: "Clean up" }),
+    runtime,
+    store,
+    submissionPolicy: { attachAttempts: 2, cleanupAttempts: 2, sleep: async () => undefined },
+  });
+
+  assert.equal(outcome.disposition, "ambiguous");
+  assert.equal(outcome.record.status, "submission-ambiguous");
+  assert.equal(runtime.calls.reset, 1);
+});
+
+test("keeps the admission reservation active when accepted-session cleanup fails", async () => {
+  const store = new AttachFailureStore(3);
+  const runtime = fakeRuntime({ resetError: new Error("runtime unavailable") });
+  const outcome = await startAgentRun({
+      accessToken: "token",
+      identity: user,
+      request: parseRequest({ idempotencyKey: "request-attach-stuck", message: "Keep admitted" }),
+      runtime,
+      store,
+      submissionPolicy: { attachAttempts: 1, cleanupAttempts: 2, sleep: async () => undefined },
+    });
+  assert.equal(outcome.disposition, "ambiguous");
+  const pending = [...store.records.values()][0];
+  assert.equal(pending?.status, "submitting");
+  assert.equal(runtime.calls.reset, 2);
+});
+
 test("a definitive Eve 4xx rejection becomes a failed run", async () => {
   const store = new MemoryAgentRunStore();
   const runtime = fakeRuntime({ startError: new ClientError(403, "forbidden") });
@@ -857,6 +909,7 @@ function fakeRuntime(options: {
   readonly cancelError?: Error;
   readonly cancelStatus?: "accepted" | "no_active_turn";
   readonly events?: readonly MessageStreamEvent[];
+  readonly resetError?: Error;
   readonly startError?: Error;
 } = {}): AgentRunRuntime & {
   readonly calls: {
@@ -897,6 +950,7 @@ function fakeRuntime(options: {
     },
     async reset() {
       calls.reset += 1;
+      if (options.resetError) throw options.resetError;
       return "reset";
     },
     async start() {
@@ -1101,6 +1155,22 @@ class MemoryAgentRunStore implements AgentRunStore {
     };
     this.records.set(runId, record);
     return record;
+  }
+}
+
+class AttachFailureStore extends MemoryAgentRunStore {
+  readonly failures: number;
+  attachAttempts = 0;
+
+  constructor(failures: number) {
+    super();
+    this.failures = failures;
+  }
+
+  override async attachSession(runId: string, sessionId: string) {
+    this.attachAttempts += 1;
+    if (this.attachAttempts <= this.failures) throw new Error("database unavailable");
+    return super.attachSession(runId, sessionId);
   }
 }
 

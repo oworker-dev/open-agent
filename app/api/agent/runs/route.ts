@@ -75,7 +75,12 @@ export async function POST(request: Request): Promise<Response> {
         outcome.record.failure?.code ?? "agent_run_submission_failed",
         outcome.record.failure?.message ?? "The AgentRun could not be submitted.",
         { run: toAgentRunSnapshot(outcome.record) },
-        agentRunHeaders(outcome.record),
+        {
+          ...agentRunHeaders(outcome.record),
+          ...(outcome.disposition === "ambiguous" && outcome.record.status === "submitting"
+            ? { "retry-after": "2" }
+            : {}),
+        },
       );
     }
     return agentRunResponse(

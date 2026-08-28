@@ -15,6 +15,15 @@ export class SandboxAdmissionError extends Error {
   }
 }
 
+export class SandboxAdmissionQueueFullError extends Error {
+  readonly code = "SANDBOX_CAPACITY_QUEUE_FULL";
+
+  constructor(maxQueued: number) {
+    super(`Sandbox admission queue is full (${maxQueued} waiting sessions).`);
+    this.name = "SandboxAdmissionQueueFullError";
+  }
+}
+
 type Waiter = {
   readonly reject: (error: Error) => void;
   readonly resolve: () => void;
@@ -37,6 +46,8 @@ export function withSandboxAdmission<BO, SO>(
   limit: number,
   timeoutMs: number,
   options: {
+    /** Maximum number of distinct sessions allowed to wait for a permit. */
+    readonly maxQueued?: number;
     readonly onStats?: (stats: SandboxAdmissionStats) => void;
   } = {},
 ): SandboxBackend<BO, SO> {
@@ -45,6 +56,10 @@ export function withSandboxAdmission<BO, SO>(
   }
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
     throw new Error("sandbox admission timeoutMs must be a positive integer.");
+  }
+  const maxQueued = options.maxQueued ?? Math.max(1_024, limit * 128);
+  if (!Number.isSafeInteger(maxQueued) || maxQueued < 1 || maxQueued > 100_000) {
+    throw new Error("sandbox admission maxQueued must be an integer from 1 to 100000.");
   }
 
   const active = new Map<string, ActiveSession>();
@@ -89,6 +104,9 @@ export function withSandboxAdmission<BO, SO>(
     if (permitsInUse < limit && waiters.length === 0) {
       permitsInUse += 1;
       return;
+    }
+    if (waiters.length >= maxQueued) {
+      throw new SandboxAdmissionQueueFullError(maxQueued);
     }
     await new Promise<void>((resolve, reject) => {
       const waiter: Waiter = {
