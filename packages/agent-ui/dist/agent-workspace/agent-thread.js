@@ -255,6 +255,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         host: connection.host,
         initialEvents: thread.events,
         initialSession: connection.initialSession,
+        optimistic: false,
         onError: (error) => {
             if (isRecoverableStreamError(error) &&
                 Boolean(sessionRef.current?.state.sessionId) &&
@@ -792,7 +793,11 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         const waitsForDurableBoundary = Boolean(durableSession);
         if (!waitsForDurableBoundary) {
             cancellationRef.current = { requested: false };
+            stopAgent();
         }
+        setOptimisticPendingTurn((current) => current
+            ? { ...current, state: "interrupted" }
+            : current);
         setCancellationState(waitsForDurableBoundary ? "requested" : "idle");
         pendingTurnRef.current = interruptedPendingTurn;
         onChange({

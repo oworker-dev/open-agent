@@ -425,6 +425,11 @@ export function AgentThreadView({
     host: connection.host,
     initialEvents: thread.events,
     initialSession: connection.initialSession,
+    // The workspace owns the single pending-turn projection. Eve's default
+    // optimistic `client.message.submitted` event is intentionally disabled:
+    // admission retries would otherwise append one optimistic user message
+    // per attempt before the durable `message.received` acknowledgement.
+    optimistic: false,
     onError: (error) => {
       // A response stream can fail after Eve has durably accepted the turn
       // (for example ERR_INCOMPLETE_CHUNKED_ENCODING from a proxy). Treat
@@ -1133,7 +1138,19 @@ export function AgentThreadView({
       // No Eve session exists yet, so the optimistic submission can be
       // stopped locally and there is no server-side turn to await.
       cancellationRef.current = { requested: false };
+      // Abort the in-flight session admission as well. Without this, a slow
+      // gateway response can arrive after the user pressed Stop and Eve will
+      // still open a live stream for the request that was already cancelled.
+      stopAgent();
     }
+    // Keep the submitted prompt visible after a local stop, but remove it from
+    // the in-flight admission state immediately. Otherwise the browser-only
+    // optimistic copy remains `submitting` after the durable pending turn is
+    // marked `interrupted`, leaving `isBusy` true and the composer stuck on
+    // the stop control until a full remount.
+    setOptimisticPendingTurn((current) => current
+      ? { ...current, state: "interrupted" }
+      : current);
     setCancellationState(waitsForDurableBoundary ? "requested" : "idle");
     pendingTurnRef.current = interruptedPendingTurn;
     onChange({

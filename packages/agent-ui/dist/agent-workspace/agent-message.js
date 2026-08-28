@@ -1210,7 +1210,22 @@ function QuestionnaireResponseForm({ acceptsFreeform, canRespond, locale, onInpu
         }, children: [_jsxs(QuestionnaireItem, { name: "response", required: true, children: [_jsx(QuestionnaireTitle, { className: "sr-only", children: prompt }), _jsxs(QuestionnaireChoices, { children: [options.map((option) => (_jsxs(QuestionnaireChoice, { checked: selectedOptionId === option.id, className: option.style === "danger" ? "border-destructive/40 data-checked:bg-destructive/10" : option.style === "primary" ? "data-checked:border-primary/50" : undefined, disabled: !canRespond, onChange: (event) => setSelectedOptionId(event.currentTarget.checked ? option.id : ""), value: option.id, children: [_jsx("span", { className: cn("min-w-0 break-words font-medium", option.style === "danger" && "text-destructive"), children: option.label }), option.description ? _jsx(QuestionnaireChoiceDescription, { children: option.description }) : null] }, option.id))), acceptsFreeform ? (_jsxs(_Fragment, { children: [_jsx(QuestionnaireChoice, { checked: !selectedOptionId && hasFreeformAnswer, className: "hidden", value: FREEFORM_OPTION_ID, children: localize(locale, "Freeform answer", "补充回答") }), _jsx("textarea", { "aria-label": options.length > 0 ? localize(locale, "Additional information", "补充信息") : localize(locale, "Answer", "回答"), className: "min-h-20 w-full resize-y rounded-lg border border-border/70 bg-transparent px-3 py-2 text-sm leading-5 outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-50", disabled: !canRespond, onChange: (event) => setFreeformText(event.currentTarget.value), placeholder: options.length > 0 ? localize(locale, "Add context (optional)", "补充信息（可选）") : localize(locale, "Type your answer", "输入你的回答"), value: freeformText })] })) : null] }), _jsx(QuestionnaireError, { children: localize(locale, "Choose an option or add information to continue.", "请选择一个选项或补充信息后继续。") })] }), _jsx("div", { className: "flex justify-end pt-1", children: _jsx(QuestionnaireSubmit, { disabled: !canRespond, children: localize(locale, "Confirm", "确认") }) })] }));
 }
 function TurnFailure({ failure, locale }) {
+    if (isRetryableTurnFailure(failure)) {
+        return (_jsx(RetryStatus, { locale: locale, retry: {
+                attempt: 1,
+                error: failure,
+                exhausted: true,
+                maximum: 3,
+            } }));
+    }
     return (_jsxs("div", { className: "mt-2 flex items-start gap-2 px-1 py-1.5 text-sm", role: "alert", children: [_jsx(XCircleIcon, { className: "mt-0.5 size-4 shrink-0 text-destructive" }), _jsxs("div", { className: "min-w-0 flex-1", children: [_jsx("p", { className: "font-medium text-destructive", children: failureTitle(locale, failure) }), _jsx("p", { className: "mt-1 break-words text-muted-foreground", children: sanitizeFailureMessage(failure.message) }), _jsx("code", { className: "mt-1.5 block text-xs text-muted-foreground", children: failure.code })] })] }));
+}
+function isRetryableTurnFailure(failure) {
+    const category = classifyAgentFailure(failure);
+    if (category === "unknown")
+        return false;
+    const value = `${failure.code} ${failure.message}`.toLocaleLowerCase();
+    return !/\b(?:401|403|unauthori[sz]ed|forbidden|rejected|invalid[_ -]?request)\b/u.test(value);
 }
 function failureTitle(locale, failure) {
     switch (classifyAgentFailure(failure)) {

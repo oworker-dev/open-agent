@@ -2527,6 +2527,22 @@ function QuestionnaireResponseForm({
 }
 
 function TurnFailure({ failure, locale }: { readonly failure: { readonly code: string; readonly message: string }; readonly locale: AgentLocale }) {
+  // Eve may retry a provider/model step internally and only expose the final
+  // terminal boundary. Keep that failure in the same retry presentation used
+  // by step-level failures instead of showing a mismatched generic banner.
+  if (isRetryableTurnFailure(failure)) {
+    return (
+      <RetryStatus
+        locale={locale}
+        retry={{
+          attempt: 1,
+          error: failure,
+          exhausted: true,
+          maximum: 3,
+        }}
+      />
+    );
+  }
   return (
     <div className="mt-2 flex items-start gap-2 px-1 py-1.5 text-sm" role="alert">
       <XCircleIcon className="mt-0.5 size-4 shrink-0 text-destructive" />
@@ -2537,6 +2553,13 @@ function TurnFailure({ failure, locale }: { readonly failure: { readonly code: s
       </div>
     </div>
   );
+}
+
+function isRetryableTurnFailure(failure: { readonly code: string; readonly message: string }): boolean {
+  const category = classifyAgentFailure(failure);
+  if (category === "unknown") return false;
+  const value = `${failure.code} ${failure.message}`.toLocaleLowerCase();
+  return !/\b(?:401|403|unauthori[sz]ed|forbidden|rejected|invalid[_ -]?request)\b/u.test(value);
 }
 
 function failureTitle(locale: AgentLocale, failure: { readonly code: string; readonly message: string }): string {

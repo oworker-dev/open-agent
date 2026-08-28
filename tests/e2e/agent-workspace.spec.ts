@@ -220,6 +220,67 @@ test("composer clears immediately while a turn is still being accepted", async (
   await expect(page.getByText("Accepted.", { exact: true })).toBeVisible({ timeout: 5_000 });
 });
 
+test("transient session admission errors retry with a stable bounded counter", async ({ page }) => {
+  let attempts = 0;
+  await page.route("**/eve/v1/session", async (route) => {
+    attempts += 1;
+    if (attempts === 1 || attempts === 2) {
+      await route.fulfill({
+        body: JSON.stringify({ code: attempts === 1 ? "provider_unavailable" : "gateway_busy", error: "The model Provider is temporarily unavailable." }),
+        contentType: "application/json",
+        status: attempts === 1 ? 503 : 502,
+      });
+      return;
+    }
+    await route.fulfill({
+      body: JSON.stringify({ sessionId: "retry-session" }),
+      contentType: "application/json",
+      status: 200,
+    });
+  });
+  await page.route("**/eve/v1/session/retry-session/stream**", async (route) => {
+    await route.fulfill({
+      body: mockSuccessfulTurn("Retry this request", "Recovered after retry."),
+      contentType: "application/x-ndjson",
+      status: 200,
+    });
+  });
+  await page.goto("/");
+  const composer = page.getByRole("textbox", { name: "Do anything" });
+  await composer.fill("Retry this request");
+  await composer.press("Enter");
+  await expect(composer).toHaveText("", { timeout: 300 });
+  await expect(page.getByText("Retrying request (1/3)", { exact: true })).toBeVisible({ timeout: 3_000 });
+  await expect(page.getByText("Recovered after retry.", { exact: true })).toBeVisible({ timeout: 8_000 });
+  expect(attempts).toBe(3);
+});
+
+test("a terminal Provider turn failure uses the retry presentation at its Agent message", async ({ page }) => {
+  const sessionId = "provider-failure-session";
+  await page.route("**/eve/v1/session", async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({ sessionId }),
+      contentType: "application/json",
+      status: 200,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
+    await route.fulfill({
+      body: mockProviderFailureTurn("Build the enterprise website"),
+      contentType: "application/x-ndjson",
+      status: 200,
+    });
+  });
+
+  await page.goto("/");
+  const composer = page.getByRole("textbox", { name: "Do anything" });
+  await composer.fill("Build the enterprise website");
+  await composer.press("Enter");
+  await expect(page.getByText(/Retry failed/)).toBeVisible({ timeout: 8_000 });
+  await expect(page.getByRole("log").getByText("Build the enterprise website", { exact: true })).toHaveCount(1);
+  await expect(page.getByText("This turn failed", { exact: true })).toHaveCount(0);
+});
+
 test("root stays clean and an unsent draft survives refresh", async ({ page }) => {
   await page.goto("/");
   const composer = page.getByRole("textbox", { name: "Do anything" });
@@ -1281,9 +1342,8 @@ test("a transport failure preserves the original request without inventing a con
   const original = "Build the enterprise website and publish a preview";
   await composer.fill(original);
   await composer.press("Enter");
-  await expect(page.getByText("This turn failed")).toBeVisible();
-  await expect(page.getByText(original, { exact: true })).toBeVisible();
-  await expect(page.getByText("Your original request is preserved in this session.")).toBeVisible();
+  await expect(page.getByText("Retry failed", { exact: true })).toBeVisible();
+  await expect(page.getByRole("log").getByText(original, { exact: true })).toHaveCount(1);
   await expect(page.getByRole("button", { name: "Continue" })).toHaveCount(0);
   await expect(page.getByRole("textbox", { name: "Do anything" })).toBeVisible();
 });
@@ -3814,6 +3874,21 @@ function mockSuccessfulTurn(message: string, reply: string, sequence = 0): strin
     { data: { finishReason: "stop", message: reply, sequence, stepIndex: 0, turnId }, meta: { at }, type: "message.completed" },
     { data: { finishReason: "stop", sequence, stepIndex: 0, turnId, usage: { inputTokens: 1, outputTokens: 1 } }, meta: { at }, type: "step.completed" },
     { data: { sequence, turnId }, meta: { at }, type: "turn.completed" },
+    { data: { wait: "next-user-message" }, meta: { at }, type: "session.waiting" },
+  ];
+  return `${events.map((event) => JSON.stringify(event)).join("\n")}\n`;
+}
+
+function mockProviderFailureTurn(message: string): string {
+  const at = new Date().toISOString();
+  const turnId = "turn_provider_failure";
+  const events = [
+    { data: { runtime: { agentId: "open-agent", agentName: "open-agent", eveVersion: "test", modelId: "mock/model" } }, meta: { at }, type: "session.started" },
+    { data: { sequence: 0, turnId }, meta: { at }, type: "turn.started" },
+    { data: { message, parts: [{ text: message, type: "text" }], sequence: 0, turnId }, meta: { at }, type: "message.received" },
+    { data: { sequence: 0, stepIndex: 0, turnId }, meta: { at }, type: "step.started" },
+    { data: { code: "MODEL_CALL_FAILED", message: "The model Provider request timed out.", sequence: 0, stepIndex: 0, turnId }, meta: { at }, type: "step.failed" },
+    { data: { code: "MODEL_CALL_FAILED", message: "The model Provider request timed out.", sequence: 0, turnId }, meta: { at }, type: "turn.failed" },
     { data: { wait: "next-user-message" }, meta: { at }, type: "session.waiting" },
   ];
   return `${events.map((event) => JSON.stringify(event)).join("\n")}\n`;

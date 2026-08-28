@@ -804,26 +804,22 @@ export function AssistantComposer({
                * DOM anchor preserves the assistant-ui cancellation contract
                * without changing the visual one-button interaction.
                */}
-              <ComposerPrimitive.Cancel asChild>
-                <Button
-                  aria-hidden={!(stopping || (runtimeBusy && composerIsEmpty))}
-                  aria-label={cancellationState === "idle" ? messages.cancel : messages.stopping}
-                  className={cn("size-9 shrink-0 rounded-full sm:size-8", !(stopping || (runtimeBusy && composerIsEmpty)) && "hidden")}
-                  disabled={cancellationState !== "idle" || !(stopping || (runtimeBusy && composerIsEmpty))}
-                  onClick={() => {
-                    if (!isRunning) onCancel?.();
-                  }}
-                  size="icon-sm"
-                  tabIndex={stopping || (runtimeBusy && composerIsEmpty) ? 0 : -1}
-                  type="button"
-                >
-                  {cancellationState === "idle" ? (
-                    <SquareIcon className="size-3.5 fill-current" />
-                  ) : (
-                    <LoaderCircleIcon className="size-4 animate-spin" />
-                  )}
-                </Button>
-              </ComposerPrimitive.Cancel>
+              <Button
+                aria-hidden={!(stopping || (runtimeBusy && composerIsEmpty))}
+                aria-label={cancellationState === "idle" ? messages.cancel : messages.stopping}
+                className={cn("size-9 shrink-0 rounded-full sm:size-8", !(stopping || (runtimeBusy && composerIsEmpty)) && "hidden")}
+                disabled={cancellationState !== "idle" || !(stopping || (runtimeBusy && composerIsEmpty))}
+                onClick={() => onCancel?.()}
+                size="icon-sm"
+                tabIndex={stopping || (runtimeBusy && composerIsEmpty) ? 0 : -1}
+                type="button"
+              >
+                {cancellationState === "idle" ? (
+                  <SquareIcon className="size-3.5 fill-current" />
+                ) : (
+                  <LoaderCircleIcon className="size-4 animate-spin" />
+                )}
+              </Button>
               <Button
                 aria-hidden={stopping || (runtimeBusy && composerIsEmpty)}
                 aria-label={runtimeBusy ? messages.queueFollowUp : messages.send}
