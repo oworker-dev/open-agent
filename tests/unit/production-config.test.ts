@@ -95,13 +95,16 @@ test("database pool timeouts are bounded and defaulted", () => {
   const defaults = readAgentDatabaseConfig({ AGENT_DATABASE_URL: "postgresql://agent:secret@db.internal:5432/open_agent" });
   assert.equal(defaults?.connectionTimeoutMillis, 10_000);
   assert.equal(defaults?.idleTimeoutMillis, 30_000);
+  assert.equal(defaults?.queryTimeoutMillis, 15_000);
   const configured = readAgentDatabaseConfig({
     AGENT_DATABASE_URL: "postgresql://agent:secret@db.internal:5432/open_agent",
     AGENT_DATABASE_CONNECTION_TIMEOUT_MS: "5000",
     AGENT_DATABASE_IDLE_TIMEOUT_MS: "60000",
+    AGENT_DATABASE_QUERY_TIMEOUT_MS: "12000",
   });
   assert.equal(configured?.connectionTimeoutMillis, 5_000);
   assert.equal(configured?.idleTimeoutMillis, 60_000);
+  assert.equal(configured?.queryTimeoutMillis, 12_000);
   assert.throws(
     () => readAgentDatabaseConfig({
       AGENT_DATABASE_URL: "postgresql://agent:secret@db.internal:5432/open_agent",

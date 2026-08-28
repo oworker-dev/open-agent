@@ -196,7 +196,16 @@ export async function startAgentRun(options: {
     // `submitting`. If the process exits before cleanup, the reconciler can
     // then reset this exact session instead of releasing an unknown task.
     try {
-      await options.store.bindSubmissionSession?.(reservation.record.runId, session.sessionId);
+      const bound = await options.store.bindSubmissionSession?.(
+        reservation.record.runId,
+        session.sessionId,
+      );
+      // An attach response can be lost after its transaction commits. The
+      // binding lookup then returns the already-running row; do not reset a
+      // live Eve session in that case.
+      if (bound?.status === "running" && bound.sessionId === session.sessionId) {
+        return { disposition: "started", record: bound };
+      }
     } catch {
       // A database outage can make this write impossible. The cleanup below
       // still runs, and the reservation remains submitting if it cannot be

@@ -10,6 +10,8 @@ export type AgentDatabaseConfig = {
   readonly connectionTimeoutMillis?: number;
   /** Release idle clients so a quiet replica does not retain all database slots. */
   readonly idleTimeoutMillis?: number;
+  /** Abort a PostgreSQL query that is blocked or slow beyond this bound. */
+  readonly queryTimeoutMillis?: number;
   readonly maxPoolSize: number;
   readonly schema: string;
 };
@@ -17,6 +19,7 @@ export type AgentDatabaseConfig = {
 const DEFAULT_SCHEMA = "open_agent";
 export const DEFAULT_AGENT_DATABASE_CONNECTION_TIMEOUT_MS = 10_000;
 export const DEFAULT_AGENT_DATABASE_IDLE_TIMEOUT_MS = 30_000;
+export const DEFAULT_AGENT_DATABASE_QUERY_TIMEOUT_MS = 15_000;
 const globalAgentDatabase = globalThis as typeof globalThis & {
   __openAgentDatabasePools?: Map<string, Pool>;
 };
@@ -48,6 +51,11 @@ export function readAgentDatabaseConfig(
     "AGENT_DATABASE_IDLE_TIMEOUT_MS",
     DEFAULT_AGENT_DATABASE_IDLE_TIMEOUT_MS,
   );
+  const queryTimeoutMillis = readBoundedMillis(
+    environment.AGENT_DATABASE_QUERY_TIMEOUT_MS,
+    "AGENT_DATABASE_QUERY_TIMEOUT_MS",
+    DEFAULT_AGENT_DATABASE_QUERY_TIMEOUT_MS,
+  );
 
   return {
     connectionString,
@@ -55,6 +63,7 @@ export function readAgentDatabaseConfig(
     maxActiveRunsPerTenant: readOptionalBoundedLimit(environment.AGENT_MAX_ACTIVE_RUNS_PER_TENANT, "AGENT_MAX_ACTIVE_RUNS_PER_TENANT"),
     connectionTimeoutMillis,
     idleTimeoutMillis,
+    queryTimeoutMillis,
     maxPoolSize,
     schema,
   };
@@ -81,7 +90,8 @@ function readBoundedMillis(value: string | undefined, name: string, fallback: nu
 export function getAgentDatabasePool(config: AgentDatabaseConfig): Pool {
   const connectionTimeoutMillis = config.connectionTimeoutMillis ?? DEFAULT_AGENT_DATABASE_CONNECTION_TIMEOUT_MS;
   const idleTimeoutMillis = config.idleTimeoutMillis ?? DEFAULT_AGENT_DATABASE_IDLE_TIMEOUT_MS;
-  const key = `${config.connectionString}\u0000${config.maxPoolSize}\u0000${connectionTimeoutMillis}\u0000${idleTimeoutMillis}`;
+  const queryTimeoutMillis = config.queryTimeoutMillis ?? DEFAULT_AGENT_DATABASE_QUERY_TIMEOUT_MS;
+  const key = `${config.connectionString}\u0000${config.maxPoolSize}\u0000${connectionTimeoutMillis}\u0000${idleTimeoutMillis}\u0000${queryTimeoutMillis}`;
   const pools = globalAgentDatabase.__openAgentDatabasePools ??= new Map();
   const existing = pools.get(key);
   if (existing) return existing;
@@ -91,6 +101,7 @@ export function getAgentDatabasePool(config: AgentDatabaseConfig): Pool {
     connectionString: config.connectionString,
     connectionTimeoutMillis,
     idleTimeoutMillis,
+    query_timeout: queryTimeoutMillis,
     max: config.maxPoolSize,
   });
   pools.set(key, pool);
@@ -119,6 +130,69 @@ export function getAgentDatabasePoolStats(): readonly {
     idle: pool.idleCount,
     waiting: pool.waitingCount,
   }));
+}
+
+export type AgentRunAdmissionStats = {
+  readonly available: true;
+  readonly activeRuns: number;
+  readonly byStatus: Readonly<Record<string, number>>;
+  readonly oldestActiveAt: string | null;
+};
+
+/**
+ * Read low-cardinality AgentRun admission counters for protected diagnostics.
+ * This intentionally returns no tenant ids, prompts, or result payloads. The
+ * query uses the partial status index and is safe to sample during load tests.
+ */
+export async function getAgentRunAdmissionStats(
+  config: AgentDatabaseConfig,
+  pool: Pick<Pool, "query"> = getAgentDatabasePool(config),
+): Promise<AgentRunAdmissionStats> {
+  const table = `${quoteIdentifier(config.schema)}."agent_runs"`;
+  const result = await pool.query<{
+    status: string;
+    count: string;
+    oldestActiveAt: Date | string | null;
+  }>(
+    `select status,
+            count(*)::text as count,
+            min(updated_at) as "oldestActiveAt"
+       from ${table}
+      where status in ('submitting', 'running', 'waiting-input', 'waiting-authorization')
+      group by status`,
+  );
+  const byStatus: Record<string, number> = {
+    submitting: 0,
+    running: 0,
+    "waiting-input": 0,
+    "waiting-authorization": 0,
+  };
+  let activeRuns = 0;
+  let oldestActiveAt: string | null = null;
+  for (const row of result.rows) {
+    if (!(row.status in byStatus)) throw new Error("Invalid AgentRun admission status.");
+    const count = parseCount(row.count);
+    byStatus[row.status] = count;
+    activeRuns += count;
+    if (row.oldestActiveAt) {
+      const timestamp = row.oldestActiveAt instanceof Date
+        ? row.oldestActiveAt.toISOString()
+        : new Date(row.oldestActiveAt).toISOString();
+      if (!oldestActiveAt || timestamp < oldestActiveAt) oldestActiveAt = timestamp;
+    }
+  }
+  return {
+    available: true,
+    activeRuns,
+    byStatus,
+    oldestActiveAt,
+  };
+}
+
+function parseCount(value: string): number {
+  const count = Number(value);
+  if (!Number.isSafeInteger(count) || count < 0) throw new Error("Invalid AgentRun admission count.");
+  return count;
 }
 
 export function quoteIdentifier(identifier: string): string {

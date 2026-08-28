@@ -52,6 +52,7 @@
     "reap:sandboxes": "node scripts/reap-docker-sandboxes.mjs",
     "reap:workflow": "node scripts/reap-workflow-runs.mjs",
     "archive:workflow": "node scripts/archive-workflow-roots.mjs",
+    "restore:workflow-archive": "node scripts/restore-workflow-archive.mjs",
     "verify:workflow-archive": "node scripts/verify-workflow-archive.mjs",
     "reap:assets": "node scripts/reap-assets.mjs",
     "start:asset-cleanup": "node scripts/run-asset-cleanup-worker.mjs",

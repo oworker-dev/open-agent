@@ -111,8 +111,13 @@ For server-side capacity evidence, expose the protected
 `/api/internal/metrics` route with a random `AGENT_METRICS_SECRET` (at least 32
 bytes), then pass its URL and bearer token as
 `AGENT_*_TARGET_METRICS_URL` and `AGENT_*_TARGET_METRICS_TOKEN` to the stream
-and AgentRun verifiers. The endpoint is read-only and reports only process and
-pool counters; it is not a public Prometheus surface.
+and AgentRun verifiers. The endpoint is read-only and reports only process,
+database-pool, and low-cardinality AgentRun status counters; it is not a public
+Prometheus surface. During a database outage the AgentRun section is marked
+`available: false` rather than reporting misleading zeroes. Set
+`AGENT_DATABASE_QUERY_TIMEOUT_MS` (default 15 seconds, bounded by the same
+database timeout validator) to cap diagnostics and admission queries during a
+database lock or partial outage.
 
 The doctor must pass in the same environment used for the build. In particular,
 `AGENT_EMBED_ALLOWED_ORIGINS` and `EVE_NEXT_PRODUCTION_PORT` are build inputs.
@@ -428,15 +433,21 @@ terminal history in PostgreSQL and use the audit for storage forecasting. Never
 delete individual child runs or stream chunks, and never use an event-count,
 payload-size, or conversation-length threshold as retention policy.
 
-The repository provides the non-destructive first half of that lifecycle:
+The repository provides a non-destructive export and a guarded restore path:
 `npm run archive:workflow -- --root-run-id <id> --output <file>` exports a
 complete terminal root tree as bounded, line-oriented records with binary fields
 encoded explicitly, and `npm run verify:workflow-archive -- <file>` validates
 record counts, per-table counts, and the SHA-256 manifest without loading the
-archive into memory. Copy the output to the deployment's host-controlled object
-store and restore it into an isolated Workflow World with a reviewed adapter
-before enabling any purge. These commands never delete hot rows or infer
-ownership.
+archive into memory. `npm run restore:workflow-archive -- <file>` performs the
+same streaming validation and is read-only by default. For a restore drill,
+prepare a separately migrated Workflow World database, set
+`WORKFLOW_ARCHIVE_RESTORE_URL`, then pass `--execute` together with
+`WORKFLOW_ARCHIVE_RESTORE_CONFIRM=1`. The command refuses an unknown table,
+duplicate row, missing root member, existing root collision, or missing target
+table and commits all rows in one transaction. It never creates tables, deletes
+hot rows, or infers ownership. A successful restore is still a data-integrity
+drill; the selected Eve deployment must subsequently open the restored World
+and pass its session replay gate before any purge is authorized.
 
 AgentRun startup has a post-acceptance cleanup guard. A transient database
 failure while binding Eve's accepted session is retried, and an unbound session

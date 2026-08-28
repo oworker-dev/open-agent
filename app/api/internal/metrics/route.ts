@@ -1,6 +1,10 @@
 import { timingSafeEqual } from "node:crypto";
 import { monitorEventLoopDelay } from "node:perf_hooks";
-import { getAgentDatabasePoolStats } from "@/server/data/agent-database";
+import {
+  getAgentDatabasePoolStats,
+  getAgentRunAdmissionStats,
+  readAgentDatabaseConfig,
+} from "@/server/data/agent-database";
 
 export const runtime = "nodejs";
 
@@ -25,6 +29,19 @@ export async function GET(request: Request): Promise<Response> {
   const eventLoopP95Ms = Number((eventLoop.percentile(95) / 1e6).toFixed(2));
   const eventLoopMaxMs = Number((eventLoop.max / 1e6).toFixed(2));
   eventLoop.reset();
+  const databaseConfig = readAgentDatabaseConfig();
+  let agentRuns;
+  if (databaseConfig) {
+    try {
+      agentRuns = await getAgentRunAdmissionStats(databaseConfig);
+    } catch {
+      // Diagnostics must remain available during a database incident. The
+      // absence of counters is explicit and never represented as zero work.
+      agentRuns = { available: false as const };
+    }
+  } else {
+    agentRuns = { available: false as const };
+  }
   return Response.json(
     {
       ok: true,
@@ -43,6 +60,7 @@ export async function GET(request: Request): Promise<Response> {
         activeResources: process.getActiveResourcesInfo?.() ?? [],
       },
       agentDatabasePools: getAgentDatabasePoolStats(),
+      agentRuns,
     },
     { headers: { "cache-control": "no-store" } },
   );

@@ -725,6 +725,24 @@ test("retries durable Eve session attachment before cleaning up", async () => {
   assert.equal(runtime.calls.reset, 0);
 });
 
+test("does not reset an Eve session when attach committed before its response was lost", async () => {
+  const store = new LostAttachResponseStore();
+  const runtime = fakeRuntime();
+  const outcome = await startAgentRun({
+    accessToken: "token",
+    identity: user,
+    request: parseRequest({ idempotencyKey: "request-attach-committed", message: "Recover attach" }),
+    runtime,
+    store,
+    submissionPolicy: { attachAttempts: 1, cleanupAttempts: 1, sleep: async () => undefined },
+  });
+
+  assert.equal(outcome.disposition, "started");
+  assert.equal(outcome.record.status, "running");
+  assert.equal(outcome.record.sessionId, "session-1");
+  assert.equal(runtime.calls.reset, 0);
+});
+
 test("resets an accepted Eve session before releasing a failed attachment", async () => {
   const store = new AttachFailureStore(3);
   const runtime = fakeRuntime();
@@ -1180,6 +1198,19 @@ class AttachFailureStore extends MemoryAgentRunStore {
     this.attachAttempts += 1;
     if (this.attachAttempts <= this.failures) throw new Error("database unavailable");
     return super.attachSession(runId, sessionId);
+  }
+}
+
+class LostAttachResponseStore extends MemoryAgentRunStore {
+  private lostResponse = true;
+
+  override async attachSession(runId: string, sessionId: string) {
+    const record = await super.attachSession(runId, sessionId);
+    if (this.lostResponse) {
+      this.lostResponse = false;
+      throw new Error("database response lost after commit");
+    }
+    return record;
   }
 }
 

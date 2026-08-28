@@ -33,7 +33,7 @@ for that topology.
 | Result artifacts | Static preview and bounded artifact stores exist | Keep as output projection; do not use it for user uploads |
 | Vision | `view_image` validates signatures, bounds payloads, resizes oversized images, and emits typed file output | Verify provider capability negotiation and visual rendering across hosts |
 | Host SDK and Muses bridge | Contracts, client, host, UI, and MCP packages exist as alpha artifacts | Publish only after cross-host, auth, quota, and failure conformance |
-| Capacity | Deterministic unit/build gates, non-destructive root-tree retention audit, versioned Workflow archive export/checksum validation, disk-safe sequential and mixed capacity matrices, continuous target metrics, Workflow storage deltas, explicit connection-versus-distinct-session evidence, and real Docker sandbox admission/lifecycle evidence exist | No current real 1k/5k/10k distinct-session run, deployed SLO, target-backend sandbox evidence at scale, isolated archive restore/replay drill, or ten-thousand-user capacity report |
+| Capacity | Deterministic unit/build gates, non-destructive root-tree retention audit, versioned Workflow archive export/checksum validation, guarded streaming restore into a pre-migrated isolated World, disk-safe sequential and mixed capacity matrices, continuous target metrics, Workflow storage deltas, explicit connection-versus-distinct-session evidence, and real Docker sandbox admission/lifecycle evidence exist | No current real 1k/5k/10k distinct-session run, deployed SLO, target-backend sandbox evidence at scale, isolated archive restore/replay against a live Eve deployment, or ten-thousand-user capacity report |
 
 The current upload and vision contract is specified in
 [Assets, Uploads, And Vision](./assets-and-vision.md). That document is a
@@ -324,12 +324,15 @@ retry hint when capacity is exhausted. This is the first safety boundary; a
 future distributed scheduler should move queued work behind the same contract
 instead of removing the gate or adding process-local semaphores.
 
-The Agent PostgreSQL pool now has bounded connection checkout and idle-client
-timeouts (`AGENT_DATABASE_CONNECTION_TIMEOUT_MS` and
-`AGENT_DATABASE_IDLE_TIMEOUT_MS`). The active-run query is backed by partial
-indexes on status and tenant, so admission remains cheap as terminal history
-grows. `npm run doctor:host` provides read-only host/cgroup/Docker evidence and
-fails closed for low free disk or memory before a load test starts.
+The Agent PostgreSQL pool now has bounded connection checkout, query, and
+idle-client timeouts (`AGENT_DATABASE_CONNECTION_TIMEOUT_MS`,
+`AGENT_DATABASE_QUERY_TIMEOUT_MS`, and `AGENT_DATABASE_IDLE_TIMEOUT_MS`). The
+active-run query is backed by partial indexes on status and tenant, so admission
+remains cheap as terminal history grows. Protected metrics expose active-run
+counts and the oldest active timestamp, while reporting `available: false` if
+the database cannot answer in time. `npm run doctor:host` provides read-only
+host/cgroup/Docker evidence and fails closed for low free disk or memory before
+a load test starts.
 
 Sandbox allocation remains lazy per durable session. Docker compute is stopped
 after a durable idle boundary and reattached to the preserved `/workspace` on
@@ -361,6 +364,12 @@ Collect CPU, memory, event-loop lag, database pool usage, queue age, provider
 latency/error rate, object-store throughput, active sandboxes, mount bytes,
 reconnect count, and SLO/error-budget data. Keep prompts and sensitive outputs
 out of telemetry.
+
+Workflow retention now has a guarded restore command. The command validates the
+archive in a streaming pass and can insert it transactionally into an already
+migrated isolated World only after an explicit operator confirmation. It is a
+restore-integrity gate, not permission to purge hot history; a live Eve replay
+against that restored World remains a deployment-specific release gate.
 
 ## Delivery order
 
