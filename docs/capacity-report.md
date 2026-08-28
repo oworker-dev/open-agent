@@ -71,6 +71,16 @@ message events. This proves the local archive restore/replay path; an external
 deployment drill with the exact production image and credentials is still
 required before any hot-history deletion policy is approved.
 
+After the 2026-08-28 production-preview restart, the stream-recovery gate was
+rerun against the rebuilt Eve gateway. It observed 49 canonical events, forced
+two client disconnects at cursor 4, recovered the remaining 45 events with one
+reconnect, matched the complete stable-event-id sequence, and retired the
+synthetic sandbox. A same-build 100-session distinct-stream run then established
+100/100 connections with p95 handshake 289 ms, zero seed failures, zero
+unexpected disconnects, and zero cleanup failures; all 100 synthetic sessions
+were retired. These are regression and conservative operating-point results,
+not a maximum-capacity claim.
+
 The public preview now terminates traffic in a dedicated loopback-only gateway
 instead of asking Next's compiled rewrite proxy to carry Eve streams. The
 legacy proxy instantiated a fixed `maxSockets: 256` HTTP agent and applied a
