@@ -331,3 +331,11 @@ fixture was removed after verification.
 These are regression measurements only. The large capacity matrix remains
 intentionally unstarted unless an isolated Workflow database volume provides
 adequate disk headroom; the separate planning levels above are unchanged.
+
+The same post-cleanup build also passed a bounded mixed smoke with 20 pooled
+SSE followers over four durable sessions and one concurrent AgentRun. All 20
+connections established with zero errors or unexpected disconnects (handshake
+p95 43 ms); the AgentRun completed without error in 21.9 s and the load
+generator event-loop p95 was 20.5 ms. The stream fixtures and AgentRun session
+were retired after the run. Provider completion latency is reported separately
+and is not treated as a host-saturation measurement.
