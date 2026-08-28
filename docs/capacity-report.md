@@ -305,3 +305,29 @@ against this shared Workflow volume. No maximum user count is claimed from the
 recheck. The current conservative planning envelope remains 1,000 pooled
 connections, 100 distinct sessions, and 12 active AgentRuns, each as a separate
 dimension.
+
+## 2026-08-28 post-cleanup verification
+
+The non-destructive host preflight initially refused the capacity matrix with
+1.57 GiB free disk. The only space reclaimed in this pass was the rebuildable
+local npm cache (about 1.2 GiB); no Workflow rows, user assets, or sandbox
+workspaces were removed. The resulting preflight reported 2.79 GiB free disk,
+3.0 GiB available memory, four CPUs, no swap, and 975 stopped/zero running Eve
+sandbox containers.
+
+On the same `9fd6e6c` production preview, stream recovery observed 40 canonical
+events. Two forced disconnects at cursor 4 recovered the remaining 36 events
+with one reconnect and an exact stable-event-id sequence match; the synthetic
+session and sandbox were reset and removed. The AgentRun API and pinned Docker
+sandbox runtime gates also passed.
+
+The real PostgreSQL + MinIO + ClamAV asset gate passed quota reservation,
+externalized publication objects, malware rejection, expiry and stale multipart
+cleanup. A 100 MiB direct multipart upload completed in 1.415 s (70.66 MiB/s),
+with one interrupted-part retry, zero failures, and 403 isolation responses for
+both a different tenant and a different principal in the same tenant. The
+fixture was removed after verification.
+
+These are regression measurements only. The large capacity matrix remains
+intentionally unstarted unless an isolated Workflow database volume provides
+adequate disk headroom; the separate planning levels above are unchanged.
