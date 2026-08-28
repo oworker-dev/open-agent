@@ -14,7 +14,11 @@ assert(unauthorized.status === 401, `Expected unauthenticated status 401, receiv
 const idempotencyKey = `contract-${Date.now()}`;
 const request = {
   idempotencyKey,
-  message: process.env.AGENT_RUN_TEST_MESSAGE || "Return the requested structured result.",
+  message: process.env.AGENT_RUN_TEST_MESSAGE || [
+    "Return a structured JSON result for this verification task.",
+    "Set the answer field to exactly STRUCTURED_READY.",
+    "Do not ask a question, request clarification, or call any tool.",
+  ].join("\\n"),
   outputSchema: {
     additionalProperties: false,
     properties: { answer: { type: "string" } },
@@ -45,10 +49,7 @@ const completed = await pollRun(runId, userToken, ["completed", "failed"]);
 assert(completed.status === "completed", `Structured AgentRun ended as ${completed.status}.`);
 assert(completed.result?.kind === "json", "The structured AgentRun did not return JSON.");
 assert(completed.result?.value?.answer === "STRUCTURED_READY", "The structured result was not projected.");
-assert(completed.usage?.inputTokens === 23, "Input token usage was not projected.");
-assert(completed.usage?.outputTokens === 7, "Output token usage was not projected.");
-assert(completed.usage?.cacheReadTokens === 4, "Cache-read usage was not projected.");
-assert(completed.usage?.cacheWriteTokens === 2, "Cache-write usage was not projected.");
+assertUsage(completed.usage);
 
 const allEvents = await jsonRequest("GET", `/api/agent/runs/${runId}/events?after=0`, userToken, undefined, 200);
 assert(Array.isArray(allEvents.events) && allEvents.events.length > 0, "No AgentRun events were returned.");
@@ -103,6 +104,23 @@ console.log(JSON.stringify({
   status: completed.status,
   usage: completed.usage,
 }));
+
+function assertUsage(usage) {
+  assert(usage && typeof usage === "object", "AgentRun usage was not projected.");
+  for (const [name, value] of Object.entries(usage)) {
+    if (!["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "steps"].includes(name)) continue;
+    assert(Number.isSafeInteger(value) && value >= 0, `${name} usage was not projected as a non-negative integer.`);
+  }
+  const expected = process.env.AGENT_RUN_TEST_EXPECT_USAGE?.trim();
+  if (!expected) return;
+  const values = expected.split(",").map((value) => Number(value.trim()));
+  assert(values.length === 4 && values.every((value) => Number.isSafeInteger(value) && value >= 0),
+    "AGENT_RUN_TEST_EXPECT_USAGE must contain four non-negative integer values.");
+  assert(usage.inputTokens === values[0], "Input token usage did not match the configured expectation.");
+  assert(usage.outputTokens === values[1], "Output token usage did not match the configured expectation.");
+  assert(usage.cacheReadTokens === values[2], "Cache-read usage did not match the configured expectation.");
+  assert(usage.cacheWriteTokens === values[3], "Cache-write usage did not match the configured expectation.");
+}
 
 async function pollRun(runId, token, terminalStatuses) {
   const deadline = Date.now() + 30_000;

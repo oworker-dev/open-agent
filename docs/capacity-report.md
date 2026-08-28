@@ -275,3 +275,30 @@ capacity runner's 2 GiB default safety margin. The v2 preflight correctly
 refused to start a new matrix. Run the next capacity campaign on an isolated
 database volume with enough headroom; lowering the margin on this host would
 turn the load generator into a production-data availability risk.
+
+## 2026-08-28 production-preview recheck
+
+The rebuilt local production preview passed the following bounded gates without
+changing the durable-history policy:
+
+- Stream recovery forced two disconnects at cursor 4, recovered 39 events with
+  one reconnect, matched the complete stable-event-id sequence, and retired its
+  synthetic session and sandbox.
+- One 100 MiB direct multipart upload completed at 34.44 MiB/s with one
+  interrupted-part retry. Cross-tenant and cross-principal reads returned 403;
+  the object was removed by the verifier.
+- The AgentRun API completed a structured result with a live Provider, preserved
+  idempotent replay and event cursors, and accepted cancellation. Usage is
+  checked as non-negative integer counters because live Provider token counts
+  are not the deterministic fixture values.
+- The dedicated gateway established 1,000 pooled SSE followers over eight
+  durable sessions with zero errors or unexpected disconnects; handshake p95 was
+  209 ms and target Web RSS remained about 217 MiB. This is connection fan-out
+  evidence, not 1,000-user or distinct-session capacity.
+
+The full 1k/5k/10k stream, active-turn, and mixed capacity matrix remains
+blocked by the host's 1.6 GiB free-disk level and is intentionally not run
+against this shared Workflow volume. No maximum user count is claimed from the
+recheck. The current conservative planning envelope remains 1,000 pooled
+connections, 100 distinct sessions, and 12 active AgentRuns, each as a separate
+dimension.
