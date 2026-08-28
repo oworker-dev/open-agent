@@ -3,7 +3,14 @@ import type { MessageStreamEvent } from "eve/client";
 import { compactThreadEvents } from "@oworker/open-agent-ui/agent-workspace";
 const threadStores = new WeakMap<Page, FakeThreadStore>();
 
-test.beforeEach(async ({ page }) => {
+test.beforeEach(async ({ page }, testInfo) => {
+  // The live provider test must exercise the real standalone auth and
+  // PostgreSQL-backed thread storage. The in-memory route below intentionally
+  // omits Set-Cookie, which would make Eve's browser request look unauthenticated
+  // even though the production route correctly issues open_agent_anonymous.
+  if (process.env.RUN_AGENT_LIVE_E2E === "1" && testInfo.title.includes("real conversation survives refresh")) {
+    return;
+  }
   const store: FakeThreadStore = {
     collection: { threads: [], version: 1 },
     revision: 0,
