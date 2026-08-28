@@ -86,6 +86,10 @@ export function getWorkflowDatabasePool(config: WorkflowDatabaseConfig): Pool {
     connectionString: config.connectionString,
     connectionTimeoutMillis: config.connectionTimeoutMillis,
     idleTimeoutMillis: config.idleTimeoutMillis,
+    // Keep the database-side timeout aligned with the client timeout so a
+    // metrics or control-plane query cannot linger after its HTTP request is
+    // gone.
+    statement_timeout: config.queryTimeoutMillis,
     query_timeout: config.queryTimeoutMillis,
     max: config.maxPoolSize,
   });

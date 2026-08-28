@@ -51,7 +51,10 @@ Override `AGENT_DATABASE_CONNECTION_TIMEOUT_MS` and
 values are validated between 100 ms and 5 minutes. A database outage should
 surface as a recoverable error, not leave an HTTP request waiting forever.
 `AGENT_DATABASE_QUERY_TIMEOUT_MS` bounds statements at 15 seconds by default
-and is validated by the production doctor. The reference Web thread-storage
+and is validated by the production doctor. The pool applies this value both as
+the client wait timeout and PostgreSQL's `statement_timeout`, so cancelling an
+HTTP request does not leave the server-side query consuming a connection. The
+reference Web thread-storage
 client also bounds asynchronous access-token resolution and aborts a read after
 15 seconds, retrying only transient GET failures with bounded backoff; writes
 are never automatically replayed. Keep

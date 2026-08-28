@@ -101,6 +101,10 @@ export function getAgentDatabasePool(config: AgentDatabaseConfig): Pool {
     connectionString: config.connectionString,
     connectionTimeoutMillis,
     idleTimeoutMillis,
+    // query_timeout aborts the client-side wait. statement_timeout also asks
+    // PostgreSQL to cancel the server-side statement, so a blocked query does
+    // not keep occupying a pooled connection after the caller has timed out.
+    statement_timeout: queryTimeoutMillis,
     query_timeout: queryTimeoutMillis,
     max: config.maxPoolSize,
   });
