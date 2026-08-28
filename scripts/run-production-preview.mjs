@@ -103,7 +103,9 @@ const runtimeEnvironment = {
   AGENT_PROVIDER_MODE: "live",
   AGENT_PUBLIC_BASE_URL: publicOrigin,
   AGENT_RUNTIME_URL: `http://127.0.0.1:${EVE_PORT}`,
-  AGENT_SANDBOX_BACKEND: "docker",
+  // Docker remains the local-preview default, while allowing a deployment to
+  // select a provider-owned backend without starting the Docker-only reaper.
+  AGENT_SANDBOX_BACKEND: process.env.AGENT_SANDBOX_BACKEND?.trim() || "docker",
   AGENT_SANDBOX_MAX_ACTIVE: process.env.AGENT_SANDBOX_MAX_ACTIVE || "2",
   AGENT_SANDBOX_MAX_QUEUED: process.env.AGENT_SANDBOX_MAX_QUEUED || "1024",
   AGENT_SANDBOX_ADMISSION_TIMEOUT_MS: process.env.AGENT_SANDBOX_ADMISSION_TIMEOUT_MS || "30000",
@@ -202,10 +204,16 @@ try {
     env: runtimeEnvironment,
     stdio: "inherit",
   });
-  spawnManaged("sandbox-cleanup-worker", process.execPath, ["scripts/run-sandbox-cleanup-worker.mjs"], {
-    env: runtimeEnvironment,
-    stdio: "inherit",
-  });
+  // The cleanup worker owns Docker's exact-session reaper. Alternate
+  // backends (microVM/remote sandbox) provide their own lifecycle controller
+  // and must not cause the preview supervisor to fail at startup by launching
+  // a Docker-only worker.
+  if (runtimeEnvironment.AGENT_SANDBOX_BACKEND === "docker") {
+    spawnManaged("sandbox-cleanup-worker", process.execPath, ["scripts/run-sandbox-cleanup-worker.mjs"], {
+      env: runtimeEnvironment,
+      stdio: "inherit",
+    });
+  }
   spawnManaged("run-reconciler", process.execPath, ["scripts/run-agent-run-reconciler.mjs"], {
     env: runtimeEnvironment,
     stdio: "inherit",

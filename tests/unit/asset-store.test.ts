@@ -237,6 +237,76 @@ test("filesystem asset store binds a provisional browser upload once", async () 
   }
 });
 
+test("filesystem asset completion serializes concurrent callers", async () => {
+  const root = await mkdtemp(join(tmpdir(), "open-agent-assets-"));
+  try {
+    let releaseScan!: () => void;
+    let signalScanStarted!: () => void;
+    const scanStarted = new Promise<void>((resolve) => { signalScanStarted = resolve; });
+    const scanGate = new Promise<void>((resolve) => { releaseScan = resolve; });
+    let scanCalls = 0;
+    const store = createFilesystemAssetStore({
+      root,
+      scanMode: "required",
+      scanner: {
+        async scan() {
+          scanCalls += 1;
+          signalScanStarted();
+          await scanGate;
+          return { status: "clean" as const };
+        },
+      },
+    });
+    const upload = await store.createUpload({
+      filename: "concurrent.txt",
+      mediaType: "text/plain",
+      owner,
+      sessionId: "session-1",
+      sizeBytes: 1,
+    });
+    await store.writePart({ content: new Uint8Array([0x41]), owner, partNumber: 1, uploadId: upload.uploadId });
+
+    const first = store.completeUpload({ owner, uploadId: upload.uploadId });
+    await scanStarted;
+    const second = store.completeUpload({ owner, uploadId: upload.uploadId });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(scanCalls, 1, "a second completion must wait for the first lifecycle mutation");
+    releaseScan();
+    const [firstAsset, secondAsset] = await Promise.all([first, second]);
+    assert.equal(scanCalls, 1);
+    assert.equal(firstAsset.assetId, secondAsset.assetId);
+    assert.equal(secondAsset.status, "ready");
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("filesystem asset binding allows only one concurrent session claim", async () => {
+  const root = await mkdtemp(join(tmpdir(), "open-agent-assets-"));
+  try {
+    const store = createFilesystemAssetStore({ root });
+    const upload = await store.createUpload({
+      filename: "claim.txt",
+      mediaType: "text/plain",
+      owner,
+      sessionId: "browser-tab-claim",
+      sizeBytes: 1,
+    });
+    await store.writePart({ content: new Uint8Array([0x41]), owner, partNumber: 1, uploadId: upload.uploadId });
+    const asset = await store.completeUpload({ owner, uploadId: upload.uploadId });
+
+    const [first, second] = await Promise.all([
+      store.bindAssetSession?.({ assetId: asset.assetId, owner, sessionId: "session-a" }),
+      store.bindAssetSession?.({ assetId: asset.assetId, owner, sessionId: "session-b" }),
+    ]);
+    assert.equal([first, second].filter(Boolean).length, 1);
+    const bound = await store.findAsset(asset.assetId, owner);
+    assert.ok(bound?.sessionId === "session-a" || bound?.sessionId === "session-b");
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
 test("filesystem asset store removes expired objects and abandoned uploads", async () => {
   const root = await mkdtemp(join(tmpdir(), "open-agent-assets-"));
   try {

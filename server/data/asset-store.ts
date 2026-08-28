@@ -67,6 +67,10 @@ let cachedS3AssetStore: {
 // must live at module scope. A per-store map would not protect two concurrent
 // HTTP requests that each resolve the environment into a fresh adapter.
 const filesystemQuotaLocks = new Map<string, Promise<void>>();
+// The filesystem adapter is a development/custom-host implementation, but it
+// can still receive concurrent HTTP requests. Serialize mutations for one
+// upload/asset so metadata cannot be lost between read and atomic rename.
+const filesystemLifecycleLocks = new Map<string, Promise<void>>();
 
 /**
  * Host bootstrap hook. Muses or another deployment can register an S3/R2/GCS
@@ -138,120 +142,130 @@ export function createFilesystemAssetStore(options: FilesystemAssetStoreOptions)
       if (input.content.byteLength === 0 || input.content.byteLength > MAX_ASSET_PART_BYTES) {
         throw new AssetStoreError("quota", `Asset parts must be between 1 byte and ${MAX_ASSET_PART_BYTES} bytes.`);
       }
-      const record = await readUpload(root, input.uploadId);
-      assertOwner(record.owner, input.owner);
-      if (record.status !== "uploading") throw new AssetStoreError("conflict", "The asset upload is no longer writable.");
-      if (input.partNumber > (record.partCount ?? 1)) {
-        throw new AssetStoreError("invalid", "The asset part number exceeds the declared object size.");
-      }
-      const previous = record.parts[String(input.partNumber)];
-      const currentTotal = Object.entries(record.parts).reduce(
-        (sum, [number, part]) => sum + (Number(number) === input.partNumber ? 0 : part.sizeBytes),
-        0,
-      ) + input.content.byteLength;
-      if (currentTotal > record.sizeBytes) throw new AssetStoreError("quota", "Uploaded parts exceed the declared asset size.");
-      const digest = createHash("sha256").update(input.content).digest("hex");
-      const part: AssetPart = { etag: digest, partNumber: input.partNumber, sizeBytes: input.content.byteLength };
-      const partPath = uploadPartPath(root, input.uploadId, input.partNumber);
-      await mkdir(dirname(partPath), { recursive: true });
-      await writeFile(partPath, input.content);
-      const next: UploadRecord = { ...record, parts: { ...record.parts, [String(input.partNumber)]: part } };
-      await writeJson(uploadPath(root, input.uploadId), next);
-      return previous && previous.etag === part.etag ? previous : part;
+      return withFilesystemLifecycleLock(root, `upload:${input.uploadId}`, async () => {
+        const record = await readUpload(root, input.uploadId);
+        assertOwner(record.owner, input.owner);
+        if (record.status !== "uploading") throw new AssetStoreError("conflict", "The asset upload is no longer writable.");
+        if (input.partNumber > (record.partCount ?? 1)) {
+          throw new AssetStoreError("invalid", "The asset part number exceeds the declared object size.");
+        }
+        const previous = record.parts[String(input.partNumber)];
+        const currentTotal = Object.entries(record.parts).reduce(
+          (sum, [number, part]) => sum + (Number(number) === input.partNumber ? 0 : part.sizeBytes),
+          0,
+        ) + input.content.byteLength;
+        if (currentTotal > record.sizeBytes) throw new AssetStoreError("quota", "Uploaded parts exceed the declared asset size.");
+        const digest = createHash("sha256").update(input.content).digest("hex");
+        const part: AssetPart = { etag: digest, partNumber: input.partNumber, sizeBytes: input.content.byteLength };
+        const partPath = uploadPartPath(root, input.uploadId, input.partNumber);
+        await mkdir(dirname(partPath), { recursive: true });
+        await writeFile(partPath, input.content);
+        const next: UploadRecord = { ...record, parts: { ...record.parts, [String(input.partNumber)]: part } };
+        await writeJson(uploadPath(root, input.uploadId), next);
+        return previous && previous.etag === part.etag ? previous : part;
+      });
     },
 
     async completeUpload(input) {
-      const record = await readUpload(root, input.uploadId);
-      assertOwner(record.owner, input.owner);
-      if (record.status === "ready") {
-        const existing = await readAssetMetadata(root, record.assetId);
-        if (existing) return existing;
-      }
-      if (record.status !== "uploading") throw new AssetStoreError("conflict", "The asset upload cannot be completed.");
-      const partNumbers = Object.keys(record.parts).map(Number).sort((a, b) => a - b);
-      if (partNumbers.length !== record.partCount || partNumbers.some((part, index) => part !== index + 1)) {
-        throw new AssetStoreError("invalid", "All asset parts must be uploaded before completion.");
-      }
-      const totalBytes = partNumbers.reduce((sum, part) => sum + record.parts[String(part)].sizeBytes, 0);
-      if (totalBytes !== record.sizeBytes) throw new AssetStoreError("invalid", "Uploaded bytes do not match the declared asset size.");
-
-      const temporaryPath = join(root, "assets", `.complete-${record.assetId}-${randomUUID()}`);
-      await mkdir(dirname(temporaryPath), { recursive: true });
-      const destination = createWriteStream(temporaryPath, { flags: "wx" });
-      const digest = createHash("sha256");
-      try {
-        for (const partNumber of partNumbers) {
-          const source = createReadStream(uploadPartPath(root, input.uploadId, partNumber));
-          for await (const chunk of source) {
-            digest.update(chunk);
-            if (!destination.write(chunk)) await once(destination, "drain");
+      return withFilesystemLifecycleLock(root, `upload:${input.uploadId}`, async () => {
+        const record = await readUpload(root, input.uploadId);
+        assertOwner(record.owner, input.owner);
+        return withFilesystemLifecycleLock(root, `asset:${record.assetId}`, async () => {
+          if (record.status === "ready") {
+            const existing = await readAssetMetadata(root, record.assetId);
+            if (existing) return existing;
           }
-        }
-        destination.end();
-        await once(destination, "close");
-      } catch (error) {
-        destination.destroy();
-        await rm(temporaryPath, { force: true });
-        throw error;
-      }
-      const checksumSha256 = digest.digest("hex");
-      if (input.checksumSha256 && input.checksumSha256 !== checksumSha256) {
-        await rm(temporaryPath, { force: true });
-        throw new AssetStoreError("invalid", "The completed asset checksum does not match.");
-      }
-        const metadata: AssetMetadata = {
-          assetId: record.assetId,
-        checksumSha256,
-        createdAt: record.createdAt,
-        expiresAt: record.expiresAt,
-        filename: record.filename,
-        ...(record.messageId ? { messageId: record.messageId } : {}),
-          mediaType: record.mediaType,
-          ...(record.owner.principalType ? { principalType: record.owner.principalType } : {}),
-          ...(record.owner.issuer ? { issuer: record.owner.issuer } : {}),
-        principalId: record.owner.principalId,
-        sessionId: record.sessionId,
-        sizeBytes: record.sizeBytes,
-        status: "ready",
-        scanStatus: scanMode === "disabled" ? "disabled" : "scanning",
-        storageKey: `assets/${record.assetId}/content`,
-        tenantId: record.owner.tenantId,
-      };
-      const destinationDirectory = join(root, "assets", record.assetId);
-      await mkdir(destinationDirectory, { recursive: true });
-      await rename(temporaryPath, join(destinationDirectory, "content"));
-      await writeJson(join(destinationDirectory, "meta.json"), metadata);
-      const scanned = await scanAsset(
-        metadata,
-        scanMode,
-        options.scanner,
-        async () => {
-          const download = await openFilesystemReadStream(root, metadata);
-          if (!download) throw new Error("The asset could not be read for scanning.");
-          return download.stream;
-        },
-      );
-      await writeJson(join(destinationDirectory, "meta.json"), scanned);
-      await writeJson(uploadPath(root, input.uploadId), {
-        ...record,
-        scanStatus: scanned.scanStatus,
-        status: "ready",
+          if (record.status !== "uploading") throw new AssetStoreError("conflict", "The asset upload cannot be completed.");
+          const partNumbers = Object.keys(record.parts).map(Number).sort((a, b) => a - b);
+          if (partNumbers.length !== record.partCount || partNumbers.some((part, index) => part !== index + 1)) {
+            throw new AssetStoreError("invalid", "All asset parts must be uploaded before completion.");
+          }
+          const totalBytes = partNumbers.reduce((sum, part) => sum + record.parts[String(part)].sizeBytes, 0);
+          if (totalBytes !== record.sizeBytes) throw new AssetStoreError("invalid", "Uploaded bytes do not match the declared asset size.");
+
+          const temporaryPath = join(root, "assets", `.complete-${record.assetId}-${randomUUID()}`);
+          await mkdir(dirname(temporaryPath), { recursive: true });
+          const destination = createWriteStream(temporaryPath, { flags: "wx" });
+          const digest = createHash("sha256");
+          try {
+            for (const partNumber of partNumbers) {
+              const source = createReadStream(uploadPartPath(root, input.uploadId, partNumber));
+              for await (const chunk of source) {
+                digest.update(chunk);
+                if (!destination.write(chunk)) await once(destination, "drain");
+              }
+            }
+            destination.end();
+            await once(destination, "close");
+          } catch (error) {
+            destination.destroy();
+            await rm(temporaryPath, { force: true });
+            throw error;
+          }
+          const checksumSha256 = digest.digest("hex");
+          if (input.checksumSha256 && input.checksumSha256 !== checksumSha256) {
+            await rm(temporaryPath, { force: true });
+            throw new AssetStoreError("invalid", "The completed asset checksum does not match.");
+          }
+          const metadata: AssetMetadata = {
+            assetId: record.assetId,
+            checksumSha256,
+            createdAt: record.createdAt,
+            expiresAt: record.expiresAt,
+            filename: record.filename,
+            ...(record.messageId ? { messageId: record.messageId } : {}),
+            mediaType: record.mediaType,
+            ...(record.owner.principalType ? { principalType: record.owner.principalType } : {}),
+            ...(record.owner.issuer ? { issuer: record.owner.issuer } : {}),
+            principalId: record.owner.principalId,
+            sessionId: record.sessionId,
+            sizeBytes: record.sizeBytes,
+            status: "ready",
+            scanStatus: scanMode === "disabled" ? "disabled" : "scanning",
+            storageKey: `assets/${record.assetId}/content`,
+            tenantId: record.owner.tenantId,
+          };
+          const destinationDirectory = join(root, "assets", record.assetId);
+          await mkdir(destinationDirectory, { recursive: true });
+          await rename(temporaryPath, join(destinationDirectory, "content"));
+          await writeJson(join(destinationDirectory, "meta.json"), metadata);
+          const scanned = await scanAsset(
+            metadata,
+            scanMode,
+            options.scanner,
+            async () => {
+              const download = await openFilesystemReadStream(root, metadata);
+              if (!download) throw new Error("The asset could not be read for scanning.");
+              return download.stream;
+            },
+          );
+          await writeJson(join(destinationDirectory, "meta.json"), scanned);
+          await writeJson(uploadPath(root, input.uploadId), {
+            ...record,
+            scanStatus: scanned.scanStatus,
+            status: "ready",
+          });
+          return scanned;
+        });
       });
-      return scanned;
     },
 
     async abortUpload(input) {
-      const record = await readUpload(root, input.uploadId);
-      assertOwner(record.owner, input.owner);
-      if (record.status === "ready") throw new AssetStoreError("conflict", "A completed asset cannot be aborted.");
-      await rm(join(root, "uploads", input.uploadId), { force: true, recursive: true });
+      await withFilesystemLifecycleLock(root, `upload:${input.uploadId}`, async () => {
+        const record = await readUpload(root, input.uploadId);
+        assertOwner(record.owner, input.owner);
+        if (record.status === "ready") throw new AssetStoreError("conflict", "A completed asset cannot be aborted.");
+        await rm(join(root, "uploads", input.uploadId), { force: true, recursive: true });
+      });
     },
 
     async deleteAsset(input) {
-      const metadata = await readAssetMetadata(root, input.assetId);
-      if (!metadata) return;
-      assertOwner({ principalId: metadata.principalId, tenantId: metadata.tenantId }, input.owner);
-      await rm(join(root, "assets", input.assetId), { force: true, recursive: true });
+      await withFilesystemLifecycleLock(root, `asset:${input.assetId}`, async () => {
+        const metadata = await readAssetMetadata(root, input.assetId);
+        if (!metadata) return;
+        assertOwner({ principalId: metadata.principalId, tenantId: metadata.tenantId }, input.owner);
+        await rm(join(root, "assets", input.assetId), { force: true, recursive: true });
+      });
     },
 
     async getQuota(owner) {
@@ -275,14 +289,16 @@ export function createFilesystemAssetStore(options: FilesystemAssetStoreOptions)
       assertIdentifier(input.assetId, "assetId");
       assertIdentifier(input.sessionId, "sessionId");
       assertOwnerInput(input.owner);
-      const metadata = await readAssetMetadata(root, input.assetId);
-      if (!metadata) return undefined;
-      assertOwner({ tenantId: metadata.tenantId, principalId: metadata.principalId }, input.owner);
-      if (metadata.sessionId === input.sessionId) return metadata;
-      if (!metadata.sessionId.startsWith("browser-") || metadata.status !== "ready") return undefined;
-      const rebound = { ...metadata, sessionId: input.sessionId } satisfies AssetMetadata;
-      await writeJson(join(root, "assets", input.assetId, "meta.json"), rebound);
-      return rebound;
+      return withFilesystemLifecycleLock(root, `asset:${input.assetId}`, async () => {
+        const metadata = await readAssetMetadata(root, input.assetId);
+        if (!metadata) return undefined;
+        assertOwner({ tenantId: metadata.tenantId, principalId: metadata.principalId }, input.owner);
+        if (metadata.sessionId === input.sessionId) return metadata;
+        if (!metadata.sessionId.startsWith("browser-") || metadata.status !== "ready") return undefined;
+        const rebound = { ...metadata, sessionId: input.sessionId } satisfies AssetMetadata;
+        await writeJson(join(root, "assets", input.assetId, "meta.json"), rebound);
+        return rebound;
+      });
     },
 
     async findAsset(assetId, owner) {
@@ -339,24 +355,29 @@ export function createFilesystemAssetStore(options: FilesystemAssetStoreOptions)
       ] as const));
       for (const assetId of assetIds) {
         if (deletedAssets >= limit) break;
-        const metadata = await readAssetMetadata(root, assetId);
-        if (!metadata || !metadata.expiresAt || Date.parse(metadata.expiresAt) > now) continue;
-        await rm(join(root, "assets", assetId), { force: true, recursive: true });
-        for (const [uploadId, upload] of uploads) {
-          if (upload?.assetId === assetId) await rm(join(root, "uploads", uploadId), { force: true, recursive: true });
-        }
-        deletedAssets += 1;
+        await withFilesystemLifecycleLock(root, `asset:${assetId}`, async () => {
+          const metadata = await readAssetMetadata(root, assetId);
+          if (!metadata || !metadata.expiresAt || Date.parse(metadata.expiresAt) > now) return;
+          await rm(join(root, "assets", assetId), { force: true, recursive: true });
+          for (const [uploadId, upload] of uploads) {
+            if (upload?.assetId === assetId) await rm(join(root, "uploads", uploadId), { force: true, recursive: true });
+          }
+          deletedAssets += 1;
+        });
       }
 
       // A failed client may leave a multipart upload with no completed asset
       // metadata. Remove those records as soon as their own expiry is reached.
-      for (const [uploadId, upload] of uploads) {
+      for (const [uploadId] of uploads) {
         if (abortedUploads >= limit) break;
-        if (!upload || upload.status !== "uploading" || !upload.expiresAt || Date.parse(upload.expiresAt) > now) continue;
-        // An upload whose completed asset was removed above is already gone.
-        if (!(await stat(join(root, "uploads", uploadId)).catch(() => undefined))) continue;
-        await rm(join(root, "uploads", uploadId), { force: true, recursive: true });
-        abortedUploads += 1;
+        await withFilesystemLifecycleLock(root, `upload:${uploadId}`, async () => {
+          const upload = await readUpload(root, uploadId).catch(() => undefined);
+          if (!upload || upload.status !== "uploading" || !upload.expiresAt || Date.parse(upload.expiresAt) > now) return;
+          // An upload whose completed asset was removed above is already gone.
+          if (!(await stat(join(root, "uploads", uploadId)).catch(() => undefined))) return;
+          await rm(join(root, "uploads", uploadId), { force: true, recursive: true });
+          abortedUploads += 1;
+        });
       }
       return { abortedUploads, deletedAssets };
     },
@@ -616,6 +637,28 @@ async function withOwnerMutex<T>(
   } finally {
     release();
     if (locks.get(key) === current) locks.delete(key);
+  }
+}
+
+/** Serialize one filesystem asset/upload lifecycle mutation in this process. */
+async function withFilesystemLifecycleLock<T>(
+  root: string,
+  resource: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const key = `${root}\u0000${resource}`;
+  const previous = filesystemLifecycleLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  filesystemLifecycleLocks.set(key, current);
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (filesystemLifecycleLocks.get(key) === current) filesystemLifecycleLocks.delete(key);
   }
 }
 

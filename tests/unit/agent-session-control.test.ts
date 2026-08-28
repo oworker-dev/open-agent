@@ -92,6 +92,30 @@ test("session hydration keeps the durable page when authority is temporarily una
   assert.equal(result?.session.status, "running");
 });
 
+test("session hydration does not inspect Eve for every full history page", async () => {
+  let inspected = 0;
+  const runtime: AgentSessionRuntime = {
+    async readEvents() {
+      return [event("message.appended", { text: "page event" }), event("message.appended", { text: "page event 2" })];
+    },
+    async inspect() {
+      inspected += 1;
+      return { state: "running" as const, turnId: "turn-1" };
+    },
+    async cancel() { return "no_active_turn"; },
+  };
+  const result = await readAgentSession({
+    accessToken: "token",
+    identity: owner,
+    limit: 2,
+    ownershipStore: ownershipStore("owned"),
+    runtime,
+    sessionId: "session-1",
+  });
+  assert.equal(result?.hasMore, true);
+  assert.equal(inspected, 0);
+});
+
 test("session cancellation is ownership checked and delegated to the runtime", async () => {
   let calls = 0;
   const result = await cancelAgentSession({

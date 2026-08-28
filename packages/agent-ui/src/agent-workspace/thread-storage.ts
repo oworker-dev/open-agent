@@ -411,7 +411,7 @@ export function appendThreadEvent(
   const cumulativeKey = cumulativeEventKey(event);
   if (cumulativeKey) {
     const existingIndex = findLastCumulativeEventIndex(events, cumulativeKey);
-    if (existingIndex !== undefined) {
+    if (existingIndex !== undefined && canReplaceCumulativeEvent(events, existingIndex, event)) {
       return [...events.slice(0, existingIndex), event, ...events.slice(existingIndex + 1)];
     }
     return [...events, event];
@@ -443,7 +443,7 @@ export function appendThreadEventIndexed(
   const cumulativeKey = cumulativeEventKey(event);
   if (cumulativeKey) {
     const existingIndex = findLastCumulativeEventIndex(events, cumulativeKey);
-    if (existingIndex !== undefined) {
+    if (existingIndex !== undefined && canReplaceCumulativeEvent(events, existingIndex, event)) {
       events[existingIndex] = event;
       return true;
     }
@@ -491,7 +491,7 @@ export function compactThreadEvents(
     const cumulativeKey = cumulativeEventKey(event);
     if (cumulativeKey) {
       const existingIndex = cumulativeIndexes.get(cumulativeKey);
-      if (existingIndex !== undefined) {
+      if (existingIndex !== undefined && canReplaceCumulativeEvent(compacted, existingIndex, event)) {
         compacted[existingIndex] = event;
         continue;
       }
@@ -523,6 +523,62 @@ function findLastCumulativeEventIndex(
   for (let index = events.length - 1; index >= 0; index -= 1) {
     if (cumulativeEventKey(events[index]!) === key) return index;
   }
+  return undefined;
+}
+
+/**
+ * Cumulative stream events may be emitted again when Eve retries an
+ * interrupted durable step. A retry reuses the turn/step key, so replacing an
+ * earlier snapshot unconditionally would erase the failed attempt from the
+ * transcript. Only replace when the new snapshot is a continuation of the
+ * same attempt. A repeated step.started event marks a new attempt; the
+ * snapshot-prefix check also protects recovery from a missing boundary event.
+ */
+function canReplaceCumulativeEvent(
+  events: readonly MessageStreamEvent[],
+  existingIndex: number,
+  next: MessageStreamEvent,
+): boolean {
+  const existing = events[existingIndex];
+  if (!existing || !cumulativeEventKey(existing) || cumulativeEventKey(existing) !== cumulativeEventKey(next)) {
+    return false;
+  }
+
+  const scope = stepScope(next);
+  for (let index = existingIndex + 1; index < events.length; index += 1) {
+    const candidate = events[index]!;
+    if (candidate.type === "step.started" && stepScope(candidate) === scope) {
+      return false;
+    }
+  }
+
+  const previousSnapshot = cumulativeSnapshot(existing);
+  const nextSnapshot = cumulativeSnapshot(next);
+  // Eve's cumulative fields are present for all current event versions. If a
+  // legacy adapter omits one, retain both events rather than risk data loss.
+  if (previousSnapshot === undefined || nextSnapshot === undefined) return false;
+  // Provider snapshots are usually textual prefixes. Some adapters serialize
+  // a growing JSON value, however, so the newly appended bytes can appear
+  // before the closing quote and the full JSON string is no longer a literal
+  // prefix. In that case monotonic growth is the only safe signal available;
+  // a proper Eve retry still has a repeated step.started boundary above.
+  return nextSnapshot.length >= previousSnapshot.length;
+}
+
+function stepScope(event: MessageStreamEvent): string | undefined {
+  if (event.type === "step.started" ||
+      event.type === "message.appended" ||
+      event.type === "reasoning.appended" ||
+      event.type === "action.input.partial") {
+    return `${event.data.turnId}:${event.data.stepIndex}`;
+  }
+  return undefined;
+}
+
+function cumulativeSnapshot(event: MessageStreamEvent): string | undefined {
+  if (event.type === "message.appended") return event.data.messageSoFar;
+  if (event.type === "reasoning.appended") return event.data.reasoningSoFar;
+  if (event.type === "action.input.partial") return event.data.inputTextSoFar;
   return undefined;
 }
 

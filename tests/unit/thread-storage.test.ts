@@ -319,6 +319,92 @@ test("indexed recovery append deduplicates and replaces cumulative tool snapshot
   assert.equal(appendThreadEventIndexed(events, ids, events[0]!), false);
 });
 
+test("preserves cumulative reasoning from a failed attempt when Eve retries the same step", () => {
+  const event = (
+    id: string,
+    type: "step.started" | "reasoning.appended" | "step.failed",
+    data: Record<string, unknown>,
+  ) => ({
+    data,
+    meta: { at: new Date(0).toISOString(), id },
+    type,
+  }) as unknown as MessageStreamEvent;
+  const compacted = compactThreadEvents([
+    event("start-1", "step.started", { sequence: 0, stepIndex: 0, turnId: "turn-retry" }),
+    event("reasoning-1", "reasoning.appended", {
+      reasoningDelta: "Planning",
+      reasoningSoFar: "Planning",
+      sequence: 0,
+      stepIndex: 0,
+      turnId: "turn-retry",
+    }),
+    event("failed-1", "step.failed", {
+      code: "UPSTREAM_ERROR",
+      message: "temporary provider failure",
+      sequence: 0,
+      stepIndex: 0,
+      turnId: "turn-retry",
+    }),
+    event("start-2", "step.started", { sequence: 0, stepIndex: 0, turnId: "turn-retry" }),
+    event("reasoning-2", "reasoning.appended", {
+      reasoningDelta: "Inspecting",
+      reasoningSoFar: "Inspecting",
+      sequence: 0,
+      stepIndex: 0,
+      turnId: "turn-retry",
+    }),
+    event("reasoning-3", "reasoning.appended", {
+      reasoningDelta: " the workspace",
+      reasoningSoFar: "Inspecting the workspace",
+      sequence: 0,
+      stepIndex: 0,
+      turnId: "turn-retry",
+    }),
+  ]);
+
+  assert.deepEqual(compacted.map((candidate) => candidate.meta.id), [
+    "start-1",
+    "reasoning-1",
+    "failed-1",
+    "start-2",
+    "reasoning-3",
+  ]);
+  assert.equal(compacted[1]?.type, "reasoning.appended");
+  assert.equal(compacted[4]?.type, "reasoning.appended");
+  if (compacted[4]?.type === "reasoning.appended") {
+    assert.equal(compacted[4].data.reasoningSoFar, "Inspecting the workspace");
+  }
+});
+
+test("preserves a reset tool-input snapshot even when the retry boundary is missing", () => {
+  const event = (id: string, inputTextSoFar: string) => ({
+    data: {
+      callId: "call-patch",
+      inputTextDelta: inputTextSoFar,
+      inputTextSoFar,
+      sequence: 0,
+      stepIndex: 0,
+      toolName: "apply_patch",
+      turnId: "turn-tool-retry",
+    },
+    meta: { at: new Date(0).toISOString(), id },
+    type: "action.input.partial" as const,
+  }) as unknown as MessageStreamEvent;
+  const source = [
+    event("input-1", "{\"patch\":\"*** Begin Patch"),
+    event("input-2", "{\"patch\":\"rewrite\"}"),
+  ];
+  const compacted = compactThreadEvents(source);
+
+  assert.equal(compacted.length, 2);
+  assert.deepEqual(compacted.map((candidate) => candidate.meta.id), ["input-1", "input-2"]);
+
+  const indexed: MessageStreamEvent[] = [];
+  const ids = new Set<string>();
+  for (const item of source) appendThreadEventIndexed(indexed, ids, item);
+  assert.equal(indexed.length, 2);
+});
+
 test("conflict merge never replaces a complete remote transcript with a compact local prefix", () => {
   const event = (id: string, type: "step.started" | "reasoning.appended", stepIndex: number) => ({
     data: type === "step.started"

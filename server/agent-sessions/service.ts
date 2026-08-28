@@ -120,7 +120,12 @@ export async function readAgentSession(options: {
   // stale running child in that case. Eve's mailbox boundary is the source of
   // truth for the current turn and is intentionally best-effort here so a
   // transient runtime outage does not hide the durable event history.
-  if (runtime.inspect && !hasLifecycleBoundary(events)) {
+  // A page that is full is a middle page until proven otherwise. Avoid an Eve
+  // control-plane inspection for every page of a long transcript; the final
+  // short/empty page is sufficient to reconcile the authoritative boundary.
+  // This keeps approval/history hydration bounded even when a session has
+  // hundreds of thousands of durable events.
+  if (runtime.inspect && !hasLifecycleBoundary(events) && (events.length < limit || events.length === 0)) {
     try {
       session = applyRuntimeBoundary(session, await runtime.inspect({
         owner: options.identity,

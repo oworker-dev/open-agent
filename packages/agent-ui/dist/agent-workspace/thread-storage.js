@@ -340,7 +340,7 @@ export function appendThreadEvent(events, event) {
     const cumulativeKey = cumulativeEventKey(event);
     if (cumulativeKey) {
         const existingIndex = findLastCumulativeEventIndex(events, cumulativeKey);
-        if (existingIndex !== undefined) {
+        if (existingIndex !== undefined && canReplaceCumulativeEvent(events, existingIndex, event)) {
             return [...events.slice(0, existingIndex), event, ...events.slice(existingIndex + 1)];
         }
         return [...events, event];
@@ -358,7 +358,7 @@ export function appendThreadEventIndexed(events, eventIds, event) {
     const cumulativeKey = cumulativeEventKey(event);
     if (cumulativeKey) {
         const existingIndex = findLastCumulativeEventIndex(events, cumulativeKey);
-        if (existingIndex !== undefined) {
+        if (existingIndex !== undefined && canReplaceCumulativeEvent(events, existingIndex, event)) {
             events[existingIndex] = event;
             return true;
         }
@@ -388,7 +388,7 @@ export function compactThreadEvents(events) {
         const cumulativeKey = cumulativeEventKey(event);
         if (cumulativeKey) {
             const existingIndex = cumulativeIndexes.get(cumulativeKey);
-            if (existingIndex !== undefined) {
+            if (existingIndex !== undefined && canReplaceCumulativeEvent(compacted, existingIndex, event)) {
                 compacted[existingIndex] = event;
                 continue;
             }
@@ -412,6 +412,42 @@ function findLastCumulativeEventIndex(events, key) {
         if (cumulativeEventKey(events[index]) === key)
             return index;
     }
+    return undefined;
+}
+function canReplaceCumulativeEvent(events, existingIndex, next) {
+    const existing = events[existingIndex];
+    if (!existing || !cumulativeEventKey(existing) || cumulativeEventKey(existing) !== cumulativeEventKey(next)) {
+        return false;
+    }
+    const scope = stepScope(next);
+    for (let index = existingIndex + 1; index < events.length; index += 1) {
+        const candidate = events[index];
+        if (candidate.type === "step.started" && stepScope(candidate) === scope) {
+            return false;
+        }
+    }
+    const previousSnapshot = cumulativeSnapshot(existing);
+    const nextSnapshot = cumulativeSnapshot(next);
+    if (previousSnapshot === undefined || nextSnapshot === undefined)
+        return false;
+    return nextSnapshot.length >= previousSnapshot.length;
+}
+function stepScope(event) {
+    if (event.type === "step.started" ||
+        event.type === "message.appended" ||
+        event.type === "reasoning.appended" ||
+        event.type === "action.input.partial") {
+        return `${event.data.turnId}:${event.data.stepIndex}`;
+    }
+    return undefined;
+}
+function cumulativeSnapshot(event) {
+    if (event.type === "message.appended")
+        return event.data.messageSoFar;
+    if (event.type === "reasoning.appended")
+        return event.data.reasoningSoFar;
+    if (event.type === "action.input.partial")
+        return event.data.inputTextSoFar;
     return undefined;
 }
 export function reconcilePendingTurnWithEvents(pendingTurn, events) {
