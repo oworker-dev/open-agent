@@ -184,6 +184,15 @@ evidence). This keeps capacity runs from leaving resumable Workflow roots that
 would otherwise be re-enqueued on the next runtime restart. Historical user
 sessions and Muses host sessions are never selected by that cleanup path.
 
+Submission recovery is also session-addressed. If Eve accepts a session while
+the database attach response is lost, the run keeps `submitting` admission
+state and persists the exact Eve session id. The background reconciler mints a
+short-lived host token for that recorded owner, resets that exact session, and
+only then marks the reservation `submission-ambiguous`. If runtime credentials
+are unavailable, the row remains active and is reported as deferred rather than
+being released blindly. This prevents an accepted Eve turn from becoming an
+untracked workload after a process restart.
+
 ## Storage finding
 
 The 2026-08-27 read-only audit confirms that the local Workflow database is

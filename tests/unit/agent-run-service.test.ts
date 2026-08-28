@@ -756,6 +756,7 @@ test("keeps the admission reservation active when accepted-session cleanup fails
   assert.equal(outcome.disposition, "ambiguous");
   const pending = [...store.records.values()][0];
   assert.equal(pending?.status, "submitting");
+  assert.equal(pending?.sessionId, "session-1");
   assert.equal(runtime.calls.reset, 2);
 });
 
@@ -1086,6 +1087,14 @@ class MemoryAgentRunStore implements AgentRunStore {
       sessionId,
       status: "running",
     });
+  }
+
+  async bindSubmissionSession(runId: string, sessionId: string) {
+    const current = this.require(runId);
+    if (current.status !== "submitting" && current.sessionId !== sessionId) {
+      throw new Error("submission already settled");
+    }
+    return current.sessionId === sessionId ? current : this.update(runId, { sessionId });
   }
 
   async findOwned(tenantId: string, principalId: string, runId: string) {

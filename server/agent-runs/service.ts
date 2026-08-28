@@ -192,6 +192,16 @@ export async function startAgentRun(options: {
     );
     return { disposition: "started", record };
   } catch {
+    // Keep the accepted Eve identity durable even while the run remains in
+    // `submitting`. If the process exits before cleanup, the reconciler can
+    // then reset this exact session instead of releasing an unknown task.
+    try {
+      await options.store.bindSubmissionSession?.(reservation.record.runId, session.sessionId);
+    } catch {
+      // A database outage can make this write impossible. The cleanup below
+      // still runs, and the reservation remains submitting if it cannot be
+      // confirmed safe to release.
+    }
     // Eve has accepted the session, so a failed database attach must never
     // silently release the admission slot while the runtime keeps working.
     // Reset the exact accepted session before terminally marking the request

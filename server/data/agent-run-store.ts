@@ -78,6 +78,13 @@ export interface AgentRunStore {
    * session was already attached after a lost database response.
    */
   attachSession(runId: string, sessionId: string): Promise<AgentRunRecord>;
+  /**
+   * Persist an Eve session handle while a submission is still being attached.
+   * This is used after Eve accepts a session but the running-state transition
+   * loses a database response, so a later reconciler can address that exact
+   * session instead of guessing.
+   */
+  bindSubmissionSession?(runId: string, sessionId: string): Promise<AgentRunRecord>;
   findOwned(tenantId: string, principalId: string, runId: string): Promise<AgentRunRecord | undefined>;
   /**
    * Resolve a run by its Eve session identity. This is optional so lightweight
@@ -245,6 +252,29 @@ function postgresAgentRunStore(pool: Pool, table: string, config: AgentDatabaseC
       const row = requireRow(existing.rows[0]);
       if (row.sessionId === sessionId && row.status === "running") return toRecord(row);
       throw new Error("AgentRun session attachment was already settled with a different state.");
+    },
+    async bindSubmissionSession(runId, sessionId) {
+      const result = await pool.query<AgentRunRow>(
+        `update ${table}
+            set eve_session_id = $2,
+                revision = revision + 1,
+                updated_at = now()
+          where run_id = $1
+            and status = 'submitting'
+            and (eve_session_id is null or eve_session_id = $2)
+          returning ${selectColumns()}`,
+        [runId, sessionId],
+      );
+      if (result.rows[0]) return toRecord(result.rows[0]);
+      const existing = await pool.query<AgentRunRow>(
+        `select ${selectColumns()} from ${table} where run_id = $1 limit 1`,
+        [runId],
+      );
+      const row = requireRow(existing.rows[0]);
+      if (row.sessionId === sessionId && (row.status === "submitting" || row.status === "running")) {
+        return toRecord(row);
+      }
+      throw new Error("AgentRun submission session was already settled with a different state.");
     },
     async findOwned(tenantId, principalId, runId) {
       const result = await pool.query<AgentRunRow>(
