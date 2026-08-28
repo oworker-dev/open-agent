@@ -24,6 +24,15 @@ const olderThanMs = boundedInteger(
 );
 const scanLimit = boundedInteger("WORKFLOW_RETENTION_SCAN_LIMIT", 10_000, 1, 100_000);
 const topRootLimit = boundedInteger("WORKFLOW_RETENTION_TOP_ROOTS", 25, 1, 1_000);
+// Retention is an operator diagnostic, not a reason to hold a database
+// connection forever. Percentile scans over a large stream table must fail
+// closed instead of competing with live Agent traffic.
+const queryTimeoutMs = boundedInteger(
+  "WORKFLOW_POSTGRES_QUERY_TIMEOUT_MS",
+  15_000,
+  100,
+  300_000,
+);
 
 // A Workflow root remains replay state even after a turn is terminal. This
 // operator intentionally cannot purge it until Open Agent has a tested cold
@@ -40,6 +49,8 @@ const pool = new Pool({
   connectionString,
   connectionTimeoutMillis: 10_000,
   idleTimeoutMillis: 10_000,
+  query_timeout: queryTimeoutMs,
+  statement_timeout: queryTimeoutMs,
   max: 2,
 });
 const now = new Date();
@@ -63,7 +74,7 @@ try {
     schemaVersion: "open-agent.workflow-retention-evidence.v2",
     generatedAt: now.toISOString(),
     mode: "audit",
-    configuration: { maxRoots, olderThanMs, scanLimit, schema: schemaName, topRootLimit },
+    configuration: { maxRoots, olderThanMs, queryTimeoutMs, scanLimit, schema: schemaName, topRootLimit },
     lifecycle: {
       destructiveOperationsEnabled: false,
       hotStore: "PostgreSQL Workflow World",

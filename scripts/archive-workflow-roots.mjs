@@ -36,6 +36,12 @@ const output = resolve(args.output || process.env.WORKFLOW_ARCHIVE_OUTPUT || "")
 if (!args.output && !process.env.WORKFLOW_ARCHIVE_OUTPUT?.trim()) {
   throw new Error("Provide --output or WORKFLOW_ARCHIVE_OUTPUT.");
 }
+const queryTimeoutMs = boundedInteger(
+  "WORKFLOW_POSTGRES_QUERY_TIMEOUT_MS",
+  15_000,
+  100,
+  300_000,
+);
 await mkdir(dirname(output), { recursive: true });
 
 const pool = new Pool({
@@ -43,6 +49,8 @@ const pool = new Pool({
   connectionString,
   connectionTimeoutMillis: 10_000,
   idleTimeoutMillis: 10_000,
+  query_timeout: queryTimeoutMs,
+  statement_timeout: queryTimeoutMs,
   max: 2,
 });
 const writer = createWriteStream(output, { flags: "wx", mode: 0o600 });

@@ -49,6 +49,12 @@ const minFreeDiskBytes = boundedBytes(
 const aggregateEvidencePath = resolve(
   process.env.AGENT_CAPACITY_EVIDENCE_PATH?.trim() || `${evidenceDirectory}/summary.json`,
 );
+const workflowQueryTimeoutMs = boundedInteger(
+  "WORKFLOW_POSTGRES_QUERY_TIMEOUT_MS",
+  15_000,
+  100,
+  300_000,
+);
 
 await mkdir(evidenceDirectory, { recursive: true });
 
@@ -391,6 +397,8 @@ async function readWorkflowStorageSnapshot(connectionString, schema) {
     connectionString,
     connectionTimeoutMillis: 10_000,
     idleTimeoutMillis: 10_000,
+    query_timeout: workflowQueryTimeoutMs,
+    statement_timeout: workflowQueryTimeoutMs,
     max: 1,
   });
   try {
