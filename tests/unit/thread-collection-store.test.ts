@@ -160,6 +160,39 @@ test("append-only thread patches do not load the existing transcript", async () 
   assert.equal(updatedCollection?.activeThreadId, "thread-1");
 });
 
+test("a concurrent first patch reports a conflict instead of leaking a unique-key error", async () => {
+  const calls: string[] = [];
+  const client = {
+    async query(sql: string) {
+      calls.push(sql);
+      if (sql === "begin" || sql === "rollback") return { rows: [] };
+      if (sql.includes("for update")) return { rows: [] };
+      if (sql.includes("on conflict") && sql.includes("returning revision::text")) return { rows: [] };
+      throw new Error(`Unexpected transaction query: ${sql}`);
+    },
+    release() {},
+  };
+  const pool = {
+    async connect() { return client; },
+    async query(sql: string) {
+      assert.match(sql, /select collection, revision::text/u);
+      return { rows: [{ collection: { threads: [], version: 2 }, revision: "1" }] };
+    },
+  } as unknown as Pool;
+  const store = createPostgresThreadCollectionStore(config, pool);
+
+  const result = await store.patch?.("tenant-1", "principal-1", "workspace-1", 0, {
+    deletedThreadIds: [],
+    eventAppends: [],
+    upsertThreads: [],
+  });
+
+  assert.deepEqual(result, { currentRevision: 1, status: "conflict" });
+  assert.equal(calls.filter((sql) => sql === "commit").length, 0);
+  assert.equal(calls.filter((sql) => sql === "rollback").length, 1);
+  assert.match(calls.find((sql) => sql.includes("on conflict")) ?? "", /do nothing/u);
+});
+
 test("append-only thread patches keep event indexes contiguous after replay deduplication", async () => {
   let insertedParameters: readonly unknown[] | undefined;
   const client = {

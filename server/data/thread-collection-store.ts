@@ -369,12 +369,19 @@ function postgresThreadCollectionStore<TCollection>(
         if (serialized === undefined) throw new Error("Thread patch must be JSON serializable.");
 
         if (!row) {
-          await connection.query(
+          const inserted = await connection.query(
             `insert into ${table}
               (tenant_id, principal_id, storage_key, revision, collection)
-             values ($1, $2, $3, 1, $4::jsonb)`,
+             values ($1, $2, $3, 1, $4::jsonb)
+             on conflict (tenant_id, principal_id, storage_key) do nothing
+             returning revision::text`,
             [tenantId, principalId, storageKey, serialized],
           );
+          if (inserted.rows.length === 0) {
+            await connection.query("rollback");
+            const current = await load(tenantId, principalId, storageKey);
+            return { currentRevision: current?.revision ?? 0, status: "conflict" };
+          }
         } else {
           await connection.query(
             `update ${table}
