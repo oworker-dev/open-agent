@@ -390,7 +390,10 @@ export function AgentThreadView({
           if (!current) return current;
           if (event.data.clientMessageId === current.id) return undefined;
           if (event.data.clientMessageId) return current;
-          return event.data.message.trim() === current.text.trim() ? undefined : current;
+          const eventIndex = compactedEventsRef.current.lastIndexOf(event);
+          const isAfterSubmission = current.eventCountAtSubmission === undefined ||
+            eventIndex >= current.eventCountAtSubmission;
+          return isAfterSubmission && event.data.message.trim() === current.text.trim() ? undefined : current;
         });
 
         // Consume a queued admission at the receipt boundary as well. The
@@ -841,6 +844,11 @@ export function AgentThreadView({
         acceptedQueuedTurn = true;
       }
       if (pendingTurnRef.current) {
+        const pending = pendingTurnRef.current;
+        const eventIndex = compactedEventsRef.current.lastIndexOf(event);
+        const isAfterSubmission = pending.eventCountAtSubmission === undefined ||
+          eventIndex >= pending.eventCountAtSubmission;
+        if (!isAfterSubmission || event.data.message.trim() !== pending.text.trim()) continue;
         pendingTurnRef.current = undefined;
         acceptedPendingTurn = true;
       }
@@ -1290,6 +1298,7 @@ export function AgentThreadView({
     if (text.length > 0 || message.files.length > 0) {
       const pendingTurn = {
         ...(message.files.length > 0 ? { files: message.files } : {}),
+        eventCountAtSubmission: compactedEventsRef.current.length,
         id: createPendingTurnId(),
         state: "submitting" as const,
         submittedAt: Date.now(),
@@ -1384,6 +1393,7 @@ export function AgentThreadView({
       interruptedDisplayEvents,
       isBusy || isPendingTurnInFlight(displayPendingTurn) || Boolean(latestTurnFailure(interruptedDisplayEvents)),
       displayPendingTurn,
+      optimisticPendingTurn?.id === displayPendingTurn?.id,
     ),
     thread.queuedTurns.filter((turn) => turn.intent === "post-cancellation"),
   ), [displayPendingTurn, interruptedDisplayEvents, isBusy, projectedRuntimeMessages, thread.queuedTurns]);
@@ -1742,6 +1752,7 @@ export function AgentThreadView({
     prepareTurn();
     onChange({
       pendingTurn: {
+        eventCountAtSubmission: compactedEventsRef.current.length,
         id: next.id,
         state: "submitting",
         submittedAt: next.submittedAt,
@@ -1902,8 +1913,9 @@ function ensureActiveAssistantMessage(
   events: readonly MessageStreamEvent[],
   isBusy: boolean,
   pendingTurn?: AgentThread["pendingTurn"],
+  optimisticPending = false,
 ): readonly EveMessage[] {
-  const projectedMessages = projectPendingUserMessage(messages, pendingTurn);
+  const projectedMessages = projectPendingUserMessage(messages, pendingTurn, events, optimisticPending);
   const terminalFailure = latestTurnFailure(events);
   if (!isBusy && !terminalFailure) return projectedMessages;
   const started = [...events].reverse().find((event) => event.type === "turn.started");
@@ -1940,19 +1952,16 @@ function ensureActiveAssistantMessage(
 function projectPendingUserMessage(
   messages: readonly EveMessage[],
   pendingTurn?: AgentThread["pendingTurn"],
+  events: readonly MessageStreamEvent[] = [],
+  optimisticPending = false,
 ): readonly EveMessage[] {
   if (!pendingTurn) return messages;
-  // The assistant response normally follows the accepted user message. Only
-  // checking `messages.at(-1)` therefore projected a second copy after a
-  // refresh while the pending edit checkpoint was still present. Search the
-  // authoritative transcript by content/attachments instead.
-  // Only the latest durable user message can acknowledge a pending admission.
-  // Matching any earlier identical prompt suppresses a legitimate repeated
-  // request and makes the following assistant turn look as if it vanished.
-  const latestUserMessage = [...messages].reverse().find((message) => message.role === "user");
-  const alreadyProjected = latestUserMessage !== undefined &&
-    pendingTurnMatchesMessage(pendingTurn, latestUserMessage);
-  if (alreadyProjected) return messages;
+  // Text is not an admission identity: users may intentionally submit the
+  // same prompt more than once. Only a durable message.received event for
+  // this pending admission (matching Eve's client id or its post-submission
+  // timestamp) may suppress the optimistic projection. This keeps a repeated
+  // prompt visible immediately while the new Eve stream is still opening.
+  if (!optimisticPending && reconcilePendingTurnWithEvents(pendingTurn, events) === undefined) return messages;
   return [
     ...messages,
     {
@@ -1987,21 +1996,6 @@ function projectStagedUserMessages(
     });
   }
   return projected;
-}
-
-function pendingTurnMatchesMessage(
-  pendingTurn: NonNullable<AgentThread["pendingTurn"]>,
-  message: EveMessage,
-): boolean {
-  if (eveMessageText(message) !== pendingTurn.text) return false;
-  const messageFiles = message.parts.filter((part) => part.type === "file");
-  const pendingFiles = pendingTurn.files ?? [];
-  return messageFiles.length === pendingFiles.length && messageFiles.every((file, index) => {
-    const pending = pendingFiles[index];
-    return pending?.mediaType === file.mediaType &&
-      pending.filename === file.filename &&
-      pending.url === file.url;
-  });
 }
 
 function isPendingTurnInFlight(pendingTurn?: AgentThread["pendingTurn"]): boolean {
@@ -2072,13 +2066,6 @@ function upsertInterruptedTurn(
     ...turns.filter((candidate) => candidate.turnId !== turn.turnId),
     turn,
   ].slice(-32);
-}
-
-function eveMessageText(message: EveMessage): string {
-  return message.parts
-    .flatMap((part) => part.type === "text" ? [part.text] : [])
-    .join("\n")
-    .trim();
 }
 
 function createPendingTurnId(): string {

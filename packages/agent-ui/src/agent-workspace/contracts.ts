@@ -19,6 +19,8 @@ export type AgentThreadPreferences = {
 };
 
 export type AgentPendingTurn = {
+  /** Number of locally observed Eve events when this admission was created. */
+  readonly eventCountAtSubmission?: number;
   readonly files?: PromptInputMessage["files"];
   readonly id: string;
   readonly state: "clearing" | "delivery-failed" | "interrupted" | "resubmitting" | "submitting";

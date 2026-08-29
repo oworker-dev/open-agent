@@ -379,7 +379,6 @@ export function AgentWorkspace({
       ...(settledCoverage
         ? { transcriptCoverage: settledCoverage }
         : { transcriptCoverage: undefined }),
-      revision: (thread.revision ?? 0) + 1,
       session: settledSession,
       status: settledStatus,
       updatedAt: Date.now(),
@@ -484,7 +483,7 @@ export function AgentWorkspace({
         ...(settledCoverage
           ? { transcriptCoverage: settledCoverage }
           : { transcriptCoverage: undefined }),
-        revision: (thread.revision ?? 0) + 2,
+        revision: (thread.revision ?? 0) + 1,
         session: settledSession,
         status: settledStatus,
         updatedAt: Date.now(),
@@ -1322,7 +1321,12 @@ export function AgentWorkspace({
                   );
                   if (committedTurn) {
                     committedCatchUpTurns.delete(committedTurn.id);
-                  } else if (pendingTurn) {
+                  } else if (
+                    pendingTurn &&
+                    (pendingTurn.eventCountAtSubmission === undefined ||
+                      events.lastIndexOf(event) >= pendingTurn.eventCountAtSubmission) &&
+                    pendingTurn.text.trim() === event.data.message.trim()
+                  ) {
                     consumedPendingTurnIds.add(pendingTurn.id);
                     pendingTurn = undefined;
                   } else {
@@ -1642,6 +1646,10 @@ export function AgentWorkspace({
               isRecovering={activeIsRecovering}
               historyHasMore={activeThread.transcriptWindow?.hasMoreBefore === true}
               historyLoading={threadHistoryLoading.has(activeThread.id)}
+              // Runtime settling keeps the existing assistant-ui reducer
+              // mounted. Its bounded tail merge increments revision only when
+              // new history actually arrives, while ordinary completion does
+              // not invoke the primitive's initial bottom scroll.
               key={`${activeThread.id}:${activeThread.revision ?? 0}:${activeIsRecovering ? "recovering" : "ready"}`}
               locale={locale}
               mailbox={mailbox}
@@ -2540,6 +2548,7 @@ function samePendingTurn(
   if (!left || !right) return left === right;
   return left.id === right.id &&
     left.state === right.state &&
+    left.eventCountAtSubmission === right.eventCountAtSubmission &&
     left.submittedAt === right.submittedAt &&
     left.text === right.text &&
     JSON.stringify(left.files ?? []) === JSON.stringify(right.files ?? []);

@@ -308,6 +308,9 @@ function parsePendingTurn(value) {
         return undefined;
     }
     return {
+        ...(typeof value.eventCountAtSubmission === "number" && Number.isInteger(value.eventCountAtSubmission) && value.eventCountAtSubmission >= 0
+            ? { eventCountAtSubmission: value.eventCountAtSubmission }
+            : {}),
         ...(files.length > 0 ? { files } : {}),
         id: value.id,
         state: value.state,
@@ -470,14 +473,17 @@ export function reconcilePendingTurnWithEvents(pendingTurn, events) {
     if (!pendingTurn)
         return undefined;
     const latestReceived = [...events].reverse().find((event) => event.type === "message.received");
+    const latestReceivedIndex = latestReceived ? events.lastIndexOf(latestReceived) : -1;
     const eventAt = latestReceived?.meta.at ? Date.parse(latestReceived.meta.at) : Number.NaN;
     const submittedAt = pendingTurn.submittedAt;
     const eventCanAcknowledge = !Number.isFinite(eventAt) || eventAt >= submittedAt - 5_000;
     const hasAuthoritativeClientId = latestReceived?.type === "message.received" &&
         typeof latestReceived.data.clientMessageId === "string" &&
         latestReceived.data.clientMessageId.trim().length > 0;
+    const isAfterSubmission = pendingTurn.eventCountAtSubmission === undefined ||
+        latestReceivedIndex >= pendingTurn.eventCountAtSubmission;
     const accepted = latestReceived?.type === "message.received" && (latestReceived.data.clientMessageId === pendingTurn.id ||
-        (!hasAuthoritativeClientId && eventCanAcknowledge && pendingTurn.text.trim().length > 0 &&
+        (!hasAuthoritativeClientId && isAfterSubmission && eventCanAcknowledge && pendingTurn.text.trim().length > 0 &&
             latestReceived.data.message.trim() === pendingTurn.text.trim()));
     return accepted ? undefined : pendingTurn;
 }

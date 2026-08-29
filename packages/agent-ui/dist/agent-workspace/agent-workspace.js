@@ -267,7 +267,6 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
             ...(settledCoverage
                 ? { transcriptCoverage: settledCoverage }
                 : { transcriptCoverage: undefined }),
-            revision: (thread.revision ?? 0) + 1,
             session: settledSession,
             status: settledStatus,
             updatedAt: Date.now(),
@@ -337,7 +336,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                 ...(settledCoverage
                     ? { transcriptCoverage: settledCoverage }
                     : { transcriptCoverage: undefined }),
-                revision: (thread.revision ?? 0) + 2,
+                revision: (thread.revision ?? 0) + 1,
                 session: settledSession,
                 status: settledStatus,
                 updatedAt: Date.now(),
@@ -1081,7 +1080,10 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                                     if (committedTurn) {
                                         committedCatchUpTurns.delete(committedTurn.id);
                                     }
-                                    else if (pendingTurn) {
+                                    else if (pendingTurn &&
+                                        (pendingTurn.eventCountAtSubmission === undefined ||
+                                            events.lastIndexOf(event) >= pendingTurn.eventCountAtSubmission) &&
+                                        pendingTurn.text.trim() === event.data.message.trim()) {
                                         consumedPendingTurnIds.add(pendingTurn.id);
                                         pendingTurn = undefined;
                                     }
@@ -1805,6 +1807,7 @@ function samePendingTurn(left, right) {
         return left === right;
     return left.id === right.id &&
         left.state === right.state &&
+        left.eventCountAtSubmission === right.eventCountAtSubmission &&
         left.submittedAt === right.submittedAt &&
         left.text === right.text &&
         JSON.stringify(left.files ?? []) === JSON.stringify(right.files ?? []);

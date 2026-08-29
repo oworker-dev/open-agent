@@ -222,8 +222,14 @@ test("composer clears immediately while a turn is still being accepted", async (
 
 test("a settled session renders the next message before its delayed stream", async ({ page }) => {
   const sessionId = "settled-follow-up-session";
-  const firstTurn = eventsFromNdjson(mockSuccessfulTurn("First request", "First done."));
-  const secondTurn = eventsFromNdjson(mockContinuationTurn("Second request", "Second done."));
+  const firstTurn = eventsFromNdjson(mockSuccessfulTurn(
+    "First request",
+    `First done. ${"A long settled response keeps enough transcript height to exercise the top anchor. ".repeat(24)}`,
+  ));
+  const secondTurn = eventsFromNdjson(mockContinuationTurn(
+    "Second request",
+    `Second done. ${"The completed response must keep the submitted turn anchored instead of jumping to the bottom. ".repeat(24)}`,
+  ));
   let streamRequests = 0;
 
   await page.route("**/eve/v1/session", async (route) => {
@@ -264,7 +270,7 @@ test("a settled session renders the next message before its delayed stream", asy
   const composer = page.getByRole("textbox", { name: "Do anything" });
   await composer.fill("First request");
   await composer.press("Enter");
-  await expect(page.getByText("First done.", { exact: true })).toBeVisible({ timeout: 5_000 });
+  await expect(page.getByText(/First done\./)).toBeVisible({ timeout: 5_000 });
 
   await composer.fill("Second request");
   await composer.press("Enter");
@@ -274,7 +280,64 @@ test("a settled session renders the next message before its delayed stream", asy
   const viewportBox = await page.getByRole("log").boundingBox();
   const secondRequestBox = await page.getByRole("log").getByText("Second request", { exact: true }).boundingBox();
   expect((secondRequestBox?.y ?? 0) - (viewportBox?.y ?? 0)).toBeGreaterThanOrEqual(16);
-  await expect(page.getByText("Second done.", { exact: true })).toBeVisible({ timeout: 5_000 });
+  await expect(page.getByText(/Second done\./)).toBeVisible({ timeout: 5_000 });
+  const settledViewportBox = await page.getByRole("log").boundingBox();
+  const settledSecondRequestBox = await page.getByRole("log").getByText("Second request", { exact: true }).boundingBox();
+  expect((settledSecondRequestBox?.y ?? 0) - (settledViewportBox?.y ?? 0)).toBeGreaterThanOrEqual(16);
+  const settledScroll = await page.getByRole("log").evaluate((element) => ({
+    scrollHeight: element.scrollHeight,
+    scrollTop: element.scrollTop,
+    clientHeight: element.clientHeight,
+  }));
+  expect(settledScroll.scrollHeight - settledScroll.clientHeight - settledScroll.scrollTop).toBeGreaterThan(48);
+});
+
+test("a repeated prompt stays visible before its new stream is acknowledged", async ({ page }) => {
+  const sessionId = "repeated-prompt-session";
+  let streamRequests = 0;
+  await page.route("**/eve/v1/session", async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({ sessionId }),
+      contentType: "application/json",
+      headers: { "x-eve-session-id": sessionId },
+      status: 200,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}`, async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({ sessionId }),
+      contentType: "application/json",
+      status: 200,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
+    streamRequests += 1;
+    if (streamRequests === 1) {
+      await route.fulfill({
+        body: mockSuccessfulTurn("Repeat this request", "First response."),
+        contentType: "application/x-ndjson",
+        status: 200,
+      });
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    await route.fulfill({
+      body: mockContinuationTurn("Repeat this request", "Second response.", 1),
+      contentType: "application/x-ndjson",
+      status: 200,
+    });
+  });
+
+  await page.goto("/");
+  const composer = page.getByRole("textbox", { name: "Do anything" });
+  await composer.fill("Repeat this request");
+  await composer.press("Enter");
+  await expect(page.getByText("First response.", { exact: true })).toBeVisible({ timeout: 5_000 });
+  await composer.fill("Repeat this request");
+  await composer.press("Enter");
+  await expect(page.getByRole("log").getByText("Repeat this request", { exact: true })).toHaveCount(2, { timeout: 300 });
+  await expect(page.getByRole("status").filter({ hasText: "Thinking" })).toBeVisible({ timeout: 300 });
+  await expect(page.getByText("Second response.", { exact: true })).toBeVisible({ timeout: 5_000 });
 });
 
 test("transient session admission errors retry with a stable bounded counter", async ({ page }) => {

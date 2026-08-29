@@ -9,6 +9,7 @@ export type AgentThreadPreferences = {
     readonly reasoning: string;
 };
 export type AgentPendingTurn = {
+    readonly eventCountAtSubmission?: number;
     readonly files?: PromptInputMessage["files"];
     readonly id: string;
     readonly state: "clearing" | "delivery-failed" | "interrupted" | "resubmitting" | "submitting";

@@ -225,7 +225,10 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
                     return undefined;
                 if (event.data.clientMessageId)
                     return current;
-                return event.data.message.trim() === current.text.trim() ? undefined : current;
+                const eventIndex = compactedEventsRef.current.lastIndexOf(event);
+                const isAfterSubmission = current.eventCountAtSubmission === undefined ||
+                    eventIndex >= current.eventCountAtSubmission;
+                return isAfterSubmission && event.data.message.trim() === current.text.trim() ? undefined : current;
             });
             const clientMessageId = event.data.clientMessageId;
             const dispatchedId = dispatchingQueuedTurnIdRef.current;
@@ -542,6 +545,12 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
                 acceptedQueuedTurn = true;
             }
             if (pendingTurnRef.current) {
+                const pending = pendingTurnRef.current;
+                const eventIndex = compactedEventsRef.current.lastIndexOf(event);
+                const isAfterSubmission = pending.eventCountAtSubmission === undefined ||
+                    eventIndex >= pending.eventCountAtSubmission;
+                if (!isAfterSubmission || event.data.message.trim() !== pending.text.trim())
+                    continue;
                 pendingTurnRef.current = undefined;
                 acceptedPendingTurn = true;
             }
@@ -914,6 +923,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         if (text.length > 0 || message.files.length > 0) {
             const pendingTurn = {
                 ...(message.files.length > 0 ? { files: message.files } : {}),
+                eventCountAtSubmission: compactedEventsRef.current.length,
                 id: createPendingTurnId(),
                 state: "submitting",
                 submittedAt: Date.now(),
@@ -982,7 +992,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             : effectiveRenderMessages;
         return normalizeSettledAgentMessages(source, interruptedDisplayEvents);
     }, [displayInterruptedTurns.length, effectiveRenderMessages, interruptedDisplayEvents]);
-    const projectedMessages = useMemo(() => projectStagedUserMessages(ensureActiveAssistantMessage(projectedRuntimeMessages, interruptedDisplayEvents, isBusy || isPendingTurnInFlight(displayPendingTurn) || Boolean(latestTurnFailure(interruptedDisplayEvents)), displayPendingTurn), thread.queuedTurns.filter((turn) => turn.intent === "post-cancellation")), [displayPendingTurn, interruptedDisplayEvents, isBusy, projectedRuntimeMessages, thread.queuedTurns]);
+    const projectedMessages = useMemo(() => projectStagedUserMessages(ensureActiveAssistantMessage(projectedRuntimeMessages, interruptedDisplayEvents, isBusy || isPendingTurnInFlight(displayPendingTurn) || Boolean(latestTurnFailure(interruptedDisplayEvents)), displayPendingTurn, optimisticPendingTurn?.id === displayPendingTurn?.id), thread.queuedTurns.filter((turn) => turn.intent === "post-cancellation")), [displayPendingTurn, interruptedDisplayEvents, isBusy, projectedRuntimeMessages, thread.queuedTurns]);
     const ungroupedVisibleMessages = useMemo(() => projectedMessages.filter((message) => !isProxiedInputOnlyMessage(message, effectiveRenderEvents)), [effectiveRenderEvents, projectedMessages]);
     const ungroupedDisplayEvents = interruptedDisplayEvents;
     const displayTimeline = useMemo(() => projectAgentDisplayTimeline(ungroupedVisibleMessages, ungroupedDisplayEvents), [ungroupedDisplayEvents, ungroupedVisibleMessages]);
@@ -1280,6 +1290,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         prepareTurn();
         onChange({
             pendingTurn: {
+                eventCountAtSubmission: compactedEventsRef.current.length,
                 id: next.id,
                 state: "submitting",
                 submittedAt: next.submittedAt,
@@ -1338,8 +1349,8 @@ function expandPromptDirectives(value, commands, mentions) {
 export function FollowUpQueue({ error, messages, onRemove, onRetry, turns, }) {
     return (_jsxs("div", { className: "border-b border-border/60 px-1 pb-2 text-sm", "data-agent-steer-queue": true, children: [_jsxs("div", { className: "flex items-center gap-2 px-1 pb-1 text-xs text-muted-foreground", children: [_jsx(Clock3Icon, { className: "size-3.5" }), _jsx("span", { children: messages.queuedFollowUps }), turns.length > 0 ? _jsx("span", { children: turns.length }) : null] }), _jsx("div", { className: "space-y-0.5", children: turns.map((turn) => (_jsxs("div", { className: "flex min-w-0 items-center gap-2 rounded-lg px-1 py-1 hover:bg-muted/55", children: [_jsx("span", { className: cn("size-1.5 shrink-0 rounded-full", turn.state === "delivery-failed" ? "bg-destructive" : "bg-amber-500") }), _jsx("span", { className: "min-w-0 flex-1 truncate text-[13px]", children: turn.text }), turn.state === "delivery-failed" ? _jsx("span", { className: "shrink-0 text-xs text-destructive", children: messages.queueDeliveryFailed }) : turn.state === "admission-ambiguous" ? _jsx("span", { className: "shrink-0 text-xs text-amber-700 dark:text-amber-300", children: messages.queueAdmissionAmbiguous }) : turn.state === "delivering" ? _jsx("span", { className: "shrink-0 text-xs text-muted-foreground", children: messages.queueDelivering }) : turn.state === "accepted" || turn.state === "committed" ? _jsx("span", { className: "shrink-0 text-xs text-muted-foreground", children: messages.queueAccepted }) : null, turn.state === "delivery-failed" ? _jsx(Button, { "aria-label": messages.retryQueuedMessage, className: "size-7", onClick: () => onRetry(turn.id), size: "icon-sm", variant: "ghost", children: _jsx(RotateCcwIcon, { className: "size-3.5" }) }) : null, mailboxTurnIsCancellable(turn) ? _jsx(Button, { "aria-label": messages.removeQueuedMessage, className: "size-7", onClick: () => onRemove(turn.id), size: "icon-sm", variant: "ghost", children: _jsx(XIcon, { className: "size-3.5" }) }) : null] }, turn.id))) }), error ? _jsx("p", { className: "px-1 pt-1 text-xs text-destructive", role: "alert", children: error }) : null] }));
 }
-function ensureActiveAssistantMessage(messages, events, isBusy, pendingTurn) {
-    const projectedMessages = projectPendingUserMessage(messages, pendingTurn);
+function ensureActiveAssistantMessage(messages, events, isBusy, pendingTurn, optimisticPending = false) {
+    const projectedMessages = projectPendingUserMessage(messages, pendingTurn, events, optimisticPending);
     const terminalFailure = latestTurnFailure(events);
     if (!isBusy && !terminalFailure)
         return projectedMessages;
@@ -1370,13 +1381,10 @@ function ensureActiveAssistantMessage(messages, events, isBusy, pendingTurn) {
         },
     ];
 }
-function projectPendingUserMessage(messages, pendingTurn) {
+function projectPendingUserMessage(messages, pendingTurn, events = [], optimisticPending = false) {
     if (!pendingTurn)
         return messages;
-    const latestUserMessage = [...messages].reverse().find((message) => message.role === "user");
-    const alreadyProjected = latestUserMessage !== undefined &&
-        pendingTurnMatchesMessage(pendingTurn, latestUserMessage);
-    if (alreadyProjected)
+    if (!optimisticPending && reconcilePendingTurnWithEvents(pendingTurn, events) === undefined)
         return messages;
     return [
         ...messages,
@@ -1410,18 +1418,6 @@ function projectStagedUserMessages(messages, turns) {
         });
     }
     return projected;
-}
-function pendingTurnMatchesMessage(pendingTurn, message) {
-    if (eveMessageText(message) !== pendingTurn.text)
-        return false;
-    const messageFiles = message.parts.filter((part) => part.type === "file");
-    const pendingFiles = pendingTurn.files ?? [];
-    return messageFiles.length === pendingFiles.length && messageFiles.every((file, index) => {
-        const pending = pendingFiles[index];
-        return pending?.mediaType === file.mediaType &&
-            pending.filename === file.filename &&
-            pending.url === file.url;
-    });
 }
 function isPendingTurnInFlight(pendingTurn) {
     return pendingTurn?.state === "clearing" ||
@@ -1471,12 +1467,6 @@ function upsertInterruptedTurn(turns, turn) {
         ...turns.filter((candidate) => candidate.turnId !== turn.turnId),
         turn,
     ].slice(-32);
-}
-function eveMessageText(message) {
-    return message.parts
-        .flatMap((part) => part.type === "text" ? [part.text] : [])
-        .join("\n")
-        .trim();
 }
 function createPendingTurnId() {
     return typeof crypto !== "undefined" && "randomUUID" in crypto
