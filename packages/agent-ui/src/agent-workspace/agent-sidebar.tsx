@@ -179,8 +179,10 @@ function SidebarThreadItems({
               ThreadListItem: () => (
                 <ThreadListItemPrimitive.Root
                   className={cn(
-                    "group relative flex min-h-9 items-center gap-0.5 overflow-visible rounded-md transition-colors hover:bg-sidebar-foreground/5 hover:text-sidebar-foreground",
-                    thread.id === activeThreadId && "bg-sidebar-foreground/10 text-sidebar-foreground",
+                    "group relative flex min-h-9 items-center gap-0.5 overflow-visible rounded-md transition-colors",
+                    thread.id === activeThreadId
+                      ? "bg-sidebar-foreground/[0.15] text-sidebar-foreground"
+                      : "hover:bg-sidebar-foreground/[0.07] hover:text-sidebar-foreground",
                   )}
                 >
                   {editingThreadId === thread.id ? (

@@ -44,6 +44,36 @@ export function classifyAgentFailure(failure) {
         return "provider";
     return "unknown";
 }
+export function stableUserMessageId(sourceId, turnId, stableRoot) {
+    const prefix = `${turnId}:user`;
+    if (sourceId === prefix)
+        return `${stableRoot}:user`;
+    if (sourceId.startsWith(`${prefix}:`)) {
+        return `${stableRoot}:user:${sourceId.slice(prefix.length + 1)}`;
+    }
+    return sourceId;
+}
+export function activeTurnIdAfterPendingSubmission(events, pendingTurn) {
+    const startedIndex = events.findLastIndex((event) => event.type === "turn.started");
+    if (startedIndex < 0)
+        return undefined;
+    const started = events[startedIndex];
+    if (started?.type !== "turn.started")
+        return undefined;
+    const turnId = started.data.turnId;
+    const settled = events.some((event) => (event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled") &&
+        event.data.turnId === turnId);
+    if (settled)
+        return undefined;
+    const submissionIndex = pendingTurn.eventCountAtSubmission;
+    if (submissionIndex !== undefined && events.length >= submissionIndex) {
+        return startedIndex >= submissionIndex ? turnId : undefined;
+    }
+    const eventAt = started.meta.at ? Date.parse(started.meta.at) : Number.NaN;
+    return Number.isFinite(eventAt) && eventAt >= pendingTurn.submittedAt - 1_000
+        ? turnId
+        : undefined;
+}
 export const INTERRUPTED_TOOL_ERROR = "Open Agent: tool call cancelled before completion.";
 export const CANCELLING_TOOL_ERROR = "Open Agent: tool call cancellation is pending.";
 export const INCOMPLETE_TOOL_ERROR = "Open Agent: tool call did not complete.";
@@ -573,7 +603,15 @@ export function presentAgentStep(events, turnId, stepIndex) {
 }
 export function reasoningContentForStep(events, turnId, stepIndex) {
     let content = "";
+    let completedBlock = false;
     for (const event of events) {
+        if (event.type === "step.started" &&
+            (turnId === undefined || event.data.turnId === turnId) &&
+            (stepIndex === undefined || event.data.stepIndex === stepIndex)) {
+            content = "";
+            completedBlock = false;
+            continue;
+        }
         if ((event.type !== "reasoning.appended" && event.type !== "reasoning.completed") ||
             (turnId !== undefined && event.data.turnId !== turnId) ||
             (stepIndex !== undefined && event.data.stepIndex !== stepIndex))
@@ -581,7 +619,12 @@ export function reasoningContentForStep(events, turnId, stepIndex) {
         if (event.type === "reasoning.completed") {
             if (event.data.reasoning.trim())
                 content = event.data.reasoning;
+            completedBlock = true;
             continue;
+        }
+        if (completedBlock) {
+            content = "";
+            completedBlock = false;
         }
         if (event.data.reasoningSoFar.trim()) {
             content = event.data.reasoningSoFar;
@@ -687,12 +730,17 @@ function orderAssistantMessageParts(parts, events, turnId) {
             activeStep = markerSteps.get(index);
         else if ("stepIndex" in part && typeof part.stepIndex === "number")
             activeStep = part.stepIndex;
+        const eventIndex = partEventIndex(part, events, turnId, activeStep);
+        const eventStep = eventIndex === undefined || !Number.isInteger(eventIndex)
+            ? undefined
+            : eventStepIndex(events[eventIndex]);
         return {
-            eventIndex: partEventIndex(part, events, turnId, activeStep),
+            eventIndex,
             index,
             isMarker: part.type === "step-start",
             part,
             stepIndex: activeStep,
+            sortStep: activeStep ?? eventStep,
         };
     });
     const groups = new Map();
@@ -735,11 +783,16 @@ function orderAssistantMessageParts(parts, events, turnId) {
             }
         }
     }
+    for (const entry of indexed) {
+        if (!localOrder.has(entry.index)) {
+            localOrder.set(entry.index, entry.eventIndex ?? entry.index);
+        }
+    }
     const hasComparablePosition = indexed.some((entry) => entry.eventIndex !== undefined);
     if (!hasComparablePosition)
         return parts;
     return indexed
-        .toSorted((left, right) => (left.stepIndex ?? Number.MAX_SAFE_INTEGER) - (right.stepIndex ?? Number.MAX_SAFE_INTEGER) ||
+        .toSorted((left, right) => (left.sortStep ?? Number.MAX_SAFE_INTEGER) - (right.sortStep ?? Number.MAX_SAFE_INTEGER) ||
         (localOrder.get(left.index) ?? Number.MAX_SAFE_INTEGER) - (localOrder.get(right.index) ?? Number.MAX_SAFE_INTEGER) ||
         left.index - right.index)
         .map((entry) => entry.part);
@@ -1122,6 +1175,13 @@ function mergeAssistantMessages(left, right) {
     for (const part of right.parts) {
         if (part.type === "dynamic-tool") {
             const existing = parts.findIndex((candidate) => candidate.type === "dynamic-tool" && candidate.toolCallId === part.toolCallId);
+            if (existing >= 0) {
+                parts[existing] = part;
+                continue;
+            }
+        }
+        if (part.type === "reasoning" && part.stepIndex !== undefined) {
+            const existing = parts.findIndex((candidate) => candidate.type === "reasoning" && candidate.stepIndex === part.stepIndex);
             if (existing >= 0) {
                 parts[existing] = part;
                 continue;

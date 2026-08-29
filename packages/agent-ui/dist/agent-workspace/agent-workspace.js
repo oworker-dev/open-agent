@@ -348,9 +348,17 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
     const inspectThreadRuntime = useCallback(async (thread) => {
         const runtimeCheckKey = runtimeInspectionKey(thread);
         if (!thread.session.sessionId ||
-            !threadNeedsRuntimeInspection(thread) ||
             runtimeChecksStarted.current.has(runtimeCheckKey))
             return;
+        if (!threadNeedsRuntimeInspection(thread)) {
+            if (thread.status === "streaming" || thread.status === "submitted") {
+                updateThread(thread.id, {
+                    status: statusFromEvents(thread.events, new Set(thread.closedInputRequestIds)),
+                    updatedAt: Date.now(),
+                });
+            }
+            return;
+        }
         runtimeChecksStarted.current.add(runtimeCheckKey);
         if (!inspectSession) {
             setRecoveringIds((current) => new Set(current).add(thread.id));
@@ -369,7 +377,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
             runtimeChecksStarted.current.delete(runtimeCheckKey);
             setRecoveringIds((current) => new Set(current).add(thread.id));
         }
-    }, [inspectSession, settleThreadHistory]);
+    }, [inspectSession, settleThreadHistory, updateThread]);
     const createThread = useCallback(() => {
         const active = activeThreadId ? threadsRef.current.find((thread) => thread.id === activeThreadId) : undefined;
         if (active && ephemeralThreadIds.has(active.id) && isEmptyDraftThread(active)) {
@@ -825,7 +833,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
             return;
         }
         let knownRuntimeBoundary;
-        let runtimeBoundaryState = inspectSession ? "unknown" : "running";
+        let runtimeBoundaryState = "unknown";
         let runtimeTailIndex;
         let followIdleTimeouts = 0;
         if (inspectSession) {
@@ -1607,15 +1615,30 @@ function threadNeedsRecovery(thread) {
     const pendingTurnInFlight = thread.pendingTurn?.state === "clearing" ||
         thread.pendingTurn?.state === "resubmitting" ||
         thread.pendingTurn?.state === "submitting";
+    if (!pendingTurnInFlight && thread.status !== "cancelling" && hasSettledSessionBoundaryForThread(thread.events)) {
+        return false;
+    }
     if (!pendingTurnInFlight && thread.status !== "streaming" && thread.status !== "submitted") {
         return thread.status === "cancelling";
     }
     const lastEvent = thread.events.at(-1);
     return !lastEvent || !isRecoveryBoundary(lastEvent);
 }
+function hasSettledSessionBoundaryForThread(events) {
+    const latestTurnStart = events.findLastIndex((event) => event.type === "turn.started");
+    const latestBoundary = events.findLastIndex((event) => event.type === "session.waiting" ||
+        event.type === "session.completed" ||
+        event.type === "session.failed");
+    return latestBoundary > latestTurnStart;
+}
 function threadNeedsRuntimeInspection(thread) {
     if (threadNeedsRecovery(thread))
         return true;
+    if (hasSettledSessionBoundaryForThread(thread.events) &&
+        !thread.pendingTurn &&
+        thread.status !== "cancelling" &&
+        !thread.queuedTurns.some((turn) => turn.intent === "post-cancellation"))
+        return false;
     if (thread.transcriptWindow &&
         thread.status !== "streaming" &&
         thread.status !== "submitted" &&

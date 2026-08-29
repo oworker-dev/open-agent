@@ -154,7 +154,7 @@ export function AssistantThreadSurface({
     () => new Map(eveMessages.map((message) => [message.id, message])),
     [eveMessages],
   );
-  const lastMessageId = eveMessages.at(-1)?.id;
+  const lastAssistantMessageId = [...eveMessages].reverse().find((message) => message.role === "assistant")?.id;
   const canRespondToInputRequest = eveMessages.some((message) =>
     message.parts.some((part) =>
       part.type === "dynamic-tool" &&
@@ -188,7 +188,7 @@ export function AssistantThreadSurface({
             </Button>
           </div>
         ) : null}
-        <div className="mx-auto flex w-full max-w-(--thread-max-width) flex-col gap-6 pb-3 empty:hidden">
+        <div className="mx-auto flex w-full max-w-(--thread-max-width) flex-col gap-4 pb-3 empty:hidden">
           <ThreadPrimitive.Messages>
             {({ message }) => message.composer.isEditing ? (
               <EditMessage messages={messages} />
@@ -199,21 +199,25 @@ export function AssistantThreadSurface({
               assetUrl={assetUrl}
               canRespond={!isBusy || canRespondToInputRequest}
               events={events}
-                fallbackStartedAt={fallbackStartedAt}
-              isStreaming={isBusy && message.id === lastMessageId}
+              fallbackStartedAt={fallbackStartedAt}
+              isStreaming={isBusy && message.id === lastAssistantMessageId}
               isTurnContinuation={isSteeringContinuationMessage(message, events)}
               locale={locale}
-                message={eveMessagesById.get(message.id)}
-                messages={messages}
-                onInputResponses={onInputResponses}
-                onCloseInputRequest={onCloseInputRequest}
-                onOpenDeliverable={onOpenDeliverable}
-                onOpenSubagent={onOpenSubagent}
-                closedInputRequestIds={closedInputRequestIds}
+              message={eveMessagesById.get(message.id)}
+              messages={messages}
+              onInputResponses={onInputResponses}
+              onCloseInputRequest={onCloseInputRequest}
+              onOpenDeliverable={onOpenDeliverable}
+              onOpenSubagent={onOpenSubagent}
+              closedInputRequestIds={closedInputRequestIds}
+              onRetryRuntimeError={onRetryRuntimeError}
+              runtimeError={message.id === lastAssistantMessageId ? runtimeError : undefined}
+              runtimeFailure={message.id === lastAssistantMessageId ? runtimeFailure : undefined}
+              runtimeRetry={message.id === lastAssistantMessageId ? runtimeRetry : undefined}
               />
           )}
           </ThreadPrimitive.Messages>
-          {runtimeError ? (
+          {runtimeError && !lastAssistantMessageId ? (
             <RuntimeErrorMessage
               locale={locale}
               message={runtimeError}
@@ -276,8 +280,14 @@ function isSteeringContinuationMessage(message: {
     ? message.metadata as { readonly turnId?: unknown }
     : undefined;
   const turnId = typeof metadata?.turnId === "string" ? metadata.turnId : undefined;
-  if (message.role !== "assistant" || !turnId || !message.id.startsWith(`${turnId}:assistant:`)) return false;
-  const clientMessageId = message.id.slice(`${turnId}:assistant:`.length);
+  if (message.role !== "assistant" || !turnId) return false;
+  // The live workspace may retain a pending display root while Eve replaces
+  // its source id. The segment suffix is stable, so use the id shape rather
+  // than requiring the durable turn id as the prefix.
+  const segmentMarker = ":assistant:";
+  const segmentStart = message.id.lastIndexOf(segmentMarker);
+  if (segmentStart < 0) return false;
+  const clientMessageId = message.id.slice(segmentStart + segmentMarker.length);
   if (!clientMessageId) return false;
   const receipts = events.filter((event) =>
     event.type === "message.received" && event.data.turnId === turnId,
@@ -356,7 +366,10 @@ function UserMessage({ messages }: { readonly messages: AgentMessages }) {
     return lastUser?.id === state.message.id;
   });
   return (
-    <MessagePrimitive.Root className="group mx-auto flex w-full max-w-(--thread-max-width) scroll-mt-5 flex-col items-end">
+    <MessagePrimitive.Root
+      className="group relative mx-auto flex w-full max-w-(--thread-max-width) flex-col items-end"
+      data-latest-user={isLastUserMessage ? "" : undefined}
+    >
       <AttachmentGroup className="mb-2 max-w-[88%] justify-end py-0 empty:hidden">
         <MessagePrimitive.Attachments>
           {({ attachment }) => <UserAttachment attachment={attachment} messages={messages} />}
@@ -370,8 +383,8 @@ function UserMessage({ messages }: { readonly messages: AgentMessages }) {
       >
         <MessagePrimitive.Parts components={{ Text: DirectiveText }} />
       </div>
-      <div className={cn("mt-0.5 flex min-h-7 items-center transition-opacity", actionsVisible ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100")}>
-        <ActionBarPrimitive.Root className="flex min-h-7 items-center gap-0.5">
+      <div className={cn("pointer-events-none absolute right-0 top-full z-10 flex h-7 items-center transition-opacity", actionsVisible ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100")}>
+        <ActionBarPrimitive.Root className="pointer-events-auto flex h-7 items-center gap-0.5">
           <ReliableCopyButton label={messages.copyResponse} />
           {isLastUserMessage ? (
             <ActionBarPrimitive.Edit
@@ -445,6 +458,10 @@ function AssistantMessage({
   onCloseInputRequest,
   onOpenDeliverable,
   onOpenSubagent,
+  onRetryRuntimeError,
+  runtimeError,
+  runtimeFailure,
+  runtimeRetry,
 }: {
   readonly assetUrl?: (assetId: string) => string;
   readonly canRespond: boolean;
@@ -460,6 +477,15 @@ function AssistantMessage({
   readonly onCloseInputRequest: (requestId: string) => void;
   readonly onOpenDeliverable?: (deliverable: AgentSessionDeliverable) => void;
   readonly onOpenSubagent?: (sessionId: string) => void;
+  readonly onRetryRuntimeError?: () => void;
+  readonly runtimeError?: string;
+  readonly runtimeFailure?: AgentTurnFailure;
+  readonly runtimeRetry?: {
+    readonly attempt: number;
+    readonly error: AgentTurnFailure;
+    readonly exhausted?: boolean;
+    readonly maximum: number;
+  };
 }) {
   const task = message
     ? presentAgentTurn(message, events, closedInputRequestIds, { mergeSameTurn: true })
@@ -476,7 +502,7 @@ function AssistantMessage({
             .trim() || undefined
     : undefined;
   return (
-    <MessagePrimitive.Root className="group mx-auto flex w-full max-w-(--thread-max-width) scroll-mt-5 flex-col">
+    <MessagePrimitive.Root className="group relative mx-auto flex w-full max-w-(--thread-max-width) flex-col">
       <div className="min-w-0 px-1 text-[15px] leading-7 text-foreground">
         {message ? (
           <AgentMessage
@@ -498,9 +524,19 @@ function AssistantMessage({
         ) : (
           <MessagePrimitive.Parts components={{ Text: MarkdownText, tools: { Fallback: ToolFallback } }} />
         )}
+        {runtimeError ? (
+          <RuntimeErrorMessage
+            failure={runtimeFailure}
+            locale={locale}
+            message={runtimeError}
+            messages={messages}
+            onRetry={onRetryRuntimeError}
+            retry={runtimeRetry}
+          />
+        ) : null}
       </div>
       {!isStreaming && copyableText ? (
-        <ActionBarPrimitive.Root className="mt-1 flex min-h-7 items-center opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
+        <ActionBarPrimitive.Root className="pointer-events-none absolute right-0 top-full z-10 flex h-7 items-center opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
           <ReliableCopyButton label={messages.copyResponse} text={copyableText} />
         </ActionBarPrimitive.Root>
       ) : null}

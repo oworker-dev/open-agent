@@ -1,6 +1,6 @@
 import type { MessageStreamEvent, InputRequest } from "eve/client";
 import type { EveDynamicToolPart, EveMessage, EveMessagePart } from "eve/react";
-import type { AgentInterruptedTurn, AgentSubagentSummary } from "./contracts.js";
+import type { AgentInterruptedTurn, AgentPendingTurn, AgentSubagentSummary } from "./contracts.js";
 export type AgentTurnStatus = "cancelled" | "completed" | "failed" | "running" | "waiting";
 export type SubagentCallPresentation = {
     readonly childSessionId?: string;
@@ -57,6 +57,8 @@ export type AgentDisplayProjection = {
     readonly events: readonly MessageStreamEvent[];
     readonly messages: readonly EveMessage[];
 };
+export declare function stableUserMessageId(sourceId: string, turnId: string, stableRoot: string): string;
+export declare function activeTurnIdAfterPendingSubmission(events: readonly MessageStreamEvent[], pendingTurn: Pick<AgentPendingTurn, "eventCountAtSubmission" | "submittedAt">): string | undefined;
 export declare const INTERRUPTED_TOOL_ERROR = "Open Agent: tool call cancelled before completion.";
 export declare const CANCELLING_TOOL_ERROR = "Open Agent: tool call cancellation is pending.";
 export declare const INCOMPLETE_TOOL_ERROR = "Open Agent: tool call did not complete.";

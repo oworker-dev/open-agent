@@ -72,12 +72,32 @@ export function AgentMessage({ assetUrl, canRespond, closedInputRequestIds = EMP
     const responseText = task?.finalPart?.text ?? (task ? undefined : lastText(displayMessage.parts));
     const failure = failureForTurn(events, displayMessage.metadata?.turnId);
     const hasFailureStepAnchor = task?.failureAnchored === true;
-    const hasVisiblePart = displayMessage.parts.some((part) => part.type !== "step-start");
+    const executionShellRef = useRef(Boolean(task || isStreaming || failure));
+    if (task || isStreaming || failure)
+        executionShellRef.current = true;
+    const showExecutionShell = executionShellRef.current;
+    const executionTask = task ?? {
+        proxiedInputParts: [],
+        processParts: [],
+        startedAt: fallbackStartedAt,
+        status: isStreaming ? "running" : failure ? "failed" : "completed",
+    };
     const publishedDeliverables = task?.status === "completed"
         ? deliverablesForTurn(events, displayMessage.metadata?.turnId)
         : [];
-    return (_jsx(DeliverableOpenContext.Provider, { value: onOpenDeliverable, children: _jsxs(Message, { "data-optimistic": message.metadata?.optimistic ? "true" : undefined, from: message.role, children: [_jsxs(MessageContent, { className: message.role === "assistant" ? "w-full" : undefined, children: [message.role === "assistant" && isStreaming && !hasVisiblePart ? (_jsx(ReasoningRoot, { className: "mb-1", role: "status", streaming: true, variant: "ghost", children: _jsx(ReasoningTrigger, { active: true, hideChevron: true, label: localize(locale, "Thinking", "正在思考") }) })) : null, task ? (_jsxs(_Fragment, { children: [isTurnContinuation ? (_jsxs("div", { className: "mt-2 space-y-3", children: [_jsx(ProcessParts, { assetUrl: assetUrl, canRespond: canRespond, closedInputRequestIds: closedInputRequestIds, events: events, inActiveExecution: task.status === "running" || task.status === "waiting", locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, parts: task.processParts, turnId: message.metadata?.turnId }), task.proxiedInputParts.map((part) => (_jsxs("div", { className: "space-y-2", children: [_jsx("p", { className: "text-xs font-medium text-amber-700 dark:text-amber-300", children: localize(locale, "A delegated task needs your approval", "子代理任务需要你的批准") }), _jsx(AgentMessagePart, { assetUrl: assetUrl, canRespond: canRespond, closedInputRequestIds: closedInputRequestIds, events: events, inActiveExecution: true, locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, part: part, turnId: message.metadata?.turnId })] }, `proxied-input:${part.toolCallId}`)))] })) : (_jsxs(ExecutionGroup, { collapseWhenSettled: task.status === "completed" && Boolean(task.finalPart?.text.trim() ||
-                                        hasLaterFinalDelivery(events, message.metadata?.turnId)), fallbackStartedAt: fallbackStartedAt, locale: locale, task: task, children: [_jsx(ProcessParts, { assetUrl: assetUrl, canRespond: canRespond, closedInputRequestIds: closedInputRequestIds, events: events, inActiveExecution: task.status === "running" || task.status === "waiting", locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, parts: task.processParts, turnId: message.metadata?.turnId }), task.proxiedInputParts.map((part) => (_jsxs("div", { className: "space-y-2", children: [_jsx("p", { className: "text-xs font-medium text-amber-700 dark:text-amber-300", children: localize(locale, "A delegated task needs your approval", "子代理任务需要你的批准") }), _jsx(AgentMessagePart, { assetUrl: assetUrl, canRespond: canRespond, closedInputRequestIds: closedInputRequestIds, events: events, inActiveExecution: true, locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, part: part, turnId: message.metadata?.turnId })] }, `proxied-input:${part.toolCallId}`)))] })), task.finalPart ? (_jsx("div", { className: "pt-3", children: _jsx(AgentMessagePart, { assetUrl: assetUrl, canRespond: canRespond, events: events, inActiveExecution: false, locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, part: task.finalPart, turnId: message.metadata?.turnId }) })) : null, publishedDeliverables.length > 0 ? (_jsx("div", { className: "space-y-2 pt-3", "data-turn-deliverables": true, children: publishedDeliverables.map((deliverable) => _jsx(PublishedDeliverableCard, { deliverable: deliverable, locale: locale }, `${deliverable.kind}:${deliverable.id}`)) })) : null] })) : displayMessage.parts.map((part, index) => (_jsx(AgentMessagePart, { assetUrl: assetUrl, canRespond: canRespond, events: events, inActiveExecution: false, locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, part: part, turnId: message.metadata?.turnId }, partKey(part, index)))), failure && !hasFailureStepAnchor ? _jsx(TurnFailure, { failure: failure, locale: locale }) : null] }), showCopyAction && message.role === "assistant" && responseText && !isStreaming ? (_jsx(CopyResponseAction, { locale: locale, text: responseText })) : null] }) }));
+    const directParts = !task && message.role === "assistant" && isStreaming &&
+        !displayMessage.parts.some((part) => part.type === "reasoning")
+        ? [
+            {
+                state: "streaming",
+                stepIndex: activeReasoningStep(events, displayMessage.metadata?.turnId),
+                text: "",
+                type: "reasoning",
+            },
+            ...displayMessage.parts,
+        ]
+        : displayMessage.parts;
+    return (_jsx(DeliverableOpenContext.Provider, { value: onOpenDeliverable, children: _jsxs(Message, { "data-optimistic": message.metadata?.optimistic ? "true" : undefined, from: message.role, children: [_jsxs(MessageContent, { className: message.role === "assistant" ? "w-full" : undefined, children: [showExecutionShell ? (_jsxs(_Fragment, { children: [_jsx(ExecutionGroup, { collapseWhenSettled: Boolean(task && task.status === "completed" && (task.finalPart?.text.trim() || hasLaterFinalDelivery(events, message.metadata?.turnId))), fallbackStartedAt: fallbackStartedAt, locale: locale, showTrigger: Boolean(task), task: executionTask, children: _jsxs("div", { className: isTurnContinuation ? "space-y-2" : undefined, children: [_jsx(ProcessParts, { assetUrl: assetUrl, canRespond: canRespond, closedInputRequestIds: closedInputRequestIds, events: events, inActiveExecution: executionTask.status === "running" || executionTask.status === "waiting", locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, parts: withReasoningParts(task?.processParts ?? directParts, events, message.metadata?.turnId), turnId: message.metadata?.turnId }), task?.proxiedInputParts.map((part) => (_jsxs("div", { className: "space-y-2", children: [_jsx("p", { className: "text-xs font-medium text-amber-700 dark:text-amber-300", children: localize(locale, "A delegated task needs your approval", "子代理任务需要你的批准") }), _jsx(AgentMessagePart, { assetUrl: assetUrl, canRespond: canRespond, closedInputRequestIds: closedInputRequestIds, events: events, inActiveExecution: true, locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, part: part, turnId: message.metadata?.turnId })] }, `proxied-input:${part.toolCallId}`)))] }) }), task?.finalPart ? (_jsx("div", { className: "pt-2", children: _jsx(AgentMessagePart, { assetUrl: assetUrl, canRespond: canRespond, events: events, inActiveExecution: false, locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, part: task.finalPart, turnId: message.metadata?.turnId }) })) : null, task && publishedDeliverables.length > 0 ? (_jsx("div", { className: "space-y-2 pt-3", "data-turn-deliverables": true, children: publishedDeliverables.map((deliverable) => _jsx(PublishedDeliverableCard, { deliverable: deliverable, locale: locale }, `${deliverable.kind}:${deliverable.id}`)) })) : null] })) : directParts.map((part, index) => (_jsx(AgentMessagePart, { assetUrl: assetUrl, canRespond: canRespond, events: events, inActiveExecution: false, locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenSubagent: onOpenSubagent, part: part, turnId: message.metadata?.turnId }, partKey(part, index)))), failure && !hasFailureStepAnchor ? _jsx(TurnFailure, { failure: failure, locale: locale }) : null] }), showCopyAction && message.role === "assistant" && responseText && !isStreaming ? (_jsx(CopyResponseAction, { locale: locale, text: responseText })) : null] }) }));
 }
 function AgentMessagePart({ assetUrl, canRespond, closedInputRequestIds = EMPTY_CLOSED_INPUT_REQUEST_IDS, events, inActiveExecution, locale, onOpenSubagent, onInputResponses, onCloseInputRequest = () => undefined, part, turnId, }) {
     switch (part.type) {
@@ -104,6 +124,7 @@ function ProcessParts({ assetUrl, canRespond, closedInputRequestIds = EMPTY_CLOS
     let previousStepIndex = -1;
     const toolGroupOrdinalByStep = new Map();
     const lastReasoningPartByStep = new Map();
+    const renderedStepActivity = new Set();
     for (let partIndex = 0; partIndex < parts.length; partIndex += 1) {
         const candidate = parts[partIndex];
         if (candidate?.type === "reasoning" && typeof candidate.stepIndex === "number") {
@@ -119,14 +140,19 @@ function ProcessParts({ assetUrl, canRespond, closedInputRequestIds = EMPTY_CLOS
             const stepIndex = stepIndexForParts(stepParts, events, turnId, previousStepIndex);
             if (stepIndex !== undefined)
                 previousStepIndex = stepIndex;
-            const hasReasoning = stepIndex !== undefined && (stepParts.some((candidate) => candidate.type === "reasoning" && candidate.stepIndex === stepIndex && candidate.text.trim().length > 0) || Boolean(reasoningContentForStep(events, turnId, stepIndex)));
+            const hasReasoning = stepIndex !== undefined && (stepParts.some((candidate) => candidate.type === "reasoning" && candidate.stepIndex === stepIndex) ||
+                Boolean(reasoningContentForStep(events, turnId, stepIndex)));
             if (!hasReasoning) {
                 const hasStepEvidence = stepIndex !== undefined && events.some((event) => eventStepMatches(event, turnId, stepIndex));
                 if (!hasStepEvidence) {
                     index += 1;
                     continue;
                 }
-                rendered.push(_jsx(StepActivity, { events: events, locale: locale, stepIndex: stepIndex ?? previousStepIndex, turnId: turnId }, `step-activity:${turnId}:${stepIndex ?? index}`));
+                const activityStep = stepIndex ?? previousStepIndex;
+                if (activityStep >= 0 && !renderedStepActivity.has(activityStep)) {
+                    renderedStepActivity.add(activityStep);
+                    rendered.push(_jsx(StepActivity, { events: events, locale: locale, stepIndex: activityStep, turnId: turnId }, `step-activity:${turnId}:${activityStep}`));
+                }
             }
             index += 1;
             continue;
@@ -172,6 +198,54 @@ function ProcessParts({ assetUrl, canRespond, closedInputRequestIds = EMPTY_CLOS
         index = cursor;
     }
     return _jsx(_Fragment, { children: rendered });
+}
+function withReasoningParts(parts, events, turnId) {
+    if (!turnId || !parts.some((part) => part.type === "step-start"))
+        return parts;
+    const reasoningParts = parts.filter((part) => part.type === "reasoning");
+    const remaining = parts.filter((part) => part.type !== "reasoning");
+    const next = [];
+    const usedReasoning = new Set();
+    const representedReasoningSteps = new Set();
+    let previousStepIndex = -1;
+    for (let index = 0; index < remaining.length; index += 1) {
+        const part = remaining[index];
+        next.push(part);
+        if (part.type !== "step-start")
+            continue;
+        const nextMarker = remaining.findIndex((candidate, candidateIndex) => candidateIndex > index && candidate.type === "step-start");
+        const stepParts = remaining.slice(index + 1, nextMarker < 0 ? remaining.length : nextMarker);
+        const stepIndex = stepIndexForParts(stepParts, events, turnId, previousStepIndex);
+        if (stepIndex === undefined)
+            continue;
+        previousStepIndex = stepIndex;
+        if (representedReasoningSteps.has(stepIndex))
+            continue;
+        const existing = reasoningParts.find((candidate, candidateIndex) => !usedReasoning.has(candidateIndex) && candidate.stepIndex === stepIndex) ?? reasoningParts.find((candidate, candidateIndex) => !usedReasoning.has(candidateIndex) && candidate.stepIndex === undefined);
+        const existingIndex = existing ? reasoningParts.indexOf(existing) : -1;
+        if (existingIndex >= 0)
+            usedReasoning.add(existingIndex);
+        const eventText = reasoningContentForStep(events, turnId, stepIndex);
+        const text = eventText || existing?.text.trim() || "";
+        if (existing || text) {
+            representedReasoningSteps.add(stepIndex);
+            next.push({
+                ...(existing ?? { state: "done", text, type: "reasoning" }),
+                ...(existing?.text.trim() ? {} : { text }),
+                stepIndex,
+            });
+        }
+    }
+    const representedSteps = new Set(next.flatMap((part) => part.type === "reasoning" && typeof part.stepIndex === "number" ? [part.stepIndex] : []));
+    for (let index = 0; index < reasoningParts.length; index += 1) {
+        if (usedReasoning.has(index))
+            continue;
+        const part = reasoningParts[index];
+        if (part.stepIndex !== undefined && representedSteps.has(part.stepIndex))
+            continue;
+        next.push(part);
+    }
+    return next.length === parts.length && next.every((part, index) => part === parts[index]) ? parts : next;
 }
 function stepIndexForParts(parts, events, turnId, previousStepIndex) {
     const explicit = parts.find((part) => "stepIndex" in part && typeof part.stepIndex === "number");
@@ -498,14 +572,15 @@ function countContentLines(value) {
 }
 function StepActivity({ events, locale, stepIndex, turnId, }) {
     const step = presentAgentStep(events, turnId, stepIndex);
-    const retryItems = step.retries ?? (step.retry ? [step.retry] : []);
     const hasReasoningContent = Boolean(reasoningContentForStep(events, turnId, stepIndex));
-    if (!hasReasoningContent && step.status !== "running") {
-        return (_jsxs(_Fragment, { children: [retryItems.map((retry, index) => (_jsx(RetryStatus, { locale: locale, retry: retry }, `retry:${turnId ?? "unknown"}:${stepIndex}:${index}`))), step.status === "failed" && step.failure && !step.retry?.exhausted ? _jsx(StepFailure, { failure: step.failure, locale: locale }) : null] }));
-    }
-    return (_jsxs(_Fragment, { children: [retryItems.map((retry, index) => (_jsx(RetryStatus, { locale: locale, retry: retry }, `retry:${turnId ?? "unknown"}:${stepIndex}:${index}`))), step.status === "failed" && step.failure && !step.retry?.exhausted ? _jsx(StepFailure, { failure: step.failure, locale: locale }) : null, _jsx(ReasoningRoot, { className: "mb-1", role: "status", streaming: step.status === "running", variant: "ghost", children: _jsx(ReasoningTrigger, { active: step.status === "running", hideChevron: true, label: step.status === "running"
-                        ? localize(locale, "Thinking", "正在思考")
-                        : localize(locale, "Reasoning complete", "思考完成") }) })] }));
+    const hasToolActivity = events.some((event) => {
+        if (event.type !== "actions.requested" && event.type !== "action.input.partial" && event.type !== "action.result")
+            return false;
+        return eventTurnMatches(event, turnId, stepIndex);
+    });
+    const timing = reasoningTiming(events, turnId, stepIndex);
+    const durationSeconds = useElapsedSeconds(timing.startedAt, timing.endedAt);
+    return (_jsx(ReasoningBlock, { durationSeconds: durationSeconds, events: events, failure: step.failure, locale: locale, retryItems: step.retries ?? (step.retry ? [step.retry] : []), stepIndex: stepIndex, streaming: step.status === "running" && !hasToolActivity, text: hasReasoningContent ? reasoningContentForStep(events, turnId, stepIndex) : "", timing: timing, turnId: turnId }));
 }
 function StepFailure({ failure, locale, }) {
     return (_jsxs("div", { className: "mb-1 flex items-start gap-2 text-sm text-destructive", role: "alert", children: [_jsx(XCircleIcon, { className: "mt-0.5 size-4 shrink-0" }), _jsxs("span", { className: "min-w-0 break-words", children: [failureTitle(locale, failure), ": ", sanitizeFailureMessage(failure.message)] })] }));
@@ -526,11 +601,55 @@ function ReasoningPart({ events, locale, part, turnId, }) {
     const retryItems = step.retries ?? (step.retry ? [step.retry] : []);
     const stepIndex = part.stepIndex ?? 0;
     const durationSeconds = useElapsedSeconds(timing.startedAt, timing.endedAt);
-    const streaming = part.state === "streaming";
-    const text = part.text.trim() || reasoningContentForStep(events, turnId, part.stepIndex);
-    if (!text && !streaming)
-        return null;
-    return (_jsxs(_Fragment, { children: [retryItems.map((retry, index) => (_jsx(RetryStatus, { locale: locale, retry: retry }, `retry:${turnId ?? "unknown"}:${stepIndex}:${index}`))), step.status === "failed" && step.failure && !step.retry?.exhausted ? _jsx(StepFailure, { failure: step.failure, locale: locale }) : null, _jsxs(ReasoningRoot, { className: "mb-1", streaming: streaming, variant: "ghost", children: [_jsx(ReasoningTrigger, { active: streaming, duration: timing.startedAt && durationSeconds > 0 ? durationSeconds : undefined, hideChevron: !text, label: reasoningTriggerLabel(locale, streaming, text) }), _jsx(ReasoningContent, { "aria-busy": streaming, children: _jsx(ReasoningText, { children: _jsx(StaticMarkdownText, { text: text }) }) })] })] }));
+    const retryInFlight = isReasoningRetryInFlight(events, turnId, part.stepIndex);
+    const eventText = reasoningContentForStep(events, turnId, part.stepIndex);
+    const responseStarted = Boolean(turnId) && !eventText && events.some((event) => (event.type === "message.appended" || event.type === "message.completed") &&
+        eventTurnMatches(event, turnId, stepIndex) &&
+        (event.type !== "message.appended" || event.data.messageSoFar.trim().length > 0) &&
+        (event.type !== "message.completed" || Boolean(event.data.message?.trim())));
+    const streaming = (part.state === "streaming" || retryInFlight) && !responseStarted;
+    const text = retryInFlight ? eventText : eventText || part.text.trim();
+    if (!text && !streaming) {
+        return (_jsx(ReasoningBlock, { durationSeconds: durationSeconds, events: events, failure: step.failure, locale: locale, retryItems: retryItems, stepIndex: stepIndex, streaming: false, text: "", timing: timing, turnId: turnId }));
+    }
+    return (_jsx(ReasoningBlock, { durationSeconds: durationSeconds, events: events, failure: step.failure, locale: locale, retryItems: retryItems, stepIndex: stepIndex, streaming: streaming, text: text, timing: timing, turnId: turnId }));
+}
+function ReasoningBlock({ durationSeconds, failure, locale, retryItems, stepIndex, streaming, text, timing, turnId, }) {
+    const hasText = text.trim().length > 0;
+    return (_jsxs(_Fragment, { children: [retryItems.map((retry, index) => (_jsx(RetryStatus, { locale: locale, retry: retry }, `retry:${turnId ?? "unknown"}:${stepIndex}:${index}`))), failure && !retryItems.some((retry) => retry.exhausted) ? _jsx(StepFailure, { failure: failure, locale: locale }) : null, hasText || streaming ? (_jsxs(ReasoningRoot, { className: "mb-1", role: streaming ? "status" : undefined, streaming: streaming, variant: "ghost", children: [_jsx(ReasoningTrigger, { active: streaming, duration: timing.startedAt && durationSeconds > 0 ? durationSeconds : undefined, hideChevron: !hasText, label: reasoningTriggerLabel(locale, streaming, text) }), hasText ? (_jsx(ReasoningContent, { "aria-busy": streaming, children: _jsx(ReasoningText, { children: _jsx(StaticMarkdownText, { text: text }) }) })) : null] })) : null] }));
+}
+function eventTurnMatches(event, turnId, stepIndex) {
+    if (!("data" in event) || !event.data || typeof event.data !== "object")
+        return false;
+    const data = event.data;
+    return (turnId === undefined || data.turnId === turnId) && data.stepIndex === stepIndex;
+}
+function isReasoningRetryInFlight(events, turnId, stepIndex) {
+    if (!turnId || stepIndex === undefined)
+        return false;
+    let latestStart = -1;
+    let latestReasoning = -1;
+    let latestCompletion = -1;
+    let latestFailure = -1;
+    for (let index = 0; index < events.length; index += 1) {
+        const event = events[index];
+        if (!("data" in event))
+            continue;
+        const data = event.data;
+        if (data.turnId !== turnId || data.stepIndex !== stepIndex)
+            continue;
+        if (event.type === "step.started")
+            latestStart = index;
+        else if (event.type === "reasoning.appended" || event.type === "reasoning.completed") {
+            latestReasoning = index;
+            if (event.type === "reasoning.completed")
+                latestCompletion = index;
+        }
+        else if (event.type === "step.failed")
+            latestFailure = index;
+    }
+    return latestStart > latestReasoning && (latestCompletion >= 0 || latestFailure >= 0) &&
+        latestStart > Math.max(latestCompletion, latestFailure);
 }
 function reasoningTriggerLabel(locale, streaming, text) {
     if (streaming)
@@ -546,6 +665,10 @@ function reasoningSummary(text) {
     if (!firstLine)
         return undefined;
     return firstLine.length > 64 ? `${firstLine.slice(0, 63)}…` : firstLine;
+}
+function activeReasoningStep(events, turnId) {
+    const started = [...events].reverse().find((event) => event.type === "step.started" && (turnId === undefined || event.data.turnId === turnId));
+    return started?.type === "step.started" ? started.data.stepIndex : 0;
 }
 function reasoningTiming(events, turnId, stepIndex) {
     const matching = events
@@ -958,7 +1081,7 @@ function SubagentProgress({ events, locale, onOpenSubagent, part, }) {
                                 ? localize(locale, "Works in the parent Agent workspace.", "在父 Agent 的工作区中执行。")
                                 : localize(locale, "Runs in its own isolated workspace.", "在独立隔离的工作区中执行。")] }), presentation.childSessionId && onOpenSubagent ? (_jsxs(Button, { className: "mt-2 h-7 px-2 text-xs", onClick: () => onOpenSubagent(presentation.childSessionId), size: "sm", variant: "outline", children: [_jsx(NetworkIcon, { className: "size-3.5" }), localize(locale, `Open ${presentation.name === "agent" ? "sub-agent" : presentation.name ?? "sub-agent"} session`, `打开${presentation.name && presentation.name !== "agent" ? ` ${presentation.name}` : "子代理"}会话`)] })) : null] }), presentation.startedAt ? (_jsx("span", { className: "shrink-0 text-xs tabular-nums text-muted-foreground", children: formatDuration(elapsedSeconds) })) : null] }));
 }
-function ExecutionGroup({ children, collapseWhenSettled, fallbackStartedAt, locale, task, }) {
+function ExecutionGroup({ children, collapseWhenSettled, fallbackStartedAt, locale, showTrigger = true, task, }) {
     const isActive = task.status === "running" || task.status === "waiting";
     const hasFinalDelivery = task.status === "completed" && collapseWhenSettled;
     const [open, setOpen] = useState(!hasFinalDelivery);
@@ -983,7 +1106,9 @@ function ExecutionGroup({ children, collapseWhenSettled, fallbackStartedAt, loca
     return (_jsxs(Collapsible, { className: "group/execution w-full", onOpenChange: (nextOpen) => {
             lockScroll();
             setOpen(nextOpen);
-        }, open: open, ref: executionRef, children: [_jsx(CollapsibleTrigger, { asChild: true, children: _jsxs("button", { className: "flex w-full items-center gap-1.5 border-b border-border/60 py-1.5 text-left text-sm text-muted-foreground transition-colors hover:text-foreground", type: "button", children: [_jsx("span", { children: executionLabel(locale, task) }), startedAt && elapsedSeconds > 0 ? _jsx("span", { className: "tabular-nums", children: formatDuration(elapsedSeconds) }) : null, _jsx(ChevronDownIcon, { className: "size-3.5 transition-transform group-data-[state=open]/execution:rotate-180" })] }) }), _jsx(CollapsibleContent, { className: "overflow-hidden data-[state=closed]:animate-out data-[state=open]:animate-in", children: _jsx("div", { className: "mt-2 space-y-3 pt-2", children: children }) })] }));
+        }, open: open, ref: executionRef, children: [_jsx(CollapsibleTrigger, { asChild: true, children: _jsxs("button", { "aria-hidden": !showTrigger, className: showTrigger
+                        ? "flex w-full items-center gap-1.5 border-b border-border/60 py-1.5 text-left text-sm text-muted-foreground transition-colors hover:text-foreground"
+                        : "pointer-events-none invisible h-0 w-full overflow-hidden", tabIndex: showTrigger ? undefined : -1, type: "button", children: [_jsx("span", { children: executionLabel(locale, task) }), startedAt && elapsedSeconds > 0 ? _jsx("span", { className: "tabular-nums", children: formatDuration(elapsedSeconds) }) : null, _jsx(ChevronDownIcon, { className: "size-3.5 transition-transform group-data-[state=open]/execution:rotate-180" })] }) }), _jsx(CollapsibleContent, { className: "overflow-hidden data-[state=closed]:animate-out data-[state=open]:animate-in", children: _jsx("div", { className: "mt-2 space-y-3 pt-2", children: children }) })] }));
 }
 function hasLaterFinalDelivery(events, turnId) {
     if (!turnId)
@@ -1333,6 +1458,8 @@ function partKey(part, index) {
     switch (part.type) {
         case "authorization":
             return `authorization:${part.turnId}:${part.stepIndex}:${part.name}`;
+        case "reasoning":
+            return `reasoning:${part.stepIndex ?? "pending"}`;
         case "dynamic-tool":
             return part.toolCallId;
         default:

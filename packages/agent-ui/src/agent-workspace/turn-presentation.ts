@@ -1,6 +1,6 @@
 import type { MessageStreamEvent, InputRequest } from "eve/client";
 import type { EveDynamicToolPart, EveMessage, EveMessagePart } from "eve/react";
-import type { AgentInterruptedTurn, AgentSubagentSummary } from "./contracts.js";
+import type { AgentInterruptedTurn, AgentPendingTurn, AgentSubagentSummary } from "./contracts.js";
 
 export type AgentTurnStatus = "cancelled" | "completed" | "failed" | "running" | "waiting";
 
@@ -122,6 +122,58 @@ export type AgentDisplayProjection = {
   readonly events: readonly MessageStreamEvent[];
   readonly messages: readonly EveMessage[];
 };
+
+/**
+ * Replace only the durable turn prefix while preserving the per-message
+ * suffix Eve uses for steering/follow-up receipts.
+ */
+export function stableUserMessageId(sourceId: string, turnId: string, stableRoot: string): string {
+  const prefix = `${turnId}:user`;
+  if (sourceId === prefix) return `${stableRoot}:user`;
+  if (sourceId.startsWith(`${prefix}:`)) {
+    return `${stableRoot}:user:${sourceId.slice(prefix.length + 1)}`;
+  }
+  return sourceId;
+}
+
+/**
+ * Return the active turn only when it belongs to the pending admission.
+ *
+ * Eve can publish a throttled snapshot containing the previous turn's
+ * `turn.started` before its terminal event reaches the browser. Treating that
+ * snapshot as the new turn causes the previous assistant message to be
+ * rebound to the optimistic root and briefly displays stale reasoning.
+ */
+export function activeTurnIdAfterPendingSubmission(
+  events: readonly MessageStreamEvent[],
+  pendingTurn: Pick<AgentPendingTurn, "eventCountAtSubmission" | "submittedAt">,
+): string | undefined {
+  const startedIndex = events.findLastIndex((event) => event.type === "turn.started");
+  if (startedIndex < 0) return undefined;
+  const started = events[startedIndex];
+  if (started?.type !== "turn.started") return undefined;
+  const turnId = started.data.turnId;
+  const settled = events.some((event) =>
+    (event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled") &&
+    event.data.turnId === turnId,
+  );
+  if (settled) return undefined;
+
+  const submissionIndex = pendingTurn.eventCountAtSubmission;
+  // The pending count is measured against the append-only event buffer. A
+  // started event before it is historical even when its terminal event is
+  // missing from this throttled snapshot.
+  if (submissionIndex !== undefined && events.length >= submissionIndex) {
+    return startedIndex >= submissionIndex ? turnId : undefined;
+  }
+
+  // Display projections may be shorter than the append-only buffer. In that
+  // case use Eve's timestamp; without either signal, do not alias history.
+  const eventAt = started.meta.at ? Date.parse(started.meta.at) : Number.NaN;
+  return Number.isFinite(eventAt) && eventAt >= pendingTurn.submittedAt - 1_000
+    ? turnId
+    : undefined;
+}
 
 /** Marker used only in the UI projection for a tool that was interrupted
  * before Eve produced an action.result. It is never written into Eve's stream.
@@ -839,7 +891,20 @@ export function reasoningContentForStep(
   stepIndex: number | undefined,
 ): string {
   let content = "";
+  let completedBlock = false;
   for (const event of events) {
+    if (
+      event.type === "step.started" &&
+      (turnId === undefined || event.data.turnId === turnId) &&
+      (stepIndex === undefined || event.data.stepIndex === stepIndex)
+    ) {
+      // eve retries an interrupted step with the same turn/step coordinates.
+      // A new step boundary starts a new reasoning block; never carry the
+      // previous attempt's text into the retry.
+      content = "";
+      completedBlock = false;
+      continue;
+    }
     if (
       (event.type !== "reasoning.appended" && event.type !== "reasoning.completed") ||
       (turnId !== undefined && event.data.turnId !== turnId) ||
@@ -847,7 +912,14 @@ export function reasoningContentForStep(
     ) continue;
     if (event.type === "reasoning.completed") {
       if (event.data.reasoning.trim()) content = event.data.reasoning;
+      completedBlock = true;
       continue;
+    }
+    if (completedBlock) {
+      // Older providers may omit the next step.started and begin a retry with
+      // a delta-only reasoning event. Treat that first delta as a fresh block.
+      content = "";
+      completedBlock = false;
     }
     if (event.data.reasoningSoFar.trim()) {
       content = event.data.reasoningSoFar;
@@ -1014,12 +1086,21 @@ function orderAssistantMessageParts(
   const indexed = parts.map((part, index) => {
     if (part.type === "step-start") activeStep = markerSteps.get(index);
     else if ("stepIndex" in part && typeof part.stepIndex === "number") activeStep = part.stepIndex;
+    const eventIndex = partEventIndex(part, events, turnId, activeStep);
+    // A reducer snapshot can omit the step index on narration parts. If the
+    // matching durable event has one, use it for ordering instead of sending
+    // the part to the end of the message. This is what keeps narration before
+    // a following tool after a reconnect.
+    const eventStep = eventIndex === undefined || !Number.isInteger(eventIndex)
+      ? undefined
+      : eventStepIndex(events[eventIndex]!);
     return {
-      eventIndex: partEventIndex(part, events, turnId, activeStep),
+      eventIndex,
       index,
       isMarker: part.type === "step-start",
       part,
       stepIndex: activeStep,
+      sortStep: activeStep ?? eventStep,
     };
   });
   const groups = new Map<number, typeof indexed>();
@@ -1061,11 +1142,16 @@ function orderAssistantMessageParts(
       }
     }
   }
+  for (const entry of indexed) {
+    if (!localOrder.has(entry.index)) {
+      localOrder.set(entry.index, entry.eventIndex ?? entry.index);
+    }
+  }
   const hasComparablePosition = indexed.some((entry) => entry.eventIndex !== undefined);
   if (!hasComparablePosition) return parts;
   return indexed
     .toSorted((left, right) =>
-      (left.stepIndex ?? Number.MAX_SAFE_INTEGER) - (right.stepIndex ?? Number.MAX_SAFE_INTEGER) ||
+      (left.sortStep ?? Number.MAX_SAFE_INTEGER) - (right.sortStep ?? Number.MAX_SAFE_INTEGER) ||
       (localOrder.get(left.index) ?? Number.MAX_SAFE_INTEGER) - (localOrder.get(right.index) ?? Number.MAX_SAFE_INTEGER) ||
       left.index - right.index,
     )
@@ -1601,6 +1687,18 @@ function mergeAssistantMessages(left: EveMessage, right: EveMessage): EveMessage
         candidate.type === "dynamic-tool" && candidate.toolCallId === part.toolCallId
       );
       if (existing >= 0) {
+        parts[existing] = part;
+        continue;
+      }
+    }
+    if (part.type === "reasoning" && part.stepIndex !== undefined) {
+      const existing = parts.findIndex((candidate) =>
+        candidate.type === "reasoning" && candidate.stepIndex === part.stepIndex,
+      );
+      if (existing >= 0) {
+        // Same-turn continuation/retry snapshots can carry the same logical
+        // reasoning step more than once. Keep one part; the event projection
+        // supplies the authoritative text for the current attempt.
         parts[existing] = part;
         continue;
       }

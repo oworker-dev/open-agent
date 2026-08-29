@@ -498,9 +498,20 @@ export function AgentWorkspace({
     const runtimeCheckKey = runtimeInspectionKey(thread);
     if (
       !thread.session.sessionId ||
-      !threadNeedsRuntimeInspection(thread) ||
       runtimeChecksStarted.current.has(runtimeCheckKey)
     ) return;
+    if (!threadNeedsRuntimeInspection(thread)) {
+      // A stale browser status must not survive hydration when the durable
+      // transcript already contains its session boundary. Normalize the
+      // metadata without opening Eve's stream.
+      if (thread.status === "streaming" || thread.status === "submitted") {
+        updateThread(thread.id, {
+          status: statusFromEvents(thread.events, new Set(thread.closedInputRequestIds)),
+          updatedAt: Date.now(),
+        });
+      }
+      return;
+    }
     runtimeChecksStarted.current.add(runtimeCheckKey);
     if (!inspectSession) {
       setRecoveringIds((current) => new Set(current).add(thread.id));
@@ -524,7 +535,7 @@ export function AgentWorkspace({
       runtimeChecksStarted.current.delete(runtimeCheckKey);
       setRecoveringIds((current) => new Set(current).add(thread.id));
     }
-  }, [inspectSession, settleThreadHistory]);
+  }, [inspectSession, settleThreadHistory, updateThread]);
 
   const createThread = useCallback(() => {
     const active = activeThreadId ? threadsRef.current.find((thread) => thread.id === activeThreadId) : undefined;
@@ -1004,10 +1015,13 @@ export function AgentWorkspace({
     // says that this session is running. A stale browser checkpoint or a
     // failed/unauthorized inspection must never be treated as proof of life:
     // doing so turns a completed session into an unbounded replay subscription.
-    // Host integrations that do not expose a lifecycle inspector retain the
-    // original live-session behavior; standalone deployments always provide
-    // the inspector and therefore fail closed until it says "running".
-    let runtimeBoundaryState: "unknown" | "running" | "waiting" | "terminal" = inspectSession ? "unknown" : "running";
+    // Hosts that do not expose a lifecycle inspector therefore use bounded
+    // catch-up only; they must provide an inspector to opt into live follow.
+    // Never assume a recovered session is still running. Without an
+    // inspector we can only perform bounded catch-up reads; opening `follow:
+    // true` from a stale checkpoint would leave a finished session subscribed
+    // forever and is the same failure mode as the historical infinite replay.
+    let runtimeBoundaryState: "unknown" | "running" | "waiting" | "terminal" = "unknown";
     let runtimeTailIndex: number | undefined;
     let followIdleTimeouts = 0;
     // A browser checkpoint can remain "submitted" after Eve has already
@@ -2262,6 +2276,12 @@ function threadNeedsRecovery(thread: AgentThread): boolean {
   const pendingTurnInFlight = thread.pendingTurn?.state === "clearing" ||
     thread.pendingTurn?.state === "resubmitting" ||
     thread.pendingTurn?.state === "submitting";
+  // A durable session boundary is authoritative even when a compacted
+  // transcript has a few non-lifecycle events after it. Reopening recovery in
+  // that state turns a completed conversation into a replay subscription.
+  if (!pendingTurnInFlight && thread.status !== "cancelling" && hasSettledSessionBoundaryForThread(thread.events)) {
+    return false;
+  }
   if (!pendingTurnInFlight && thread.status !== "streaming" && thread.status !== "submitted") {
     return thread.status === "cancelling";
   }
@@ -2269,8 +2289,31 @@ function threadNeedsRecovery(thread: AgentThread): boolean {
   return !lastEvent || !isRecoveryBoundary(lastEvent);
 }
 
+function hasSettledSessionBoundaryForThread(events: readonly MessageStreamEvent[]): boolean {
+  const latestTurnStart = events.findLastIndex((event) => event.type === "turn.started");
+  const latestBoundary = events.findLastIndex((event) =>
+    event.type === "session.waiting" ||
+    event.type === "session.completed" ||
+    event.type === "session.failed",
+  );
+  return latestBoundary > latestTurnStart;
+}
+
 function threadNeedsRuntimeInspection(thread: AgentThread): boolean {
   if (threadNeedsRecovery(thread)) return true;
+  // A durable session boundary is a complete lifecycle decision for the
+  // current transcript. Missing prefix coverage is a history-pagination
+  // concern, not evidence that a settled session is still running. Probing
+  // Eve again here only adds latency on refresh and can make a finished turn
+  // look like it is replaying. Active admissions/queues/cancellation are
+  // handled by `threadNeedsRecovery` above and must continue through the
+  // runtime inspection path.
+  if (
+    hasSettledSessionBoundaryForThread(thread.events) &&
+    !thread.pendingTurn &&
+    thread.status !== "cancelling" &&
+    !thread.queuedTurns.some((turn) => turn.intent === "post-cancellation")
+  ) return false;
   // A bounded history window is expected for settled sessions. Its missing
   // prefix is a pagination concern, not evidence that Eve is still running;
   // probing it and invoking transcript repair would re-read the full stream

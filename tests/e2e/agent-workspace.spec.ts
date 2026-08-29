@@ -449,6 +449,7 @@ test("the thread index hydrates only the transcript selected from the sidebar", 
 });
 
 test("a settled transcript with stale coverage is not replayed from Eve", async ({ page }) => {
+  test.skip(!process.env.AGENT_DATABASE_URL, "Requires the server-backed thread storage boundary.");
   const now = Date.now();
   const events = mockSuccessfulTurn("Stored request", "Stored response")
     .trim()
@@ -472,9 +473,13 @@ test("a settled transcript with stale coverage is not replayed from Eve", async 
     version: 2,
   });
   let repairRequests = 0;
+  let runtimeInspectionRequests = 0;
   page.on("request", (request) => {
     if (request.method() === "POST" && request.url().includes("/thread-collections/") && request.url().includes("/repair")) {
       repairRequests += 1;
+    }
+    if (request.method() === "GET" && request.url().includes("/api/standalone/sessions/stale-coverage-session")) {
+      runtimeInspectionRequests += 1;
     }
   });
   await page.goto("/");
@@ -482,6 +487,7 @@ test("a settled transcript with stale coverage is not replayed from Eve", async 
   await expect(page.getByText("Stored response", { exact: true })).toBeVisible();
   await page.waitForTimeout(250);
   expect(repairRequests).toBe(0);
+  expect(runtimeInspectionRequests).toBe(0);
 });
 
 test("composer exposes assistant-ui attachments, permissions, and safe trigger selection", async ({ page }) => {
@@ -950,6 +956,259 @@ test("assistant content keeps markdown, reasoning state, and action affordances"
   const userMessage = page.getByRole("log").getByText("Explain the result", { exact: true });
   await userMessage.hover();
   await expect(page.getByRole("button", { name: "Edit message" })).toBeVisible();
+});
+
+test("investigation: sample assistant message transitions without visual remount", async ({ page }) => {
+  const sessionId = "investigation-flash-session";
+  const turnId = "turn_investigation_flash";
+  const base = Date.now();
+  const at = (offset: number) => new Date(base + offset).toISOString();
+  const events = [
+    { data: { runtime: { agentId: "open-agent", agentName: "open-agent", eveVersion: "test", modelId: "mock/model" } }, meta: { at: at(0), id: "evt-session" }, type: "session.started" },
+    { data: { sequence: 0, turnId }, meta: { at: at(10), id: "evt-turn" }, type: "turn.started" },
+    { data: { message: "Investigate flash", parts: [{ text: "Investigate flash", type: "text" }], sequence: 0, turnId }, meta: { at: at(20), id: "evt-user" }, type: "message.received" },
+    { data: { sequence: 0, stepIndex: 0, turnId }, meta: { at: at(30), id: "evt-step" }, type: "step.started" },
+    { data: { reasoningDelta: "Plan", reasoningSoFar: "Plan the transition", sequence: 0, stepIndex: 0, turnId }, meta: { at: at(120), id: "evt-reasoning" }, type: "reasoning.appended" },
+    { data: { reasoning: "Plan the transition", sequence: 0, stepIndex: 0, turnId }, meta: { at: at(260), id: "evt-reasoning-complete" }, type: "reasoning.completed" },
+    { data: { finishReason: "tool-calls", message: "Inspecting the workspace.", sequence: 0, stepIndex: 0, turnId }, meta: { at: at(300), id: "evt-message-before-tool" }, type: "message.completed" },
+    { data: { actions: [{ callId: "call-inspect", input: { command: "pwd" }, kind: "tool-call", toolName: "bash" }], sequence: 0, stepIndex: 0, turnId }, meta: { at: at(340), id: "evt-actions" }, type: "actions.requested" },
+    { data: { result: { callId: "call-inspect", kind: "tool-result", output: "/workspace", toolName: "bash" }, sequence: 0, status: "completed", stepIndex: 0, turnId }, meta: { at: at(380), id: "evt-action-result" }, type: "action.result" },
+    { data: { finishReason: "tool-calls", sequence: 0, stepIndex: 0, turnId, usage: { inputTokens: 1, outputTokens: 1 } }, meta: { at: at(400), id: "evt-step-complete" }, type: "step.completed" },
+    { data: { sequence: 0, stepIndex: 1, turnId }, meta: { at: at(420), id: "evt-step-1" }, type: "step.started" },
+    { data: { finishReason: "stop", message: "Done", sequence: 0, stepIndex: 1, turnId }, meta: { at: at(460), id: "evt-final-message" }, type: "message.completed" },
+    { data: { finishReason: "stop", sequence: 0, stepIndex: 1, turnId, usage: { inputTokens: 2, outputTokens: 2 } }, meta: { at: at(480), id: "evt-final-step-complete" }, type: "step.completed" },
+    { data: { sequence: 0, turnId }, meta: { at: at(500), id: "evt-turn-complete" }, type: "turn.completed" },
+    { data: { wait: "next-user-message" }, meta: { at: at(520), id: "evt-waiting" }, type: "session.waiting" },
+  ];
+  await page.addInitScript(({ streamEvents, targetSessionId }) => {
+    const nativeFetch = window.fetch.bind(window);
+    const browser = window as typeof window & { __flashSamples?: Array<Record<string, unknown>>; __flashNodeId?: number };
+    browser.__flashSamples = [];
+    browser.__flashNodeId = 0;
+    window.fetch = async (input, init) => {
+      const requestUrl = new URL(typeof input === "string" || input instanceof URL ? input.toString() : input.url, window.location.href);
+      if (requestUrl.pathname !== `/eve/v1/session/${targetSessionId}/stream`) return await nativeFetch(input, init);
+      const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+      let index = 0;
+      const body = new ReadableStream({
+        async pull(controller) {
+          if (signal?.aborted) {
+            controller.error(new DOMException("Aborted", "AbortError"));
+            return;
+          }
+          const event = streamEvents[index++];
+          if (!event) {
+            controller.close();
+            return;
+          }
+          controller.enqueue(new TextEncoder().encode(`${JSON.stringify(event)}\n`));
+          await new Promise((resolve) => setTimeout(resolve, event.type === "reasoning.appended" ? 180 : 45));
+        },
+      });
+      return new Response(body, { headers: { "content-type": "application/x-ndjson" }, status: 200 });
+    };
+    const sample = () => {
+      const log = document.querySelector('[role="log"]');
+      const articles = log ? [...log.querySelectorAll("article")] : [];
+      const articleRecords = articles.map((article) => ({
+        messageId: article.parentElement?.parentElement?.getAttribute("data-message-id") ?? "",
+        role: article.className.includes("items-end") ? "user" : "assistant",
+      }));
+      const messageRoots = log ? [...log.querySelectorAll("[data-message-id]")].map((root) => ({
+        id: root.getAttribute("data-message-id") ?? "",
+        top: root.getAttribute("data-aui-top-anchor-target") !== null,
+        user: root.getAttribute("data-aui-top-anchor-user") !== null,
+      })) : [];
+      const assistant = articles.find((article) => !article.querySelector('[data-slot="message-content"]')) ?? articles.at(-1);
+      if (assistant && !(assistant as HTMLElement).dataset.flashNodeId) {
+        browser.__flashNodeId = (browser.__flashNodeId ?? 0) + 1;
+        (assistant as HTMLElement).dataset.flashNodeId = String(browser.__flashNodeId);
+      }
+      const roots = assistant ? [...assistant.querySelectorAll('[data-slot="reasoning-root"]')] : [];
+      for (const root of roots) {
+        if (!(root as HTMLElement).dataset.flashReasoningId) {
+          browser.__flashNodeId = (browser.__flashNodeId ?? 0) + 1;
+          (root as HTMLElement).dataset.flashReasoningId = String(browser.__flashNodeId);
+        }
+      }
+      browser.__flashSamples?.push({
+        assistantCount: articles.length,
+        articleRecords,
+        messageRoots,
+        assistantAttributes: assistant ? Object.fromEntries([...assistant.attributes].map((attribute) => [attribute.name, attribute.value])) : {},
+        assistantHtml: assistant?.innerHTML.slice(0, 1000) ?? "",
+        assistantId: assistant ? (assistant as HTMLElement).dataset.testid ?? "" : "",
+        assistantNodeId: assistant ? (assistant as HTMLElement).dataset.flashNodeId ?? "" : "",
+        assistantParentAttributes: assistant?.parentElement ? Object.fromEntries([...assistant.parentElement.attributes].map((attribute) => [attribute.name, attribute.value])) : {},
+        assistantOuterAttributes: assistant?.parentElement?.parentElement ? Object.fromEntries([...assistant.parentElement.parentElement.attributes].map((attribute) => [attribute.name, attribute.value])) : {},
+        assistantY: assistant?.getBoundingClientRect().y ?? null,
+        assistantHeight: assistant?.getBoundingClientRect().height ?? null,
+        reasoningCount: roots.length,
+        reasoningNodeIds: roots.map((root) => (root as HTMLElement).dataset.flashReasoningId ?? ""),
+        reasoningControls: roots.map((root) => root.querySelector("[data-slot=reasoning-trigger]")?.getAttribute("aria-controls") ?? ""),
+        reasoningLabels: roots.map((root) => root.textContent ?? ""),
+        scrollTop: log?.scrollTop ?? null,
+        time: performance.now(),
+      });
+      if (performance.now() < 4000) requestAnimationFrame(sample);
+    };
+    requestAnimationFrame(sample);
+  }, { streamEvents: events, targetSessionId: sessionId });
+  await page.route("**/eve/v1/session", async (route) => route.fulfill({ body: JSON.stringify({ sessionId }), contentType: "application/json", status: 200 }));
+  await page.goto("/");
+  const composer = page.getByRole("textbox", { name: "Do anything" });
+  await composer.fill("Investigate flash");
+  await composer.press("Enter");
+  await expect(page.getByText("Done", { exact: true })).toBeVisible({ timeout: 8_000 });
+  await page.waitForTimeout(250);
+  const samples = await page.evaluate(() => (window as typeof window & { __flashSamples?: Array<Record<string, unknown>> }).__flashSamples ?? []);
+  const visibleSamples = samples.filter((sample) => typeof sample.assistantNodeId === "string" && sample.assistantNodeId.length > 0);
+  expect(visibleSamples.length).toBeGreaterThan(0);
+  const assistantNodeIds = new Set(visibleSamples.map((sample) => sample.assistantNodeId));
+  expect(assistantNodeIds.size).toBe(1);
+  const reasoningNodeIds = new Set(
+    visibleSamples.flatMap((sample) => {
+      const ids = Array.isArray(sample.reasoningNodeIds) ? sample.reasoningNodeIds : [];
+      const labels = Array.isArray(sample.reasoningLabels) ? sample.reasoningLabels : [];
+      return ids.filter((_, index) => typeof labels[index] === "string" && labels[index] !== "Thinking");
+    }),
+  );
+  expect(reasoningNodeIds.size).toBe(1);
+  const placeholderSamples = visibleSamples.filter((sample) => {
+    const labels = Array.isArray(sample.reasoningLabels) ? sample.reasoningLabels : [];
+    return labels.length > 0 && labels.every((label) => label === "Thinking");
+  });
+  expect(placeholderSamples.every((sample) => sample.reasoningCount === 1)).toBe(true);
+  for (const sample of visibleSamples) {
+    const roots = Array.isArray(sample.messageRoots) ? sample.messageRoots as Array<{ id: string }> : [];
+    const userIndex = roots.findIndex((root) => root.id.endsWith(":user"));
+    const assistantIndex = roots.findIndex((root) => root.id.endsWith(":assistant"));
+    if (userIndex >= 0 && assistantIndex >= 0) expect(userIndex).toBeLessThan(assistantIndex);
+  }
+});
+
+test("a second turn keeps its thinking placeholder visible before the Provider responds", async ({ page }) => {
+  const sessionId = "investigation-second-turn-session";
+  const firstTurn = eventsFromNdjson(mockSuccessfulTurn("First turn", "First completed", 0));
+  // A follow-up stream starts at the next turn; Eve does not replay the
+  // session.started envelope when reusing the parked session.
+  const secondTurn = eventsFromNdjson(mockContinuationTurn("Second turn", "Second completed", 1));
+  let streamCalls = 0;
+  await page.route("**/eve/v1/session", async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({ sessionId }),
+      contentType: "application/json",
+      headers: { "x-eve-session-id": sessionId },
+      status: 200,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}`, async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({ sessionId }),
+      contentType: "application/json",
+      headers: { "x-eve-session-id": sessionId },
+      status: 200,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
+    streamCalls += 1;
+    if (streamCalls > 1) await new Promise((resolve) => setTimeout(resolve, 800));
+    const events = streamCalls === 1 ? firstTurn : secondTurn;
+    await route.fulfill({
+      body: `${events.map((event) => JSON.stringify(event)).join("\n")}\n`,
+      contentType: "application/x-ndjson",
+      status: 200,
+    });
+  });
+
+  await page.goto("/");
+  const composer = page.getByRole("textbox", { name: "Do anything" });
+  await composer.fill("First turn");
+  await composer.press("Enter");
+  await expect(page.getByText("First completed", { exact: true })).toBeVisible({ timeout: 8_000 });
+  await expect(page.getByRole("button", { name: "Stop", exact: true })).toHaveCount(0);
+  await page.waitForTimeout(250);
+  await composer.fill("Second turn");
+  await composer.press("Enter");
+  await expect(page.getByRole("status").filter({ hasText: "Thinking" })).toBeVisible({ timeout: 2_000 });
+  await expect(page.getByText("Second completed", { exact: true })).toBeVisible({ timeout: 8_000 });
+  await expect(page.getByRole("log").getByText("Second turn", { exact: true })).toHaveCount(1);
+});
+
+test("provider failure feedback does not remount the active reasoning row", async ({ page }) => {
+  const sessionId = "investigation-failure-flash-session";
+  const turnId = "turn_investigation_failure_flash";
+  const base = Date.now();
+  const at = (offset: number) => new Date(base + offset).toISOString();
+  const events = [
+    { data: { runtime: { agentId: "open-agent", agentName: "open-agent", eveVersion: "test", modelId: "mock/model" } }, meta: { at: at(0), id: "failure-session" }, type: "session.started" },
+    { data: { sequence: 0, turnId }, meta: { at: at(10), id: "failure-turn" }, type: "turn.started" },
+    { data: { message: "Investigate failure", parts: [{ text: "Investigate failure", type: "text" }], sequence: 0, turnId }, meta: { at: at(20), id: "failure-user" }, type: "message.received" },
+    { data: { sequence: 0, stepIndex: 0, turnId }, meta: { at: at(30), id: "failure-step" }, type: "step.started" },
+    { data: { reasoningDelta: "Check", reasoningSoFar: "Check the workspace.", sequence: 0, stepIndex: 0, turnId }, meta: { at: at(120), id: "failure-reasoning" }, type: "reasoning.appended" },
+    { data: { reasoning: "Check the workspace.", sequence: 0, stepIndex: 0, turnId }, meta: { at: at(260), id: "failure-reasoning-complete" }, type: "reasoning.completed" },
+    { data: { finishReason: "tool-calls", message: "Inspecting the workspace.", sequence: 0, stepIndex: 0, turnId }, meta: { at: at(300), id: "failure-message" }, type: "message.completed" },
+    { data: { actions: [{ callId: "call-failure", input: { command: "pwd" }, kind: "tool-call", toolName: "bash" }], sequence: 0, stepIndex: 0, turnId }, meta: { at: at(340), id: "failure-actions" }, type: "actions.requested" },
+    { data: { code: "provider_stream_interrupted", message: "The model Provider stream ended before completion.", sequence: 0, stepIndex: 0, turnId }, meta: { at: at(420), id: "failure-step-failed" }, type: "step.failed" },
+    { data: { code: "provider_stream_interrupted", message: "The model Provider stream ended before completion.", sequence: 0, turnId }, meta: { at: at(460), id: "failure-turn-failed" }, type: "turn.failed" },
+    { data: { wait: "next-user-message" }, meta: { at: at(500), id: "failure-waiting" }, type: "session.waiting" },
+  ];
+  await page.addInitScript(({ streamEvents, targetSessionId }) => {
+    const nativeFetch = window.fetch.bind(window);
+    const browser = window as typeof window & { __failureSamples?: Array<Record<string, unknown>>; __failureNodeId?: number };
+    browser.__failureSamples = [];
+    browser.__failureNodeId = 0;
+    window.fetch = async (input, init) => {
+      const requestUrl = new URL(typeof input === "string" || input instanceof URL ? input.toString() : input.url, window.location.href);
+      if (requestUrl.pathname !== `/eve/v1/session/${targetSessionId}/stream`) return await nativeFetch(input, init);
+      const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+      let index = 0;
+      const body = new ReadableStream({
+        async pull(controller) {
+          if (signal?.aborted) {
+            controller.error(new DOMException("Aborted", "AbortError"));
+            return;
+          }
+          const event = streamEvents[index++];
+          if (!event) {
+            controller.close();
+            return;
+          }
+          controller.enqueue(new TextEncoder().encode(`${JSON.stringify(event)}\n`));
+          await new Promise((resolve) => setTimeout(resolve, 45));
+        },
+      });
+      return new Response(body, { headers: { "content-type": "application/x-ndjson" }, status: 200 });
+    };
+    const sample = () => {
+      const article = document.querySelector('[role="log"] article:not(:has([data-slot="message-content"]))') ?? document.querySelector('[role="log"] article');
+      if (article) {
+        const roots = [...article.querySelectorAll('[data-slot="reasoning-root"]')];
+        for (const root of roots) {
+          if (!(root as HTMLElement).dataset.failureFlashId) {
+            browser.__failureNodeId = (browser.__failureNodeId ?? 0) + 1;
+            (root as HTMLElement).dataset.failureFlashId = String(browser.__failureNodeId);
+          }
+        }
+        browser.__failureSamples?.push({
+          ids: roots.map((root) => (root as HTMLElement).dataset.failureFlashId ?? ""),
+          labels: roots.map((root) => root.textContent ?? ""),
+          time: performance.now(),
+        });
+      }
+      if (performance.now() < 4000) requestAnimationFrame(sample);
+    };
+    requestAnimationFrame(sample);
+  }, { streamEvents: events, targetSessionId: sessionId });
+  await page.route("**/eve/v1/session", async (route) => route.fulfill({ body: JSON.stringify({ sessionId }), contentType: "application/json", status: 200 }));
+  await page.goto("/");
+  const composer = page.getByRole("textbox", { name: "Do anything" });
+  await composer.fill("Investigate failure");
+  await composer.press("Enter");
+  await expect(page.getByText("Retry failed", { exact: false })).toBeVisible({ timeout: 8_000 });
+  const samples = await page.evaluate(() => (window as typeof window & { __failureSamples?: Array<Record<string, unknown>> }).__failureSamples ?? []);
+  const ids = new Set(samples.flatMap((sample) => Array.isArray(sample.ids) ? sample.ids : []));
+  expect(ids.size).toBe(1);
 });
 
 for (const editScenario of [

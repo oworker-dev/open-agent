@@ -6,6 +6,7 @@ import type { EveMessage } from "eve/react";
 import { activityLabel } from "../../packages/agent-ui/src/agent-workspace/agent-activity-state.ts";
 import { messagesFor } from "../../packages/agent-ui/src/agent-workspace/i18n.ts";
 import {
+  activeTurnIdAfterPendingSubmission,
   classifyAgentFailure,
   eventsBeforeLastUserTurn,
   hasSettledLatestTurn,
@@ -19,6 +20,7 @@ import {
   projectAgentDisplayTimeline,
   reasoningContentForStep,
   sanitizeSettledThreadEvents,
+  stableUserMessageId,
 } from "../../packages/agent-ui/src/agent-workspace/turn-presentation.ts";
 import { summarizeUsage } from "../../packages/agent-ui/src/agent-workspace/usage.ts";
 
@@ -107,6 +109,47 @@ test("empty reasoning boundaries do not fabricate completed reasoning content", 
       }),
     ], "turn-empty-reasoning", 0),
     "Inspect the workspace.",
+  );
+});
+
+test("reasoning content starts fresh when eve retries the same step", () => {
+  const turnId = "turn-reasoning-retry";
+  const events = [
+    event("step.started", startedAt, { sequence: 0, stepIndex: 0, turnId }),
+    event("reasoning.appended", startedAt, {
+      reasoningDelta: "Inspect the old attempt.",
+      reasoningSoFar: "Inspect the old attempt.",
+      sequence: 0,
+      stepIndex: 0,
+      turnId,
+    }),
+    event("reasoning.completed", startedAt, {
+      reasoning: "Inspect the old attempt.",
+      sequence: 0,
+      stepIndex: 0,
+      turnId,
+    }),
+    event("step.failed", endedAt, {
+      code: "provider_stream_interrupted",
+      message: "Provider stream interrupted.",
+      sequence: 0,
+      stepIndex: 0,
+      turnId,
+    }),
+    // eve reuses the same turn/step coordinates for the retry.
+    event("step.started", endedAt, { sequence: 0, stepIndex: 0, turnId }),
+    event("reasoning.appended", endedAt, {
+      reasoningDelta: "Retry with the current state.",
+      reasoningSoFar: "",
+      sequence: 0,
+      stepIndex: 0,
+      turnId,
+    }),
+  ];
+
+  assert.equal(
+    reasoningContentForStep(events, turnId, 0),
+    "Retry with the current state.",
   );
 });
 
@@ -1227,6 +1270,21 @@ test("same-turn steering shares one visual execution timer while preserving mess
   );
 });
 
+test("same-turn user messages retain distinct stable ids during the optimistic handoff", () => {
+  assert.equal(
+    stableUserMessageId("turn-root:user", "turn-root", "pending-root"),
+    "pending-root:user",
+  );
+  assert.equal(
+    stableUserMessageId("turn-root:user:client-steer-1", "turn-root", "pending-root"),
+    "pending-root:user:client-steer-1",
+  );
+  assert.notEqual(
+    stableUserMessageId("turn-root:user", "turn-root", "pending-root"),
+    stableUserMessageId("turn-root:user:client-steer-1", "turn-root", "pending-root"),
+  );
+});
+
 test("unanchored independent turns are not merged into the previous execution", () => {
   const messages: EveMessage[] = [
     {
@@ -1657,6 +1715,10 @@ test("a persisted turn failure overrides stale client stream state for editing",
     event("turn.failed", endedAt, { code: "provider_error", message: "Failed", sequence: 0, turnId: "turn-edit" }),
     event("session.failed", endedAt, { code: "provider_error", message: "Failed" }),
   ]), true);
+  assert.equal(hasSettledLatestTurn([
+    ...running,
+    event("session.completed", endedAt, { sequence: 0 }),
+  ]), true);
 });
 
 test("a terminal provider failure without a turn boundary anchors to its final step", () => {
@@ -1731,6 +1793,34 @@ test("context usage moves during a streamed step and reconciles to Provider usag
   assert.equal(reconciled.contextInputTokens, 1_250);
   assert.equal(reconciled.outputTokens, 230);
   assert.equal(reconciled.isEstimated, false);
+});
+
+test("pending admission never aliases a historical turn whose terminal event is delayed", () => {
+  const submittedAt = Date.parse("2026-08-06T01:01:00.000Z");
+  const historical = [
+    event("turn.started", startedAt, { sequence: 0, turnId: "turn-previous" }),
+    event("reasoning.appended", endedAt, {
+      reasoningDelta: "stale reasoning",
+      reasoningSoFar: "stale reasoning",
+      sequence: 0,
+      stepIndex: 0,
+      turnId: "turn-previous",
+    }),
+  ];
+  const pending = {
+    eventCountAtSubmission: historical.length,
+    submittedAt,
+  };
+
+  // The throttled snapshot is missing the previous turn's terminal event.
+  assert.equal(activeTurnIdAfterPendingSubmission(historical, pending), undefined);
+  assert.equal(
+    activeTurnIdAfterPendingSubmission([
+      ...historical,
+      event("turn.started", "2026-08-06T01:01:01.000Z", { sequence: 1, turnId: "turn-current" }),
+    ], pending),
+    "turn-current",
+  );
 });
 
 function event(

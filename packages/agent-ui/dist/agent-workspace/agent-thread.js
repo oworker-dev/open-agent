@@ -16,7 +16,7 @@ import { AgentMailboxHttpError } from "./http-agent-mailbox.js";
 import { messagesFor } from "./i18n.js";
 import { interruptedTurnContextFromEvents, interruptedTurnContextsFromEvents, rewriteContextFromEvents, } from "./retained-context.js";
 import { appendThreadEventIndexed, dedupeThreadEvents, eventIdentity, reconcilePendingTurnWithEvents, titleFromPrompt } from "./thread-storage.js";
-import { eventsBeforeLastUserTurn, hasSettledLatestTurn, isProxiedInputOnlyMessage, normalizeSettledAgentMessages, projectAgentDisplayTimeline, shouldSuppressInterruptedTurnDisplayEvent, shouldSuppressInterruptedTurnStreamEvent, unresolvedInputRequests, } from "./turn-presentation.js";
+import { activeTurnIdAfterPendingSubmission, eventsBeforeLastUserTurn, hasSettledLatestTurn, isProxiedInputOnlyMessage, normalizeSettledAgentMessages, projectAgentDisplayTimeline, shouldSuppressInterruptedTurnDisplayEvent, shouldSuppressInterruptedTurnStreamEvent, stableUserMessageId, unresolvedInputRequests, } from "./turn-presentation.js";
 import { summarizeUsage } from "./usage.js";
 const activeEditedTurnOperations = new Set();
 const pendingEditedTurnOperations = new Set();
@@ -85,6 +85,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     const [turnError, setTurnError] = useState(() => latestTurnFailure(thread.events));
     const [providerRetry, setProviderRetry] = useState(undefined);
     const [optimisticPendingTurn, setOptimisticPendingTurn] = useState(undefined);
+    const [optimisticDisplayTurn, setOptimisticDisplayTurn] = useState(undefined);
     const providerRetryKeyRef = useRef(undefined);
     const providerRetryAttemptRef = useRef(0);
     const providerRetryTimerRef = useRef(undefined);
@@ -353,16 +354,17 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     const effectiveRenderEvents = isRecovering ? recoveryRenderEvents : renderEvents;
     const effectiveRenderMessages = isRecovering ? recoveryRenderMessages : renderMessages;
     const runtimeIsBusy = agent.status === "submitted" || agent.status === "streaming";
-    const displayPendingTurn = optimisticPendingTurn ?? thread.pendingTurn;
+    const admissionPendingTurn = optimisticPendingTurn ?? thread.pendingTurn;
+    const displayPendingTurn = optimisticDisplayTurn ?? optimisticPendingTurn ?? thread.pendingTurn;
     latestEventsRef.current = agent.events;
     const durableSessionSettled = hasSettledSessionBoundary(thread.events);
     const localSessionSettled = hasSettledSessionBoundary(agent.events);
     const authoritativeEvents = isRecovering || (durableSessionSettled && !localSessionSettled)
         ? thread.events
         : agent.events;
-    const pendingTurnAccepted = displayPendingTurn !== undefined &&
-        reconcilePendingTurnWithEvents(displayPendingTurn, authoritativeEvents) === undefined;
-    const pendingTurnInFlight = isPendingTurnInFlight(displayPendingTurn) && !pendingTurnAccepted;
+    const pendingTurnAccepted = admissionPendingTurn !== undefined &&
+        reconcilePendingTurnWithEvents(admissionPendingTurn, authoritativeEvents) === undefined;
+    const pendingTurnInFlight = isPendingTurnInFlight(admissionPendingTurn) && !pendingTurnAccepted;
     const durableTurnSettled = !pendingTurnInFlight &&
         hasSettledLatestTurn(authoritativeEvents) &&
         hasSettledSessionBoundary(authoritativeEvents);
@@ -373,6 +375,12 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     const agentIsBusy = (runtimeIsBusy || durableTurnOpen) && !localInterruption && !cancellationSettling && !durableTurnSettled;
     const isBusy = pendingTurnInFlight || agentIsBusy ||
         (isRecovering && !localInterruption && !cancellationSettling && !durableTurnSettled);
+    useEffect(() => {
+        const pending = optimisticDisplayTurn;
+        if (!pending || !hasVisiblePendingUserMessage(pending, effectiveRenderMessages, authoritativeEvents))
+            return;
+        setOptimisticDisplayTurn(undefined);
+    }, [authoritativeEvents, effectiveRenderMessages, optimisticDisplayTurn]);
     const admissionBusy = pendingTurnInFlight || (!durableTurnSettled &&
         (runtimeIsBusy || isRecovering || cancellationSettling));
     const pendingInputRequests = unresolvedInputRequests(authoritativeEvents, closedInputRequestIdsRef.current);
@@ -931,6 +939,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             };
             pendingTurnRef.current = pendingTurn;
             setOptimisticPendingTurn(pendingTurn);
+            setOptimisticDisplayTurn(pendingTurn);
             onChange({ pendingTurn });
         }
         if (text.length > 0 && agent.data.messages.length === 0) {
@@ -992,12 +1001,17 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             : effectiveRenderMessages;
         return normalizeSettledAgentMessages(source, interruptedDisplayEvents);
     }, [displayInterruptedTurns.length, effectiveRenderMessages, interruptedDisplayEvents]);
-    const projectedMessages = useMemo(() => projectStagedUserMessages(ensureActiveAssistantMessage(projectedRuntimeMessages, interruptedDisplayEvents, isBusy || isPendingTurnInFlight(displayPendingTurn) || Boolean(latestTurnFailure(interruptedDisplayEvents)), displayPendingTurn, optimisticPendingTurn?.id === displayPendingTurn?.id), thread.queuedTurns.filter((turn) => turn.intent === "post-cancellation")), [displayPendingTurn, interruptedDisplayEvents, isBusy, projectedRuntimeMessages, thread.queuedTurns]);
+    const displayMessageIdentityRef = useRef({
+        assistantByTurn: new Map(),
+        pendingRoot: undefined,
+    });
+    const projectedMessages = useMemo(() => projectStagedUserMessages(stabilizeDisplayMessageIdentities(ensureActiveAssistantMessage(projectedRuntimeMessages, interruptedDisplayEvents, isBusy || isPendingTurnInFlight(admissionPendingTurn) || Boolean(latestTurnFailure(interruptedDisplayEvents)), displayPendingTurn, optimisticPendingTurn?.id === displayPendingTurn?.id), interruptedDisplayEvents, displayPendingTurn, displayMessageIdentityRef.current), thread.queuedTurns.filter((turn) => turn.intent === "post-cancellation"), interruptedDisplayEvents), [admissionPendingTurn, displayPendingTurn, interruptedDisplayEvents, isBusy, optimisticPendingTurn, projectedRuntimeMessages, thread.queuedTurns]);
     const ungroupedVisibleMessages = useMemo(() => projectedMessages.filter((message) => !isProxiedInputOnlyMessage(message, effectiveRenderEvents)), [effectiveRenderEvents, projectedMessages]);
     const ungroupedDisplayEvents = interruptedDisplayEvents;
     const displayTimeline = useMemo(() => projectAgentDisplayTimeline(ungroupedVisibleMessages, ungroupedDisplayEvents), [ungroupedDisplayEvents, ungroupedVisibleMessages]);
-    const visibleMessages = displayTimeline.messages;
     const displayEvents = displayTimeline.events;
+    const orderedDisplayMessages = orderPendingUserMessage(displayTimeline.messages, displayPendingTurn, displayEvents, displayMessageIdentityRef.current);
+    const visibleMessages = stabilizeDisplayMessageIdentities(orderedDisplayMessages, displayEvents, displayPendingTurn, displayMessageIdentityRef.current);
     const assistantMessages = useMemo(() => convertEveMessages({ messages: visibleMessages }, {
         assetUrl: client?.assetUrl,
         error: agent.error,
@@ -1096,7 +1110,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         },
         isDisabled: !providerReady,
         isSendDisabled: inputLocked,
-        isRunning: isBusy,
+        isRunning: isBusy && assistantMessages.at(-1)?.role === "assistant",
         messages: assistantMessages,
         queue: queueAdapter,
         onCancel: async () => {
@@ -1360,9 +1374,29 @@ function ensureActiveAssistantMessage(messages, events, isBusy, pendingTurn, opt
         ? projectedMessages.findIndex((message) => message.id === `${pendingTurn.id}:user`)
         : -1;
     const sessionSettled = hasSettledLatestTurn(events);
-    const activeTurnId = pendingUserIndex >= 0 && sessionSettled ? undefined : turnId;
+    const activeTurnId = pendingUserIndex >= 0 && sessionSettled
+        ? undefined
+        : pendingTurn
+            ? activeTurnIdAfterPendingSubmission(events, pendingTurn)
+            : turnId;
     if (activeTurnId && projectedMessages.some((message) => message.role === "assistant" && message.metadata?.turnId === activeTurnId)) {
         return projectedMessages;
+    }
+    if (activeTurnId && pendingTurn) {
+        const pendingAssistantIndex = projectedMessages.findIndex((message) => message.role === "assistant" && message.id === `${pendingTurn.id}:assistant`);
+        if (pendingAssistantIndex >= 0) {
+            const pendingAssistant = projectedMessages[pendingAssistantIndex];
+            const next = [...projectedMessages];
+            next[pendingAssistantIndex] = {
+                ...pendingAssistant,
+                metadata: {
+                    ...pendingAssistant.metadata,
+                    status: "streaming",
+                    turnId: activeTurnId,
+                },
+            };
+            return next;
+        }
     }
     if (!activeTurnId && !pendingTurn && projectedMessages.at(-1)?.role === "assistant")
         return projectedMessages;
@@ -1381,10 +1415,60 @@ function ensureActiveAssistantMessage(messages, events, isBusy, pendingTurn, opt
         },
     ];
 }
+function stabilizeDisplayMessageIdentities(messages, events, pendingTurn, state) {
+    if (pendingTurn && state.pendingRoot !== pendingTurn.id) {
+        state.pendingUserRoot = undefined;
+        state.pendingUserTurnId = undefined;
+        state.pendingRoot = pendingTurn.id;
+    }
+    const receiptTurnId = state.pendingUserRoot === state.pendingRoot
+        ? state.pendingUserTurnId
+        : undefined;
+    const activeTurnId = pendingTurn
+        ? activeTurnIdAfterPendingSubmission(events, pendingTurn) ?? receiptTurnId
+        : receiptTurnId;
+    if (pendingTurn && state.pendingRoot) {
+        for (const [turnId, root] of state.assistantByTurn) {
+            if (root === state.pendingRoot && turnId !== activeTurnId) {
+                state.assistantByTurn.delete(turnId);
+            }
+        }
+    }
+    if (activeTurnId && state.pendingRoot) {
+        state.assistantByTurn.set(activeTurnId, state.pendingRoot);
+    }
+    let changed = false;
+    const stabilized = messages.map((message) => {
+        const turnId = message.metadata?.turnId;
+        const stableRoot = turnId ? state.assistantByTurn.get(turnId) : undefined;
+        if (!stableRoot || !turnId)
+            return message;
+        const id = message.role === "assistant"
+            ? stableAssistantMessageId(message.id, turnId, stableRoot)
+            : stableUserMessageId(message.id, turnId, stableRoot);
+        if (id === message.id)
+            return message;
+        changed = true;
+        return { ...message, id };
+    });
+    return changed ? stabilized : messages;
+}
+function stableAssistantMessageId(sourceId, turnId, stableRoot) {
+    const prefix = `${turnId}:assistant`;
+    if (sourceId === prefix)
+        return `${stableRoot}:assistant`;
+    if (sourceId.startsWith(`${prefix}:`)) {
+        return `${stableRoot}:assistant:${sourceId.slice(prefix.length + 1)}`;
+    }
+    return `${stableRoot}:assistant`;
+}
 function projectPendingUserMessage(messages, pendingTurn, events = [], optimisticPending = false) {
     if (!pendingTurn)
         return messages;
-    if (!optimisticPending && reconcilePendingTurnWithEvents(pendingTurn, events) === undefined)
+    if (messages.some((message) => message.role === "user" &&
+        (message.id === `${pendingTurn.id}:user` || message.id.startsWith(`${pendingTurn.id}:user:`))))
+        return messages;
+    if (!optimisticPending && hasVisiblePendingUserMessage(pendingTurn, messages, events))
         return messages;
     return [
         ...messages,
@@ -1403,13 +1487,77 @@ function projectPendingUserMessage(messages, pendingTurn, events = [], optimisti
         },
     ];
 }
-function projectStagedUserMessages(messages, turns) {
+function orderPendingUserMessage(messages, pendingTurn, events, state) {
+    if (pendingTurn) {
+        const receipt = acceptedMessageReceivedEvent(pendingTurn, events);
+        if (receipt) {
+            state.pendingUserRoot = pendingTurn.id;
+            state.pendingUserTurnId = receipt.data.turnId;
+        }
+    }
+    const targetTurnId = state.pendingUserTurnId;
+    if (!targetTurnId)
+        return messages;
+    const userIndex = messages.findIndex((message) => message.role === "user" &&
+        messageBelongsToTurn(message, targetTurnId) &&
+        (!pendingTurn || message.parts.some((part) => part.type === "text" && part.text.trim() === pendingTurn.text.trim())));
+    if (userIndex < 0)
+        return messages;
+    const assistantIndex = messages.findIndex((message) => message.role === "assistant" && message.metadata?.turnId === targetTurnId);
+    if (assistantIndex < 0 || userIndex < assistantIndex)
+        return messages;
+    const next = [...messages];
+    const [user] = next.splice(userIndex, 1);
+    next.splice(assistantIndex, 0, user);
+    return next;
+}
+function hasVisiblePendingUserMessage(pendingTurn, messages, events) {
+    const received = acceptedMessageReceivedEvent(pendingTurn, events);
+    if (!received)
+        return false;
+    return messages.some((message) => message.role === "user" &&
+        messageBelongsToTurn(message, received.data.turnId) &&
+        message.parts.some((part) => part.type === "text" && part.text.trim() === pendingTurn.text.trim()));
+}
+function messageBelongsToTurn(message, turnId) {
+    return message.metadata?.turnId === turnId ||
+        message.id === `${turnId}:user` ||
+        message.id.startsWith(`${turnId}:user:`);
+}
+function acceptedMessageReceivedEvent(pendingTurn, events) {
+    const receivedIndex = events.findLastIndex((event, eventIndex) => {
+        if (event.type !== "message.received")
+            return false;
+        if (event.data.clientMessageId === pendingTurn.id)
+            return true;
+        if (event.data.clientMessageId)
+            return false;
+        const isAfterSubmission = pendingTurn.eventCountAtSubmission === undefined ||
+            eventIndex >= pendingTurn.eventCountAtSubmission;
+        const eventAt = event.meta.at ? Date.parse(event.meta.at) : Number.NaN;
+        const eventCanAcknowledge = Number.isFinite(eventAt)
+            ? eventAt >= pendingTurn.submittedAt - 5_000
+            : isAfterSubmission;
+        return isAfterSubmission && eventCanAcknowledge &&
+            event.data.message.trim() === pendingTurn.text.trim();
+    });
+    if (receivedIndex < 0)
+        return undefined;
+    const received = events[receivedIndex];
+    return received?.type === "message.received" ? received : undefined;
+}
+export function projectStagedUserMessages(messages, turns, events = []) {
     if (turns.length === 0)
         return messages;
     const projected = [...messages];
     for (const turn of turns) {
         const id = `${turn.id}:user`;
         if (projected.some((message) => message.id === id))
+            continue;
+        const receipt = events.findLast((event) => event.type === "message.received" && event.data.clientMessageId === turn.id);
+        if (receipt?.type === "message.received" && projected.some((message) => message.role === "user" &&
+            messageBelongsToTurn(message, receipt.data.turnId) &&
+            message.parts.some((part) => part.type === "text" && part.text.trim() === turn.text.trim())))
             continue;
         projected.push({
             id,

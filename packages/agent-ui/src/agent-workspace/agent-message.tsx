@@ -79,6 +79,7 @@ import {
   reasoningContentForStep,
   type AgentTurnPresentation,
   type AgentTurnStatus,
+  type AgentTurnFailure,
 } from "./turn-presentation.js";
 
 function Message({ children, from, ...props }: { readonly children: React.ReactNode; readonly from: string; readonly [key: string]: unknown }) {
@@ -178,10 +179,33 @@ export function AgentMessage({
   const responseText = task?.finalPart?.text ?? (task ? undefined : lastText(displayMessage.parts));
   const failure = failureForTurn(events, displayMessage.metadata?.turnId);
   const hasFailureStepAnchor = task?.failureAnchored === true;
-  const hasVisiblePart = displayMessage.parts.some((part) => part.type !== "step-start");
+  // Keep one execution shell for the lifetime of a live assistant row. The
+  // first tool/retry event must not move an existing reasoning DOM subtree from
+  // the direct-message branch into a newly mounted collapsible container.
+  const executionShellRef = useRef(Boolean(task || isStreaming || failure));
+  if (task || isStreaming || failure) executionShellRef.current = true;
+  const showExecutionShell = executionShellRef.current;
+  const executionTask: AgentTurnPresentation = task ?? {
+    proxiedInputParts: [],
+    processParts: [],
+    startedAt: fallbackStartedAt,
+    status: isStreaming ? "running" : failure ? "failed" : "completed",
+  };
   const publishedDeliverables = task?.status === "completed"
     ? deliverablesForTurn(events, displayMessage.metadata?.turnId)
     : [];
+  const directParts = !task && message.role === "assistant" && isStreaming &&
+    !displayMessage.parts.some((part) => part.type === "reasoning")
+    ? [
+        {
+          state: "streaming" as const,
+          stepIndex: activeReasoningStep(events, displayMessage.metadata?.turnId),
+          text: "",
+          type: "reasoning" as const,
+        },
+        ...displayMessage.parts,
+      ]
+    : displayMessage.parts;
 
   return (
     <DeliverableOpenContext.Provider value={onOpenDeliverable}>
@@ -190,29 +214,32 @@ export function AgentMessage({
       from={message.role}
     >
       <MessageContent className={message.role === "assistant" ? "w-full" : undefined}>
-        {message.role === "assistant" && isStreaming && !hasVisiblePart ? (
-          <ReasoningRoot className="mb-1" role="status" streaming variant="ghost">
-            <ReasoningTrigger active hideChevron label={localize(locale, "Thinking", "正在思考")} />
-          </ReasoningRoot>
-        ) : null}
-        {task ? (
+        {showExecutionShell ? (
           <>
-            {isTurnContinuation ? (
-              <div className="mt-2 space-y-3">
+            <ExecutionGroup
+              collapseWhenSettled={Boolean(task && task.status === "completed" && (
+                task.finalPart?.text.trim() || hasLaterFinalDelivery(events, message.metadata?.turnId)
+              ))}
+              fallbackStartedAt={fallbackStartedAt}
+              locale={locale}
+              showTrigger={Boolean(task)}
+              task={executionTask}
+            >
+              <div className={isTurnContinuation ? "space-y-2" : undefined}>
                 <ProcessParts
                   assetUrl={assetUrl}
                   canRespond={canRespond}
                   closedInputRequestIds={closedInputRequestIds}
                   events={events}
-                  inActiveExecution={task.status === "running" || task.status === "waiting"}
+                  inActiveExecution={executionTask.status === "running" || executionTask.status === "waiting"}
                   locale={locale}
                   onInputResponses={onInputResponses}
                   onCloseInputRequest={onCloseInputRequest}
                   onOpenSubagent={onOpenSubagent}
-                  parts={task.processParts}
+                  parts={withReasoningParts(task?.processParts ?? directParts, events, message.metadata?.turnId)}
                   turnId={message.metadata?.turnId}
                 />
-                {task.proxiedInputParts.map((part) => (
+                {task?.proxiedInputParts.map((part) => (
                   <div className="space-y-2" key={`proxied-input:${part.toolCallId}`}>
                     <p className="text-xs font-medium text-amber-700 dark:text-amber-300">
                       {localize(locale, "A delegated task needs your approval", "子代理任务需要你的批准")}
@@ -233,53 +260,9 @@ export function AgentMessage({
                   </div>
                 ))}
               </div>
-            ) : (
-              <ExecutionGroup
-                collapseWhenSettled={task.status === "completed" && Boolean(
-                  task.finalPart?.text.trim() ||
-                  hasLaterFinalDelivery(events, message.metadata?.turnId),
-                )}
-                fallbackStartedAt={fallbackStartedAt}
-                locale={locale}
-                task={task}
-              >
-                <ProcessParts
-                  assetUrl={assetUrl}
-                  canRespond={canRespond}
-                  closedInputRequestIds={closedInputRequestIds}
-                  events={events}
-                  inActiveExecution={task.status === "running" || task.status === "waiting"}
-                  locale={locale}
-                  onInputResponses={onInputResponses}
-                  onCloseInputRequest={onCloseInputRequest}
-                  onOpenSubagent={onOpenSubagent}
-                  parts={task.processParts}
-                  turnId={message.metadata?.turnId}
-                />
-                {task.proxiedInputParts.map((part) => (
-                  <div className="space-y-2" key={`proxied-input:${part.toolCallId}`}>
-                    <p className="text-xs font-medium text-amber-700 dark:text-amber-300">
-                      {localize(locale, "A delegated task needs your approval", "子代理任务需要你的批准")}
-                    </p>
-                    <AgentMessagePart
-                      assetUrl={assetUrl}
-                      canRespond={canRespond}
-                      closedInputRequestIds={closedInputRequestIds}
-                      events={events}
-                      inActiveExecution
-                      locale={locale}
-                      onInputResponses={onInputResponses}
-                      onCloseInputRequest={onCloseInputRequest}
-                      onOpenSubagent={onOpenSubagent}
-                      part={part}
-                      turnId={message.metadata?.turnId}
-                    />
-                  </div>
-                ))}
-              </ExecutionGroup>
-            )}
-            {task.finalPart ? (
-              <div className="pt-3">
+            </ExecutionGroup>
+            {task?.finalPart ? (
+              <div className="pt-2">
                 <AgentMessagePart
                   assetUrl={assetUrl}
                   canRespond={canRespond}
@@ -294,13 +277,13 @@ export function AgentMessage({
                 />
               </div>
             ) : null}
-            {publishedDeliverables.length > 0 ? (
+            {task && publishedDeliverables.length > 0 ? (
               <div className="space-y-2 pt-3" data-turn-deliverables>
                 {publishedDeliverables.map((deliverable) => <PublishedDeliverableCard deliverable={deliverable} key={`${deliverable.kind}:${deliverable.id}`} locale={locale} />)}
               </div>
             ) : null}
           </>
-        ) : displayMessage.parts.map((part, index) => (
+        ) : directParts.map((part, index) => (
           <AgentMessagePart
             assetUrl={assetUrl}
             canRespond={canRespond}
@@ -402,6 +385,7 @@ function ProcessParts({
   let previousStepIndex = -1;
   const toolGroupOrdinalByStep = new Map<number, number>();
   const lastReasoningPartByStep = new Map<number, number>();
+  const renderedStepActivity = new Set<number>();
   for (let partIndex = 0; partIndex < parts.length; partIndex += 1) {
     const candidate = parts[partIndex];
     if (candidate?.type === "reasoning" && typeof candidate.stepIndex === "number") {
@@ -423,9 +407,10 @@ function ProcessParts({
       const stepIndex = stepIndexForParts(stepParts, events, turnId, previousStepIndex);
       if (stepIndex !== undefined) previousStepIndex = stepIndex;
       const hasReasoning = stepIndex !== undefined && (
-        stepParts.some((candidate) =>
-          candidate.type === "reasoning" && candidate.stepIndex === stepIndex && candidate.text.trim().length > 0
-        ) || Boolean(reasoningContentForStep(events, turnId, stepIndex))
+        // An empty reasoning part is still a live placeholder. Treating it as
+        // absent would add a second StepActivity row beside the placeholder.
+        stepParts.some((candidate) => candidate.type === "reasoning" && candidate.stepIndex === stepIndex) ||
+        Boolean(reasoningContentForStep(events, turnId, stepIndex))
       );
       if (!hasReasoning) {
         const hasStepEvidence = stepIndex !== undefined && events.some((event) =>
@@ -435,15 +420,19 @@ function ProcessParts({
           index += 1;
           continue;
         }
-        rendered.push(
-          <StepActivity
-            events={events}
-            key={`step-activity:${turnId}:${stepIndex ?? index}`}
-            locale={locale}
-            stepIndex={stepIndex ?? previousStepIndex}
-            turnId={turnId}
-          />,
-        );
+        const activityStep = stepIndex ?? previousStepIndex;
+        if (activityStep >= 0 && !renderedStepActivity.has(activityStep)) {
+          renderedStepActivity.add(activityStep);
+          rendered.push(
+            <StepActivity
+              events={events}
+              key={`step-activity:${turnId}:${activityStep}`}
+              locale={locale}
+              stepIndex={activityStep}
+              turnId={turnId}
+            />,
+          );
+        }
       }
       index += 1;
       continue;
@@ -560,6 +549,82 @@ function ProcessParts({
   }
 
   return <>{rendered}</>;
+}
+
+/**
+ * Eve does not always materialize a reasoning message part when a step later
+ * becomes a tool step. Keep the same keyed `AgentMessagePart` in that case so
+ * the live reasoning row is reconciled instead of being replaced by a new
+ * step-activity row when `actions.requested` arrives.
+ */
+function withReasoningParts(
+  parts: readonly EveMessagePart[],
+  events: readonly MessageStreamEvent[],
+  turnId: string | undefined,
+): readonly EveMessagePart[] {
+  if (!turnId || !parts.some((part) => part.type === "step-start")) return parts;
+  const reasoningParts = parts.filter((part): part is Extract<EveMessagePart, { type: "reasoning" }> =>
+    part.type === "reasoning",
+  );
+  const remaining = parts.filter((part) => part.type !== "reasoning");
+  const next: EveMessagePart[] = [];
+  const usedReasoning = new Set<number>();
+  const representedReasoningSteps = new Set<number>();
+  let previousStepIndex = -1;
+  for (let index = 0; index < remaining.length; index += 1) {
+    const part = remaining[index]!;
+    next.push(part);
+    if (part.type !== "step-start") continue;
+    const nextMarker = remaining.findIndex((candidate, candidateIndex) =>
+      candidateIndex > index && candidate.type === "step-start",
+    );
+    const stepParts = remaining.slice(index + 1, nextMarker < 0 ? remaining.length : nextMarker);
+    const stepIndex = stepIndexForParts(stepParts, events, turnId, previousStepIndex);
+    if (stepIndex === undefined) continue;
+    previousStepIndex = stepIndex;
+    // Eve retries a model step with the same turn/step coordinates. A
+    // transient reducer snapshot can therefore contain duplicate markers and
+    // reasoning parts for that step; keep one logical reasoning row and let
+    // the event projection supply the latest attempt text.
+    if (representedReasoningSteps.has(stepIndex)) continue;
+    const existing = reasoningParts.find((candidate, candidateIndex) =>
+      !usedReasoning.has(candidateIndex) && candidate.stepIndex === stepIndex,
+    ) ?? reasoningParts.find((candidate, candidateIndex) =>
+      !usedReasoning.has(candidateIndex) && candidate.stepIndex === undefined,
+    );
+    const existingIndex = existing ? reasoningParts.indexOf(existing) : -1;
+    if (existingIndex >= 0) usedReasoning.add(existingIndex);
+    // The durable event stream is authoritative for the current attempt. A
+    // reducer snapshot can still carry the previous attempt's part while the
+    // new reasoning deltas have already arrived; prefer those deltas so old
+    // reasoning cannot leak into the next turn/attempt.
+    const eventText = reasoningContentForStep(events, turnId, stepIndex);
+    const text = eventText || existing?.text.trim() || "";
+    if (existing || text) {
+      representedReasoningSteps.add(stepIndex);
+      next.push({
+        ...(existing ?? { state: "done", text, type: "reasoning" as const }),
+        ...(existing?.text.trim() ? {} : { text }),
+        stepIndex,
+      });
+    }
+  }
+  // A legacy checkpoint can leave a reasoning part before its first marker.
+  // It is now placed beside that step, so ProcessParts cannot create a second
+  // StepActivity representation for the same thought.
+  const representedSteps = new Set(
+    next.flatMap((part) => part.type === "reasoning" && typeof part.stepIndex === "number" ? [part.stepIndex] : []),
+  );
+  for (let index = 0; index < reasoningParts.length; index += 1) {
+    if (usedReasoning.has(index)) continue;
+    const part = reasoningParts[index]!;
+    // A repeated reasoning part for an already represented step is usually
+    // Eve's retry snapshot. Keep the latest anchored part only; rendering it
+    // as another sibling creates consecutive duplicate thought rows.
+    if (part.stepIndex !== undefined && representedSteps.has(part.stepIndex)) continue;
+    next.push(part);
+  }
+  return next.length === parts.length && next.every((part, index) => part === parts[index]) ? parts : next;
 }
 
 /**
@@ -1235,38 +1300,30 @@ function StepActivity({
   readonly turnId?: string;
 }) {
   const step = presentAgentStep(events, turnId, stepIndex);
-  const retryItems = step.retries ?? (step.retry ? [step.retry] : []);
   const hasReasoningContent = Boolean(reasoningContentForStep(events, turnId, stepIndex));
+  const hasToolActivity = events.some((event) => {
+    if (event.type !== "actions.requested" && event.type !== "action.input.partial" && event.type !== "action.result") return false;
+    return eventTurnMatches(event, turnId, stepIndex);
+  });
   // A step can legitimately contain only a tool call. Do not label its
   // terminal boundary as completed reasoning when the Provider emitted no
   // reasoning text at all. While it is live, keep the neutral thinking state
   // without implying that an expandable reasoning block exists.
-  if (!hasReasoningContent && step.status !== "running") {
-    return (
-      <>
-        {retryItems.map((retry, index) => (
-          <RetryStatus key={`retry:${turnId ?? "unknown"}:${stepIndex}:${index}`} locale={locale} retry={retry} />
-        ))}
-        {step.status === "failed" && step.failure && !step.retry?.exhausted ? <StepFailure failure={step.failure} locale={locale} /> : null}
-      </>
-    );
-  }
+  const timing = reasoningTiming(events, turnId, stepIndex);
+  const durationSeconds = useElapsedSeconds(timing.startedAt, timing.endedAt);
   return (
-    <>
-      {retryItems.map((retry, index) => (
-        <RetryStatus key={`retry:${turnId ?? "unknown"}:${stepIndex}:${index}`} locale={locale} retry={retry} />
-      ))}
-      {step.status === "failed" && step.failure && !step.retry?.exhausted ? <StepFailure failure={step.failure} locale={locale} /> : null}
-      <ReasoningRoot className="mb-1" role="status" streaming={step.status === "running"} variant="ghost">
-        <ReasoningTrigger
-          active={step.status === "running"}
-          hideChevron
-          label={step.status === "running"
-            ? localize(locale, "Thinking", "正在思考")
-            : localize(locale, "Reasoning complete", "思考完成")}
-        />
-      </ReasoningRoot>
-    </>
+    <ReasoningBlock
+      durationSeconds={durationSeconds}
+      events={events}
+      failure={step.failure}
+      locale={locale}
+      retryItems={step.retries ?? (step.retry ? [step.retry] : [])}
+      stepIndex={stepIndex}
+      streaming={step.status === "running" && !hasToolActivity}
+      text={hasReasoningContent ? reasoningContentForStep(events, turnId, stepIndex) : ""}
+      timing={timing}
+      turnId={turnId}
+    />
   );
 }
 
@@ -1358,31 +1415,147 @@ function ReasoningPart({
   const retryItems = step.retries ?? (step.retry ? [step.retry] : []);
   const stepIndex = part.stepIndex ?? 0;
   const durationSeconds = useElapsedSeconds(timing.startedAt, timing.endedAt);
-  const streaming = part.state === "streaming";
-  const text = part.text.trim() || reasoningContentForStep(events, turnId, part.stepIndex);
+  const retryInFlight = isReasoningRetryInFlight(events, turnId, part.stepIndex);
+  const eventText = reasoningContentForStep(events, turnId, part.stepIndex);
+  // A browser-only assistant placeholder has no durable turn id yet. Do not
+  // let a historical step with the same numeric index hide that placeholder
+  // before Eve emits the current turn's first event.
+  const responseStarted = Boolean(turnId) && !eventText && events.some((event) =>
+    (event.type === "message.appended" || event.type === "message.completed") &&
+    eventTurnMatches(event, turnId, stepIndex) &&
+    (event.type !== "message.appended" || event.data.messageSoFar.trim().length > 0) &&
+    (event.type !== "message.completed" || Boolean(event.data.message?.trim())),
+  );
+  const streaming = (part.state === "streaming" || retryInFlight) && !responseStarted;
+  // When Eve retries a step it reuses the same step/turn coordinates. The
+  // reducer snapshot can still contain the previous attempt's completed text
+  // while the new attempt has not emitted its first delta; never display that
+  // stale text during the hand-off. For compact historical checkpoints with
+  // no retry boundary, the reducer text remains the useful fallback.
+  const text = retryInFlight ? eventText : eventText || part.text.trim();
   // Empty reasoning boundaries are protocol bookkeeping, not user-visible
   // reasoning. Keep a live placeholder while the step is running, but remove
   // it after completion instead of rendering an empty "Reasoning complete".
-  if (!text && !streaming) return null;
+  if (!text && !streaming) {
+    return (
+      <ReasoningBlock
+        durationSeconds={durationSeconds}
+        events={events}
+        failure={step.failure}
+        locale={locale}
+        retryItems={retryItems}
+        stepIndex={stepIndex}
+        streaming={false}
+        text=""
+        timing={timing}
+        turnId={turnId}
+      />
+    );
+  }
+  return (
+    <ReasoningBlock
+      durationSeconds={durationSeconds}
+      events={events}
+      failure={step.failure}
+      locale={locale}
+      retryItems={retryItems}
+      stepIndex={stepIndex}
+      streaming={streaming}
+      text={text}
+      timing={timing}
+      turnId={turnId}
+    />
+  );
+}
+
+function ReasoningBlock({
+  durationSeconds,
+  failure,
+  locale,
+  retryItems,
+  stepIndex,
+  streaming,
+  text,
+  timing,
+  turnId,
+}: {
+  readonly durationSeconds: number;
+  readonly events: readonly MessageStreamEvent[];
+  readonly failure?: AgentTurnFailure;
+  readonly locale: AgentLocale;
+  readonly retryItems: readonly NonNullable<ReturnType<typeof presentAgentStep>["retry"]>[];
+  readonly stepIndex: number;
+  readonly streaming: boolean;
+  readonly text: string;
+  readonly timing: { readonly endedAt?: number; readonly startedAt?: number };
+  readonly turnId?: string;
+}) {
+  const hasText = text.trim().length > 0;
   return (
     <>
       {retryItems.map((retry, index) => (
         <RetryStatus key={`retry:${turnId ?? "unknown"}:${stepIndex}:${index}`} locale={locale} retry={retry} />
       ))}
-      {step.status === "failed" && step.failure && !step.retry?.exhausted ? <StepFailure failure={step.failure} locale={locale} /> : null}
-      <ReasoningRoot className="mb-1" streaming={streaming} variant="ghost">
-        <ReasoningTrigger
-          active={streaming}
-          duration={timing.startedAt && durationSeconds > 0 ? durationSeconds : undefined}
-          hideChevron={!text}
-          label={reasoningTriggerLabel(locale, streaming, text)}
-        />
-        <ReasoningContent aria-busy={streaming}>
-          <ReasoningText><StaticMarkdownText text={text} /></ReasoningText>
-        </ReasoningContent>
-      </ReasoningRoot>
+      {failure && !retryItems.some((retry) => retry.exhausted) ? <StepFailure failure={failure} locale={locale} /> : null}
+      {hasText || streaming ? (
+        <ReasoningRoot
+          className="mb-1"
+          role={streaming ? "status" : undefined}
+          streaming={streaming}
+          variant="ghost"
+        >
+          <ReasoningTrigger
+            active={streaming}
+            duration={timing.startedAt && durationSeconds > 0 ? durationSeconds : undefined}
+            hideChevron={!hasText}
+            label={reasoningTriggerLabel(locale, streaming, text)}
+          />
+          {hasText ? (
+            <ReasoningContent aria-busy={streaming}>
+              <ReasoningText><StaticMarkdownText text={text} /></ReasoningText>
+            </ReasoningContent>
+          ) : null}
+        </ReasoningRoot>
+      ) : null}
     </>
   );
+}
+
+function eventTurnMatches(
+  event: MessageStreamEvent,
+  turnId: string | undefined,
+  stepIndex: number,
+): boolean {
+  if (!("data" in event) || !event.data || typeof event.data !== "object") return false;
+  const data = event.data as { readonly stepIndex?: unknown; readonly turnId?: unknown };
+  return (turnId === undefined || data.turnId === turnId) && data.stepIndex === stepIndex;
+}
+
+function isReasoningRetryInFlight(
+  events: readonly MessageStreamEvent[],
+  turnId: string | undefined,
+  stepIndex: number | undefined,
+): boolean {
+  if (!turnId || stepIndex === undefined) return false;
+  let latestStart = -1;
+  let latestReasoning = -1;
+  let latestCompletion = -1;
+  let latestFailure = -1;
+  for (let index = 0; index < events.length; index += 1) {
+    const event = events[index]!;
+    if (!("data" in event)) continue;
+    const data = event.data as { readonly stepIndex?: unknown; readonly turnId?: unknown };
+    if (data.turnId !== turnId || data.stepIndex !== stepIndex) continue;
+    if (event.type === "step.started") latestStart = index;
+    else if (event.type === "reasoning.appended" || event.type === "reasoning.completed") {
+      latestReasoning = index;
+      if (event.type === "reasoning.completed") latestCompletion = index;
+    } else if (event.type === "step.failed") latestFailure = index;
+  }
+  // A second step boundary after a completed reasoning block is a retry. Keep
+  // the row in its live placeholder state until the replacement text arrives.
+  return latestStart > latestReasoning && (latestCompletion >= 0 || latestFailure >= 0) &&
+    latestStart > Math.max(latestCompletion, latestFailure);
 }
 
 function reasoningTriggerLabel(
@@ -1402,6 +1575,16 @@ function reasoningSummary(text: string): string | undefined {
     .find(Boolean);
   if (!firstLine) return undefined;
   return firstLine.length > 64 ? `${firstLine.slice(0, 63)}…` : firstLine;
+}
+
+function activeReasoningStep(
+  events: readonly MessageStreamEvent[],
+  turnId: string | undefined,
+): number {
+  const started = [...events].reverse().find((event) =>
+    event.type === "step.started" && (turnId === undefined || event.data.turnId === turnId),
+  );
+  return started?.type === "step.started" ? started.data.stepIndex : 0;
 }
 
 function reasoningTiming(
@@ -1943,12 +2126,14 @@ function ExecutionGroup({
   collapseWhenSettled,
   fallbackStartedAt,
   locale,
+  showTrigger = true,
   task,
 }: {
   readonly children: React.ReactNode;
   readonly collapseWhenSettled: boolean;
   readonly fallbackStartedAt?: number;
   readonly locale: AgentLocale;
+  readonly showTrigger?: boolean;
   readonly task: AgentTurnPresentation;
 }) {
   const isActive = task.status === "running" || task.status === "waiting";
@@ -1983,7 +2168,11 @@ function ExecutionGroup({
     >
       <CollapsibleTrigger asChild>
         <button
-          className="flex w-full items-center gap-1.5 border-b border-border/60 py-1.5 text-left text-sm text-muted-foreground transition-colors hover:text-foreground"
+          aria-hidden={!showTrigger}
+          className={showTrigger
+            ? "flex w-full items-center gap-1.5 border-b border-border/60 py-1.5 text-left text-sm text-muted-foreground transition-colors hover:text-foreground"
+            : "pointer-events-none invisible h-0 w-full overflow-hidden"}
+          tabIndex={showTrigger ? undefined : -1}
           type="button"
         >
           <span>{executionLabel(locale, task)}</span>
@@ -2667,6 +2856,8 @@ function partKey(part: EveMessagePart, index: number): string {
   switch (part.type) {
     case "authorization":
       return `authorization:${part.turnId}:${part.stepIndex}:${part.name}`;
+    case "reasoning":
+      return `reasoning:${part.stepIndex ?? "pending"}`;
     case "dynamic-tool":
       return part.toolCallId;
     default:

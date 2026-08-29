@@ -1,4 +1,5 @@
 import { type MessageStreamEvent } from "eve/client";
+import { type EveMessage } from "eve/react";
 import type { AgentModelOption, AgentPromptMenuItem, AgentQueuedTurn, AgentSessionDeliverable, AgentThread, AgentThreadPatch, AgentWorkspaceClientConfig, AgentWorkspaceMailbox } from "./contracts.js";
 import { type AgentLocale, type AgentMessages } from "./i18n.js";
 export declare function AgentThreadView({ client, commands, draftStorageKey, historyHasMore, historyLoading, isRecovering, locale, mailbox, mentions, models, onChange, onCancelRecovery, onEvent, onOpenDeliverable, onOpenSubagent, onLoadEarlier, onRetryRecovery, onRecoveryNeeded, providerReady, recoveryError, reasoningLevels, thread, }: {
@@ -32,4 +33,5 @@ export declare function FollowUpQueue({ error, messages, onRemove, onRetry, turn
     readonly onRetry: (turnId: string) => void;
     readonly turns: readonly AgentQueuedTurn[];
 }): import("react/jsx-runtime").JSX.Element;
+export declare function projectStagedUserMessages(messages: readonly EveMessage[], turns: readonly AgentQueuedTurn[], events?: readonly MessageStreamEvent[]): readonly EveMessage[];
 //# sourceMappingURL=agent-thread.d.ts.map
