@@ -227,6 +227,20 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
                     return current;
                 return event.data.message.trim() === current.text.trim() ? undefined : current;
             });
+            const clientMessageId = event.data.clientMessageId;
+            const dispatchedId = dispatchingQueuedTurnIdRef.current;
+            const acceptedQueuedId = clientMessageId && queuedTurnsRef.current.some((turn) => turn.id === clientMessageId)
+                ? clientMessageId
+                : dispatchedId && queuedTurnsRef.current.some((turn) => turn.id === dispatchedId)
+                    ? dispatchedId
+                    : undefined;
+            if (acceptedQueuedId) {
+                queuedTurnsRef.current = queuedTurnsRef.current.filter((turn) => turn.id !== acceptedQueuedId);
+                if (dispatchingQueuedTurnIdRef.current === acceptedQueuedId) {
+                    dispatchingQueuedTurnIdRef.current = undefined;
+                }
+                onChange({ queuedTurns: queuedTurnsRef.current, updatedAt: Date.now() });
+            }
         }
         if (event.type === "turn.failed" || event.type === "session.failed") {
             setTurnError(event.data.message);
@@ -343,8 +357,9 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     const authoritativeEvents = isRecovering || (durableSessionSettled && !localSessionSettled)
         ? thread.events
         : agent.events;
-    const pendingTurnInFlight = isPendingTurnInFlight(displayPendingTurn) &&
-        !hasSettledLatestTurn(authoritativeEvents);
+    const pendingTurnAccepted = displayPendingTurn !== undefined &&
+        reconcilePendingTurnWithEvents(displayPendingTurn, authoritativeEvents) === undefined;
+    const pendingTurnInFlight = isPendingTurnInFlight(displayPendingTurn) && !pendingTurnAccepted;
     const durableTurnSettled = !pendingTurnInFlight &&
         hasSettledLatestTurn(authoritativeEvents) &&
         hasSettledSessionBoundary(authoritativeEvents);
@@ -863,7 +878,11 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             }
             return;
         }
-        if (admissionBusy || turnAdmissionBusyRef.current) {
+        const liveSessionSettled = hasSettledLatestTurn(agent.events) &&
+            hasSettledSessionBoundary(agent.events);
+        if (liveSessionSettled)
+            turnAdmissionBusyRef.current = false;
+        if ((admissionBusy || turnAdmissionBusyRef.current) && !liveSessionSettled) {
             if (message.files.length > 0) {
                 setQueueError(messages.queueAttachmentsUnsupported);
                 return;
@@ -963,7 +982,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             : effectiveRenderMessages;
         return normalizeSettledAgentMessages(source, interruptedDisplayEvents);
     }, [displayInterruptedTurns.length, effectiveRenderMessages, interruptedDisplayEvents]);
-    const projectedMessages = useMemo(() => projectStagedUserMessages(ensureActiveAssistantMessage(projectedRuntimeMessages, interruptedDisplayEvents, isBusy || displayPendingTurn?.state === "resubmitting" || Boolean(latestTurnFailure(interruptedDisplayEvents)), displayPendingTurn), thread.queuedTurns.filter((turn) => turn.intent === "post-cancellation")), [displayPendingTurn, interruptedDisplayEvents, isBusy, projectedRuntimeMessages, thread.queuedTurns]);
+    const projectedMessages = useMemo(() => projectStagedUserMessages(ensureActiveAssistantMessage(projectedRuntimeMessages, interruptedDisplayEvents, isBusy || isPendingTurnInFlight(displayPendingTurn) || Boolean(latestTurnFailure(interruptedDisplayEvents)), displayPendingTurn), thread.queuedTurns.filter((turn) => turn.intent === "post-cancellation")), [displayPendingTurn, interruptedDisplayEvents, isBusy, projectedRuntimeMessages, thread.queuedTurns]);
     const ungroupedVisibleMessages = useMemo(() => projectedMessages.filter((message) => !isProxiedInputOnlyMessage(message, effectiveRenderEvents)), [effectiveRenderEvents, projectedMessages]);
     const ungroupedDisplayEvents = interruptedDisplayEvents;
     const displayTimeline = useMemo(() => projectAgentDisplayTimeline(ungroupedVisibleMessages, ungroupedDisplayEvents), [ungroupedDisplayEvents, ungroupedVisibleMessages]);
@@ -1326,13 +1345,18 @@ function ensureActiveAssistantMessage(messages, events, isBusy, pendingTurn) {
         return projectedMessages;
     const started = [...events].reverse().find((event) => event.type === "turn.started");
     const turnId = started?.type === "turn.started" ? started.data.turnId : undefined;
-    if (turnId && projectedMessages.some((message) => message.role === "assistant" && message.metadata?.turnId === turnId)) {
+    const pendingUserIndex = pendingTurn
+        ? projectedMessages.findIndex((message) => message.id === `${pendingTurn.id}:user`)
+        : -1;
+    const sessionSettled = hasSettledLatestTurn(events);
+    const activeTurnId = pendingUserIndex >= 0 && sessionSettled ? undefined : turnId;
+    if (activeTurnId && projectedMessages.some((message) => message.role === "assistant" && message.metadata?.turnId === activeTurnId)) {
         return projectedMessages;
     }
-    if (!turnId && !pendingTurn && projectedMessages.at(-1)?.role === "assistant")
+    if (!activeTurnId && !pendingTurn && projectedMessages.at(-1)?.role === "assistant")
         return projectedMessages;
-    const placeholderId = turnId ?? pendingTurn?.id ?? "pending-turn";
-    const displayTurnId = turnId ?? (terminalFailure ? placeholderId : undefined);
+    const placeholderId = activeTurnId ?? pendingTurn?.id ?? "pending-turn";
+    const displayTurnId = activeTurnId ?? (terminalFailure ? placeholderId : undefined);
     return [
         ...projectedMessages,
         {
@@ -1696,10 +1720,11 @@ function latestTurnOutcome(events) {
     return undefined;
 }
 function hasSettledSessionBoundary(events) {
-    const last = events.at(-1);
-    return last?.type === "session.waiting" ||
-        last?.type === "session.completed" ||
-        last?.type === "session.failed";
+    const latestTurnIndex = events.findLastIndex((event) => event.type === "turn.started");
+    const latestBoundaryIndex = events.findLastIndex((event) => event.type === "session.waiting" ||
+        event.type === "session.completed" ||
+        event.type === "session.failed");
+    return latestBoundaryIndex > latestTurnIndex;
 }
 function latestTurnFailure(events) {
     if (latestTurnOutcome(events) !== "failed")

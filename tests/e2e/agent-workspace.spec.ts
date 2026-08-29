@@ -220,6 +220,60 @@ test("composer clears immediately while a turn is still being accepted", async (
   await expect(page.getByText("Accepted.", { exact: true })).toBeVisible({ timeout: 5_000 });
 });
 
+test("a settled session renders the next message before its delayed stream", async ({ page }) => {
+  const sessionId = "settled-follow-up-session";
+  const firstTurn = eventsFromNdjson(mockSuccessfulTurn("First request", "First done."));
+  const secondTurn = eventsFromNdjson(mockContinuationTurn("Second request", "Second done."));
+  let streamRequests = 0;
+
+  await page.route("**/eve/v1/session", async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({ sessionId }),
+      contentType: "application/json",
+      headers: { "x-eve-session-id": sessionId },
+      status: 200,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}`, async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({ sessionId }),
+      contentType: "application/json",
+      headers: { "x-eve-session-id": sessionId },
+      status: 200,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
+    streamRequests += 1;
+    if (streamRequests === 1) {
+      await route.fulfill({
+        body: ndjson(firstTurn),
+        contentType: "application/x-ndjson",
+        status: 200,
+      });
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    await route.fulfill({
+      body: ndjson(secondTurn),
+      contentType: "application/x-ndjson",
+      status: 200,
+    });
+  });
+
+  await page.goto("/");
+  const composer = page.getByRole("textbox", { name: "Do anything" });
+  await composer.fill("First request");
+  await composer.press("Enter");
+  await expect(page.getByText("First done.", { exact: true })).toBeVisible({ timeout: 5_000 });
+
+  await composer.fill("Second request");
+  await composer.press("Enter");
+  await expect(page.getByRole("log").getByText("Second request", { exact: true })).toBeVisible({ timeout: 300 });
+  await expect(page.getByRole("status").filter({ hasText: "Thinking" })).toBeVisible({ timeout: 300 });
+  await expect(page.locator("[data-agent-steer-queue]")).toHaveCount(0);
+  await expect(page.getByText("Second done.", { exact: true })).toBeVisible({ timeout: 5_000 });
+});
+
 test("transient session admission errors retry with a stable bounded counter", async ({ page }) => {
   let attempts = 0;
   await page.route("**/eve/v1/session", async (route) => {

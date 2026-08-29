@@ -392,6 +392,27 @@ export function AgentThreadView({
           if (event.data.clientMessageId) return current;
           return event.data.message.trim() === current.text.trim() ? undefined : current;
         });
+
+        // Consume a queued admission at the receipt boundary as well. The
+        // reducer snapshot and the parent thread checkpoint are intentionally
+        // asynchronous; waiting for the next React effect leaves an accepted
+        // message rendered both in the transcript and in the follow-up queue.
+        // Prefer Eve's client id, then the browser dispatch lane. Do not fall
+        // back to text matching because repeated prompts are valid turns.
+        const clientMessageId = event.data.clientMessageId;
+        const dispatchedId = dispatchingQueuedTurnIdRef.current;
+        const acceptedQueuedId = clientMessageId && queuedTurnsRef.current.some((turn) => turn.id === clientMessageId)
+          ? clientMessageId
+          : dispatchedId && queuedTurnsRef.current.some((turn) => turn.id === dispatchedId)
+            ? dispatchedId
+            : undefined;
+        if (acceptedQueuedId) {
+          queuedTurnsRef.current = queuedTurnsRef.current.filter((turn) => turn.id !== acceptedQueuedId);
+          if (dispatchingQueuedTurnIdRef.current === acceptedQueuedId) {
+            dispatchingQueuedTurnIdRef.current = undefined;
+          }
+          onChange({ queuedTurns: queuedTurnsRef.current, updatedAt: Date.now() });
+        }
       }
       if (event.type === "turn.failed" || event.type === "session.failed") {
         setTurnError(event.data.message);
@@ -568,8 +589,15 @@ export function AgentThreadView({
     : agent.events;
   // A durable turn boundary is authoritative. React stream state can remain
   // stale after a reconnect even though Eve has already parked the session.
-  const pendingTurnInFlight = isPendingTurnInFlight(displayPendingTurn) &&
-    !hasSettledLatestTurn(authoritativeEvents);
+  // A previous turn's `session.waiting` boundary must not hide the optimistic
+  // admission for a new message whose POST/stream has not produced its own
+  // `message.received` receipt yet. Reconcile against the latest receipt
+  // instead of using the session's historical settled flag; otherwise the
+  // second message briefly loses both its thinking placeholder and running
+  // state until the first model output arrives.
+  const pendingTurnAccepted = displayPendingTurn !== undefined &&
+    reconcilePendingTurnWithEvents(displayPendingTurn, authoritativeEvents) === undefined;
+  const pendingTurnInFlight = isPendingTurnInFlight(displayPendingTurn) && !pendingTurnAccepted;
   const durableTurnSettled = !pendingTurnInFlight &&
     hasSettledLatestTurn(authoritativeEvents) &&
     hasSettledSessionBoundary(authoritativeEvents);
@@ -1223,7 +1251,14 @@ export function AgentThreadView({
       }
       return;
     }
-    if (admissionBusy || turnAdmissionBusyRef.current) {
+    // The event handler clears the imperative gate as soon as Eve emits its
+    // durable boundary. A render can still carry the previous `admissionBusy`
+    // value for one frame; trust the current Eve transcript in that window so
+    // a normal next message is not misclassified as a queued follow-up.
+    const liveSessionSettled = hasSettledLatestTurn(agent.events) &&
+      hasSettledSessionBoundary(agent.events);
+    if (liveSessionSettled) turnAdmissionBusyRef.current = false;
+    if ((admissionBusy || turnAdmissionBusyRef.current) && !liveSessionSettled) {
       if (message.files.length > 0) {
         setQueueError(messages.queueAttachmentsUnsupported);
         return;
@@ -1347,7 +1382,7 @@ export function AgentThreadView({
     ensureActiveAssistantMessage(
       projectedRuntimeMessages,
       interruptedDisplayEvents,
-      isBusy || displayPendingTurn?.state === "resubmitting" || Boolean(latestTurnFailure(interruptedDisplayEvents)),
+      isBusy || isPendingTurnInFlight(displayPendingTurn) || Boolean(latestTurnFailure(interruptedDisplayEvents)),
       displayPendingTurn,
     ),
     thread.queuedTurns.filter((turn) => turn.intent === "post-cancellation"),
@@ -1873,12 +1908,21 @@ function ensureActiveAssistantMessage(
   if (!isBusy && !terminalFailure) return projectedMessages;
   const started = [...events].reverse().find((event) => event.type === "turn.started");
   const turnId = started?.type === "turn.started" ? started.data.turnId : undefined;
-  if (turnId && projectedMessages.some((message) => message.role === "assistant" && message.metadata?.turnId === turnId)) {
+  // A settled session can have a complete assistant message while the next
+  // POST is still waiting for Eve's first `turn.started` event. Keep the new
+  // optimistic user turn paired with its own thinking placeholder instead of
+  // treating the previous assistant response as the active head.
+  const pendingUserIndex = pendingTurn
+    ? projectedMessages.findIndex((message) => message.id === `${pendingTurn.id}:user`)
+    : -1;
+  const sessionSettled = hasSettledLatestTurn(events);
+  const activeTurnId = pendingUserIndex >= 0 && sessionSettled ? undefined : turnId;
+  if (activeTurnId && projectedMessages.some((message) => message.role === "assistant" && message.metadata?.turnId === activeTurnId)) {
     return projectedMessages;
   }
-  if (!turnId && !pendingTurn && projectedMessages.at(-1)?.role === "assistant") return projectedMessages;
-  const placeholderId = turnId ?? pendingTurn?.id ?? "pending-turn";
-  const displayTurnId = turnId ?? (terminalFailure ? placeholderId : undefined);
+  if (!activeTurnId && !pendingTurn && projectedMessages.at(-1)?.role === "assistant") return projectedMessages;
+  const placeholderId = activeTurnId ?? pendingTurn?.id ?? "pending-turn";
+  const displayTurnId = activeTurnId ?? (terminalFailure ? placeholderId : undefined);
   return [
     ...projectedMessages,
     {
@@ -2343,10 +2387,16 @@ function latestTurnOutcome(events: readonly MessageStreamEvent[]): "cancelled" |
  * boundary. The composer must remain locked until the session is parked or
  * terminal, otherwise a follow-up can race the still-active runtime. */
 function hasSettledSessionBoundary(events: readonly MessageStreamEvent[]): boolean {
-  const last = events.at(-1);
-  return last?.type === "session.waiting" ||
-    last?.type === "session.completed" ||
-    last?.type === "session.failed";
+  const latestTurnIndex = events.findLastIndex((event) => event.type === "turn.started");
+  const latestBoundaryIndex = events.findLastIndex((event) =>
+    event.type === "session.waiting" ||
+    event.type === "session.completed" ||
+    event.type === "session.failed",
+  );
+  // A transport snapshot can append non-lifecycle events after the durable
+  // boundary. The boundary is still authoritative as long as it belongs to
+  // the latest turn; only a newer turn invalidates it.
+  return latestBoundaryIndex > latestTurnIndex;
 }
 
 function latestTurnFailure(events: readonly MessageStreamEvent[]): string | undefined {

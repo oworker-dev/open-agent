@@ -845,9 +845,10 @@ export function hasUnresolvedInputRequests(events, closedInputRequestIds = new S
     return unresolvedInputRequests(events, closedInputRequestIds).length > 0;
 }
 export function hasSettledLatestTurn(events) {
-    if (events.at(-1)?.type === "session.waiting")
-        return true;
     const startedIndex = events.findLastIndex((event) => event.type === "turn.started");
+    const sessionBoundaryIndex = events.findLastIndex((event) => event.type === "session.waiting" || event.type === "session.completed" || event.type === "session.failed");
+    if (sessionBoundaryIndex > startedIndex)
+        return startedIndex >= 0;
     if (startedIndex < 0)
         return false;
     const started = events[startedIndex];

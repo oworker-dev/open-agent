@@ -1221,8 +1221,16 @@ export function hasUnresolvedInputRequests(
 
 /** Treats Eve's persisted turn boundary as authoritative over stale UI stream state. */
 export function hasSettledLatestTurn(events: readonly MessageStreamEvent[]): boolean {
-  if (events.at(-1)?.type === "session.waiting") return true;
   const startedIndex = events.findLastIndex((event) => event.type === "turn.started");
+  const sessionBoundaryIndex = events.findLastIndex((event) =>
+    event.type === "session.waiting" || event.type === "session.completed" || event.type === "session.failed",
+  );
+  // A session boundary settles the latest turn only when it follows that turn.
+  // Looking only at `events.at(-1)` was brittle when a checkpoint appended a
+  // non-lifecycle event after `session.waiting`; conversely, accepting any
+  // historical waiting event could unlock a newer turn after an out-of-order
+  // recovery merge.
+  if (sessionBoundaryIndex > startedIndex) return startedIndex >= 0;
   if (startedIndex < 0) return false;
   const started = events[startedIndex];
   if (started?.type !== "turn.started") return false;

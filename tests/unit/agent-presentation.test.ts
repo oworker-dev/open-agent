@@ -1637,6 +1637,21 @@ test("a persisted turn failure overrides stale client stream state for editing",
     ...running,
     event("session.waiting", endedAt, { wait: "next-user-message" }),
   ]), true);
+  // Eve may append a non-lifecycle observation after the waiting boundary
+  // while a client checkpoint is being committed. The completed turn remains
+  // settled in that snapshot.
+  assert.equal(hasSettledLatestTurn([
+    ...running,
+    event("session.waiting", endedAt, { wait: "next-user-message" }),
+    event("message.appended", endedAt, { messageSoFar: "checkpoint flushed", sequence: 0, stepIndex: 0, turnId: "turn-edit" }),
+  ]), true);
+  // A historical boundary must never settle a newer turn that started after
+  // it, even when the newer turn has not emitted its first model step yet.
+  assert.equal(hasSettledLatestTurn([
+    ...running,
+    event("session.waiting", endedAt, { wait: "next-user-message" }),
+    event("turn.started", endedAt, { sequence: 1, turnId: "turn-next" }),
+  ]), false);
   assert.equal(hasSettledLatestTurn([
     ...running,
     event("turn.failed", endedAt, { code: "provider_error", message: "Failed", sequence: 0, turnId: "turn-edit" }),
