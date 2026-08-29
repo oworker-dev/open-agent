@@ -8530,6 +8530,9 @@
 .open-agent-ui [data-slot="thread-viewport"] {
   scrollbar-gutter: stable;
 }
+.open-agent-ui [data-slot="thread-viewport"] [data-aui-top-anchor-user] {
+  padding-top: clamp(1rem, 2vw, 1.5rem);
+}
 .open-agent-ui .aui-md-pre > .aui-md-inline-code {
   border-radius: 0;
   background: transparent;

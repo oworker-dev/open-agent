@@ -200,6 +200,15 @@
   scrollbar-gutter: stable;
 }
 
+/*
+ * Top anchoring scrolls the active user turn itself to the viewport edge.
+ * Keep the reading gap inside that turn so it remains visible after the
+ * scroll, instead of relying on viewport padding (which is scrolled away).
+ */
+.open-agent-ui [data-slot="thread-viewport"] [data-aui-top-anchor-user] {
+  padding-top: clamp(1rem, 2vw, 1.5rem);
+}
+
 .open-agent-ui .aui-md-pre > .aui-md-inline-code {
   border-radius: 0;
   background: transparent;
