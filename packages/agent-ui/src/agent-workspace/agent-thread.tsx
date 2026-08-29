@@ -3,7 +3,7 @@
 import type { UserContent } from "ai";
 import { ClientError, defaultMessageReducer, isCurrentTurnBoundaryEvent, type ClientSession, type MessageStreamEvent } from "eve/client";
 import { useEveAgent, type EveMessage } from "eve/react";
-import { AssistantRuntimeProvider, unstable_defaultDirectiveFormatter, useExternalStoreRuntime, type AppendMessage, type ExternalThreadQueueAdapter } from "@assistant-ui/react";
+import { AssistantRuntimeProvider, unstable_defaultDirectiveFormatter, useExternalStoreRuntime, type AppendMessage, type ExternalStoreAdapter, type ExternalThreadQueueAdapter, type RespondToToolApprovalOptions } from "@assistant-ui/react";
 import { AlertCircleIcon, Clock3Icon, HammerIcon, RotateCcwIcon, SearchIcon, ShieldCheckIcon, SparklesIcon, XIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "../ui/button.js";
@@ -60,6 +60,10 @@ const activeEditedTurnOperations = new Set<string>();
 const pendingEditedTurnOperations = new Set<string>();
 const CANCELLATION_STREAM_REATTACH_AFTER_MS = 5_000;
 const MAX_PROVIDER_SUBMISSION_RETRIES = 3;
+// Thread state is a persistence/cache boundary, not the render clock. Eve
+// already publishes the live reducer at frame cadence; checkpoint less often
+// so the parent workspace is not rebuilt for every provider fragment.
+const LIVE_CHECKPOINT_INTERVAL_MS = 250;
 
 type ProviderRetryState = {
   readonly attempt: number;
@@ -178,6 +182,7 @@ export function AgentThreadView({
   const editResubmitPendingRef = useRef(false);
   const turnAdmissionBusyRef = useRef(false);
   const cancellationRecoveryRef = useRef<() => void>(() => undefined);
+  const persistedThreadStatusRef = useRef<AgentThread["status"]>(thread.status);
   const cancellationIdleTimerRef = useRef<number | undefined>(undefined);
   const [cancellationState, setCancellationState] = useState<"idle" | "requested" | "cancelling">(
     thread.status === "cancelling" ? "cancelling" : "idle",
@@ -218,6 +223,11 @@ export function AgentThreadView({
     if (providerRetryTimerRef.current !== undefined) {
       window.clearTimeout(providerRetryTimerRef.current);
     }
+    // A thread can unmount while a hot Eve stream is waiting for its
+    // checkpoint cadence (for example when the user switches sessions).
+    // Flush the append-only buffer before teardown so the last observed events
+    // are not stranded in this component's refs.
+    flushCheckpointRef.current();
   }, []);
 
   useEffect(() => {
@@ -341,7 +351,7 @@ export function AgentThreadView({
         checkpointTimerRef.current = window.setTimeout(() => {
           checkpointTimerRef.current = undefined;
           flushCheckpointRef.current();
-        }, 50);
+        }, LIVE_CHECKPOINT_INTERVAL_MS);
       }
       if (event.type === "turn.started") {
         const cancellation = cancellationRef.current;
@@ -807,27 +817,36 @@ export function AgentThreadView({
         acceptedPendingTurn = true;
       }
     }
-    onChange({
-      // The recovery buffer is mutated in place for linear-time ingestion.
-      // Never let that mutable array escape into React or storage state.
-      events: [...compactedEventsRef.current],
-      ...(acceptedPendingTurn ? { pendingTurn: undefined } : {}),
-      ...(acceptedQueuedTurn ? { queuedTurns: queuedTurnsRef.current } : {}),
-      ...(cancelledTurn ? { retainedContext } : {}),
-      ...(coverageStart === undefined ? {} : {
-        transcriptCoverage: {
-          complete: true,
-          endIndex: streamIndex,
-          startIndex: coverageStart,
-          version: 1 as const,
-        },
-      }),
-      session: agent.session ? { ...agent.session, streamIndex } : { streamIndex },
-      status: cancellationRef.current.requested
-        ? "cancelling"
-        : turnError ? "error" : awaitingInput ? "waiting" : agent.status,
-      updatedAt: Date.now(),
-    });
+    const nextStatus: AgentThread["status"] = cancellationRef.current.requested
+      ? "cancelling"
+      : turnError ? "error" : awaitingInput ? "waiting" : agent.status;
+    const metadataChanged = acceptedPendingTurn || acceptedQueuedTurn ||
+      cancelledTurn !== undefined || nextStatus !== persistedThreadStatusRef.current;
+    if (metadataChanged) {
+      // Live event ingestion is checkpointed by handleEvent. This effect only
+      // publishes a parent update when admission or lifecycle metadata changes;
+      // a 16ms Eve snapshot must never rebuild the whole workspace by itself.
+      persistedThreadStatusRef.current = nextStatus;
+      onChange({
+        // The recovery buffer is mutated in place for linear-time ingestion.
+        // Never let that mutable array escape into React or storage state.
+        events: [...compactedEventsRef.current],
+        ...(acceptedPendingTurn ? { pendingTurn: undefined } : {}),
+        ...(acceptedQueuedTurn ? { queuedTurns: queuedTurnsRef.current } : {}),
+        ...(cancelledTurn ? { retainedContext } : {}),
+        ...(coverageStart === undefined ? {} : {
+          transcriptCoverage: {
+            complete: true,
+            endIndex: streamIndex,
+            startIndex: coverageStart,
+            version: 1 as const,
+          },
+        }),
+        session: agent.session ? { ...agent.session, streamIndex } : { streamIndex },
+        status: nextStatus,
+        updatedAt: Date.now(),
+      });
+    }
   }, [agent.events, agent.session, agent.status, awaitingInput, isRecovering, localInterruption, onChange, recoveryContextWindowTokens, turnError]);
 
   const hasTurnFailure = Boolean(latestTurnFailure(authoritativeEvents));
@@ -1324,7 +1343,7 @@ export function AgentThreadView({
     return normalizeSettledAgentMessages(source, interruptedDisplayEvents);
   },
     [displayInterruptedTurns.length, effectiveRenderMessages, interruptedDisplayEvents]);
-  const projectedMessages = projectStagedUserMessages(
+  const projectedMessages = useMemo(() => projectStagedUserMessages(
     ensureActiveAssistantMessage(
       projectedRuntimeMessages,
       interruptedDisplayEvents,
@@ -1332,9 +1351,12 @@ export function AgentThreadView({
       displayPendingTurn,
     ),
     thread.queuedTurns.filter((turn) => turn.intent === "post-cancellation"),
-  );
-  const ungroupedVisibleMessages = projectedMessages.filter((message) =>
-    !isProxiedInputOnlyMessage(message, effectiveRenderEvents),
+  ), [displayPendingTurn, interruptedDisplayEvents, isBusy, projectedRuntimeMessages, thread.queuedTurns]);
+  const ungroupedVisibleMessages = useMemo(
+    () => projectedMessages.filter((message) =>
+      !isProxiedInputOnlyMessage(message, effectiveRenderEvents),
+    ),
+    [effectiveRenderEvents, projectedMessages],
   );
   const ungroupedDisplayEvents = interruptedDisplayEvents;
   const displayTimeline = useMemo(
@@ -1343,17 +1365,22 @@ export function AgentThreadView({
   );
   const visibleMessages = displayTimeline.messages;
   const displayEvents = displayTimeline.events;
-  const assistantMessages = convertEveMessages({ ...agent.data, messages: visibleMessages }, {
-    assetUrl: client?.assetUrl,
-    error: agent.error,
-    isRunning: isBusy,
-  });
-  const queueAdapter: ExternalThreadQueueAdapter = {
+  const assistantMessages = useMemo(
+    () => convertEveMessages({ messages: visibleMessages }, {
+      assetUrl: client?.assetUrl,
+      error: agent.error,
+      isRunning: isBusy,
+    }),
+    [agent.error, client?.assetUrl, isBusy, visibleMessages],
+  );
+  const queueCallbacksRef = useRef({ removeQueuedTurn, submit });
+  queueCallbacksRef.current = { removeQueuedTurn, submit };
+  const queueAdapter = useMemo<ExternalThreadQueueAdapter>(() => ({
     edit: () => {
       throw new Error("Editing a durable mailbox item is not supported.");
     },
     enqueue: (message) => {
-      void submit(promptFromAssistantMessage(getEveMessageContent(message)));
+      void queueCallbacksRef.current.submit(promptFromAssistantMessage(getEveMessageContent(message)));
     },
     items: thread.queuedTurns.filter((turn) => turn.intent !== "post-cancellation").map((turn) => ({
       id: turn.id,
@@ -1363,14 +1390,14 @@ export function AgentThreadView({
     move: () => {
       throw new Error("Reordering durable mailbox items is not supported.");
     },
-    remove: removeQueuedTurn,
+    remove: (turnId) => queueCallbacksRef.current.removeQueuedTurn(turnId),
     // Eve injects follow-ups at the next safe turn boundary. The default
     // assistant-ui steer lane is deliberately mapped to that durable FIFO.
     steer: (message) => {
-      void submit(promptFromAssistantMessage(getEveMessageContent(message)));
+      void queueCallbacksRef.current.submit(promptFromAssistantMessage(getEveMessageContent(message)));
     },
     steerItems: [],
-  };
+  }), [thread.queuedTurns]);
 
   const stageEditedTurn = (prompt: PromptInputMessage) => {
     if (!prompt.text && prompt.files.length === 0) return;
@@ -1431,37 +1458,56 @@ export function AgentThreadView({
     ),
     [assetUploadAdapter, thread.session.sessionId],
   );
-  const assistantRuntime = useExternalStoreRuntime({
-    adapters: {
-      attachments: attachmentAdapter,
+  const runtimeCallbacksRef = useRef<{
+    cancel: () => void;
+    edit: (message: AppendMessage) => void;
+    newMessage: (message: AppendMessage) => Promise<void>;
+    respondToToolApproval: (response: RespondToToolApprovalOptions) => Promise<void>;
+  }>({
+    cancel: () => undefined,
+    edit: () => undefined,
+    newMessage: async () => undefined,
+    respondToToolApproval: async () => undefined,
+  });
+  runtimeCallbacksRef.current = {
+    cancel: requestCancellation,
+    edit: (message) => {
+      stageEditedTurn(promptFromAssistantMessage(getEveMessageContent(message)));
     },
-    // Lock regular sends while an approval is pending, but keep the runtime
-    // available to the edit composer. assistant-ui intentionally allows edits
-    // while `isSendDisabled` is true; `isDisabled` would disable both paths.
-    isDisabled: !providerReady,
-    isSendDisabled: inputLocked,
-    isRunning: isBusy,
-    messages: assistantMessages,
-    queue: queueAdapter,
-    onCancel: async () => {
-      requestCancellation();
-    },
-    onEdit: async (message: AppendMessage) => {
-      const content = getEveMessageContent(message);
-      const prompt = promptFromAssistantMessage(content);
-      stageEditedTurn(prompt);
-    },
-    onNew: async (message: AppendMessage) => {
-      await submit(promptFromAssistantMessage(getEveMessageContent(message)));
-    },
-    onRespondToToolApproval: async (response) => {
+    newMessage: (message) => submit(promptFromAssistantMessage(getEveMessageContent(message))),
+    respondToToolApproval: async (response) => {
       prepareTurn();
       await agent.respond(
         [{ optionId: response.optionId, requestId: response.approvalId, text: response.reason }],
         retainedContextOptions(thread.retainedContext),
       );
     },
-  });
+  };
+  const assistantRuntimeAdapter = useMemo<ExternalStoreAdapter<ReturnType<typeof convertEveMessages>[number]>>(
+    () => ({
+      adapters: {
+        attachments: attachmentAdapter,
+      },
+      // Lock regular sends while an approval is pending, but keep the runtime
+      // available to the edit composer. assistant-ui intentionally allows edits
+      // while `isSendDisabled` is true; `isDisabled` would disable both paths.
+      isDisabled: !providerReady,
+      isSendDisabled: inputLocked,
+      isRunning: isBusy,
+      messages: assistantMessages,
+      queue: queueAdapter,
+      onCancel: async () => {
+        runtimeCallbacksRef.current.cancel();
+      },
+      onEdit: async (message) => {
+        runtimeCallbacksRef.current.edit(message);
+      },
+      onNew: (message) => runtimeCallbacksRef.current.newMessage(message),
+      onRespondToToolApproval: (response) => runtimeCallbacksRef.current.respondToToolApproval(response),
+    }),
+    [assistantMessages, attachmentAdapter, inputLocked, isBusy, providerReady, queueAdapter],
+  );
+  const assistantRuntime = useExternalStoreRuntime(assistantRuntimeAdapter);
 
   useEffect(() => {
     const pendingTurn = thread.pendingTurn;

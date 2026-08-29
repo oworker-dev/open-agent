@@ -170,7 +170,6 @@ export function AssistantThreadSurface({
     >
       <ThreadPrimitive.Viewport
         aria-live="polite"
-        autoScroll
         turnAnchor="top"
         className="relative flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-auto px-3 pt-3 sm:px-4 sm:pt-4"
         data-slot="thread-viewport"

@@ -22,6 +22,7 @@ const activeEditedTurnOperations = new Set();
 const pendingEditedTurnOperations = new Set();
 const CANCELLATION_STREAM_REATTACH_AFTER_MS = 5_000;
 const MAX_PROVIDER_SUBMISSION_RETRIES = 3;
+const LIVE_CHECKPOINT_INTERVAL_MS = 250;
 const LONG_RUNNING_STREAM_RECONNECT_POLICY = {
     retryableErrorStatuses: [404, 408, 409, 425, 429, 500, 502, 503, 504],
     streamIdleReconnectPolicy: {
@@ -75,6 +76,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     const editResubmitPendingRef = useRef(false);
     const turnAdmissionBusyRef = useRef(false);
     const cancellationRecoveryRef = useRef(() => undefined);
+    const persistedThreadStatusRef = useRef(thread.status);
     const cancellationIdleTimerRef = useRef(undefined);
     const [cancellationState, setCancellationState] = useState(thread.status === "cancelling" ? "cancelling" : "idle");
     const [localInterruption, setLocalInterruption] = useState();
@@ -107,6 +109,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         if (providerRetryTimerRef.current !== undefined) {
             window.clearTimeout(providerRetryTimerRef.current);
         }
+        flushCheckpointRef.current();
     }, []);
     useEffect(() => {
         preferencesRef.current = thread.preferences;
@@ -191,7 +194,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             checkpointTimerRef.current = window.setTimeout(() => {
                 checkpointTimerRef.current = undefined;
                 flushCheckpointRef.current();
-            }, 50);
+            }, LIVE_CHECKPOINT_INTERVAL_MS);
         }
         if (event.type === "turn.started") {
             const cancellation = cancellationRef.current;
@@ -528,25 +531,31 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
                 acceptedPendingTurn = true;
             }
         }
-        onChange({
-            events: [...compactedEventsRef.current],
-            ...(acceptedPendingTurn ? { pendingTurn: undefined } : {}),
-            ...(acceptedQueuedTurn ? { queuedTurns: queuedTurnsRef.current } : {}),
-            ...(cancelledTurn ? { retainedContext } : {}),
-            ...(coverageStart === undefined ? {} : {
-                transcriptCoverage: {
-                    complete: true,
-                    endIndex: streamIndex,
-                    startIndex: coverageStart,
-                    version: 1,
-                },
-            }),
-            session: agent.session ? { ...agent.session, streamIndex } : { streamIndex },
-            status: cancellationRef.current.requested
-                ? "cancelling"
-                : turnError ? "error" : awaitingInput ? "waiting" : agent.status,
-            updatedAt: Date.now(),
-        });
+        const nextStatus = cancellationRef.current.requested
+            ? "cancelling"
+            : turnError ? "error" : awaitingInput ? "waiting" : agent.status;
+        const metadataChanged = acceptedPendingTurn || acceptedQueuedTurn ||
+            cancelledTurn !== undefined || nextStatus !== persistedThreadStatusRef.current;
+        if (metadataChanged) {
+            persistedThreadStatusRef.current = nextStatus;
+            onChange({
+                events: [...compactedEventsRef.current],
+                ...(acceptedPendingTurn ? { pendingTurn: undefined } : {}),
+                ...(acceptedQueuedTurn ? { queuedTurns: queuedTurnsRef.current } : {}),
+                ...(cancelledTurn ? { retainedContext } : {}),
+                ...(coverageStart === undefined ? {} : {
+                    transcriptCoverage: {
+                        complete: true,
+                        endIndex: streamIndex,
+                        startIndex: coverageStart,
+                        version: 1,
+                    },
+                }),
+                session: agent.session ? { ...agent.session, streamIndex } : { streamIndex },
+                status: nextStatus,
+                updatedAt: Date.now(),
+            });
+        }
     }, [agent.events, agent.session, agent.status, awaitingInput, isRecovering, localInterruption, onChange, recoveryContextWindowTokens, turnError]);
     const hasTurnFailure = Boolean(latestTurnFailure(authoritativeEvents));
     const transportError = agent.error?.message;
@@ -954,23 +963,25 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             : effectiveRenderMessages;
         return normalizeSettledAgentMessages(source, interruptedDisplayEvents);
     }, [displayInterruptedTurns.length, effectiveRenderMessages, interruptedDisplayEvents]);
-    const projectedMessages = projectStagedUserMessages(ensureActiveAssistantMessage(projectedRuntimeMessages, interruptedDisplayEvents, isBusy || displayPendingTurn?.state === "resubmitting" || Boolean(latestTurnFailure(interruptedDisplayEvents)), displayPendingTurn), thread.queuedTurns.filter((turn) => turn.intent === "post-cancellation"));
-    const ungroupedVisibleMessages = projectedMessages.filter((message) => !isProxiedInputOnlyMessage(message, effectiveRenderEvents));
+    const projectedMessages = useMemo(() => projectStagedUserMessages(ensureActiveAssistantMessage(projectedRuntimeMessages, interruptedDisplayEvents, isBusy || displayPendingTurn?.state === "resubmitting" || Boolean(latestTurnFailure(interruptedDisplayEvents)), displayPendingTurn), thread.queuedTurns.filter((turn) => turn.intent === "post-cancellation")), [displayPendingTurn, interruptedDisplayEvents, isBusy, projectedRuntimeMessages, thread.queuedTurns]);
+    const ungroupedVisibleMessages = useMemo(() => projectedMessages.filter((message) => !isProxiedInputOnlyMessage(message, effectiveRenderEvents)), [effectiveRenderEvents, projectedMessages]);
     const ungroupedDisplayEvents = interruptedDisplayEvents;
     const displayTimeline = useMemo(() => projectAgentDisplayTimeline(ungroupedVisibleMessages, ungroupedDisplayEvents), [ungroupedDisplayEvents, ungroupedVisibleMessages]);
     const visibleMessages = displayTimeline.messages;
     const displayEvents = displayTimeline.events;
-    const assistantMessages = convertEveMessages({ ...agent.data, messages: visibleMessages }, {
+    const assistantMessages = useMemo(() => convertEveMessages({ messages: visibleMessages }, {
         assetUrl: client?.assetUrl,
         error: agent.error,
         isRunning: isBusy,
-    });
-    const queueAdapter = {
+    }), [agent.error, client?.assetUrl, isBusy, visibleMessages]);
+    const queueCallbacksRef = useRef({ removeQueuedTurn, submit });
+    queueCallbacksRef.current = { removeQueuedTurn, submit };
+    const queueAdapter = useMemo(() => ({
         edit: () => {
             throw new Error("Editing a durable mailbox item is not supported.");
         },
         enqueue: (message) => {
-            void submit(promptFromAssistantMessage(getEveMessageContent(message)));
+            void queueCallbacksRef.current.submit(promptFromAssistantMessage(getEveMessageContent(message)));
         },
         items: thread.queuedTurns.filter((turn) => turn.intent !== "post-cancellation").map((turn) => ({
             id: turn.id,
@@ -980,12 +991,12 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         move: () => {
             throw new Error("Reordering durable mailbox items is not supported.");
         },
-        remove: removeQueuedTurn,
+        remove: (turnId) => queueCallbacksRef.current.removeQueuedTurn(turnId),
         steer: (message) => {
-            void submit(promptFromAssistantMessage(getEveMessageContent(message)));
+            void queueCallbacksRef.current.submit(promptFromAssistantMessage(getEveMessageContent(message)));
         },
         steerItems: [],
-    };
+    }), [thread.queuedTurns]);
     const stageEditedTurn = (prompt) => {
         if (!prompt.text && prompt.files.length === 0)
             return;
@@ -1033,7 +1044,24 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     };
     const assetUploadAdapter = useMemo(() => client?.assetUpload ?? createHttpAgentAssetUploadAdapter(client), [client]);
     const attachmentAdapter = useMemo(() => createBrowserAttachmentAdapter(assetUploadAdapter, () => sessionRef.current?.state.sessionId ?? thread.session.sessionId), [assetUploadAdapter, thread.session.sessionId]);
-    const assistantRuntime = useExternalStoreRuntime({
+    const runtimeCallbacksRef = useRef({
+        cancel: () => undefined,
+        edit: () => undefined,
+        newMessage: async () => undefined,
+        respondToToolApproval: async () => undefined,
+    });
+    runtimeCallbacksRef.current = {
+        cancel: requestCancellation,
+        edit: (message) => {
+            stageEditedTurn(promptFromAssistantMessage(getEveMessageContent(message)));
+        },
+        newMessage: (message) => submit(promptFromAssistantMessage(getEveMessageContent(message))),
+        respondToToolApproval: async (response) => {
+            prepareTurn();
+            await agent.respond([{ optionId: response.optionId, requestId: response.approvalId, text: response.reason }], retainedContextOptions(thread.retainedContext));
+        },
+    };
+    const assistantRuntimeAdapter = useMemo(() => ({
         adapters: {
             attachments: attachmentAdapter,
         },
@@ -1043,21 +1071,15 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         messages: assistantMessages,
         queue: queueAdapter,
         onCancel: async () => {
-            requestCancellation();
+            runtimeCallbacksRef.current.cancel();
         },
         onEdit: async (message) => {
-            const content = getEveMessageContent(message);
-            const prompt = promptFromAssistantMessage(content);
-            stageEditedTurn(prompt);
+            runtimeCallbacksRef.current.edit(message);
         },
-        onNew: async (message) => {
-            await submit(promptFromAssistantMessage(getEveMessageContent(message)));
-        },
-        onRespondToToolApproval: async (response) => {
-            prepareTurn();
-            await agent.respond([{ optionId: response.optionId, requestId: response.approvalId, text: response.reason }], retainedContextOptions(thread.retainedContext));
-        },
-    });
+        onNew: (message) => runtimeCallbacksRef.current.newMessage(message),
+        onRespondToToolApproval: (response) => runtimeCallbacksRef.current.respondToToolApproval(response),
+    }), [assistantMessages, attachmentAdapter, inputLocked, isBusy, providerReady, queueAdapter]);
+    const assistantRuntime = useExternalStoreRuntime(assistantRuntimeAdapter);
     useEffect(() => {
         const pendingTurn = thread.pendingTurn;
         if (pendingTurn?.state !== "clearing" ||
