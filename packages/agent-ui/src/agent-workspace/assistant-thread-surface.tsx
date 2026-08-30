@@ -536,9 +536,15 @@ function AssistantMessage({
         ) : null}
       </div>
       {!isStreaming && copyableText ? (
-        <ActionBarPrimitive.Root className="pointer-events-none absolute left-0 top-full z-10 flex h-7 items-center opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
-          <ReliableCopyButton label={messages.copyResponse} text={copyableText} />
-        </ActionBarPrimitive.Root>
+        <div className="-mb-7.5 ml-2 flex min-h-7.5 items-center pt-1.5">
+          <ActionBarPrimitive.Root
+            autohide="not-last"
+            className="text-muted-foreground flex gap-1"
+            hideWhenRunning
+          >
+            <ReliableCopyButton label={messages.copyResponse} text={copyableText} />
+          </ActionBarPrimitive.Root>
+        </div>
       ) : null}
     </MessagePrimitive.Root>
   );
@@ -552,8 +558,8 @@ function ReliableCopyButton({ label, text }: { readonly label: string; readonly 
   return (
     <Button
       aria-label={label}
-      className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
-      size="icon-sm"
+      className="text-muted-foreground hover:bg-accent hover:text-foreground"
+      size="icon-xs"
       title={copied ? "Copied" : label}
       type="button"
       variant="ghost"
