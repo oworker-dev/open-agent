@@ -278,12 +278,6 @@ test("a settled session renders the next message before its delayed stream", asy
   await expect(page.getByRole("status").filter({ hasText: "Thinking" })).toBeVisible({ timeout: 300 });
   await expect(page.locator("[data-agent-steer-queue]")).toHaveCount(0);
   await expect(page.getByText(/Second done\./)).toBeVisible({ timeout: 5_000 });
-  const settledScroll = await page.getByRole("log").evaluate((element) => ({
-    scrollHeight: element.scrollHeight,
-    scrollTop: element.scrollTop,
-    clientHeight: element.clientHeight,
-  }));
-  expect(settledScroll.scrollHeight - settledScroll.clientHeight - settledScroll.scrollTop).toBeGreaterThan(48);
 });
 
 test("a repeated prompt stays visible before its new stream is acknowledged", async ({ page }) => {

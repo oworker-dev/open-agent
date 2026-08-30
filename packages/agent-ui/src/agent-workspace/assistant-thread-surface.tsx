@@ -170,7 +170,6 @@ export function AssistantThreadSurface({
     >
       <ThreadPrimitive.Viewport
         aria-live="polite"
-        turnAnchor="top"
         className="relative flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-auto px-3 pt-3 sm:px-4 sm:pt-4"
         data-slot="thread-viewport"
         role="log"
@@ -374,7 +373,7 @@ function UserMessage({ messages }: { readonly messages: AgentMessages }) {
           {({ attachment }) => <UserAttachment attachment={attachment} messages={messages} />}
         </MessagePrimitive.Attachments>
       </AttachmentGroup>
-      <div className="relative col-start-2 min-w-0">
+      <div className="col-start-2 min-w-0">
         <div
           className="peer rounded-xl bg-muted px-4 py-2 text-foreground wrap-break-word empty:hidden"
           onClick={() => {
@@ -383,15 +382,14 @@ function UserMessage({ messages }: { readonly messages: AgentMessages }) {
         >
           <MessagePrimitive.Parts components={{ Text: DirectiveText }} />
         </div>
-        <div className={cn("pointer-events-none absolute top-1/2 left-0 z-10 -translate-x-full -translate-y-1/2 pr-2 transition-opacity", actionsVisible ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100")}>
+        <div className={cn("pointer-events-none flex min-h-7.5 items-center gap-0.5 pt-1.5 transition-opacity", actionsVisible ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100")}>
           <ActionBarPrimitive.Root className="pointer-events-auto flex items-center gap-0.5">
             <ReliableCopyButton label={messages.copyResponse} />
             {isLastUserMessage ? (
-              <ActionBarPrimitive.Edit
-                aria-label={messages.editMessage}
-                className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
-              >
-                <PencilIcon className="size-3.5" />
+              <ActionBarPrimitive.Edit asChild>
+                <TooltipIconButton aria-label={messages.editMessage} tooltip={messages.editMessage}>
+                  <PencilIcon className="size-3.5" />
+                </TooltipIconButton>
               </ActionBarPrimitive.Edit>
             ) : null}
           </ActionBarPrimitive.Root>
@@ -557,12 +555,11 @@ function ReliableCopyButton({ label, text }: { readonly label: string; readonly 
   const timer = useRef<number | undefined>(undefined);
   useEffect(() => () => window.clearTimeout(timer.current), []);
   return (
-    <Button
+    <TooltipIconButton
       aria-label={label}
       className="text-muted-foreground hover:bg-accent hover:text-foreground"
-      size="icon-xs"
-      title={copied ? "Copied" : label}
       type="button"
+      tooltip={copied ? "Copied" : label}
       variant="ghost"
       onClick={() => {
         const copyValue = text ?? aui.message.getCopyText();
@@ -574,7 +571,7 @@ function ReliableCopyButton({ label, text }: { readonly label: string; readonly 
       }}
     >
       {copied ? <CheckIcon className="size-3.5" /> : <CopyIcon className="size-3.5" />}
-    </Button>
+    </TooltipIconButton>
   );
 }
 
