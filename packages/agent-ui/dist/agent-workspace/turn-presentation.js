@@ -576,10 +576,10 @@ export function presentAgentStep(events, turnId, stepIndex) {
     const retryableFailure = retryFailure && shouldPresentRetryFailure(retryFailure)
         ? retryFailure
         : undefined;
-    const retryExhausted = Boolean(terminalFailure && retryableFailure);
     const observedRetryAttempt = retryableFailure
         ? Math.max(1, failures.length)
         : undefined;
+    const retryExhausted = Boolean(terminalFailure && retryableFailure);
     const retryEvents = failures.flatMap((failure, index) => {
         const candidate = failureFromData(failure.data);
         return shouldPresentRetryFailure(candidate)
@@ -594,12 +594,7 @@ export function presentAgentStep(events, turnId, stepIndex) {
     const retries = retryEvents.length > 0
         ? retryEvents
         : retryableFailure
-            ? [{
-                    attempt: 1,
-                    error: retryableFailure,
-                    ...(retryExhausted ? { exhausted: true } : {}),
-                    maximum: MAX_DURABLE_STEP_RETRIES,
-                }]
+            ? [{ attempt: 1, error: retryableFailure, ...(retryExhausted ? { exhausted: true } : {}), maximum: MAX_DURABLE_STEP_RETRIES }]
             : [];
     const latestStartIndex = stepEvents.findLastIndex((event) => event.type === "step.started");
     const latestAttemptEvents = latestStartIndex >= 0 ? stepEvents.slice(latestStartIndex) : stepEvents;

@@ -1363,18 +1363,33 @@ function RetryStatus({
 }) {
   if (retry.exhausted) {
     return (
-      <Alert className="mb-2 py-2.5" data-agent-failure-alert variant="destructive">
-        <CircleAlertIcon />
-        <AlertTitle>
-          {localize(locale, "Retry failed", "重试失败")}
-        </AlertTitle>
-        {retry.error ? (
-          <AlertDescription>
-            <p>{failureSummary(locale, retry.error)}</p>
-            {retry.error.code ? <code className="break-all text-xs">{retry.error.code}</code> : null}
-          </AlertDescription>
-        ) : null}
-      </Alert>
+      <>
+        <Collapsible className="mb-1 text-sm text-muted-foreground" data-agent-retry defaultOpen={false}>
+          <CollapsibleTrigger className="group/retry flex max-w-full items-center gap-2 py-1.5 text-left hover:text-foreground">
+            <WifiIcon className="size-4 shrink-0" />
+            <span>{localize(locale, "Retry details", "重试详情")}</span>
+            <ChevronDownIcon className="size-3.5 -rotate-90 transition-transform group-data-[state=open]/retry:rotate-0" />
+          </CollapsibleTrigger>
+          {retry.error ? (
+            <CollapsibleContent className="overflow-hidden">
+              <div className="ml-6 mt-1 max-w-full text-xs">
+                <p className="break-words text-foreground">{failureSummary(locale, retry.error)}</p>
+                {retry.error.code ? <code className="mt-1 block break-all text-muted-foreground">{retry.error.code}</code> : null}
+              </div>
+            </CollapsibleContent>
+          ) : null}
+        </Collapsible>
+        <Alert className="mb-2 py-2.5" data-agent-failure-alert variant="destructive">
+          <CircleAlertIcon />
+          <AlertTitle>{localize(locale, "Retry failed", "重试失败")}</AlertTitle>
+          {retry.error ? (
+            <AlertDescription>
+              <p>{failureSummary(locale, retry.error)}</p>
+              {retry.error.code ? <code className="break-all text-xs">{retry.error.code}</code> : null}
+            </AlertDescription>
+          ) : null}
+        </Alert>
+      </>
     );
   }
   return (

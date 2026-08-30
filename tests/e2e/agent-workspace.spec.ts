@@ -388,6 +388,8 @@ test("a Provider 404 remains recoverable and keeps the edit affordance", async (
   await composer.fill("Use the unavailable model");
   await composer.press("Enter");
   await expect(page.getByText(/Retry failed/)).toBeVisible({ timeout: 8_000 });
+  await expect(page.locator('[data-agent-retry]')).toHaveCount(1);
+  await expect(page.locator('[data-agent-retry]')).toHaveAttribute("data-state", "closed");
   await expect(page.locator('[data-agent-failure-alert]')).toBeVisible();
   await expect(page.getByRole("log").getByText("Use the unavailable model", { exact: true })).toHaveCount(1);
   await expect(page.getByRole("button", { name: "Edit message", exact: true })).toHaveCount(1);
