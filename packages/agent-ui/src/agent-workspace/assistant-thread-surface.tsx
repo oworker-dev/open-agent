@@ -373,7 +373,7 @@ function UserMessage({ isBusy, messages, sessionSettled }: { readonly isBusy: bo
     <MessagePrimitive.Root
       className="group fade-in slide-in-from-bottom-1 animate-in mx-auto grid w-full max-w-(--thread-max-width) auto-rows-auto grid-cols-[minmax(72px,1fr)_auto] content-start gap-y-2 px-2 duration-150 [&:where(>*)]:col-start-2"
     >
-      <AttachmentGroup className="col-start-2 mb-0 max-w-[88%] justify-end py-0 empty:hidden">
+      <AttachmentGroup className="col-start-2 mb-0 max-w-[88%] justify-end py-0">
         <MessagePrimitive.Attachments>
           {({ attachment }) => <UserAttachment attachment={attachment} messages={messages} />}
         </MessagePrimitive.Attachments>
@@ -387,8 +387,8 @@ function UserMessage({ isBusy, messages, sessionSettled }: { readonly isBusy: bo
         >
           <MessagePrimitive.Parts components={{ Text: DirectiveText }} />
         </div>
-        <div className={cn("pointer-events-none absolute top-full right-0 z-10 flex items-center justify-end gap-0.5 transition-opacity peer-empty:hidden", actionsVisible ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100")}>
-          <ActionBarPrimitive.Root className="pointer-events-auto flex items-center justify-end gap-0.5 text-muted-foreground">
+        <div className={cn("flex min-h-7.5 items-center justify-end gap-0.5 pt-1.5 transition-opacity peer-empty:hidden", actionsVisible ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100")}>
+          <ActionBarPrimitive.Root className="flex items-center justify-end gap-0.5 text-muted-foreground">
             <ReliableCopyButton label={messages.copyResponse} />
             {canEdit ? (
               <ActionBarPrimitive.Edit asChild>
