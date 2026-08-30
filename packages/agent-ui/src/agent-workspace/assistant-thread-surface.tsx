@@ -188,7 +188,7 @@ export function AssistantThreadSurface({
             </Button>
           </div>
         ) : null}
-        <div className="mx-auto flex w-full max-w-(--thread-max-width) flex-col gap-4 pb-3 empty:hidden">
+        <div className="mx-auto mb-14 flex w-full max-w-(--thread-max-width) flex-col gap-y-6 empty:hidden">
           <ThreadPrimitive.Messages>
             {({ message }) => message.composer.isEditing ? (
               <EditMessage messages={messages} />
@@ -367,34 +367,35 @@ function UserMessage({ messages }: { readonly messages: AgentMessages }) {
   });
   return (
     <MessagePrimitive.Root
-      className="group relative mx-auto flex w-full max-w-(--thread-max-width) flex-col items-end"
-      data-latest-user={isLastUserMessage ? "" : undefined}
+      className="group fade-in slide-in-from-bottom-1 animate-in mx-auto grid w-full max-w-(--thread-max-width) auto-rows-auto grid-cols-[minmax(72px,1fr)_auto] content-start gap-y-2 px-2 duration-150 [&:where(>*)]:col-start-2"
     >
-      <AttachmentGroup className="mb-2 max-w-[88%] justify-end py-0 empty:hidden">
+      <AttachmentGroup className="col-start-2 mb-0 max-w-[88%] justify-end py-0 empty:hidden">
         <MessagePrimitive.Attachments>
           {({ attachment }) => <UserAttachment attachment={attachment} messages={messages} />}
         </MessagePrimitive.Attachments>
       </AttachmentGroup>
-      <div
-        className="max-w-[min(44rem,88%)] rounded-2xl bg-muted/75 px-4 py-3 text-[15px] leading-6 text-foreground"
-        onClick={() => {
-          if (window.matchMedia("(pointer: coarse)").matches) setActionsVisible((visible) => !visible);
-        }}
-      >
-        <MessagePrimitive.Parts components={{ Text: DirectiveText }} />
-      </div>
-      <div className={cn("pointer-events-none absolute right-0 top-full z-10 flex h-7 items-center transition-opacity", actionsVisible ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100")}>
-        <ActionBarPrimitive.Root className="pointer-events-auto flex h-7 items-center gap-0.5">
-          <ReliableCopyButton label={messages.copyResponse} />
-          {isLastUserMessage ? (
-            <ActionBarPrimitive.Edit
-              aria-label={messages.editMessage}
-              className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
-            >
-              <PencilIcon className="size-3.5" />
-            </ActionBarPrimitive.Edit>
-          ) : null}
-        </ActionBarPrimitive.Root>
+      <div className="relative col-start-2 min-w-0">
+        <div
+          className="peer rounded-xl bg-muted px-4 py-2 text-foreground wrap-break-word empty:hidden"
+          onClick={() => {
+            if (window.matchMedia("(pointer: coarse)").matches) setActionsVisible((visible) => !visible);
+          }}
+        >
+          <MessagePrimitive.Parts components={{ Text: DirectiveText }} />
+        </div>
+        <div className={cn("pointer-events-none absolute top-1/2 left-0 z-10 -translate-x-full -translate-y-1/2 pr-2 transition-opacity", actionsVisible ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100")}>
+          <ActionBarPrimitive.Root className="pointer-events-auto flex items-center gap-0.5">
+            <ReliableCopyButton label={messages.copyResponse} />
+            {isLastUserMessage ? (
+              <ActionBarPrimitive.Edit
+                aria-label={messages.editMessage}
+                className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
+              >
+                <PencilIcon className="size-3.5" />
+              </ActionBarPrimitive.Edit>
+            ) : null}
+          </ActionBarPrimitive.Root>
+        </div>
       </div>
     </MessagePrimitive.Root>
   );
@@ -502,8 +503,8 @@ function AssistantMessage({
             .trim() || undefined
     : undefined;
   return (
-    <MessagePrimitive.Root className="group relative mx-auto flex w-full max-w-(--thread-max-width) flex-col">
-      <div className="min-w-0 px-1 text-[15px] leading-7 text-foreground">
+    <MessagePrimitive.Root className="group relative mx-auto w-full max-w-(--thread-max-width)">
+      <div className="min-w-0 px-2 leading-relaxed text-foreground wrap-break-word">
         {message ? (
           <AgentMessage
             assetUrl={assetUrl}

@@ -200,12 +200,6 @@
   scrollbar-gutter: stable;
 }
 
-/* A settled latest user turn is not an active top-anchor, but it still needs
-   a small reading inset after the viewport snaps to that turn. */
-.open-agent-ui [data-slot="thread-viewport"] [data-latest-user] {
-  padding-top: 1rem;
-}
-
 .open-agent-ui .aui-md-pre > .aui-md-inline-code {
   border-radius: 0;
   background: transparent;

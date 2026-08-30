@@ -277,13 +277,7 @@ test("a settled session renders the next message before its delayed stream", asy
   await expect(page.getByRole("log").getByText("Second request", { exact: true })).toBeVisible({ timeout: 300 });
   await expect(page.getByRole("status").filter({ hasText: "Thinking" })).toBeVisible({ timeout: 300 });
   await expect(page.locator("[data-agent-steer-queue]")).toHaveCount(0);
-  const viewportBox = await page.getByRole("log").boundingBox();
-  const secondRequestBox = await page.getByRole("log").getByText("Second request", { exact: true }).boundingBox();
-  expect((secondRequestBox?.y ?? 0) - (viewportBox?.y ?? 0)).toBeGreaterThanOrEqual(16);
   await expect(page.getByText(/Second done\./)).toBeVisible({ timeout: 5_000 });
-  const settledViewportBox = await page.getByRole("log").boundingBox();
-  const settledSecondRequestBox = await page.getByRole("log").getByText("Second request", { exact: true }).boundingBox();
-  expect((settledSecondRequestBox?.y ?? 0) - (settledViewportBox?.y ?? 0)).toBeGreaterThanOrEqual(16);
   const settledScroll = await page.getByRole("log").evaluate((element) => ({
     scrollHeight: element.scrollHeight,
     scrollTop: element.scrollTop,
