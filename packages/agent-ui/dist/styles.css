@@ -585,9 +585,6 @@
   .h-\(--cell-size\) {
     height: var(--cell-size);
   }
-  .h-0 {
-    height: calc(var(--spacing) * 0);
-  }
   .h-1 {
     height: calc(var(--spacing) * 1);
   }
@@ -3753,6 +3750,11 @@
     &:is(:where(.group\/collapsible-content):where([data-state="closed"], [data-closed]:not([data-closed="false"])) *) {
       --tw-duration: var(--animation-duration);
       transition-duration: var(--animation-duration);
+    }
+  }
+  .peer-empty\:hidden {
+    &:is(:where(.peer):empty ~ *) {
+      display: none;
     }
   }
   .peer-hover\/menu-button\:text-sidebar-accent-foreground {

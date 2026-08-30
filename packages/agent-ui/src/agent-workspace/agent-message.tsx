@@ -2166,20 +2166,18 @@ function ExecutionGroup({
       open={open}
       ref={executionRef}
     >
-      <CollapsibleTrigger asChild>
-        <button
-          aria-hidden={!showTrigger}
-          className={showTrigger
-            ? "flex w-full items-center gap-1.5 border-b border-border/60 py-1.5 text-left text-sm text-muted-foreground transition-colors hover:text-foreground"
-            : "pointer-events-none invisible h-0 w-full overflow-hidden"}
-          tabIndex={showTrigger ? undefined : -1}
-          type="button"
-        >
-          <span>{executionLabel(locale, task)}</span>
-          {startedAt && elapsedSeconds > 0 ? <span className="tabular-nums">{formatDuration(elapsedSeconds)}</span> : null}
-          <ChevronDownIcon className="size-3.5 transition-transform group-data-[state=open]/execution:rotate-180" />
-        </button>
-      </CollapsibleTrigger>
+      {showTrigger ? (
+        <CollapsibleTrigger asChild>
+          <button
+            className="flex w-full items-center gap-1.5 border-b border-border/60 py-1.5 text-left text-sm text-muted-foreground transition-colors hover:text-foreground"
+            type="button"
+          >
+            <span>{executionLabel(locale, task)}</span>
+            {startedAt && elapsedSeconds > 0 ? <span className="tabular-nums">{formatDuration(elapsedSeconds)}</span> : null}
+            <ChevronDownIcon className="size-3.5 transition-transform group-data-[state=open]/execution:rotate-180" />
+          </button>
+        </CollapsibleTrigger>
+      ) : null}
       <CollapsibleContent className="overflow-hidden data-[state=closed]:animate-out data-[state=open]:animate-in">
         <div className="mt-2 space-y-3 pt-2">
           {children}

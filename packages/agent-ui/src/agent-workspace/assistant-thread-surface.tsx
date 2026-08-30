@@ -378,7 +378,7 @@ function UserMessage({ isBusy, messages, sessionSettled }: { readonly isBusy: bo
           {({ attachment }) => <UserAttachment attachment={attachment} messages={messages} />}
         </MessagePrimitive.Attachments>
       </AttachmentGroup>
-      <div className="col-start-2 min-w-0">
+      <div className="relative col-start-2 min-w-0">
         <div
           className="peer rounded-xl bg-muted px-4 py-2 text-foreground wrap-break-word empty:hidden"
           onClick={() => {
@@ -387,7 +387,7 @@ function UserMessage({ isBusy, messages, sessionSettled }: { readonly isBusy: bo
         >
           <MessagePrimitive.Parts components={{ Text: DirectiveText }} />
         </div>
-        <div className={cn("pointer-events-none flex min-h-7.5 items-center justify-end gap-0.5 pt-1.5 transition-opacity", actionsVisible ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100")}>
+        <div className={cn("pointer-events-none absolute top-full right-0 z-10 flex items-center justify-end gap-0.5 transition-opacity peer-empty:hidden", actionsVisible ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100")}>
           <ActionBarPrimitive.Root className="pointer-events-auto flex items-center justify-end gap-0.5 text-muted-foreground">
             <ReliableCopyButton label={messages.copyResponse} />
             {canEdit ? (
