@@ -1354,7 +1354,7 @@ const MAX_RECOVERY_RECONNECT_ATTEMPTS = 6;
 const RECOVERY_RETRY_BASE_DELAY_MS = 750;
 const RECOVERY_RETRY_MAX_DELAY_MS = 15_000;
 const RECOVERY_STREAM_RECONNECT_POLICY = {
-    retryableErrorStatuses: [404, 409, 425, 429, 500, 502, 503, 504],
+    retryableErrorStatuses: [408, 409, 425, 429, 500, 502, 503, 504],
     streamIdleReconnectPolicy: {
         baseDelayMs: 750,
         maxAttempts: 8,
@@ -1559,7 +1559,7 @@ function isAbortError(error) {
 }
 function isRetryableRecoveryError(error) {
     if (error instanceof ClientError) {
-        return error.status === 0 || [404, 409, 425, 429, 500, 502, 503, 504].includes(error.status);
+        return error.status === 0 || [408, 409, 425, 429, 500, 502, 503, 504].includes(error.status);
     }
     return error instanceof TypeError || (error instanceof Error && /fetch|network|socket|stream/i.test(error.message));
 }

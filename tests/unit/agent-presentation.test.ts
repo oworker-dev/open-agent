@@ -11,6 +11,7 @@ import {
   eventsBeforeLastUserTurn,
   hasSettledLatestTurn,
   hasUnresolvedInputRequests,
+  isRetryableAgentFailure,
   isProxiedInputOnlyMessage,
   normalizeSettledAgentMessages,
   presentAgentStep,
@@ -32,6 +33,34 @@ test("failure classification keeps transient provider errors out of the generic 
   assert.equal(classifyAgentFailure({ code: "provider_stream_interrupted", message: "network connection reset" }), "network");
   assert.equal(classifyAgentFailure({ code: "request_timeout", message: "The request timed out" }), "timeout");
   assert.equal(classifyAgentFailure({ code: "unexpected", message: "bad state" }), "unknown");
+});
+
+test("permanent provider failures never fabricate a retry", () => {
+  const turnId = "turn-provider-404";
+  const events = [
+    event("turn.started", startedAt, { sequence: 0, turnId }),
+    event("step.started", startedAt, { sequence: 0, stepIndex: 0, turnId }),
+    event("step.failed", endedAt, {
+      code: "MODEL_CALL_FAILED",
+      details: { isRetryable: false, statusCode: 404 },
+      message: "The model Provider request failed (HTTP 404).",
+      sequence: 0,
+      stepIndex: 0,
+      turnId,
+    }),
+    event("turn.failed", endedAt, {
+      code: "MODEL_CALL_FAILED",
+      details: { isRetryable: false, statusCode: 404 },
+      message: "The model Provider request failed (HTTP 404).",
+      sequence: 0,
+      turnId,
+    }),
+  ];
+  const presentation = presentAgentStep(events, turnId, 0);
+  assert.equal(isRetryableAgentFailure(presentation.failure!), false);
+  assert.equal(presentation.retry, undefined);
+  assert.equal(presentation.failure?.statusCode, 404);
+  assert.equal(presentation.failure?.retryable, false);
 });
 
 test("a failed step without settled assistant parts keeps a display anchor", () => {

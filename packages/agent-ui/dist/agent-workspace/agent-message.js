@@ -15,7 +15,7 @@ import { Attachment, AttachmentAction, AttachmentContent, AttachmentDescription,
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "../ui/collapsible.js";
 import { Questionnaire, QuestionnaireChoice, QuestionnaireChoiceDescription, QuestionnaireChoices, QuestionnaireError, QuestionnaireItem, QuestionnaireSubmit, QuestionnaireTitle, } from "../ui/questionnaire.js";
 import { cn } from "../utils.js";
-import { failureForTurn, classifyAgentFailure, isCancellationPendingToolPart, isInterruptedToolPart, presentAgentTurn, presentAgentStep, presentSubagentCall, reasoningContentForStep, } from "./turn-presentation.js";
+import { failureForTurn, classifyAgentFailure, isRetryableAgentFailure, isCancellationPendingToolPart, isInterruptedToolPart, presentAgentTurn, presentAgentStep, presentSubagentCall, reasoningContentForStep, } from "./turn-presentation.js";
 function Message({ children, from, ...props }) {
     return _jsx("article", { className: cn("group flex w-full flex-col", from === "user" ? "items-end" : "items-start"), ...props, children: children });
 }
@@ -1344,11 +1344,7 @@ function TurnFailure({ failure, locale }) {
     return (_jsxs("div", { className: "mt-2 flex items-start gap-2 px-1 py-1.5 text-sm", role: "alert", children: [_jsx(XCircleIcon, { className: "mt-0.5 size-4 shrink-0 text-destructive" }), _jsxs("div", { className: "min-w-0 flex-1", children: [_jsx("p", { className: "font-medium text-destructive", children: failureTitle(locale, failure) }), _jsx("p", { className: "mt-1 break-words text-muted-foreground", children: sanitizeFailureMessage(failure.message) }), _jsx("code", { className: "mt-1.5 block text-xs text-muted-foreground", children: failure.code })] })] }));
 }
 function isRetryableTurnFailure(failure) {
-    const category = classifyAgentFailure(failure);
-    if (category === "unknown")
-        return false;
-    const value = `${failure.code} ${failure.message}`.toLocaleLowerCase();
-    return !/\b(?:401|403|unauthori[sz]ed|forbidden|rejected|invalid[_ -]?request)\b/u.test(value);
+    return isRetryableAgentFailure(failure);
 }
 function failureTitle(locale, failure) {
     switch (classifyAgentFailure(failure)) {

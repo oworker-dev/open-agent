@@ -32,9 +32,12 @@ export type AgentTurnPresentationOptions = {
 export type AgentTurnFailure = {
     readonly code: string;
     readonly message: string;
+    readonly retryable?: boolean;
+    readonly statusCode?: number;
 };
 export type AgentFailureCategory = "network" | "provider" | "timeout" | "unknown";
 export declare function classifyAgentFailure(failure: AgentTurnFailure): AgentFailureCategory;
+export declare function isRetryableAgentFailure(failure: AgentTurnFailure): boolean;
 export type AgentStepPresentation = {
     readonly endedAt?: number;
     readonly failure?: AgentTurnFailure;

@@ -363,6 +363,39 @@ test("transient session admission errors retry with a stable bounded counter", a
   expect(attempts).toBe(3);
 });
 
+test("a permanent Provider 404 is terminal and never enters a retry loop", async ({ page }) => {
+  const sessionId = "terminal-provider-404-session";
+  let streamRequests = 0;
+  await page.route("**/eve/v1/session", async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({ sessionId }),
+      contentType: "application/json",
+      status: 200,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
+    streamRequests += 1;
+    await route.fulfill({
+      body: JSON.stringify({
+        code: "MODEL_CALL_FAILED",
+        error: "The model Provider request failed (HTTP 404).",
+      }),
+      contentType: "application/json",
+      status: 404,
+    });
+  });
+
+  await page.goto("/");
+  const composer = page.getByRole("textbox", { name: "Do anything" });
+  await composer.fill("Use the unavailable model");
+  await composer.press("Enter");
+  await expect(page.getByText("Provider request failed", { exact: true })).toBeVisible({ timeout: 8_000 });
+  await expect(page.getByText(/Retrying request|Retry failed/)).toHaveCount(0);
+  await expect(page.getByRole("log").getByText("Use the unavailable model", { exact: true })).toHaveCount(1);
+  await page.waitForTimeout(1_500);
+  expect(streamRequests).toBe(1);
+});
+
 test("a terminal Provider turn failure uses the retry presentation at its Agent message", async ({ page }) => {
   const sessionId = "provider-failure-session";
   await page.route("**/eve/v1/session", async (route) => {

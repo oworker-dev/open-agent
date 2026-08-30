@@ -326,8 +326,8 @@ function RuntimeErrorMessage({
     ? messages.retryFailed
     : retry
       ? `${messages.retryingRequest} (${retry.attempt}/${retry.maximum})`
-      : transient
-        ? messages.retryFailed
+      : failure
+        ? failureTitle(locale, failure)
         : locale === "zh-CN" ? "本轮执行失败" : messages.requestFailed;
   return (
     <article className="mx-auto flex w-full max-w-(--thread-max-width) flex-col" data-agent-message-error role="alert">
@@ -357,6 +357,15 @@ function RuntimeErrorMessage({
       </div>
     </article>
   );
+}
+
+function failureTitle(locale: AgentLocale, failure: AgentTurnFailure): string {
+  switch (classifyAgentFailure(failure)) {
+    case "network": return locale === "zh-CN" ? "网络连接失败" : "Network connection failed";
+    case "timeout": return locale === "zh-CN" ? "请求超时" : "Request timed out";
+    case "provider": return locale === "zh-CN" ? "上游模型请求失败" : "Provider request failed";
+    default: return locale === "zh-CN" ? "本轮执行失败" : "This turn failed";
+  }
 }
 
 function UserMessage({ isBusy, messages, sessionSettled }: { readonly isBusy: boolean; readonly messages: AgentMessages; readonly sessionSettled?: boolean }) {

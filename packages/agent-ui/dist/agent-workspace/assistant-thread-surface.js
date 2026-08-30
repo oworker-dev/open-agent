@@ -51,10 +51,18 @@ function RuntimeErrorMessage({ failure, locale, message, messages, onRetry, retr
         ? messages.retryFailed
         : retry
             ? `${messages.retryingRequest} (${retry.attempt}/${retry.maximum})`
-            : transient
-                ? messages.retryFailed
+            : failure
+                ? failureTitle(locale, failure)
                 : locale === "zh-CN" ? "本轮执行失败" : messages.requestFailed;
     return (_jsx("article", { className: "mx-auto flex w-full max-w-(--thread-max-width) flex-col", "data-agent-message-error": true, role: "alert", children: _jsxs("div", { className: "flex items-start gap-3 px-1 text-sm", children: [_jsx(CircleXIcon, { className: "mt-0.5 size-4 shrink-0 text-destructive" }), _jsxs("div", { className: "min-w-0 flex-1", children: [_jsx("p", { className: "font-medium text-foreground", children: title }), !retry?.exhausted ? _jsx("p", { className: "mt-1 break-words text-muted-foreground", children: message }) : null, retry?.exhausted ? (_jsxs(_Fragment, { children: [_jsx("p", { className: "mt-1 break-words text-muted-foreground", children: retry.error.message }), _jsx("code", { className: "mt-1 block break-all text-xs text-muted-foreground", children: retry.error.code || "provider_request_failed" })] })) : null, !retry?.exhausted && !retry && !transient ? _jsx("p", { className: "mt-1 text-muted-foreground", children: messages.requestPreserved }) : null, onRetry ? (_jsxs(Button, { className: "mt-2 h-7 px-2.5 text-xs", onClick: onRetry, size: "sm", variant: "outline", children: [_jsx(RotateCcwIcon, { className: "size-3.5" }), messages.retry] })) : null] })] }) }));
+}
+function failureTitle(locale, failure) {
+    switch (classifyAgentFailure(failure)) {
+        case "network": return locale === "zh-CN" ? "网络连接失败" : "Network connection failed";
+        case "timeout": return locale === "zh-CN" ? "请求超时" : "Request timed out";
+        case "provider": return locale === "zh-CN" ? "上游模型请求失败" : "Provider request failed";
+        default: return locale === "zh-CN" ? "本轮执行失败" : "This turn failed";
+    }
 }
 function UserMessage({ isBusy, messages, sessionSettled }) {
     const [actionsVisible, setActionsVisible] = useState(false);

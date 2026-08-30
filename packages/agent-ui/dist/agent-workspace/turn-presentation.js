@@ -44,6 +44,36 @@ export function classifyAgentFailure(failure) {
         return "provider";
     return "unknown";
 }
+export function isRetryableAgentFailure(failure) {
+    if (failure.retryable !== undefined)
+        return failure.retryable;
+    if (failure.statusCode !== undefined && failure.statusCode >= 400 && failure.statusCode < 500) {
+        return failure.statusCode === 408 || failure.statusCode === 409 || failure.statusCode === 425 || failure.statusCode === 429;
+    }
+    const category = classifyAgentFailure(failure);
+    if (category === "unknown")
+        return false;
+    const value = `${failure.code} ${failure.message}`.toLocaleLowerCase();
+    return !/\b(?:400|401|403|404|422|unauthori[sz]ed|forbidden|rejected|invalid[_ -]?request)\b/u.test(value);
+}
+function failureFromData(data) {
+    const statusCode = typeof data.details?.statusCode === "number" && Number.isInteger(data.details.statusCode)
+        ? data.details.statusCode
+        : typeof data.details?.status === "number" && Number.isInteger(data.details.status)
+            ? data.details.status
+            : undefined;
+    const retryable = typeof data.details?.isRetryable === "boolean"
+        ? data.details.isRetryable
+        : typeof data.details?.retryable === "boolean"
+            ? data.details.retryable
+            : undefined;
+    return {
+        code: data.code,
+        message: data.message,
+        ...(retryable === undefined ? {} : { retryable }),
+        ...(statusCode === undefined ? {} : { statusCode }),
+    };
+}
 export function stableUserMessageId(sourceId, turnId, stableRoot) {
     const prefix = `${turnId}:user`;
     if (sourceId === prefix)
@@ -376,7 +406,7 @@ function failedRetryToolParts(events, turnId, visibleToolCallIds) {
         if (event.type === "step.failed") {
             if (!current || current.stepIndex !== event.data.stepIndex)
                 continue;
-            current.failure = { code: event.data.code, message: event.data.message };
+            current.failure = failureFromData(event.data);
         }
     }
     const failedAttempts = attempts.filter((attempt) => attempt.failure && attempt.actions.length > 0);
@@ -442,11 +472,7 @@ function isOpenToolPart(part) {
 }
 const MAX_DURABLE_STEP_RETRIES = 3;
 function shouldPresentRetryFailure(failure) {
-    const category = classifyAgentFailure(failure);
-    if (category === "unknown")
-        return false;
-    const value = `${failure.code} ${failure.message}`.toLocaleLowerCase();
-    return !/\b(?:401|403|unauthori[sz]ed|forbidden|rejected|invalid[_ -]?request)\b/u.test(value);
+    return isRetryableAgentFailure(failure);
 }
 export function shouldSuppressInterruptedTurnDisplayEvent(event, eventIndex, turns) {
     return shouldSuppressInterruptedTurnEvent(event, turns, (turn) => eventIndex >= turn.eventCount);
@@ -541,14 +567,11 @@ export function presentAgentStep(events, turnId, stepIndex) {
         ? [...events].reverse().find((event) => event.type === "turn.failed" && event.data.turnId === turnId) ?? [...events].reverse().find((event) => event.type === "session.failed")
         : undefined;
     const terminalFailure = terminalFailureEvent
-        ? {
-            code: terminalFailureEvent.data.code,
-            message: terminalFailureEvent.data.message,
-        }
+        ? failureFromData(terminalFailureEvent.data)
         : undefined;
     const latestFailure = failures.at(-1);
     const retryFailure = latestFailure?.type === "step.failed"
-        ? { code: latestFailure.data.code, message: latestFailure.data.message }
+        ? failureFromData(latestFailure.data)
         : terminalFailure;
     const retryableFailure = retryFailure && shouldPresentRetryFailure(retryFailure)
         ? retryFailure
@@ -558,7 +581,7 @@ export function presentAgentStep(events, turnId, stepIndex) {
         : undefined;
     const retryExhausted = Boolean(terminalFailure && retryableFailure);
     const retryEvents = failures.flatMap((failure, index) => {
-        const candidate = { code: failure.data.code, message: failure.data.message };
+        const candidate = failureFromData(failure.data);
         return shouldPresentRetryFailure(candidate)
             ? [{
                     attempt: index + 1,
@@ -915,13 +938,13 @@ export function failureForTurn(events, turnId) {
         return undefined;
     const event = [...events].reverse().find((candidate) => candidate.type === "turn.failed" && candidate.data.turnId === turnId);
     if (event?.type === "turn.failed") {
-        return { code: event.data.code, message: event.data.message };
+        return failureFromData(event.data);
     }
     const startedIndex = events.findLastIndex((candidate) => candidate.type === "turn.started" && candidate.data.turnId === turnId);
     const sessionFailureIndex = events.findLastIndex((candidate) => candidate.type === "session.failed");
     const sessionFailure = sessionFailureIndex > startedIndex ? events[sessionFailureIndex] : undefined;
     return sessionFailure?.type === "session.failed"
-        ? { code: sessionFailure.data.code, message: sessionFailure.data.message }
+        ? failureFromData(sessionFailure.data)
         : undefined;
 }
 export function eventsBeforeLastUserTurn(events) {

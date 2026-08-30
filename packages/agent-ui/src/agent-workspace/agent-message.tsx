@@ -71,6 +71,7 @@ import type { AgentSessionDeliverable } from "./contracts.js";
 import {
   failureForTurn,
   classifyAgentFailure,
+  isRetryableAgentFailure,
   isCancellationPendingToolPart,
   isInterruptedToolPart,
   presentAgentTurn,
@@ -2743,10 +2744,7 @@ function TurnFailure({ failure, locale }: { readonly failure: { readonly code: s
 }
 
 function isRetryableTurnFailure(failure: { readonly code: string; readonly message: string }): boolean {
-  const category = classifyAgentFailure(failure);
-  if (category === "unknown") return false;
-  const value = `${failure.code} ${failure.message}`.toLocaleLowerCase();
-  return !/\b(?:401|403|unauthori[sz]ed|forbidden|rejected|invalid[_ -]?request)\b/u.test(value);
+  return isRetryableAgentFailure(failure);
 }
 
 function failureTitle(locale: AgentLocale, failure: { readonly code: string; readonly message: string }): string {

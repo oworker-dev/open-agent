@@ -1,9 +1,9 @@
 "use client";
-import { jsx as _jsx, jsxs as _jsxs } from "react/jsx-runtime";
+import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-runtime";
 import { ClientError, defaultMessageReducer, isCurrentTurnBoundaryEvent } from "eve/client";
 import { useEveAgent } from "eve/react";
 import { AssistantRuntimeProvider, unstable_defaultDirectiveFormatter, useExternalStoreRuntime } from "@assistant-ui/react";
-import { Clock3Icon, HammerIcon, RotateCcwIcon, SearchIcon, ShieldCheckIcon, SparklesIcon, XIcon } from "lucide-react";
+import { Clock3Icon, HammerIcon, LoaderCircleIcon, RotateCcwIcon, SearchIcon, ShieldCheckIcon, SparklesIcon, XIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "../ui/button.js";
 import { cn } from "../utils.js";
@@ -24,7 +24,7 @@ const CANCELLATION_STREAM_REATTACH_AFTER_MS = 5_000;
 const MAX_PROVIDER_SUBMISSION_RETRIES = 3;
 const LIVE_CHECKPOINT_INTERVAL_MS = 250;
 const LONG_RUNNING_STREAM_RECONNECT_POLICY = {
-    retryableErrorStatuses: [404, 408, 409, 425, 429, 500, 502, 503, 504],
+    retryableErrorStatuses: [408, 409, 425, 429, 500, 502, 503, 504],
     streamIdleReconnectPolicy: {
         baseDelayMs: 500,
         maxAttempts: 64,
@@ -1341,7 +1341,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     };
     const closeInputRequest = (requestId) => closeInputRequests([requestId]);
     const visibleQueuedTurns = thread.queuedTurns.filter((turn) => turn.intent !== "post-cancellation");
-    return (_jsx(AssistantRuntimeProvider, { runtime: assistantRuntime, children: _jsx("main", { className: "flex min-h-0 flex-1 flex-col overflow-hidden", children: _jsx(AssistantThreadSurface, { assetUrl: client?.assetUrl, approvalTakeover: approvalTakeover, cancellationState: cancellationState, commands: commands, composerTop: visibleQueuedTurns.length > 0 || queueError ? (_jsx(FollowUpQueue, { error: queueError, messages: messages, onRemove: removeQueuedTurn, onRetry: markQueuedTurnForRetry, turns: visibleQueuedTurns })) : undefined, draftStorageKey: draftStorageKey, historyHasMore: historyHasMore, historyLoading: historyLoading, events: displayEvents, eveMessages: visibleMessages, fallbackStartedAt: displayPendingTurn?.submittedAt, inputDisabled: inputLocked, isBusy: isBusy, sessionSettled: durableTurnSettled, onCancel: requestCancellation, locale: locale, mentions: mentions, messages: messages, models: models, onInputResponses: respond, onCloseInputRequest: closeInputRequest, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, onLoadEarlier: onLoadEarlier, onPreferencesChange: (preferences) => onChange({ preferences }), onDraftRestoreConsumed: (id) => {
+    return (_jsx(AssistantRuntimeProvider, { runtime: assistantRuntime, children: _jsx("main", { className: "flex min-h-0 flex-1 flex-col overflow-hidden", children: _jsx(AssistantThreadSurface, { assetUrl: client?.assetUrl, approvalTakeover: approvalTakeover, cancellationState: cancellationState, commands: commands, composerTop: isRecovering || visibleQueuedTurns.length > 0 || queueError ? (_jsxs(_Fragment, { children: [isRecovering ? (_jsxs("div", { className: "flex items-center gap-2 border-b border-border/60 px-1 pb-2 text-xs text-muted-foreground", "data-agent-recovery-status": true, role: "status", children: [_jsx(LoaderCircleIcon, { className: "size-3.5 animate-spin" }), _jsx("span", { children: messages.reconnecting })] })) : null, visibleQueuedTurns.length > 0 || queueError ? (_jsx(FollowUpQueue, { error: queueError, messages: messages, onRemove: removeQueuedTurn, onRetry: markQueuedTurnForRetry, turns: visibleQueuedTurns })) : null] })) : undefined, draftStorageKey: draftStorageKey, historyHasMore: historyHasMore, historyLoading: historyLoading, events: displayEvents, eveMessages: visibleMessages, fallbackStartedAt: displayPendingTurn?.submittedAt, inputDisabled: inputLocked, isBusy: isBusy, sessionSettled: durableTurnSettled, onCancel: requestCancellation, locale: locale, mentions: mentions, messages: messages, models: models, onInputResponses: respond, onCloseInputRequest: closeInputRequest, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, onLoadEarlier: onLoadEarlier, onPreferencesChange: (preferences) => onChange({ preferences }), onDraftRestoreConsumed: (id) => {
                     if (thread.draftRestore?.id === id)
                         onChange({ draftRestore: undefined });
                 }, onRetryRuntimeError: recoveryError ? onRetryRecovery : undefined, closedInputRequestIds: closedInputRequestIdsRef.current, preferences: thread.preferences, reasoningLevels: reasoningLevels, draftRestore: thread.draftRestore, runtimeFailure: runtimeFailure, runtimeError: runtimeError, runtimeRetry: providerRetry, usage: usage }) }) }));
@@ -1799,16 +1799,30 @@ function isRetryableSubmissionError(error) {
 }
 function toAgentFailure(error) {
     if (error instanceof ClientError) {
+        const statusCode = error.status >= 100 && error.status <= 599 ? error.status : undefined;
+        const retryable = error.status === 0 || error.status === 408 || error.status === 409 ||
+            error.status === 425 || error.status === 429 || error.status >= 500;
         return {
             code: error.code ?? `http_${error.status}`,
             message: error.message,
+            ...(statusCode === undefined ? {} : { statusCode }),
+            retryable,
         };
     }
     if (error instanceof Error) {
         const code = "code" in error && typeof error.code === "string" ? error.code : "agent_request_failed";
-        return { code, message: error.message };
+        const status = "status" in error && typeof error.status === "number" ? error.status : undefined;
+        const retryable = status === undefined
+            ? /network|fetch|socket|chunk|terminated|incomplete|connection|timeout/iu.test(error.message)
+            : status === 0 || status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
+        return {
+            code,
+            message: error.message,
+            ...(status === undefined ? {} : { statusCode: status }),
+            retryable,
+        };
     }
-    return { code: "agent_request_failed", message: String(error) };
+    return { code: "agent_request_failed", message: String(error), retryable: false };
 }
 function providerRetryDelay(attempt) {
     return Math.min(4_000, 500 * 2 ** Math.max(0, attempt - 1));

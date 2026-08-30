@@ -400,6 +400,8 @@ test("loads the thread index without joining or aggregating event payloads", asy
 
   assert.equal(result?.revision, 11);
   assert.match(loadedSql, /'events', '\[\]'::jsonb/u);
+  assert.match(loadedSql, /'pendingTurn', thread->'pendingTurn'/u);
+  assert.match(loadedSql, /'queuedTurns', coalesce\(thread->'queuedTurns'/u);
   assert.doesNotMatch(loadedSql, /agent_thread_events/u);
 });
 

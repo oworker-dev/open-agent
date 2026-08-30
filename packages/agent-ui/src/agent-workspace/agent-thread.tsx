@@ -4,7 +4,7 @@ import type { UserContent } from "ai";
 import { ClientError, defaultMessageReducer, isCurrentTurnBoundaryEvent, type ClientSession, type MessageStreamEvent } from "eve/client";
 import { useEveAgent, type EveMessage } from "eve/react";
 import { AssistantRuntimeProvider, unstable_defaultDirectiveFormatter, useExternalStoreRuntime, type AppendMessage, type ExternalStoreAdapter, type ExternalThreadQueueAdapter, type RespondToToolApprovalOptions } from "@assistant-ui/react";
-import { AlertCircleIcon, Clock3Icon, HammerIcon, RotateCcwIcon, SearchIcon, ShieldCheckIcon, SparklesIcon, XIcon } from "lucide-react";
+import { AlertCircleIcon, Clock3Icon, HammerIcon, LoaderCircleIcon, RotateCcwIcon, SearchIcon, ShieldCheckIcon, SparklesIcon, XIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "../ui/button.js";
 import { cn } from "../utils.js";
@@ -79,7 +79,8 @@ type ProviderRetryState = {
 // ordinary chat turns. Keep long-running response streams reconnectable without
 // changing the server-side durable loop.
 const LONG_RUNNING_STREAM_RECONNECT_POLICY = {
-  retryableErrorStatuses: [404, 408, 409, 425, 429, 500, 502, 503, 504],
+  // A missing session is terminal; retry only transport/transient statuses.
+  retryableErrorStatuses: [408, 409, 425, 429, 500, 502, 503, 504],
   streamIdleReconnectPolicy: {
     baseDelayMs: 500,
     maxAttempts: 64,
@@ -1853,14 +1854,24 @@ export function AgentThreadView({
           approvalTakeover={approvalTakeover}
           cancellationState={cancellationState}
           commands={commands}
-          composerTop={visibleQueuedTurns.length > 0 || queueError ? (
-            <FollowUpQueue
-              error={queueError}
-              messages={messages}
-              onRemove={removeQueuedTurn}
-              onRetry={markQueuedTurnForRetry}
-              turns={visibleQueuedTurns}
-            />
+          composerTop={isRecovering || visibleQueuedTurns.length > 0 || queueError ? (
+            <>
+              {isRecovering ? (
+                <div className="flex items-center gap-2 border-b border-border/60 px-1 pb-2 text-xs text-muted-foreground" data-agent-recovery-status role="status">
+                  <LoaderCircleIcon className="size-3.5 animate-spin" />
+                  <span>{messages.reconnecting}</span>
+                </div>
+              ) : null}
+              {visibleQueuedTurns.length > 0 || queueError ? (
+                <FollowUpQueue
+                  error={queueError}
+                  messages={messages}
+                  onRemove={removeQueuedTurn}
+                  onRetry={markQueuedTurnForRetry}
+                  turns={visibleQueuedTurns}
+                />
+              ) : null}
+            </>
           ) : undefined}
           draftStorageKey={draftStorageKey}
           historyHasMore={historyHasMore}
@@ -2537,16 +2548,30 @@ function isRetryableSubmissionError(error: unknown): boolean {
 
 function toAgentFailure(error: unknown): AgentTurnFailure {
   if (error instanceof ClientError) {
+    const statusCode = error.status >= 100 && error.status <= 599 ? error.status : undefined;
+    const retryable = error.status === 0 || error.status === 408 || error.status === 409 ||
+      error.status === 425 || error.status === 429 || error.status >= 500;
     return {
       code: error.code ?? `http_${error.status}`,
       message: error.message,
+      ...(statusCode === undefined ? {} : { statusCode }),
+      retryable,
     };
   }
   if (error instanceof Error) {
     const code = "code" in error && typeof error.code === "string" ? error.code : "agent_request_failed";
-    return { code, message: error.message };
+    const status = "status" in error && typeof error.status === "number" ? error.status : undefined;
+    const retryable = status === undefined
+      ? /network|fetch|socket|chunk|terminated|incomplete|connection|timeout/iu.test(error.message)
+      : status === 0 || status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
+    return {
+      code,
+      message: error.message,
+      ...(status === undefined ? {} : { statusCode: status }),
+      retryable,
+    };
   }
-  return { code: "agent_request_failed", message: String(error) };
+  return { code: "agent_request_failed", message: String(error), retryable: false };
 }
 
 function providerRetryDelay(attempt: number): number {

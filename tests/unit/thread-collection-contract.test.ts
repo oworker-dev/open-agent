@@ -145,6 +145,30 @@ test("summary patches clear a stale pending edit instead of resurrecting it", ()
   assert.equal(result.threads[0]?.status, "ready");
 });
 
+test("thread indexes retain an unacknowledged pending admission for refresh recovery", () => {
+  const pending = {
+    ...createAgentThread(1, "Pending"),
+    pendingTurn: {
+      id: "pending-send",
+      state: "submitting" as const,
+      submittedAt: 2,
+      text: "Keep this request visible",
+    },
+    queuedTurns: [{
+      id: "queued-follow-up",
+      state: "queued" as const,
+      submittedAt: 3,
+      text: "Follow up",
+    }],
+  };
+  const summary = summarizeThreadCollection(
+    { activeThreadId: pending.id, threads: [pending], version: 2 },
+    "other-thread",
+  );
+  assert.deepEqual(summary.threads[0]?.pendingTurn, pending.pendingTurn);
+  assert.deepEqual(summary.threads[0]?.queuedTurns, pending.queuedTurns);
+});
+
 test("summary checkpoints cannot downgrade authoritative transcript coverage", () => {
   const first = {
     ...createAgentThread(1, "First"),
