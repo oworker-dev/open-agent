@@ -200,11 +200,10 @@
   scrollbar-gutter: stable;
 }
 
-/* Keep assistant-ui's top-anchor user turn below the viewport edge. The
-   primitive scrolls the marked message root itself, so the spacing belongs
-   inside that root rather than on the scroll container. */
-.open-agent-ui [data-slot="thread-viewport"] :is([data-aui-top-anchor-user], [data-latest-user]) {
-  padding-top: clamp(1rem, 2vw, 1.5rem);
+/* A settled latest user turn is not an active top-anchor, but it still needs
+   a small reading inset after the viewport snaps to that turn. */
+.open-agent-ui [data-slot="thread-viewport"] [data-latest-user] {
+  padding-top: 1rem;
 }
 
 .open-agent-ui .aui-md-pre > .aui-md-inline-code {

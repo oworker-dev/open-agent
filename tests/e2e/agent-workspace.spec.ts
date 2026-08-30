@@ -956,6 +956,14 @@ test("assistant content keeps markdown, reasoning state, and action affordances"
   const userMessage = page.getByRole("log").getByText("Explain the result", { exact: true });
   await userMessage.hover();
   await expect(page.getByRole("button", { name: "Edit message" })).toBeVisible();
+
+  const assistantRoot = page.locator('[data-message-id]').filter({ hasText: "Result" }).last();
+  await assistantRoot.hover();
+  const assistantCopy = assistantRoot.getByRole("button", { name: "Copy response" });
+  await expect(assistantCopy).toBeVisible();
+  const rootBox = await assistantRoot.boundingBox();
+  const copyBox = await assistantCopy.boundingBox();
+  expect(copyBox?.x ?? Number.POSITIVE_INFINITY).toBeLessThan((rootBox?.x ?? 0) + (rootBox?.width ?? 0) / 2);
 });
 
 test("investigation: sample assistant message transitions without visual remount", async ({ page }) => {

@@ -536,7 +536,7 @@ function AssistantMessage({
         ) : null}
       </div>
       {!isStreaming && copyableText ? (
-        <ActionBarPrimitive.Root className="pointer-events-none absolute right-0 top-full z-10 flex h-7 items-center opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
+        <ActionBarPrimitive.Root className="pointer-events-none absolute left-0 top-full z-10 flex h-7 items-center opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
           <ReliableCopyButton label={messages.copyResponse} text={copyableText} />
         </ActionBarPrimitive.Root>
       ) : null}
