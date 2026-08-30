@@ -79,6 +79,7 @@ export declare function isProxiedInputOnlyMessage(message: EveMessage, events: r
 export declare function unresolvedInputRequests(events: readonly MessageStreamEvent[], closedInputRequestIds?: ReadonlySet<string>): readonly InputRequest[];
 export declare function hasUnresolvedInputRequests(events: readonly MessageStreamEvent[], closedInputRequestIds?: ReadonlySet<string>): boolean;
 export declare function hasSettledLatestTurn(events: readonly MessageStreamEvent[]): boolean;
+export declare function hasTerminalSessionBoundary(events: readonly MessageStreamEvent[]): boolean;
 export declare function failureForTurn(events: readonly MessageStreamEvent[], turnId: string | undefined): AgentTurnFailure | undefined;
 export declare function eventsBeforeLastUserTurn(events: readonly MessageStreamEvent[]): readonly MessageStreamEvent[];
 export declare function presentSubagentCall(events: readonly MessageStreamEvent[], callId: string): SubagentCallPresentation;

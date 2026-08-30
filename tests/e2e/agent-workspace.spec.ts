@@ -395,8 +395,35 @@ test("a permanent Provider 404 is terminal and never enters a retry loop", async
   await expect(page.locator('[data-agent-failure-alert]')).toBeVisible();
   await expect(page.locator('[data-slot="collapsible"].group\\/execution')).toHaveCount(0);
   await expect(page.getByRole("log").getByText("Use the unavailable model", { exact: true })).toHaveCount(1);
+  await expect(page.getByRole("button", { name: "Edit message", exact: true })).toHaveCount(0);
   await page.waitForTimeout(1_500);
   expect(streamRequests).toBe(1);
+});
+
+test("a terminal admission error does not leave a stale edit affordance before hydration", async ({ page }) => {
+  const sessionId = "terminal-admission-session";
+  const at = new Date().toISOString();
+  setFakeThreadCollection(page, {
+    activeThreadId: "terminal-admission-thread",
+    threads: [{
+      createdAt: Date.now(),
+      events: [
+        { data: { runtime: { agentId: "open-agent" } }, meta: { at, id: "terminal-session-started" }, type: "session.started" },
+      ],
+      id: "terminal-admission-thread",
+      pendingTurn: { id: "pending-terminal-admission", state: "delivery-failed", submittedAt: Date.now(), text: "Try again" },
+      preferences: { executionMode: "standard", modelId: "gpt-5.6-sol", reasoning: "medium" },
+      session: { sessionId, streamIndex: 1 },
+      status: "error",
+      title: "Try again",
+      updatedAt: Date.now(),
+    }],
+    version: 2,
+  });
+
+  await page.goto("/threads/terminal-admission-thread");
+  await expect(page.getByRole("log").getByText("Try again", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Edit message", exact: true })).toHaveCount(0);
 });
 
 test("a terminal Provider turn failure uses the retry presentation at its Agent message", async ({ page }) => {

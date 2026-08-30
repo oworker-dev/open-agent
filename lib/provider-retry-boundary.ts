@@ -77,16 +77,46 @@ function providerRetryable(
   error: unknown,
   statusCode: number | undefined,
 ): boolean | undefined {
+  // AI SDK marks every HTTP 404 as non-retryable before the provider response
+  // body is inspected. A gateway can nevertheless use 404 for a temporary
+  // route deployment, so only override that default when the response does
+  // not identify a permanent missing/invalid model. The retry remains bounded
+  // by Eve's model-call retry budget.
   if (error && typeof error === "object") {
     const explicit = Reflect.get(error, "isRetryable");
-    if (typeof explicit === "boolean") return explicit;
+    if (typeof explicit === "boolean") {
+      // AI SDK derives `false` from the bare HTTP status. For 404 only, keep
+      // the session recoverable unless the provider body names a permanent
+      // missing/invalid model. An explicit `true` remains authoritative.
+      if (explicit === true) return true;
+      if (statusCode !== 404 || isPermanentNotFound(error)) return false;
+    }
   }
   if (isTransientNetworkError(error)) return true;
   if (statusCode === undefined) return undefined;
-  // Match the AI SDK's transient HTTP classification. 409 is commonly used
-  // by gateways for an overloaded/temporarily unavailable upstream and is
-  // safe for Eve to retry before any tool boundary has been crossed.
-  return statusCode === 408 || statusCode === 409 || statusCode === 429 || statusCode >= 500;
+  // Gateways can temporarily return 404 while a model route is being
+  // deployed or recovered. Treat an otherwise-unclassified 404 as
+  // retryable; Eve owns a bounded three-attempt budget and parks an
+  // interactive session after exhaustion instead of killing its context.
+  return statusCode === 404 || statusCode === 408 || statusCode === 409 || statusCode === 429 || statusCode >= 500;
+}
+
+function isPermanentNotFound(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const values: string[] = [];
+  for (const key of ["type", "code", "message", "responseBody"] as const) {
+    const value = Reflect.get(error, key);
+    if (typeof value === "string") values.push(value);
+  }
+  const data = Reflect.get(error, "data");
+  if (data !== undefined) {
+    try {
+      values.push(JSON.stringify(data));
+    } catch {
+      // Ignore unserializable provider metadata.
+    }
+  }
+  return /(?:model[_ -]?not[_ -]?found|unknown[_ -]?model|resource[_ -]?not[_ -]?found|invalid[_ -]?request(?:[_ -]?error)?|model[^\n]{0,40}does not exist)/iu.test(values.join("\n"));
 }
 
 const TRANSIENT_NETWORK_CODES = new Set([

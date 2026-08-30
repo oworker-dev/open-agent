@@ -924,7 +924,7 @@ export function hasSettledLatestTurn(events) {
     const startedIndex = events.findLastIndex((event) => event.type === "turn.started");
     const sessionBoundaryIndex = events.findLastIndex((event) => event.type === "session.waiting" || event.type === "session.completed" || event.type === "session.failed");
     if (sessionBoundaryIndex > startedIndex)
-        return startedIndex >= 0;
+        return true;
     if (startedIndex < 0)
         return false;
     const started = events[startedIndex];
@@ -932,6 +932,11 @@ export function hasSettledLatestTurn(events) {
         return false;
     return events.slice(startedIndex + 1).some((event) => (event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled") &&
         event.data.turnId === started.data.turnId) || events.slice(startedIndex + 1).some((event) => event.type === "session.failed");
+}
+export function hasTerminalSessionBoundary(events) {
+    const startedIndex = events.findLastIndex((event) => event.type === "turn.started");
+    const terminalIndex = events.findLastIndex((event) => event.type === "session.completed" || event.type === "session.failed");
+    return terminalIndex > startedIndex;
 }
 export function failureForTurn(events, turnId) {
     if (!turnId)

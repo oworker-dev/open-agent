@@ -9,6 +9,7 @@ import {
   activeTurnIdAfterPendingSubmission,
   classifyAgentFailure,
   eventsBeforeLastUserTurn,
+  hasTerminalSessionBoundary,
   hasSettledLatestTurn,
   hasUnresolvedInputRequests,
   isRetryableAgentFailure,
@@ -1748,6 +1749,28 @@ test("a persisted turn failure overrides stale client stream state for editing",
     ...running,
     event("session.completed", endedAt, { sequence: 0 }),
   ]), true);
+  // A provider can fail while the first turn is being admitted, before Eve
+  // publishes `turn.started`. The session failure still settles that request.
+  assert.equal(hasSettledLatestTurn([
+    event("session.started", startedAt, { sessionId: "session-failed-before-turn" }),
+    event("session.failed", endedAt, { code: "MODEL_CALL_FAILED", message: "HTTP 404" }),
+  ]), true);
+});
+
+test("terminal session boundaries disable edit capability without hiding waiting sessions", () => {
+  assert.equal(hasTerminalSessionBoundary([
+    event("session.started", startedAt, { sessionId: "waiting-session" }),
+    event("session.waiting", endedAt, { wait: "next-user-message" }),
+  ]), false);
+  assert.equal(hasTerminalSessionBoundary([
+    event("session.started", startedAt, { sessionId: "failed-session" }),
+    event("session.failed", endedAt, { code: "MODEL_CALL_FAILED", message: "HTTP 404" }),
+  ]), true);
+  assert.equal(hasTerminalSessionBoundary([
+    event("turn.started", startedAt, { sequence: 0, turnId: "turn-next" }),
+    event("session.failed", endedAt, { code: "MODEL_CALL_FAILED", message: "HTTP 404" }),
+    event("turn.started", endedAt, { sequence: 1, turnId: "turn-newer" }),
+  ]), false);
 });
 
 test("a terminal provider failure without a turn boundary anchors to its final step", () => {

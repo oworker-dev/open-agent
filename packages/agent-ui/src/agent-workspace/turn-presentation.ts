@@ -1343,12 +1343,17 @@ export function hasSettledLatestTurn(events: readonly MessageStreamEvent[]): boo
   const sessionBoundaryIndex = events.findLastIndex((event) =>
     event.type === "session.waiting" || event.type === "session.completed" || event.type === "session.failed",
   );
-  // A session boundary settles the latest turn only when it follows that turn.
-  // Looking only at `events.at(-1)` was brittle when a checkpoint appended a
-  // non-lifecycle event after `session.waiting`; conversely, accepting any
-  // historical waiting event could unlock a newer turn after an out-of-order
-  // recovery merge.
-  if (sessionBoundaryIndex > startedIndex) return startedIndex >= 0;
+  // A session boundary settles the latest turn only when it follows the latest
+  // turn start (or when no turn start was ever emitted). Looking only at
+  // `events.at(-1)` was brittle when a checkpoint appended a non-lifecycle
+  // event after `session.waiting`; conversely, accepting any historical
+  // waiting event could unlock a newer turn after an out-of-order recovery
+  // merge.
+  // A session can fail before Eve emits `turn.started` (for example, a model
+  // request rejected while the first turn is being admitted). The session
+  // boundary is still authoritative in that shape; requiring a turn start
+  // here leaves the UI in a phantom running/editable state forever.
+  if (sessionBoundaryIndex > startedIndex) return true;
   if (startedIndex < 0) return false;
   const started = events[startedIndex];
   if (started?.type !== "turn.started") return false;
@@ -1358,6 +1363,19 @@ export function hasSettledLatestTurn(events: readonly MessageStreamEvent[]): boo
   ) || events.slice(startedIndex + 1).some((event) =>
     event.type === "session.failed"
   );
+}
+
+/**
+ * Whether the latest session boundary is terminal rather than resumable.
+ * `session.waiting` is intentionally excluded: Eve accepts another message
+ * in that state, while completed/failed sessions reject clear/send controls.
+ */
+export function hasTerminalSessionBoundary(events: readonly MessageStreamEvent[]): boolean {
+  const startedIndex = events.findLastIndex((event) => event.type === "turn.started");
+  const terminalIndex = events.findLastIndex((event) =>
+    event.type === "session.completed" || event.type === "session.failed",
+  );
+  return terminalIndex > startedIndex;
 }
 
 export function failureForTurn(

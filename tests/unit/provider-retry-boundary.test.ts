@@ -59,13 +59,52 @@ test("classifies transient Provider HTTP, timeout, and network failures for Eve"
   }
 });
 
-test("keeps permanent Provider rejections out of the transient retry budget", async () => {
-  for (const statusCode of [400, 401, 403, 404]) {
+test("keeps known permanent Provider rejections out of the transient retry budget", async () => {
+  for (const statusCode of [400, 401, 403]) {
     await assert.rejects(
       oneProviderAttempt(async () => { throw Object.assign(new Error("rejected"), { statusCode }); }),
       (error: unknown) => error instanceof EveOwnedProviderAttemptError && error.isRetryable === false,
     );
   }
+});
+
+test("treats an unclassified Provider 404 as bounded-retryable", async () => {
+  await assert.rejects(
+    oneProviderAttempt(async () => {
+      throw Object.assign(new Error("route unavailable"), {
+        isRetryable: false,
+        responseBody: JSON.stringify({ error: { type: "temporary_route_unavailable" } }),
+        statusCode: 404,
+      });
+    }),
+    (error: unknown) => error instanceof EveOwnedProviderAttemptError && error.isRetryable === true,
+  );
+});
+
+test("honors an explicit permanent Provider classification for 404", async () => {
+  await assert.rejects(
+    oneProviderAttempt(async () => {
+      throw Object.assign(new Error("model not found"), {
+        isRetryable: false,
+        responseBody: JSON.stringify({ error: { type: "model_not_found" } }),
+        statusCode: 404,
+      });
+    }),
+    (error: unknown) => error instanceof EveOwnedProviderAttemptError && error.isRetryable === false,
+  );
+});
+
+test("does not treat a temporary route-not-found message as permanent", async () => {
+  await assert.rejects(
+    oneProviderAttempt(async () => {
+      throw Object.assign(new Error("route not found during deployment"), {
+        isRetryable: false,
+        responseBody: JSON.stringify({ error: { type: "temporary_route_unavailable" } }),
+        statusCode: 404,
+      });
+    }),
+    (error: unknown) => error instanceof EveOwnedProviderAttemptError && error.isRetryable === true,
+  );
 });
 
 test("preserves abort errors for Eve cancellation", async () => {

@@ -90,6 +90,7 @@ export function AssistantThreadSurface({
   historyLoading = false,
   inputDisabled,
   isBusy,
+  sessionTerminal,
   sessionSettled,
   onCancel,
   locale,
@@ -127,6 +128,8 @@ export function AssistantThreadSurface({
   /** Locks the main composer without disabling assistant-ui's edit composer. */
   readonly inputDisabled?: boolean;
   readonly isBusy: boolean;
+  /** True when Eve has durably completed or failed the current session. */
+  readonly sessionTerminal?: boolean;
   /** Authoritative Eve session boundary; overrides a stale local hook state. */
   readonly sessionSettled?: boolean;
   readonly onCancel?: () => void;
@@ -197,7 +200,7 @@ export function AssistantThreadSurface({
             {({ message }) => message.composer.isEditing ? (
               <EditMessage messages={messages} />
             ) : message.role === "user" ? (
-              <UserMessage isBusy={isBusy} messages={messages} sessionSettled={sessionSettled} />
+              <UserMessage isBusy={isBusy} messages={messages} sessionTerminal={sessionTerminal} sessionSettled={sessionSettled} />
           ) : (
             <AssistantMessage
               assetUrl={assetUrl}
@@ -394,7 +397,7 @@ function failureSummary(locale: AgentLocale, failure: AgentTurnFailure): string 
   }
 }
 
-function UserMessage({ isBusy, messages, sessionSettled }: { readonly isBusy: boolean; readonly messages: AgentMessages; readonly sessionSettled?: boolean }) {
+function UserMessage({ isBusy, messages, sessionTerminal = false, sessionSettled }: { readonly isBusy: boolean; readonly messages: AgentMessages; readonly sessionTerminal?: boolean; readonly sessionSettled?: boolean }) {
   const [actionsVisible, setActionsVisible] = useState(false);
   const isLastUserMessage = useAuiState((state) => {
     const lastUser = [...state.thread.messages].reverse().find((message) => message.role === "user");
@@ -403,7 +406,7 @@ function UserMessage({ isBusy, messages, sessionSettled }: { readonly isBusy: bo
   // The host supplies the durable boundary once the latest request has
   // completed, failed, or been interrupted. Keep editing unavailable during
   // the boundary hand-off to avoid racing the active runtime.
-  const canEdit = isLastUserMessage && !isBusy && sessionSettled !== false;
+  const canEdit = isLastUserMessage && !isBusy && !sessionTerminal && sessionSettled !== false;
   return (
     <MessagePrimitive.Root
       className="group fade-in slide-in-from-bottom-1 animate-in mx-auto grid w-full max-w-(--thread-max-width) auto-rows-auto grid-cols-[minmax(72px,1fr)_auto] content-start gap-y-2 px-2 duration-150 [&:where(>*)]:col-start-2"

@@ -54,6 +54,22 @@ try {
     "PROVIDER_429_RECOVER. Do not use tools. Reply exactly: RATE_LIMIT_RECOVERED");
   assert(messageText(rateLimit) === "RATE_LIMIT_RECOVERED", "429 recovery returned the wrong result.");
 
+  const temporaryNotFound = await completedTurn(eveUrl,
+    "PROVIDER_404_RECOVER. Do not use tools. Reply exactly: NOT_FOUND_RECOVERED");
+  assert(messageText(temporaryNotFound) === "NOT_FOUND_RECOVERED",
+    "The temporary 404 provider route did not recover automatically.");
+
+  const exhaustedNotFound = await createAndConsume(eveUrl,
+    "PROVIDER_404_THREE. Reply exactly: STALE");
+  assertRecoverableFailure(exhaustedNotFound.events, "exhausted temporary 404 provider route");
+  const resumedAfterNotFound = await consume(
+    exhaustedNotFound.session,
+    "Continue the same task. Reply exactly: NOT_FOUND_CONTINUED",
+  );
+  assertCompleted(resumedAfterNotFound, "exhausted temporary 404 continuation");
+  assert(completedMessageText(resumedAfterNotFound) === "NOT_FOUND_CONTINUED",
+    "The session did not continue after exhausting the temporary 404 retry budget.");
+
   const serverError = await completedTurn(eveUrl,
     "PROVIDER_500_RECOVER. Do not use tools. Reply exactly: SERVER_ERROR_RECOVERED");
   assert(messageText(serverError) === "SERVER_ERROR_RECOVERED", "500 recovery returned the wrong result.");
@@ -119,6 +135,10 @@ try {
   const state = await fetch(`${providerUrl}/debug/state`).then((response) => response.json());
   assert(state.scenarioAttempts.PROVIDER_429_RECOVER === 3,
     `Expected three 429 attempts, received ${state.scenarioAttempts.PROVIDER_429_RECOVER}.`);
+  assert(state.scenarioAttempts.PROVIDER_404_RECOVER === 3,
+    `Expected three 404 attempts, received ${state.scenarioAttempts.PROVIDER_404_RECOVER}.`);
+  assert(state.scenarioAttempts.PROVIDER_404_THREE === 3,
+    `Expected three exhausted 404 attempts, received ${state.scenarioAttempts.PROVIDER_404_THREE}.`);
   assert(state.scenarioAttempts.PROVIDER_500_RECOVER === 3,
     `Expected three 500 attempts, received ${state.scenarioAttempts.PROVIDER_500_RECOVER}.`);
   assert(state.scenarioAttempts.PROVIDER_408_RECOVER === 3,
@@ -133,6 +153,8 @@ try {
   console.log(JSON.stringify({
     automaticRecovery: {
       rateLimitAttempts: state.scenarioAttempts.PROVIDER_429_RECOVER,
+      temporaryNotFoundAttempts: state.scenarioAttempts.PROVIDER_404_RECOVER,
+      exhaustedTemporaryNotFoundAttempts: state.scenarioAttempts.PROVIDER_404_THREE,
       requestTimeoutAttempts: state.scenarioAttempts.PROVIDER_408_RECOVER,
       serverErrorAttempts: state.scenarioAttempts.PROVIDER_500_RECOVER,
       streamInterruptionAttempts: state.scenarioAttempts.PROVIDER_STREAM_INTERRUPT_ONCE,

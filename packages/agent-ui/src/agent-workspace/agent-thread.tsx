@@ -26,7 +26,9 @@ import { appendThreadEvent, appendThreadEventIndexed, dedupeThreadEvents, eventI
 import {
   activeTurnIdAfterPendingSubmission,
   eventsBeforeLastUserTurn,
+  hasTerminalSessionBoundary,
   hasSettledLatestTurn,
+  isRetryableAgentFailure,
   isProxiedInputOnlyMessage,
   normalizeSettledAgentMessages,
   projectAgentDisplayTimeline,
@@ -594,6 +596,26 @@ export function AgentThreadView({
   const authoritativeEvents = isRecovering || (durableSessionSettled && !localSessionSettled)
     ? thread.events
     : agent.events;
+  const sessionHasResumableBoundary = hasSettledSessionBoundary(authoritativeEvents) &&
+    !hasTerminalSessionBoundary(authoritativeEvents);
+  // A stream can surface a terminal admission error before the corresponding
+  // lifecycle event reaches the mounted reducer. Treat only a known,
+  // non-retryable local error as terminal here; transient transport/provider
+  // errors must keep the retry path and editable state alive.
+  const localTerminalError = agent.status === "error" && agent.error
+    ? !isRetryableAgentFailure(toAgentFailure(agent.error))
+    : false;
+  // A provider/session admission can fail before the mounted Eve reducer
+  // receives the durable `session.failed` event. The workspace still records
+  // `status: error` and the session id in that case. Treat that combination as
+  // terminal immediately so the edit affordance cannot disappear only after a
+  // refresh. A turn-level failure that ends in `session.waiting` remains
+  // editable because that session is resumable.
+  const sessionTerminal = hasTerminalSessionBoundary(authoritativeEvents) ||
+    localTerminalError ||
+    (thread.status === "error" &&
+      Boolean(thread.session.sessionId) &&
+      !sessionHasResumableBoundary);
   // A durable turn boundary is authoritative. React stream state can remain
   // stale after a reconnect even though Eve has already parked the session.
   // A previous turn's `session.waiting` boundary must not hide the optimistic
@@ -1486,6 +1508,11 @@ export function AgentThreadView({
 
   const stageEditedTurn = (prompt: PromptInputMessage) => {
     if (!prompt.text && prompt.files.length === 0) return;
+    // `ClientSession.clear()` returns `no_active_session` for completed or
+    // failed Eve sessions. Guard before staging the browser edit state so a
+    // terminal session cannot briefly show "reconnecting" and then silently
+    // discard the edited prompt.
+    if (sessionTerminal) return;
     const durableSession = sessionRef.current ?? attachAgentSession(connection, agent.session);
     if (!durableSession) {
       if (thread.pendingTurn?.state === "interrupted" || thread.pendingTurn?.state === "delivery-failed") {
@@ -1881,6 +1908,7 @@ export function AgentThreadView({
           fallbackStartedAt={displayPendingTurn?.submittedAt}
           inputDisabled={inputLocked}
           isBusy={isBusy}
+          sessionTerminal={sessionTerminal}
           sessionSettled={durableTurnSettled}
           onCancel={requestCancellation}
           locale={locale}
