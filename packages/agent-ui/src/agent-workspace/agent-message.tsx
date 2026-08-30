@@ -1367,9 +1367,6 @@ function RetryStatus({
         <CircleAlertIcon />
         <AlertTitle>
           {localize(locale, "Retry failed", "重试失败")}
-          {retry.attempt !== undefined && retry.maximum !== undefined
-            ? ` (${retry.attempt}/${retry.maximum})`
-            : ""}
         </AlertTitle>
         {retry.error ? (
           <AlertDescription>

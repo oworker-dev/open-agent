@@ -870,8 +870,8 @@ export function presentAgentStep(
     ? retryFailure
     : undefined;
   // Eve intentionally does not expose an attempt number. Count only durable
-  // failed step boundaries that are actually present; never turn one terminal
-  // failure into a fabricated "3/3" display.
+  // failed step boundaries that are actually present; the terminal alert does
+  // not expose this count, while an in-flight retry row may show it.
   const observedRetryAttempt = retryableFailure
     ? Math.max(1, failures.length)
     : undefined;

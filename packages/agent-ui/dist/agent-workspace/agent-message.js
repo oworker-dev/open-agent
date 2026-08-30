@@ -589,9 +589,7 @@ function StepFailure({ failure, locale, }) {
 }
 function RetryStatus({ locale, retry, }) {
     if (retry.exhausted) {
-        return (_jsxs(Alert, { className: "mb-2 py-2.5", "data-agent-failure-alert": true, variant: "destructive", children: [_jsx(CircleAlertIcon, {}), _jsxs(AlertTitle, { children: [localize(locale, "Retry failed", "重试失败"), retry.attempt !== undefined && retry.maximum !== undefined
-                            ? ` (${retry.attempt}/${retry.maximum})`
-                            : ""] }), retry.error ? (_jsxs(AlertDescription, { children: [_jsx("p", { children: failureSummary(locale, retry.error) }), retry.error.code ? _jsx("code", { className: "break-all text-xs", children: retry.error.code }) : null] })) : null] }));
+        return (_jsxs(Alert, { className: "mb-2 py-2.5", "data-agent-failure-alert": true, variant: "destructive", children: [_jsx(CircleAlertIcon, {}), _jsx(AlertTitle, { children: localize(locale, "Retry failed", "重试失败") }), retry.error ? (_jsxs(AlertDescription, { children: [_jsx("p", { children: failureSummary(locale, retry.error) }), retry.error.code ? _jsx("code", { className: "break-all text-xs", children: retry.error.code }) : null] })) : null] }));
     }
     return (_jsxs(Collapsible, { className: "mb-1 text-sm text-muted-foreground", "data-agent-retry": true, defaultOpen: false, children: [_jsxs(CollapsibleTrigger, { className: "group/retry flex max-w-full items-center gap-2 py-1.5 text-left hover:text-foreground", children: [_jsx(WifiIcon, { className: "size-4 shrink-0" }), _jsxs("span", { children: [retryTitle(locale, retry.error), retry.attempt !== undefined && retry.maximum !== undefined
                                 ? ` (${retry.attempt}/${retry.maximum})`
