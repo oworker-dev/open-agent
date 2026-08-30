@@ -170,6 +170,7 @@ export function AssistantThreadSurface({
     >
       <ThreadPrimitive.Viewport
         aria-live="polite"
+        turnAnchor="top"
         className="relative flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-auto px-3 pt-3 sm:px-4 sm:pt-4"
         data-slot="thread-viewport"
         role="log"
@@ -192,7 +193,7 @@ export function AssistantThreadSurface({
             {({ message }) => message.composer.isEditing ? (
               <EditMessage messages={messages} />
             ) : message.role === "user" ? (
-              <UserMessage messages={messages} />
+              <UserMessage isBusy={isBusy} messages={messages} sessionSettled={sessionSettled} />
           ) : (
             <AssistantMessage
               assetUrl={assetUrl}
@@ -358,12 +359,16 @@ function RuntimeErrorMessage({
   );
 }
 
-function UserMessage({ messages }: { readonly messages: AgentMessages }) {
+function UserMessage({ isBusy, messages, sessionSettled }: { readonly isBusy: boolean; readonly messages: AgentMessages; readonly sessionSettled?: boolean }) {
   const [actionsVisible, setActionsVisible] = useState(false);
   const isLastUserMessage = useAuiState((state) => {
     const lastUser = [...state.thread.messages].reverse().find((message) => message.role === "user");
     return lastUser?.id === state.message.id;
   });
+  // The host supplies the durable boundary once the latest request has
+  // completed, failed, or been interrupted. Keep editing unavailable during
+  // the boundary hand-off to avoid racing the active runtime.
+  const canEdit = isLastUserMessage && !isBusy && sessionSettled !== false;
   return (
     <MessagePrimitive.Root
       className="group fade-in slide-in-from-bottom-1 animate-in mx-auto grid w-full max-w-(--thread-max-width) auto-rows-auto grid-cols-[minmax(72px,1fr)_auto] content-start gap-y-2 px-2 duration-150 [&:where(>*)]:col-start-2"
@@ -382,12 +387,12 @@ function UserMessage({ messages }: { readonly messages: AgentMessages }) {
         >
           <MessagePrimitive.Parts components={{ Text: DirectiveText }} />
         </div>
-        <div className={cn("pointer-events-none flex min-h-7.5 items-center gap-0.5 pt-1.5 transition-opacity", actionsVisible ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100")}>
-          <ActionBarPrimitive.Root className="pointer-events-auto flex items-center gap-0.5">
+        <div className={cn("pointer-events-none flex min-h-7.5 items-center justify-end gap-0.5 pt-1.5 transition-opacity", actionsVisible ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100")}>
+          <ActionBarPrimitive.Root className="pointer-events-auto flex items-center justify-end gap-0.5 text-muted-foreground">
             <ReliableCopyButton label={messages.copyResponse} />
-            {isLastUserMessage ? (
+            {canEdit ? (
               <ActionBarPrimitive.Edit asChild>
-                <TooltipIconButton aria-label={messages.editMessage} tooltip={messages.editMessage}>
+                <TooltipIconButton aria-label={messages.editMessage} className="text-muted-foreground hover:text-foreground" tooltip={messages.editMessage}>
                   <PencilIcon className="size-3.5" />
                 </TooltipIconButton>
               </ActionBarPrimitive.Edit>
