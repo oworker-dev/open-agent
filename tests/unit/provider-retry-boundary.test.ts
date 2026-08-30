@@ -81,7 +81,7 @@ test("treats an unclassified Provider 404 as bounded-retryable", async () => {
   );
 });
 
-test("honors an explicit permanent Provider classification for 404", async () => {
+test("keeps an explicit permanent Provider 404 recoverable for interactive sessions", async () => {
   await assert.rejects(
     oneProviderAttempt(async () => {
       throw Object.assign(new Error("model not found"), {
@@ -90,7 +90,7 @@ test("honors an explicit permanent Provider classification for 404", async () =>
         statusCode: 404,
       });
     }),
-    (error: unknown) => error instanceof EveOwnedProviderAttemptError && error.isRetryable === false,
+    (error: unknown) => error instanceof EveOwnedProviderAttemptError && error.isRetryable === true,
   );
 });
 

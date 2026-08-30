@@ -48,7 +48,7 @@ export function isRetryableAgentFailure(failure) {
     if (failure.retryable !== undefined)
         return failure.retryable;
     if (failure.statusCode !== undefined && failure.statusCode >= 400 && failure.statusCode < 500) {
-        return failure.statusCode === 408 || failure.statusCode === 409 || failure.statusCode === 425 || failure.statusCode === 429;
+        return failure.statusCode === 404 || failure.statusCode === 408 || failure.statusCode === 409 || failure.statusCode === 425 || failure.statusCode === 429;
     }
     const category = classifyAgentFailure(failure);
     if (category === "unknown")

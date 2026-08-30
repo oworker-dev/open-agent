@@ -364,9 +364,8 @@ test("transient session admission errors retry with a stable bounded counter", a
   expect(attempts).toBe(3);
 });
 
-test("a permanent Provider 404 is terminal and never enters a retry loop", async ({ page }) => {
-  const sessionId = "terminal-provider-404-session";
-  let streamRequests = 0;
+test("a Provider 404 remains recoverable and keeps the edit affordance", async ({ page }) => {
+  const sessionId = "recoverable-provider-404-session";
   await page.route("**/eve/v1/session", async (route) => {
     await route.fulfill({
       body: JSON.stringify({ sessionId }),
@@ -375,14 +374,12 @@ test("a permanent Provider 404 is terminal and never enters a retry loop", async
     });
   });
   await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
-    streamRequests += 1;
     await route.fulfill({
-      body: JSON.stringify({
-        code: "MODEL_CALL_FAILED",
-        error: "The model Provider request failed (HTTP 404).",
+      body: mockProviderFailureTurn("Use the unavailable model", {
+        statusCode: 404,
       }),
-      contentType: "application/json",
-      status: 404,
+      contentType: "application/x-ndjson",
+      status: 200,
     });
   });
 
@@ -390,14 +387,10 @@ test("a permanent Provider 404 is terminal and never enters a retry loop", async
   const composer = page.getByRole("textbox", { name: "Do anything" });
   await composer.fill("Use the unavailable model");
   await composer.press("Enter");
-  await expect(page.getByText("Model request failed", { exact: true })).toBeVisible({ timeout: 8_000 });
-  await expect(page.getByText(/Retrying request|Retry failed/)).toHaveCount(0);
+  await expect(page.getByText(/Retry failed/)).toBeVisible({ timeout: 8_000 });
   await expect(page.locator('[data-agent-failure-alert]')).toBeVisible();
-  await expect(page.locator('[data-slot="collapsible"].group\\/execution')).toHaveCount(0);
   await expect(page.getByRole("log").getByText("Use the unavailable model", { exact: true })).toHaveCount(1);
-  await expect(page.getByRole("button", { name: "Edit message", exact: true })).toHaveCount(0);
-  await page.waitForTimeout(1_500);
-  expect(streamRequests).toBe(1);
+  await expect(page.getByRole("button", { name: "Edit message", exact: true })).toHaveCount(1);
 });
 
 test("a terminal admission error does not leave a stale edit affordance before hydration", async ({ page }) => {
@@ -4317,16 +4310,37 @@ function mockSuccessfulTurn(message: string, reply: string, sequence = 0): strin
   return `${events.map((event) => JSON.stringify(event)).join("\n")}\n`;
 }
 
-function mockProviderFailureTurn(message: string): string {
+function mockProviderFailureTurn(
+  message: string,
+  options: { readonly retryable?: boolean; readonly statusCode?: number } = {},
+): string {
   const at = new Date().toISOString();
   const turnId = "turn_provider_failure";
+  const details = options.retryable === undefined && options.statusCode === undefined
+    ? undefined
+    : {
+        ...(options.retryable === undefined ? {} : { isRetryable: options.retryable }),
+        ...(options.statusCode === undefined ? {} : { statusCode: options.statusCode }),
+      };
+  const failure = {
+    code: "MODEL_CALL_FAILED",
+    ...(details === undefined ? {} : { details }),
+    message: options.statusCode === 404
+      ? "The model Provider request failed (HTTP 404)."
+      : "The model Provider request timed out.",
+    sequence: 0,
+    stepIndex: 0,
+    turnId,
+  };
+  const turnFailure = { ...failure };
+  delete (turnFailure as { stepIndex?: number }).stepIndex;
   const events = [
     { data: { runtime: { agentId: "open-agent", agentName: "open-agent", eveVersion: "test", modelId: "mock/model" } }, meta: { at }, type: "session.started" },
     { data: { sequence: 0, turnId }, meta: { at }, type: "turn.started" },
     { data: { message, parts: [{ text: message, type: "text" }], sequence: 0, turnId }, meta: { at }, type: "message.received" },
     { data: { sequence: 0, stepIndex: 0, turnId }, meta: { at }, type: "step.started" },
-    { data: { code: "MODEL_CALL_FAILED", message: "The model Provider request timed out.", sequence: 0, stepIndex: 0, turnId }, meta: { at }, type: "step.failed" },
-    { data: { code: "MODEL_CALL_FAILED", message: "The model Provider request timed out.", sequence: 0, turnId }, meta: { at }, type: "turn.failed" },
+    { data: failure, meta: { at }, type: "step.failed" },
+    { data: turnFailure, meta: { at }, type: "turn.failed" },
     { data: { wait: "next-user-message" }, meta: { at }, type: "session.waiting" },
   ];
   return `${events.map((event) => JSON.stringify(event)).join("\n")}\n`;

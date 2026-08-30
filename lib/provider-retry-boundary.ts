@@ -78,18 +78,22 @@ function providerRetryable(
   statusCode: number | undefined,
 ): boolean | undefined {
   // AI SDK marks every HTTP 404 as non-retryable before the provider response
-  // body is inspected. A gateway can nevertheless use 404 for a temporary
-  // route deployment, so only override that default when the response does
-  // not identify a permanent missing/invalid model. The retry remains bounded
-  // by Eve's model-call retry budget.
+  // body is inspected. A 404 during model admission is still recoverable for
+  // an interactive session: it may be a temporary route outage, or a model
+  // selection the user can correct without losing the conversation. Mark all
+  // provider 404s retryable so Eve performs its bounded model-call retry and
+  // parks the session at `session.waiting` if the attempts are exhausted.
+  // `session.failed` remains reserved for failures that Eve cannot safely
+  // resume, such as structural workflow or authorization failures.
   if (error && typeof error === "object") {
     const explicit = Reflect.get(error, "isRetryable");
     if (typeof explicit === "boolean") {
-      // AI SDK derives `false` from the bare HTTP status. For 404 only, keep
-      // the session recoverable unless the provider body names a permanent
-      // missing/invalid model. An explicit `true` remains authoritative.
       if (explicit === true) return true;
-      if (statusCode !== 404 || isPermanentNotFound(error)) return false;
+      // A provider's `false` flag is commonly derived from HTTP status. Do
+      // not let that classification turn an otherwise recoverable 404 into a
+      // terminal Eve session.
+      if (statusCode === 404) return true;
+      return false;
     }
   }
   if (isTransientNetworkError(error)) return true;
@@ -99,24 +103,6 @@ function providerRetryable(
   // retryable; Eve owns a bounded three-attempt budget and parks an
   // interactive session after exhaustion instead of killing its context.
   return statusCode === 404 || statusCode === 408 || statusCode === 409 || statusCode === 429 || statusCode >= 500;
-}
-
-function isPermanentNotFound(error: unknown): boolean {
-  if (!error || typeof error !== "object") return false;
-  const values: string[] = [];
-  for (const key of ["type", "code", "message", "responseBody"] as const) {
-    const value = Reflect.get(error, key);
-    if (typeof value === "string") values.push(value);
-  }
-  const data = Reflect.get(error, "data");
-  if (data !== undefined) {
-    try {
-      values.push(JSON.stringify(data));
-    } catch {
-      // Ignore unserializable provider metadata.
-    }
-  }
-  return /(?:model[_ -]?not[_ -]?found|unknown[_ -]?model|resource[_ -]?not[_ -]?found|invalid[_ -]?request(?:[_ -]?error)?|model[^\n]{0,40}does not exist)/iu.test(values.join("\n"));
 }
 
 const TRANSIENT_NETWORK_CODES = new Set([

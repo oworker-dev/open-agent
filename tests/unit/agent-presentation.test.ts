@@ -64,6 +64,14 @@ test("permanent provider failures never fabricate a retry", () => {
   assert.equal(presentation.failure?.retryable, false);
 });
 
+test("provider 404 failures without an explicit flag remain retryable", () => {
+  assert.equal(isRetryableAgentFailure({
+    code: "MODEL_CALL_FAILED",
+    message: "The model Provider request failed (HTTP 404).",
+    statusCode: 404,
+  }), true);
+});
+
 test("a failed step without settled assistant parts keeps a display anchor", () => {
   const turnId = "turn-failed-anchor";
   const message: EveMessage = {

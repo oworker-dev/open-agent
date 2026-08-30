@@ -103,7 +103,12 @@ export function classifyAgentFailure(failure: AgentTurnFailure): AgentFailureCat
 export function isRetryableAgentFailure(failure: AgentTurnFailure): boolean {
   if (failure.retryable !== undefined) return failure.retryable;
   if (failure.statusCode !== undefined && failure.statusCode >= 400 && failure.statusCode < 500) {
-    return failure.statusCode === 408 || failure.statusCode === 409 || failure.statusCode === 425 || failure.statusCode === 429;
+    // Provider 404s are recoverable in Open Agent even when Eve's durable
+    // failure details omit its internal retryable flag. A missing route or
+    // model selection must not turn a long-lived interactive session into a
+    // terminal conversation; an explicit `retryable: false` above still wins
+    // for genuinely terminal failures from older/runtime-specific events.
+    return failure.statusCode === 404 || failure.statusCode === 408 || failure.statusCode === 409 || failure.statusCode === 425 || failure.statusCode === 429;
   }
   const category = classifyAgentFailure(failure);
   if (category === "unknown") return false;

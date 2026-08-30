@@ -70,6 +70,18 @@ try {
   assert(completedMessageText(resumedAfterNotFound) === "NOT_FOUND_CONTINUED",
     "The session did not continue after exhausting the temporary 404 retry budget.");
 
+  const exhaustedModelNotFound = await createAndConsume(eveUrl,
+    "PROVIDER_404_MODEL_NOT_FOUND. Reply exactly: STALE_MODEL");
+  assertRecoverableFailure(exhaustedModelNotFound.events,
+    "exhausted model-not-found provider error");
+  const resumedAfterModelNotFound = await consume(
+    exhaustedModelNotFound.session,
+    "Continue with a valid model. Reply exactly: MODEL_NOT_FOUND_CONTINUED",
+  );
+  assertCompleted(resumedAfterModelNotFound, "model-not-found continuation");
+  assert(completedMessageText(resumedAfterModelNotFound) === "MODEL_NOT_FOUND_CONTINUED",
+    "The session did not continue after an explicit model-not-found error.");
+
   const serverError = await completedTurn(eveUrl,
     "PROVIDER_500_RECOVER. Do not use tools. Reply exactly: SERVER_ERROR_RECOVERED");
   assert(messageText(serverError) === "SERVER_ERROR_RECOVERED", "500 recovery returned the wrong result.");
@@ -139,6 +151,8 @@ try {
     `Expected three 404 attempts, received ${state.scenarioAttempts.PROVIDER_404_RECOVER}.`);
   assert(state.scenarioAttempts.PROVIDER_404_THREE === 3,
     `Expected three exhausted 404 attempts, received ${state.scenarioAttempts.PROVIDER_404_THREE}.`);
+  assert(state.scenarioAttempts.PROVIDER_404_MODEL_NOT_FOUND === 3,
+    `Expected three model-not-found attempts, received ${state.scenarioAttempts.PROVIDER_404_MODEL_NOT_FOUND}.`);
   assert(state.scenarioAttempts.PROVIDER_500_RECOVER === 3,
     `Expected three 500 attempts, received ${state.scenarioAttempts.PROVIDER_500_RECOVER}.`);
   assert(state.scenarioAttempts.PROVIDER_408_RECOVER === 3,
@@ -155,6 +169,7 @@ try {
       rateLimitAttempts: state.scenarioAttempts.PROVIDER_429_RECOVER,
       temporaryNotFoundAttempts: state.scenarioAttempts.PROVIDER_404_RECOVER,
       exhaustedTemporaryNotFoundAttempts: state.scenarioAttempts.PROVIDER_404_THREE,
+      exhaustedModelNotFoundAttempts: state.scenarioAttempts.PROVIDER_404_MODEL_NOT_FOUND,
       requestTimeoutAttempts: state.scenarioAttempts.PROVIDER_408_RECOVER,
       serverErrorAttempts: state.scenarioAttempts.PROVIDER_500_RECOVER,
       streamInterruptionAttempts: state.scenarioAttempts.PROVIDER_STREAM_INTERRUPT_ONCE,
