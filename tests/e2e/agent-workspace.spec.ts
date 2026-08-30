@@ -359,6 +359,7 @@ test("transient session admission errors retry with a stable bounded counter", a
   await composer.press("Enter");
   await expect(composer).toHaveText("", { timeout: 300 });
   await expect(page.getByText("Retrying request (1/3)", { exact: true })).toBeVisible({ timeout: 3_000 });
+  await expect(page.locator('[data-agent-retry]').first()).toHaveAttribute("data-state", "closed");
   await expect(page.getByText("Recovered after retry.", { exact: true })).toBeVisible({ timeout: 8_000 });
   expect(attempts).toBe(3);
 });
@@ -389,8 +390,10 @@ test("a permanent Provider 404 is terminal and never enters a retry loop", async
   const composer = page.getByRole("textbox", { name: "Do anything" });
   await composer.fill("Use the unavailable model");
   await composer.press("Enter");
-  await expect(page.getByText("Provider request failed", { exact: true })).toBeVisible({ timeout: 8_000 });
+  await expect(page.getByText("Model request failed", { exact: true })).toBeVisible({ timeout: 8_000 });
   await expect(page.getByText(/Retrying request|Retry failed/)).toHaveCount(0);
+  await expect(page.locator('[data-agent-failure-alert]')).toBeVisible();
+  await expect(page.locator('[data-slot="collapsible"].group\\/execution')).toHaveCount(0);
   await expect(page.getByRole("log").getByText("Use the unavailable model", { exact: true })).toHaveCount(1);
   await page.waitForTimeout(1_500);
   expect(streamRequests).toBe(1);

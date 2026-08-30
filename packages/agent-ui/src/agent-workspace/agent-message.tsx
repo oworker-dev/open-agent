@@ -54,6 +54,7 @@ import {
 import { DiffViewer } from "../assistant-ui/diff-viewer.js";
 import { Button } from "../ui/button.js";
 import { Attachment, AttachmentAction, AttachmentContent, AttachmentDescription, AttachmentMedia, AttachmentTitle, AttachmentTrigger } from "../ui/attachment.js";
+import { Alert, AlertDescription, AlertTitle } from "../ui/alert.js";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "../ui/collapsible.js";
 import {
   Questionnaire,
@@ -195,7 +196,7 @@ export function AgentMessage({
   const publishedDeliverables = task?.status === "completed"
     ? deliverablesForTurn(events, displayMessage.metadata?.turnId)
     : [];
-  const directParts = !task && message.role === "assistant" && isStreaming &&
+  const directParts = !task && message.role === "assistant" && isStreaming && !failure &&
     !displayMessage.parts.some((part) => part.type === "reasoning")
     ? [
         {
@@ -207,6 +208,12 @@ export function AgentMessage({
         ...displayMessage.parts,
       ]
     : displayMessage.parts;
+  // A failed admission can leave an optimistic assistant row with no parts.
+  // Do not keep an empty execution collapsible in the layout; it otherwise
+  // contributes padding even though there is nothing to show.
+  const renderExecutionShell = showExecutionShell && (
+    Boolean(task) || isStreaming || directParts.length > 0
+  );
 
   return (
     <DeliverableOpenContext.Provider value={onOpenDeliverable}>
@@ -215,7 +222,7 @@ export function AgentMessage({
       from={message.role}
     >
       <MessageContent className={message.role === "assistant" ? "w-full" : undefined}>
-        {showExecutionShell ? (
+        {renderExecutionShell ? (
           <>
             <ExecutionGroup
               collapseWhenSettled={Boolean(task && task.status === "completed" && (
@@ -1336,12 +1343,14 @@ function StepFailure({
   readonly locale: AgentLocale;
 }) {
   return (
-    <div className="mb-1 flex items-start gap-2 text-sm text-destructive" role="alert">
-      <XCircleIcon className="mt-0.5 size-4 shrink-0" />
-      <span className="min-w-0 break-words">
-        {failureTitle(locale, failure)}: {sanitizeFailureMessage(failure.message)}
-      </span>
-    </div>
+    <Alert className="mb-2 py-2.5" data-agent-failure-alert variant="destructive">
+      <XCircleIcon />
+      <AlertTitle>{failureTitle(locale, failure)}</AlertTitle>
+      <AlertDescription>
+        <p>{failureSummary(locale, failure)}</p>
+        {failure.code ? <code className="break-all text-xs">{failure.code}</code> : null}
+      </AlertDescription>
+    </Alert>
   );
 }
 
@@ -1354,30 +1363,25 @@ function RetryStatus({
 }) {
   if (retry.exhausted) {
     return (
-      <div className="mb-1 text-sm text-muted-foreground">
-        <div className="flex max-w-full items-center gap-2 py-1.5 text-left">
-          <WifiIcon className="size-4 shrink-0" />
-          <span>
-            {localize(locale, "Retry failed", "重试失败")}
-            {retry.attempt !== undefined && retry.maximum !== undefined
-              ? ` (${retry.attempt}/${retry.maximum})`
-              : ""}
-          </span>
-        </div>
+      <Alert className="mb-2 py-2.5" data-agent-failure-alert variant="destructive">
+        <CircleAlertIcon />
+        <AlertTitle>
+          {localize(locale, "Retry failed", "重试失败")}
+          {retry.attempt !== undefined && retry.maximum !== undefined
+            ? ` (${retry.attempt}/${retry.maximum})`
+            : ""}
+        </AlertTitle>
         {retry.error ? (
-          <div className="ml-6 mt-1 flex min-w-0 items-start gap-2 rounded-xl border border-border/70 px-3 py-2 text-xs" role="alert">
-            <CircleAlertIcon className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
-            <div className="min-w-0">
-              <p className="break-words text-foreground">{sanitizeFailureMessage(retry.error.message)}</p>
-              <code className="mt-1 block break-all text-muted-foreground">{retry.error.code}</code>
-            </div>
-          </div>
+          <AlertDescription>
+            <p>{failureSummary(locale, retry.error)}</p>
+            {retry.error.code ? <code className="break-all text-xs">{retry.error.code}</code> : null}
+          </AlertDescription>
         ) : null}
-      </div>
+      </Alert>
     );
   }
   return (
-    <Collapsible className="mb-1 text-sm text-muted-foreground" defaultOpen={false}>
+    <Collapsible className="mb-1 text-sm text-muted-foreground" data-agent-retry defaultOpen={false}>
       <CollapsibleTrigger className="group/retry flex max-w-full items-center gap-2 py-1.5 text-left hover:text-foreground">
         <WifiIcon className="size-4 shrink-0" />
         <span>
@@ -1391,7 +1395,7 @@ function RetryStatus({
       {retry.error ? (
         <CollapsibleContent className="overflow-hidden">
           <div className="ml-6 mt-1 max-w-full text-xs">
-            <p className="break-words text-foreground">{sanitizeFailureMessage(retry.error.message)}</p>
+            <p className="break-words text-foreground">{failureSummary(locale, retry.error)}</p>
             <code className="mt-1 block break-all text-muted-foreground">{retry.error.code}</code>
           </div>
         </CollapsibleContent>
@@ -2732,14 +2736,14 @@ function TurnFailure({ failure, locale }: { readonly failure: { readonly code: s
     );
   }
   return (
-    <div className="mt-2 flex items-start gap-2 px-1 py-1.5 text-sm" role="alert">
-      <XCircleIcon className="mt-0.5 size-4 shrink-0 text-destructive" />
-      <div className="min-w-0 flex-1">
-        <p className="font-medium text-destructive">{failureTitle(locale, failure)}</p>
-        <p className="mt-1 break-words text-muted-foreground">{sanitizeFailureMessage(failure.message)}</p>
-        <code className="mt-1.5 block text-xs text-muted-foreground">{failure.code}</code>
-      </div>
-    </div>
+    <Alert className="mt-2 py-2.5" data-agent-failure-alert variant="destructive">
+      <XCircleIcon />
+      <AlertTitle>{failureTitle(locale, failure)}</AlertTitle>
+      <AlertDescription>
+        <p>{failureSummary(locale, failure)}</p>
+        {failure.code ? <code className="break-all text-xs">{failure.code}</code> : null}
+      </AlertDescription>
+    </Alert>
   );
 }
 
@@ -2751,8 +2755,19 @@ function failureTitle(locale: AgentLocale, failure: { readonly code: string; rea
   switch (classifyAgentFailure(failure)) {
     case "network": return localize(locale, "Network error", "网络错误");
     case "timeout": return localize(locale, "Request timed out", "请求超时");
-    case "provider": return localize(locale, "Provider request failed", "上游模型请求失败");
+    case "provider": return localize(locale, "Model request failed", "模型请求失败");
     default: return localize(locale, "This turn failed", "本轮执行失败");
+  }
+}
+
+function failureSummary(locale: AgentLocale, failure: AgentTurnFailure): string {
+  const statusCode = failure.statusCode;
+  const status = statusCode === undefined ? "" : ` (HTTP ${statusCode})`;
+  switch (classifyAgentFailure(failure)) {
+    case "network": return localize(locale, `The connection failed${status}.`, `连接失败${status}。`);
+    case "timeout": return localize(locale, `The request timed out${status}.`, `请求超时${status}。`);
+    case "provider": return localize(locale, `The model request could not be completed${status}.`, `模型请求未完成${status}。`);
+    default: return localize(locale, `The request could not be completed${status}.`, `请求未完成${status}。`);
   }
 }
 
@@ -2761,15 +2776,9 @@ function retryTitle(locale: AgentLocale, failure: { readonly code: string; reado
   switch (classifyAgentFailure(failure)) {
     case "network": return localize(locale, "Reconnecting", "正在重新连接");
     case "timeout": return localize(locale, "Retrying after timeout", "超时后正在重试");
-    case "provider": return localize(locale, "Retrying provider request", "正在重试上游请求");
+    case "provider": return localize(locale, "Retrying model request", "正在重试模型请求");
     default: return localize(locale, "Retrying", "正在重试");
   }
-}
-
-function sanitizeFailureMessage(message: string): string {
-  return message
-    .replace(/(["']?base[_ -]?url["']?\s*[:=]\s*)["']?https?:\/\/[^\s,"'}]+["']?/giu, "$1[hidden]")
-    .replace(/https?:\/\/[^\s)\]}>"']+/giu, "[provider endpoint hidden]");
 }
 
 function localize(locale: AgentLocale, english: string, chinese: string): string {

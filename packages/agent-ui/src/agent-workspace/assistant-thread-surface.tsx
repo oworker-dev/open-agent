@@ -22,6 +22,7 @@ import {
   CircleGaugeIcon,
   CircleXIcon,
   CopyIcon,
+  ChevronDownIcon,
   FileIcon,
   ImageIcon,
   LockKeyholeIcon,
@@ -33,6 +34,7 @@ import {
   SlashIcon,
   SquareIcon,
   WrenchIcon,
+  WifiIcon,
   XIcon,
 } from "lucide-react";
 import { type FormEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
@@ -45,7 +47,9 @@ import { ModelSelector, type ModelOption } from "../assistant-ui/model-selector.
 import { ToolFallback } from "../assistant-ui/tool-fallback.js";
 import { TooltipIconButton } from "../assistant-ui/tooltip-icon-button.js";
 import { Button } from "../ui/button.js";
+import { Alert, AlertDescription, AlertTitle } from "../ui/alert.js";
 import { Attachment, AttachmentContent, AttachmentDescription, AttachmentGroup, AttachmentMedia, AttachmentTitle, AttachmentTrigger } from "../ui/attachment.js";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "../ui/collapsible.js";
 import { cn } from "../utils.js";
 import {
   DropdownMenu,
@@ -200,7 +204,9 @@ export function AssistantThreadSurface({
               canRespond={!isBusy || canRespondToInputRequest}
               events={events}
               fallbackStartedAt={fallbackStartedAt}
-              isStreaming={isBusy && message.id === lastAssistantMessageId}
+              // A terminal/retry error replaces the live thinking placeholder;
+              // keeping it mounted leaves an empty execution shell in the row.
+              isStreaming={isBusy && !runtimeError && message.id === lastAssistantMessageId}
               isTurnContinuation={isSteeringContinuationMessage(message, events)}
               locale={locale}
               message={eveMessagesById.get(message.id)}
@@ -329,33 +335,42 @@ function RuntimeErrorMessage({
       : failure
         ? failureTitle(locale, failure)
         : locale === "zh-CN" ? "本轮执行失败" : messages.requestFailed;
-  return (
-    <article className="mx-auto flex w-full max-w-(--thread-max-width) flex-col" data-agent-message-error role="alert">
-      <div className="flex items-start gap-3 px-1 text-sm">
-        <CircleXIcon className="mt-0.5 size-4 shrink-0 text-destructive" />
-        <div className="min-w-0 flex-1">
-          <p className="font-medium text-foreground">
+  const detailFailure = retry?.error ?? failure ?? { code: "", message };
+  if (retry && !retry.exhausted) {
+    return (
+      <Collapsible className="mx-auto w-full max-w-(--thread-max-width) text-sm text-muted-foreground" data-agent-retry defaultOpen={false}>
+        <CollapsibleTrigger className="group/retry flex max-w-full items-center gap-2 px-1 py-1.5 text-left hover:text-foreground">
+          <WifiIcon className="size-4 shrink-0" />
+          <span>
             {title}
-          </p>
-          {!retry?.exhausted ? <p className="mt-1 break-words text-muted-foreground">{message}</p> : null}
-          {retry?.exhausted ? (
-            <>
-              <p className="mt-1 break-words text-muted-foreground">{retry.error.message}</p>
-              <code className="mt-1 block break-all text-xs text-muted-foreground">
-                {retry.error.code || "provider_request_failed"}
-              </code>
-            </>
-          ) : null}
-          {!retry?.exhausted && !retry && !transient ? <p className="mt-1 text-muted-foreground">{messages.requestPreserved}</p> : null}
-          {onRetry ? (
-            <Button className="mt-2 h-7 px-2.5 text-xs" onClick={onRetry} size="sm" variant="outline">
-              <RotateCcwIcon className="size-3.5" />
-              {messages.retry}
-            </Button>
-          ) : null}
-        </div>
-      </div>
-    </article>
+          </span>
+          <ChevronDownIcon className="size-3.5 -rotate-90 transition-transform group-data-[state=open]/retry:rotate-0" />
+        </CollapsibleTrigger>
+        <CollapsibleContent className="overflow-hidden">
+          <div className="ml-7 mt-1 max-w-full text-xs">
+            <p className="break-words text-foreground">{failureSummary(locale, detailFailure)}</p>
+            {detailFailure.code ? <code className="mt-1 block break-all text-muted-foreground">{detailFailure.code}</code> : null}
+          </div>
+        </CollapsibleContent>
+      </Collapsible>
+    );
+  }
+  return (
+    <Alert className="mx-auto mt-2 w-full max-w-(--thread-max-width) py-2.5" data-agent-failure-alert data-agent-message-error variant="destructive">
+      <CircleXIcon />
+      <AlertTitle>{title}</AlertTitle>
+      <AlertDescription>
+        <p>{failureSummary(locale, detailFailure)}</p>
+        {detailFailure.code ? <code className="break-all text-xs">{detailFailure.code}</code> : null}
+        {!retry?.exhausted && !retry && !transient ? <p>{messages.requestPreserved}</p> : null}
+        {onRetry ? (
+          <Button className="mt-1 h-7 px-2.5 text-xs" onClick={onRetry} size="sm" variant="outline">
+            <RotateCcwIcon className="size-3.5" />
+            {messages.retry}
+          </Button>
+        ) : null}
+      </AlertDescription>
+    </Alert>
   );
 }
 
@@ -363,8 +378,19 @@ function failureTitle(locale: AgentLocale, failure: AgentTurnFailure): string {
   switch (classifyAgentFailure(failure)) {
     case "network": return locale === "zh-CN" ? "网络连接失败" : "Network connection failed";
     case "timeout": return locale === "zh-CN" ? "请求超时" : "Request timed out";
-    case "provider": return locale === "zh-CN" ? "上游模型请求失败" : "Provider request failed";
+    case "provider": return locale === "zh-CN" ? "模型请求失败" : "Model request failed";
     default: return locale === "zh-CN" ? "本轮执行失败" : "This turn failed";
+  }
+}
+
+function failureSummary(locale: AgentLocale, failure: AgentTurnFailure): string {
+  const statusCode = failure.statusCode;
+  const status = statusCode === undefined ? "" : ` (HTTP ${statusCode})`;
+  switch (classifyAgentFailure(failure)) {
+    case "network": return locale === "zh-CN" ? `连接失败${status}。` : `The connection failed${status}.`;
+    case "timeout": return locale === "zh-CN" ? `请求超时${status}。` : `The request timed out${status}.`;
+    case "provider": return locale === "zh-CN" ? `模型请求未完成${status}。` : `The model request could not be completed${status}.`;
+    default: return locale === "zh-CN" ? `请求未完成${status}。` : `The request could not be completed${status}.`;
   }
 }
 
