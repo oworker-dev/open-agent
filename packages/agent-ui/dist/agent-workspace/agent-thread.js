@@ -5,6 +5,7 @@ import { useEveAgent } from "eve/react";
 import { AssistantRuntimeProvider, unstable_defaultDirectiveFormatter, useExternalStoreRuntime } from "@assistant-ui/react";
 import { Clock3Icon, HammerIcon, LoaderCircleIcon, RotateCcwIcon, SearchIcon, ShieldCheckIcon, SparklesIcon, XIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { Button } from "../ui/button.js";
 import { cn } from "../utils.js";
 import { attachAgentSession, createAgentSession } from "./agent-client.js";
@@ -82,10 +83,12 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     const [localInterruption, setLocalInterruption] = useState();
     const [cancellationError, setCancellationError] = useState();
     const [queueError, setQueueError] = useState();
-    const [turnError, setTurnError] = useState(() => latestTurnFailure(thread.events));
+    const [turnError, setTurnError] = useState(() => isPendingTurnInFlight(thread.pendingTurn) ? undefined : latestTurnFailure(thread.events));
     const [providerRetry, setProviderRetry] = useState(undefined);
     const [optimisticPendingTurn, setOptimisticPendingTurn] = useState(undefined);
     const [optimisticDisplayTurn, setOptimisticDisplayTurn] = useState(undefined);
+    const [stagedEditEvents, setStagedEditEvents] = useState(undefined);
+    const [preserveViewportDuringEdit, setPreserveViewportDuringEdit] = useState(false);
     const providerRetryKeyRef = useRef(undefined);
     const providerRetryAttemptRef = useRef(0);
     const providerRetryTimerRef = useRef(undefined);
@@ -353,6 +356,8 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     const recoveryRenderMessages = useMemo(() => isRecovering ? messagesFromEvents(recoveryRenderEvents) : [], [isRecovering, recoveryRenderEvents]);
     const effectiveRenderEvents = isRecovering ? recoveryRenderEvents : renderEvents;
     const effectiveRenderMessages = isRecovering ? recoveryRenderMessages : renderMessages;
+    const projectionEvents = stagedEditEvents ?? effectiveRenderEvents;
+    const projectionMessages = stagedEditEvents ? messagesFromEvents(stagedEditEvents) : effectiveRenderMessages;
     const runtimeIsBusy = agent.status === "submitted" || agent.status === "streaming";
     const admissionPendingTurn = optimisticPendingTurn ?? thread.pendingTurn;
     const displayPendingTurn = optimisticDisplayTurn ?? optimisticPendingTurn ?? thread.pendingTurn;
@@ -996,7 +1001,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         })
         : thread.interruptedTurns ?? [], [localInterruption, thread.interruptedTurns]);
     const interruptedDisplayEvents = useMemo(() => {
-        const settled = dedupeThreadEvents(effectiveRenderEvents);
+        const settled = dedupeThreadEvents(projectionEvents);
         if (displayInterruptedTurns.length === 0)
             return settled;
         let visible = settled.filter((event, index) => !shouldSuppressInterruptedTurnDisplayEvent(event, index, displayInterruptedTurns));
@@ -1004,19 +1009,19 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             visible = withLocalInterruptedBoundary(visible, interruptedTurn.turnId);
         }
         return visible;
-    }, [displayInterruptedTurns, effectiveRenderEvents]);
+    }, [displayInterruptedTurns, projectionEvents]);
     const projectedRuntimeMessages = useMemo(() => {
         const source = displayInterruptedTurns.length > 0
             ? messagesFromEvents(interruptedDisplayEvents)
-            : effectiveRenderMessages;
+            : projectionMessages;
         return normalizeSettledAgentMessages(source, interruptedDisplayEvents);
-    }, [displayInterruptedTurns.length, effectiveRenderMessages, interruptedDisplayEvents]);
+    }, [displayInterruptedTurns.length, interruptedDisplayEvents, projectionMessages]);
     const displayMessageIdentityRef = useRef({
         assistantByTurn: new Map(),
         pendingRoot: undefined,
     });
     const projectedMessages = useMemo(() => projectStagedUserMessages(stabilizeDisplayMessageIdentities(ensureActiveAssistantMessage(projectedRuntimeMessages, interruptedDisplayEvents, isBusy || isPendingTurnInFlight(admissionPendingTurn) || Boolean(latestTurnFailure(interruptedDisplayEvents)), displayPendingTurn, optimisticPendingTurn?.id === displayPendingTurn?.id), interruptedDisplayEvents, displayPendingTurn, displayMessageIdentityRef.current), thread.queuedTurns.filter((turn) => turn.intent === "post-cancellation"), interruptedDisplayEvents), [admissionPendingTurn, displayPendingTurn, interruptedDisplayEvents, isBusy, optimisticPendingTurn, projectedRuntimeMessages, thread.queuedTurns]);
-    const ungroupedVisibleMessages = useMemo(() => projectedMessages.filter((message) => !isProxiedInputOnlyMessage(message, effectiveRenderEvents)), [effectiveRenderEvents, projectedMessages]);
+    const ungroupedVisibleMessages = useMemo(() => projectedMessages.filter((message) => !isProxiedInputOnlyMessage(message, projectionEvents)), [projectionEvents, projectedMessages]);
     const ungroupedDisplayEvents = interruptedDisplayEvents;
     const displayTimeline = useMemo(() => projectAgentDisplayTimeline(ungroupedVisibleMessages, ungroupedDisplayEvents), [ungroupedDisplayEvents, ungroupedVisibleMessages]);
     const displayEvents = displayTimeline.events;
@@ -1081,7 +1086,11 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         };
         pendingEditedTurnOperations.add(`${pendingTurn.id}:clear`);
         const retainedEvents = eventsBeforeLastUserTurn(agent.events);
-        queueMicrotask(() => {
+        flushSync(() => {
+            setPreserveViewportDuringEdit(true);
+            setStagedEditEvents(retainedEvents);
+            setOptimisticPendingTurn(pendingTurn);
+            setOptimisticDisplayTurn(pendingTurn);
             onChange({
                 events: retainedEvents,
                 retainedContext: rewriteContextFromEvents(retainedEvents, recoveryContextWindowTokens),
@@ -1096,6 +1105,9 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
                 updatedAt: Date.now(),
             });
         });
+        pendingTurnRef.current = pendingTurn;
+        compactedEventsRef.current = [...retainedEvents];
+        compactedEventIdsRef.current = new Set(retainedEvents.map(eventIdentity));
     };
     const assetUploadAdapter = useMemo(() => client?.assetUpload ?? createHttpAgentAssetUploadAdapter(client), [client]);
     const attachmentAdapter = useMemo(() => createBrowserAttachmentAdapter(assetUploadAdapter, () => sessionRef.current?.state.sessionId ?? thread.session.sessionId), [assetUploadAdapter, thread.session.sessionId]);
@@ -1165,7 +1177,6 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
                 pendingEditedTurnOperations.add(`${pendingTurn.id}:resubmit`);
                 onChange({
                     pendingTurn: { ...pendingTurn, state: "resubmitting" },
-                    revision: (thread.revision ?? 0) + 1,
                     session: durableSession.state,
                     status: "ready",
                     updatedAt: Date.now(),
@@ -1177,6 +1188,10 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
                 editStagePendingRef.current = false;
                 editResubmitPendingRef.current = false;
                 turnAdmissionBusyRef.current = false;
+                setPreserveViewportDuringEdit(false);
+                setOptimisticPendingTurn(undefined);
+                setOptimisticDisplayTurn(undefined);
+                setStagedEditEvents(undefined);
                 onChange({ pendingTurn: { ...pendingTurn, state: "delivery-failed" }, status: "error" });
                 setTurnError(error instanceof Error ? error.message : "Unable to resend this message.");
             }
@@ -1353,7 +1368,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     };
     const closeInputRequest = (requestId) => closeInputRequests([requestId]);
     const visibleQueuedTurns = thread.queuedTurns.filter((turn) => turn.intent !== "post-cancellation");
-    return (_jsx(AssistantRuntimeProvider, { runtime: assistantRuntime, children: _jsx("main", { className: "flex min-h-0 flex-1 flex-col overflow-hidden", children: _jsx(AssistantThreadSurface, { assetUrl: client?.assetUrl, approvalTakeover: approvalTakeover, cancellationState: cancellationState, commands: commands, composerTop: isRecovering || visibleQueuedTurns.length > 0 || queueError ? (_jsxs(_Fragment, { children: [isRecovering ? (_jsxs("div", { className: "flex items-center gap-2 border-b border-border/60 px-1 pb-2 text-xs text-muted-foreground", "data-agent-recovery-status": true, role: "status", children: [_jsx(LoaderCircleIcon, { className: "size-3.5 animate-spin" }), _jsx("span", { children: messages.reconnecting })] })) : null, visibleQueuedTurns.length > 0 || queueError ? (_jsx(FollowUpQueue, { error: queueError, messages: messages, onRemove: removeQueuedTurn, onRetry: markQueuedTurnForRetry, turns: visibleQueuedTurns })) : null] })) : undefined, draftStorageKey: draftStorageKey, historyHasMore: historyHasMore, historyLoading: historyLoading, events: displayEvents, eveMessages: visibleMessages, fallbackStartedAt: displayPendingTurn?.submittedAt, inputDisabled: inputLocked, isBusy: isBusy, sessionTerminal: sessionTerminal, sessionSettled: durableTurnSettled, onCancel: requestCancellation, locale: locale, mentions: mentions, messages: messages, models: models, onInputResponses: respond, onCloseInputRequest: closeInputRequest, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, onLoadEarlier: onLoadEarlier, onPreferencesChange: (preferences) => onChange({ preferences }), onDraftRestoreConsumed: (id) => {
+    return (_jsx(AssistantRuntimeProvider, { runtime: assistantRuntime, children: _jsx("main", { className: "flex min-h-0 flex-1 flex-col overflow-hidden", children: _jsx(AssistantThreadSurface, { assetUrl: client?.assetUrl, approvalTakeover: approvalTakeover, cancellationState: cancellationState, commands: commands, composerTop: isRecovering || visibleQueuedTurns.length > 0 || queueError ? (_jsxs(_Fragment, { children: [isRecovering ? (_jsxs("div", { className: "flex items-center gap-2 border-b border-border/60 px-1 pb-2 text-xs text-muted-foreground", "data-agent-recovery-status": true, role: "status", children: [_jsx(LoaderCircleIcon, { className: "size-3.5 animate-spin" }), _jsx("span", { children: messages.reconnecting })] })) : null, visibleQueuedTurns.length > 0 || queueError ? (_jsx(FollowUpQueue, { error: queueError, messages: messages, onRemove: removeQueuedTurn, onRetry: markQueuedTurnForRetry, turns: visibleQueuedTurns })) : null] })) : undefined, draftStorageKey: draftStorageKey, historyHasMore: historyHasMore, historyLoading: historyLoading, events: displayEvents, eveMessages: visibleMessages, fallbackStartedAt: displayPendingTurn?.submittedAt, inputDisabled: inputLocked, isBusy: isBusy, scrollToBottomOnInitialize: !preserveViewportDuringEdit && thread.pendingTurn?.state !== "clearing" && thread.pendingTurn?.state !== "resubmitting", scrollToBottomOnThreadSwitch: !preserveViewportDuringEdit && thread.pendingTurn?.state !== "clearing" && thread.pendingTurn?.state !== "resubmitting", sessionTerminal: sessionTerminal, sessionSettled: durableTurnSettled, onCancel: requestCancellation, locale: locale, mentions: mentions, messages: messages, models: models, onInputResponses: respond, onCloseInputRequest: closeInputRequest, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, onLoadEarlier: onLoadEarlier, onPreferencesChange: (preferences) => onChange({ preferences }), onDraftRestoreConsumed: (id) => {
                     if (thread.draftRestore?.id === id)
                         onChange({ draftRestore: undefined });
                 }, onRetryRuntimeError: recoveryError ? onRetryRecovery : undefined, closedInputRequestIds: closedInputRequestIdsRef.current, preferences: thread.preferences, reasoningLevels: reasoningLevels, draftRestore: thread.draftRestore, runtimeFailure: runtimeFailure, runtimeError: runtimeError, runtimeRetry: providerRetry, usage: usage }) }) }));

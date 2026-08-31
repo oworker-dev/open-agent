@@ -375,9 +375,7 @@ test("a Provider 404 remains recoverable and keeps the edit affordance", async (
   });
   await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
     await route.fulfill({
-      body: mockProviderFailureTurn("Use the unavailable model", {
-        statusCode: 404,
-      }),
+      body: mockProviderFailureTurn("Use the unavailable model", { retryAttempts: 3, statusCode: 404 }),
       contentType: "application/x-ndjson",
       status: 200,
     });
@@ -389,7 +387,7 @@ test("a Provider 404 remains recoverable and keeps the edit affordance", async (
   await composer.press("Enter");
   await expect(page.getByText(/Retry failed/)).toBeVisible({ timeout: 8_000 });
   await expect(page.locator('[data-agent-retry]')).toHaveCount(1);
-  await expect(page.locator('[data-agent-retry]').getByText(/Retrying model request \(3\/3\)/)).toBeVisible();
+  await expect(page.locator('[data-agent-retry]').getByText(/Retrying \(3\/3\)/)).toBeVisible();
   await expect(page.locator('[data-agent-retry]')).toHaveAttribute("data-state", "closed");
   await expect(page.locator('[data-agent-failure-alert]')).toBeVisible();
   await expect(page.getByRole("log").getByText("Use the unavailable model", { exact: true })).toHaveCount(1);
@@ -433,7 +431,7 @@ test("a terminal Provider turn failure uses the retry presentation at its Agent 
   });
   await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
     await route.fulfill({
-      body: mockProviderFailureTurn("Build the enterprise website"),
+      body: mockProviderFailureTurn("Build the enterprise website", { retryAttempts: 3 }),
       contentType: "application/x-ndjson",
       status: 200,
     });
@@ -1190,6 +1188,53 @@ test("a second turn keeps its thinking placeholder visible before the Provider r
   await expect(page.getByRole("log").getByText("Second turn", { exact: true })).toHaveCount(1);
 });
 
+test("a pending second turn does not reuse the previous turn's reasoning", async ({ page }) => {
+  const sessionId = "investigation-reasoning-residue-session";
+  const firstTurn = eventsFromNdjson(mockReasoningMarkdownTurn());
+  const secondTurn = eventsFromNdjson(mockContinuationTurn("Second turn", "Second completed", 1));
+  let streamCalls = 0;
+  await page.route("**/eve/v1/session", async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({ sessionId }),
+      contentType: "application/json",
+      headers: { "x-eve-session-id": sessionId },
+      status: 200,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}`, async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({ sessionId }),
+      contentType: "application/json",
+      headers: { "x-eve-session-id": sessionId },
+      status: 200,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
+    streamCalls += 1;
+    if (streamCalls > 1) await new Promise((resolve) => setTimeout(resolve, 1_000));
+    const events = streamCalls === 1 ? firstTurn : secondTurn;
+    await route.fulfill({
+      body: `${events.map((event) => JSON.stringify(event)).join("\n")}\n`,
+      contentType: "application/x-ndjson",
+      status: 200,
+    });
+  });
+
+  await page.goto("/");
+  const composer = page.getByRole("textbox", { name: "Do anything" });
+  await composer.fill("Explain the result");
+  await composer.press("Enter");
+  await expect(page.getByText("Markdown is active.", { exact: true })).toBeVisible({ timeout: 8_000 });
+
+  await composer.fill("Second turn");
+  await composer.press("Enter");
+  const activeReasoning = page.locator('[data-slot="reasoning-root"][role="status"]').last();
+  await expect(activeReasoning).toBeVisible({ timeout: 2_000 });
+  await expect(activeReasoning).toContainText("Thinking");
+  await expect(activeReasoning).not.toContainText("Check the result.");
+  await expect(page.getByText("Second completed", { exact: true })).toBeVisible({ timeout: 8_000 });
+});
+
 test("provider failure feedback does not remount the active reasoning row", async ({ page }) => {
   const sessionId = "investigation-failure-flash-session";
   const turnId = "turn_investigation_failure_flash";
@@ -1282,6 +1327,41 @@ for (const editScenario of [
 ] as const) {
 test(`editing the latest user turn with ${editScenario.label} waits for clear and resends on the same session`, async ({ page }) => {
   const { editedReply, editedRequest, sessionId } = editScenario;
+  await page.addInitScript(() => {
+    const nativeScrollTo = HTMLElement.prototype.scrollTo;
+    const invokeNativeScrollTo = nativeScrollTo as unknown as (this: HTMLElement, optionsOrX?: ScrollToOptions | number, y?: number) => void;
+    const browser = window as typeof window & {
+      __openAgentThreadScrolls?: Array<{ readonly behavior?: ScrollBehavior; readonly top?: number }>;
+    };
+    browser.__openAgentThreadScrolls = [];
+    const editProbe = window as typeof window & {
+      __editRemountProbe?: { active: boolean; viewportChanges: number; assistantChanges: number; lastViewport?: Element; lastAssistant?: Element };
+    };
+    editProbe.__editRemountProbe = { active: false, viewportChanges: 0, assistantChanges: 0 };
+    const sampleEditNodes = () => {
+      const probe = editProbe.__editRemountProbe;
+      if (probe?.active) {
+        const viewport = document.querySelector('[data-slot="thread-viewport"]');
+        const assistant = document.querySelector('[role="log"] article:not(:has([data-slot="message-content"]))') ?? document.querySelector('[role="log"] article');
+        if (viewport && probe.lastViewport && viewport !== probe.lastViewport) probe.viewportChanges += 1;
+        if (assistant && probe.lastAssistant && assistant !== probe.lastAssistant) probe.assistantChanges += 1;
+        if (viewport) probe.lastViewport = viewport;
+        if (assistant) probe.lastAssistant = assistant;
+      }
+      requestAnimationFrame(sampleEditNodes);
+    };
+    requestAnimationFrame(sampleEditNodes);
+    HTMLElement.prototype.scrollTo = function (optionsOrX?: ScrollToOptions | number, y?: number) {
+      if (this.getAttribute("data-slot") === "thread-viewport") {
+        const record = typeof optionsOrX === "number"
+          ? { top: optionsOrX }
+          : { ...(optionsOrX?.behavior ? { behavior: optionsOrX.behavior } : {}), ...(typeof optionsOrX?.top === "number" ? { top: optionsOrX.top } : {}) };
+        browser.__openAgentThreadScrolls?.push(record);
+      }
+      if (typeof optionsOrX === "number") invokeNativeScrollTo.call(this, optionsOrX, y ?? 0);
+      else invokeNativeScrollTo.call(this, optionsOrX);
+    };
+  });
   let streamCalls = 0;
   let clearCalls = 0;
   let clearBoundaryPending = false;
@@ -1382,6 +1462,18 @@ test(`editing the latest user turn with ${editScenario.label} waits for clear an
     await editInput.fill("");
     await editInput.pressSequentially(editedRequest);
   }
+  await page.evaluate(() => {
+    const browser = window as typeof window & { __openAgentThreadScrolls?: unknown[] };
+    browser.__openAgentThreadScrolls = [];
+    const probe = (window as typeof window & { __editRemountProbe?: { active: boolean; viewportChanges: number; assistantChanges: number; lastViewport?: Element; lastAssistant?: Element } }).__editRemountProbe;
+    if (probe) {
+      probe.active = true;
+      probe.viewportChanges = 0;
+      probe.assistantChanges = 0;
+      probe.lastViewport = document.querySelector('[data-slot="thread-viewport"]') ?? undefined;
+      probe.lastAssistant = document.querySelector('[role="log"] article:not(:has([data-slot="message-content"]))') ?? document.querySelector('[role="log"] article') ?? undefined;
+    }
+  });
   await editComposer.getByRole("button", { name: "Send", exact: true }).click();
 
   // The visible revision changes atomically; Eve's clear/rebuild transport may
@@ -1393,6 +1485,18 @@ test(`editing the latest user turn with ${editScenario.label} waits for clear an
   await page.waitForTimeout(250);
   await expect(page.getByRole("log").getByText(editedRequest, { exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { name: editedRequest, exact: true })).toBeVisible();
+  const editScrolls = await page.evaluate(() =>
+    (window as typeof window & {
+      __openAgentThreadScrolls?: Array<{ readonly behavior?: ScrollBehavior; readonly top?: number }>;
+    }).__openAgentThreadScrolls ?? []
+  );
+  expect(editScrolls.filter((scroll) => scroll.behavior === "instant")).toHaveLength(0);
+  const editRemounts = await page.evaluate(() => {
+    const probe = (window as typeof window & { __editRemountProbe?: { viewportChanges: number; assistantChanges: number } }).__editRemountProbe;
+    return { viewportChanges: probe?.viewportChanges ?? 0, assistantChanges: probe?.assistantChanges ?? 0 };
+  });
+  expect(editRemounts.viewportChanges).toBeLessThanOrEqual(1);
+  expect(editRemounts.assistantChanges).toBeLessThanOrEqual(1);
   releaseEditedStream?.();
   await expect(page.getByText(editedReply, { exact: true })).toBeVisible();
   await expect(page.getByRole("log").getByText("Original delivery.", { exact: true })).toHaveCount(0);
@@ -1406,6 +1510,79 @@ test(`editing the latest user turn with ${editScenario.label} waits for clear an
   expect(streamCalls).toBeGreaterThanOrEqual(2);
 });
 }
+
+test("editing after a final failure removes the stale assistant row before resend", async ({ page }) => {
+  const sessionId = "failed-edit-transition-session";
+  const failedEvents = eventsFromNdjson(mockProviderFailureTurn("Original request", {
+    retryAttempts: 3,
+    statusCode: 404,
+  }));
+  setFakeThreadCollection(page, {
+    activeThreadId: "failed-edit-transition-thread",
+    threads: [{
+      createdAt: Date.now(),
+      events: failedEvents,
+      id: "failed-edit-transition-thread",
+      preferences: { executionMode: "standard", modelId: "gpt-5.6-sol", reasoning: "medium" },
+      session: { sessionId, streamIndex: failedEvents.length },
+      status: "error",
+      title: "Original request",
+      updatedAt: Date.now(),
+    }],
+    version: 2,
+  });
+
+  let clearRequested = false;
+  await page.route(`**/eve/v1/session/${sessionId}/clear`, async (route) => {
+    clearRequested = true;
+    await route.fulfill({
+      body: JSON.stringify({ ok: true, sessionId, status: "accepted" }),
+      contentType: "application/json",
+      status: 202,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}`, async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({ sessionId }),
+      contentType: "application/json",
+      status: 200,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
+    if (clearRequested) {
+      clearRequested = false;
+      const at = new Date().toISOString();
+      await route.fulfill({
+        body: `${[
+          { data: { sequence: 1, sessionId, turnId: "clear_1" }, meta: { at }, type: "context.cleared" },
+          { data: { wait: "next-user-message" }, meta: { at }, type: "session.waiting" },
+        ].map((event) => JSON.stringify(event)).join("\n")}\n`,
+        contentType: "application/x-ndjson",
+        status: 200,
+      });
+      return;
+    }
+    await route.fulfill({
+      body: mockContinuationTurn("Edited request", "Edited delivery.", 1),
+      contentType: "application/x-ndjson",
+      status: 200,
+    });
+  });
+
+  await page.goto("/threads/failed-edit-transition-thread");
+  await expect(page.getByText("Retry failed", { exact: true })).toBeVisible();
+  await page.getByRole("log").getByText("Original request", { exact: true }).hover();
+  await page.getByRole("button", { name: "Edit message", exact: true }).click();
+  const editComposer = page.locator("[data-agent-edit-composer]");
+  await editComposer.getByRole("textbox").fill("Edited request");
+  await editComposer.getByRole("button", { name: "Send", exact: true }).click();
+
+  // The stale terminal assistant message must be gone during the clear
+  // handshake; only the edited optimistic user message remains visible.
+  await expect(page.getByText("Retry failed", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("log").getByText("Edited request", { exact: true })).toBeVisible();
+  await expect(page.getByText("Edited delivery.", { exact: true })).toBeVisible();
+});
 
 test("Codex apply_patch envelopes render with the assistant-ui diff viewer and live counts", async ({ page }) => {
   const sessionId = "mock-patch-viewer-session";
@@ -4315,7 +4492,7 @@ function mockSuccessfulTurn(message: string, reply: string, sequence = 0): strin
 
 function mockProviderFailureTurn(
   message: string,
-  options: { readonly retryable?: boolean; readonly statusCode?: number } = {},
+  options: { readonly retryAttempts?: number; readonly retryable?: boolean; readonly statusCode?: number } = {},
 ): string {
   const at = new Date().toISOString();
   const turnId = "turn_provider_failure";
@@ -4337,11 +4514,28 @@ function mockProviderFailureTurn(
   };
   const turnFailure = { ...failure };
   delete (turnFailure as { stepIndex?: number }).stepIndex;
+  const retryEvents = Array.from({ length: options.retryAttempts ?? 0 }, (_, index) => ({
+    data: {
+      attempt: index + 1,
+      error: {
+        code: "EveOwnedProviderAttemptError",
+        message: failure.message,
+        ...(options.statusCode === undefined ? {} : { statusCode: options.statusCode }),
+      },
+      maximum: options.retryAttempts ?? 3,
+      sequence: 0,
+      stepIndex: 0,
+      turnId,
+    },
+    meta: { at },
+    type: "model.retrying",
+  }));
   const events = [
     { data: { runtime: { agentId: "open-agent", agentName: "open-agent", eveVersion: "test", modelId: "mock/model" } }, meta: { at }, type: "session.started" },
     { data: { sequence: 0, turnId }, meta: { at }, type: "turn.started" },
     { data: { message, parts: [{ text: message, type: "text" }], sequence: 0, turnId }, meta: { at }, type: "message.received" },
     { data: { sequence: 0, stepIndex: 0, turnId }, meta: { at }, type: "step.started" },
+    ...retryEvents,
     { data: failure, meta: { at }, type: "step.failed" },
     { data: turnFailure, meta: { at }, type: "turn.failed" },
     { data: { wait: "next-user-message" }, meta: { at }, type: "session.waiting" },

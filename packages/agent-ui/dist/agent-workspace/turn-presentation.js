@@ -74,6 +74,22 @@ function failureFromData(data) {
         ...(statusCode === undefined ? {} : { statusCode }),
     };
 }
+function modelRetryingEvents(events, turnId, stepIndex) {
+    return events.filter((event) => {
+        const candidate = event;
+        if (candidate.type !== "model.retrying" || !candidate.data || typeof candidate.data !== "object")
+            return false;
+        const data = candidate.data;
+        return data.turnId === turnId && data.stepIndex === stepIndex &&
+            typeof data.attempt === "number" && Number.isInteger(data.attempt) && data.attempt > 0 &&
+            typeof data.maximum === "number" && Number.isInteger(data.maximum) && data.maximum > 0;
+    });
+}
+function normalizeRetryFailure(failure) {
+    return failure.code === "MODEL_CALL_FAILED"
+        ? failure
+        : { ...failure, code: "MODEL_CALL_FAILED" };
+}
 export function stableUserMessageId(sourceId, turnId, stableRoot) {
     const prefix = `${turnId}:user`;
     if (sourceId === prefix)
@@ -576,26 +592,34 @@ export function presentAgentStep(events, turnId, stepIndex) {
     const retryableFailure = retryFailure && shouldPresentRetryFailure(retryFailure)
         ? retryFailure
         : undefined;
-    const observedRetryAttempt = retryableFailure
-        ? Math.max(1, failures.length)
-        : undefined;
-    const retryExhausted = Boolean(terminalFailure && retryableFailure);
-    const retryEvents = failures.flatMap((failure, index) => {
-        const candidate = failureFromData(failure.data);
-        return shouldPresentRetryFailure(candidate)
-            ? [{
-                    attempt: index + 1,
-                    error: candidate,
-                    ...(retryExhausted && index === failures.length - 1 ? { exhausted: true } : {}),
-                    maximum: MAX_DURABLE_STEP_RETRIES,
-                }]
-            : [];
-    });
+    const retrying = modelRetryingEvents(events, turnId, stepIndex);
+    const retryExhausted = Boolean(terminalFailure && (retryableFailure || retrying.length > 0));
+    const retryEvents = retrying.length > 0
+        ? retrying.map((event, index) => ({
+            attempt: event.data.attempt,
+            error: normalizeRetryFailure(index === retrying.length - 1 && terminalFailure
+                ? terminalFailure
+                : event.data.error ?? retryableFailure ?? terminalFailure ?? { code: "MODEL_CALL_FAILED", message: "The model request failed." }),
+            ...(retryExhausted && index === retrying.length - 1 ? { exhausted: true } : {}),
+            maximum: event.data.maximum,
+        }))
+        : failures.flatMap((failure, index) => {
+            const candidate = failureFromData(failure.data);
+            return shouldPresentRetryFailure(candidate)
+                ? [{
+                        attempt: index + 1,
+                        error: normalizeRetryFailure(candidate),
+                        ...(retryExhausted && index === failures.length - 1 ? { exhausted: true } : {}),
+                        maximum: MAX_DURABLE_STEP_RETRIES,
+                    }]
+                : [];
+        });
     const retries = retryEvents.length > 0
         ? retryEvents
         : retryableFailure
-            ? [{ attempt: 1, error: retryableFailure, ...(retryExhausted ? { exhausted: true } : {}), maximum: MAX_DURABLE_STEP_RETRIES }]
+            ? [{ attempt: 1, error: normalizeRetryFailure(retryableFailure), ...(retryExhausted ? { exhausted: true } : {}), maximum: MAX_DURABLE_STEP_RETRIES }]
             : [];
+    const observedRetryAttempt = retryEvents.at(-1)?.attempt;
     const latestStartIndex = stepEvents.findLastIndex((event) => event.type === "step.started");
     const latestAttemptEvents = latestStartIndex >= 0 ? stepEvents.slice(latestStartIndex) : stepEvents;
     const latestAttemptFailed = latestAttemptEvents.some((event) => event.type === "step.failed");
@@ -610,7 +634,7 @@ export function presentAgentStep(events, turnId, stepIndex) {
                 retry: {
                     ...(observedRetryAttempt !== undefined ? { attempt: observedRetryAttempt } : {}),
                     ...(retryExhausted ? { exhausted: true } : {}),
-                    error: retryableFailure,
+                    error: normalizeRetryFailure(retryableFailure),
                     maximum: MAX_DURABLE_STEP_RETRIES,
                 },
             }
@@ -625,6 +649,8 @@ export function presentAgentStep(events, turnId, stepIndex) {
     };
 }
 export function reasoningContentForStep(events, turnId, stepIndex) {
+    if (!turnId)
+        return "";
     let content = "";
     let completedBlock = false;
     for (const event of events) {

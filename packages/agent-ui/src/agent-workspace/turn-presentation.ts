@@ -161,6 +161,43 @@ export type AgentStepPresentation = {
   readonly status: "completed" | "failed" | "running";
 };
 
+type ModelRetryingEvent = {
+  readonly data: {
+    readonly attempt: number;
+    readonly error?: AgentTurnFailure;
+    readonly maximum: number;
+    readonly stepIndex: number;
+    readonly turnId: string;
+  };
+  readonly type: "model.retrying";
+};
+
+function modelRetryingEvents(
+  events: readonly MessageStreamEvent[],
+  turnId: string,
+  stepIndex: number,
+): readonly ModelRetryingEvent[] {
+  return events.filter((event): event is MessageStreamEvent & ModelRetryingEvent => {
+    const candidate = event as MessageStreamEvent & { readonly type?: unknown; readonly data?: unknown };
+    if (candidate.type !== "model.retrying" || !candidate.data || typeof candidate.data !== "object") return false;
+    const data = candidate.data as Partial<ModelRetryingEvent["data"]>;
+    return data.turnId === turnId && data.stepIndex === stepIndex &&
+      typeof data.attempt === "number" && Number.isInteger(data.attempt) && data.attempt > 0 &&
+      typeof data.maximum === "number" && Number.isInteger(data.maximum) && data.maximum > 0;
+  });
+}
+
+/**
+ * Retry events carry Eve's internal attempt-wrapper name for diagnostics.
+ * The display projection must expose one stable, provider-neutral failure
+ * code across every attempt and the terminal failure row.
+ */
+function normalizeRetryFailure(failure: AgentTurnFailure): AgentTurnFailure {
+  return failure.code === "MODEL_CALL_FAILED"
+    ? failure
+    : { ...failure, code: "MODEL_CALL_FAILED" };
+}
+
 export type AgentDisplayProjection = {
   readonly events: readonly MessageStreamEvent[];
   readonly messages: readonly EveMessage[];
@@ -869,29 +906,36 @@ export function presentAgentStep(
   const retryableFailure = retryFailure && shouldPresentRetryFailure(retryFailure)
     ? retryFailure
     : undefined;
-  // Eve intentionally does not expose an attempt number. Count only durable
-  // failed step boundaries that are actually present; the terminal alert does
-  // not expose this count, while an in-flight retry row may show it.
-  const observedRetryAttempt = retryableFailure
-    ? Math.max(1, failures.length)
-    : undefined;
-  const retryExhausted = Boolean(terminalFailure && retryableFailure);
-  const retryEvents = failures.flatMap((failure, index) => {
-    const candidate = failureFromData(failure.data);
-    return shouldPresentRetryFailure(candidate)
-      ? [{
-          attempt: index + 1,
-          error: candidate,
-          ...(retryExhausted && index === failures.length - 1 ? { exhausted: true } : {}),
-          maximum: MAX_DURABLE_STEP_RETRIES,
-        }]
-      : [];
-  });
+  const retrying = modelRetryingEvents(events, turnId, stepIndex);
+  const retryExhausted = Boolean(terminalFailure && (retryableFailure || retrying.length > 0));
+  // Prefer Eve's explicit retry events. Older streams do not contain them, so
+  // retain the compatibility fallback based on durable step failures.
+  const retryEvents = retrying.length > 0
+    ? retrying.map((event, index) => ({
+        attempt: event.data.attempt,
+        error: normalizeRetryFailure(index === retrying.length - 1 && terminalFailure
+          ? terminalFailure
+          : event.data.error ?? retryableFailure ?? terminalFailure ?? { code: "MODEL_CALL_FAILED", message: "The model request failed." }),
+        ...(retryExhausted && index === retrying.length - 1 ? { exhausted: true } : {}),
+        maximum: event.data.maximum,
+      }))
+    : failures.flatMap((failure, index) => {
+        const candidate = failureFromData(failure.data);
+        return shouldPresentRetryFailure(candidate)
+          ? [{
+              attempt: index + 1,
+              error: normalizeRetryFailure(candidate),
+              ...(retryExhausted && index === failures.length - 1 ? { exhausted: true } : {}),
+              maximum: MAX_DURABLE_STEP_RETRIES,
+            }]
+          : [];
+      });
   const retries = retryEvents.length > 0
     ? retryEvents
     : retryableFailure
-      ? [{ attempt: 1, error: retryableFailure, ...(retryExhausted ? { exhausted: true } : {}), maximum: MAX_DURABLE_STEP_RETRIES }]
+      ? [{ attempt: 1, error: normalizeRetryFailure(retryableFailure), ...(retryExhausted ? { exhausted: true } : {}), maximum: MAX_DURABLE_STEP_RETRIES }]
       : [];
+  const observedRetryAttempt = retryEvents.at(-1)?.attempt;
   const latestStartIndex = stepEvents.findLastIndex((event) => event.type === "step.started");
   const latestAttemptEvents = latestStartIndex >= 0 ? stepEvents.slice(latestStartIndex) : stepEvents;
   const latestAttemptFailed = latestAttemptEvents.some((event) => event.type === "step.failed");
@@ -906,7 +950,7 @@ export function presentAgentStep(
           retry: {
             ...(observedRetryAttempt !== undefined ? { attempt: observedRetryAttempt } : {}),
             ...(retryExhausted ? { exhausted: true } : {}),
-            error: retryableFailure,
+            error: normalizeRetryFailure(retryableFailure),
             maximum: MAX_DURABLE_STEP_RETRIES,
           },
         }
@@ -927,6 +971,10 @@ export function reasoningContentForStep(
   turnId: string | undefined,
   stepIndex: number | undefined,
 ): string {
+  // An undefined turn id is an optimistic placeholder, not a request to
+  // search every historical turn. Returning an empty value prevents a new
+  // assistant row from inheriting the previous turn's reasoning block.
+  if (!turnId) return "";
   let content = "";
   let completedBlock = false;
   for (const event of events) {

@@ -79,6 +79,7 @@ import {
   presentAgentStep,
   presentSubagentCall,
   reasoningContentForStep,
+  type AgentStepPresentation,
   type AgentTurnPresentation,
   type AgentTurnStatus,
   type AgentTurnFailure,
@@ -306,7 +307,7 @@ export function AgentMessage({
             turnId={message.metadata?.turnId}
           />
         ))}
-        {failure && !hasFailureStepAnchor ? <TurnFailure failure={failure} locale={locale} /> : null}
+        {failure && !hasFailureStepAnchor ? <TurnFailure events={events} failure={failure} locale={locale} turnId={message.metadata?.turnId} /> : null}
       </MessageContent>
       {showCopyAction && message.role === "assistant" && responseText && !isStreaming ? (
         <CopyResponseAction locale={locale} text={responseText} />
@@ -1436,13 +1437,19 @@ function ReasoningPart({
   readonly part: Extract<EveMessagePart, { type: "reasoning" }>;
   readonly turnId?: string;
 }) {
-  const timing = reasoningTiming(events, turnId, part.stepIndex);
-  const step = presentAgentStep(events, turnId, part.stepIndex ?? 0);
+  // The optimistic assistant placeholder intentionally has no turn id until
+  // Eve acknowledges the new request. Treating an undefined id as a wildcard
+  // would read the previous turn's reasoning/timer and show it as current.
+  const hasTurnId = typeof turnId === "string" && turnId.length > 0;
+  const timing = hasTurnId ? reasoningTiming(events, turnId, part.stepIndex) : {};
+  const step: AgentStepPresentation = hasTurnId
+    ? presentAgentStep(events, turnId, part.stepIndex ?? 0)
+    : { status: "running" as const };
   const retryItems = step.retries ?? (step.retry ? [step.retry] : []);
   const stepIndex = part.stepIndex ?? 0;
   const durationSeconds = useElapsedSeconds(timing.startedAt, timing.endedAt);
-  const retryInFlight = isReasoningRetryInFlight(events, turnId, part.stepIndex);
-  const eventText = reasoningContentForStep(events, turnId, part.stepIndex);
+  const retryInFlight = hasTurnId && isReasoningRetryInFlight(events, turnId, part.stepIndex);
+  const eventText = hasTurnId ? reasoningContentForStep(events, turnId, part.stepIndex) : "";
   // A browser-only assistant placeholder has no durable turn id yet. Do not
   // let a historical step with the same numeric index hide that placeholder
   // before Eve emits the current turn's first event.
@@ -1458,7 +1465,7 @@ function ReasoningPart({
   // while the new attempt has not emitted its first delta; never display that
   // stale text during the hand-off. For compact historical checkpoints with
   // no retry boundary, the reducer text remains the useful fallback.
-  const text = retryInFlight ? eventText : eventText || part.text.trim();
+  const text = hasTurnId ? (retryInFlight ? eventText : eventText || part.text.trim()) : "";
   // Empty reasoning boundaries are protocol bookkeeping, not user-visible
   // reasoning. Keep a live placeholder while the step is running, but remove
   // it after completion instead of rendering an empty "Reasoning complete".
@@ -1517,11 +1524,14 @@ function ReasoningBlock({
   readonly turnId?: string;
 }) {
   const hasText = text.trim().length > 0;
+  // Eve keeps every retry event for durable diagnostics, but the UI should
+  // present one live status row whose attempt and summary update in place.
+  // Keeping a stable key also preserves the user's expanded/collapsed state
+  // while another retry event arrives.
+  const latestRetry = retryItems.at(-1);
   return (
     <>
-      {retryItems.map((retry, index) => (
-        <RetryStatus key={`retry:${turnId ?? "unknown"}:${stepIndex}:${index}`} locale={locale} retry={retry} />
-      ))}
+      {latestRetry ? <RetryStatus key={`retry:${turnId ?? "unknown"}:${stepIndex}`} locale={locale} retry={latestRetry} /> : null}
       {failure && !retryItems.some((retry) => retry.exhausted) ? <StepFailure failure={failure} locale={locale} /> : null}
       {hasText || streaming ? (
         <ReasoningRoot
@@ -2739,19 +2749,38 @@ function QuestionnaireResponseForm({
   );
 }
 
-function TurnFailure({ failure, locale }: { readonly failure: { readonly code: string; readonly message: string }; readonly locale: AgentLocale }) {
-  // Eve may retry a provider/model step internally and only expose the final
-  // terminal boundary. Keep that failure in the same retry presentation used
-  // by step-level failures instead of showing a mismatched generic banner.
-  if (isRetryableTurnFailure(failure)) {
+function TurnFailure({ events, failure, locale, turnId }: {
+  readonly events: readonly MessageStreamEvent[];
+  readonly failure: { readonly code: string; readonly message: string };
+  readonly locale: AgentLocale;
+  readonly turnId?: string;
+}) {
+  // A turn-level failure has no step anchor in older checkpoints. Only show a
+  // retry row when Eve actually persisted retry events; a retryable-looking
+  // error by itself is not evidence that a retry occurred.
+  const retryEvents = turnId
+    ? events.filter((event) => {
+        const candidate = event as MessageStreamEvent & { readonly type?: unknown; readonly data?: unknown };
+        if (candidate.type !== "model.retrying" || !candidate.data || typeof candidate.data !== "object") return false;
+        const data = candidate.data as { readonly turnId?: unknown; readonly attempt?: unknown; readonly maximum?: unknown };
+        return data.turnId === turnId && typeof data.attempt === "number" && typeof data.maximum === "number";
+      })
+    : [];
+  const latestRetryEvent = retryEvents.at(-1);
+  if (latestRetryEvent) {
+    const data = (latestRetryEvent as unknown as { readonly data: { readonly attempt: number; readonly maximum: number } }).data;
+    // Keep one stable row for a turn-level failure as well. The terminal
+    // failure is the canonical summary for the latest attempt, so retry and
+    // final-failure details cannot drift into different error labels.
     return (
       <RetryStatus
+        key={`turn-retry:${turnId}`}
         locale={locale}
         retry={{
-          attempt: 1,
-          error: failure,
+          attempt: data.attempt,
+          error: failure.code === "MODEL_CALL_FAILED" ? failure : { ...failure, code: "MODEL_CALL_FAILED" },
           exhausted: true,
-          maximum: 3,
+          maximum: data.maximum,
         }}
       />
     );
@@ -2766,10 +2795,6 @@ function TurnFailure({ failure, locale }: { readonly failure: { readonly code: s
       </AlertDescription>
     </Alert>
   );
-}
-
-function isRetryableTurnFailure(failure: { readonly code: string; readonly message: string }): boolean {
-  return isRetryableAgentFailure(failure);
 }
 
 function failureTitle(locale: AgentLocale, failure: { readonly code: string; readonly message: string }): string {
@@ -2793,13 +2818,7 @@ function failureSummary(locale: AgentLocale, failure: AgentTurnFailure): string 
 }
 
 function retryTitle(locale: AgentLocale, failure: { readonly code: string; readonly message: string } | undefined): string {
-  if (!failure) return localize(locale, "Retrying", "正在重试");
-  switch (classifyAgentFailure(failure)) {
-    case "network": return localize(locale, "Reconnecting", "正在重新连接");
-    case "timeout": return localize(locale, "Retrying after timeout", "超时后正在重试");
-    case "provider": return localize(locale, "Retrying model request", "正在重试模型请求");
-    default: return localize(locale, "Retrying", "正在重试");
-  }
+  return localize(locale, "Retrying", "正在重试");
 }
 
 function localize(locale: AgentLocale, english: string, chinese: string): string {

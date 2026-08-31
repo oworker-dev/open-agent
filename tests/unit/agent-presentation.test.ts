@@ -150,6 +150,23 @@ test("empty reasoning boundaries do not fabricate completed reasoning content", 
   );
 });
 
+test("an optimistic placeholder never reads reasoning from a historical turn", () => {
+  const events = [
+    event("step.started", startedAt, { sequence: 0, stepIndex: 0, turnId: "turn-history" }),
+    event("reasoning.appended", endedAt, {
+      reasoningDelta: "Preparing the previous response.",
+      reasoningSoFar: "Preparing the previous response.",
+      sequence: 0,
+      stepIndex: 0,
+      turnId: "turn-history",
+    }),
+  ];
+
+  assert.equal(reasoningContentForStep(events, undefined, 0), "");
+  assert.equal(reasoningContentForStep(events, "turn-current", 0), "");
+  assert.equal(reasoningContentForStep(events, "turn-history", 0), "Preparing the previous response.");
+});
+
 test("reasoning content starts fresh when eve retries the same step", () => {
   const turnId = "turn-reasoning-retry";
   const events = [
@@ -1509,7 +1526,7 @@ test("an interrupted durable model step remains visibly retrying", () => {
     retries: [{
       attempt: 1,
       error: {
-        code: "provider_stream_interrupted",
+        code: "MODEL_CALL_FAILED",
         message: "The Provider stream ended before completion.",
       },
       maximum: 3,
@@ -1517,7 +1534,7 @@ test("an interrupted durable model step remains visibly retrying", () => {
     retry: {
       attempt: 1,
       error: {
-        code: "provider_stream_interrupted",
+        code: "MODEL_CALL_FAILED",
         message: "The Provider stream ended before completion.",
       },
       maximum: 3,
@@ -1605,6 +1622,58 @@ test("an exhausted transient provider failure is presented as retry failed with 
     startedAt: Date.parse(startedAt),
     status: "failed",
   });
+});
+
+test("explicit model retry events preserve each real attempt number", () => {
+  const turnId = "turn-explicit-retries";
+  const events = [
+    event("turn.started", startedAt, { sequence: 0, turnId }),
+    event("step.started", startedAt, { sequence: 0, stepIndex: 0, turnId }),
+    event("model.retrying" as MessageStreamEvent["type"], "2026-08-06T01:00:01.000Z", {
+      attempt: 1,
+      maximum: 3,
+      error: { code: "EveOwnedProviderAttemptError", message: "The model Provider request failed (HTTP 404).", statusCode: 404 },
+      sequence: 0,
+      stepIndex: 0,
+      turnId,
+    }),
+    event("model.retrying" as MessageStreamEvent["type"], "2026-08-06T01:00:02.000Z", {
+      attempt: 2,
+      maximum: 3,
+      error: { code: "EveOwnedProviderAttemptError", message: "The model Provider request failed (HTTP 404).", statusCode: 404 },
+      sequence: 0,
+      stepIndex: 0,
+      turnId,
+    }),
+    event("model.retrying" as MessageStreamEvent["type"], "2026-08-06T01:00:03.000Z", {
+      attempt: 3,
+      maximum: 3,
+      error: { code: "EveOwnedProviderAttemptError", message: "The model Provider request failed (HTTP 404).", statusCode: 404 },
+      sequence: 0,
+      stepIndex: 0,
+      turnId,
+    }),
+    event("step.failed", endedAt, {
+      code: "MODEL_CALL_FAILED",
+      details: { statusCode: 404 },
+      message: "The model Provider request failed (HTTP 404).",
+      sequence: 0,
+      stepIndex: 0,
+      turnId,
+    }),
+    event("turn.failed", endedAt, {
+      code: "MODEL_CALL_FAILED",
+      details: { statusCode: 404 },
+      message: "The model Provider request failed (HTTP 404).",
+      sequence: 0,
+      turnId,
+    }),
+  ];
+  const presentation = presentAgentStep(events, turnId, 0);
+  assert.deepEqual(presentation.retries?.map((retry) => [retry.attempt, retry.maximum]), [[1, 3], [2, 3], [3, 3]]);
+  assert.deepEqual(presentation.retries?.map((retry) => retry.error.code), ["MODEL_CALL_FAILED", "MODEL_CALL_FAILED", "MODEL_CALL_FAILED"]);
+  assert.equal(presentation.retry?.attempt, 3);
+  assert.equal(presentation.retry?.exhausted, true);
 });
 
 test("preserves earlier failed tool attempts when Eve reuses a call id", () => {

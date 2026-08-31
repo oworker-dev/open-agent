@@ -62,6 +62,7 @@ try {
   const exhaustedNotFound = await createAndConsume(eveUrl,
     "PROVIDER_404_THREE. Reply exactly: STALE");
   assertRecoverableFailure(exhaustedNotFound.events, "exhausted temporary 404 provider route");
+  assertRetryProgress(exhaustedNotFound.events, "exhausted temporary 404 provider route");
   const resumedAfterNotFound = await consume(
     exhaustedNotFound.session,
     "Continue the same task. Reply exactly: NOT_FOUND_CONTINUED",
@@ -74,6 +75,7 @@ try {
     "PROVIDER_404_MODEL_NOT_FOUND. Reply exactly: STALE_MODEL");
   assertRecoverableFailure(exhaustedModelNotFound.events,
     "exhausted model-not-found provider error");
+  assertRetryProgress(exhaustedModelNotFound.events, "exhausted model-not-found provider error");
   const resumedAfterModelNotFound = await consume(
     exhaustedModelNotFound.session,
     "Continue with a valid model. Reply exactly: MODEL_NOT_FOUND_CONTINUED",
@@ -136,6 +138,7 @@ try {
     "PROVIDER_STALL_THREE. Reply exactly: STALE",
   );
   assertRecoverableFailure(exhausted, "exhausted provider timeout");
+  assertRetryProgress(exhausted, "exhausted provider timeout");
   const resumedAfterExhaustion = await consume(
     exhaustedSession,
     "Continue the same task. Reply exactly: EXHAUSTED_TIMEOUT_RECOVERED",
@@ -239,6 +242,18 @@ function assertRecoverableFailure(events, label) {
   assert(events.some((event) => event.type === "turn.failed"), `${label} did not emit turn.failed.`);
   assert(events.some((event) => event.type === "session.waiting"), `${label} did not preserve the session.`);
   assert(!events.some((event) => event.type === "session.failed"), `${label} terminally failed the session.`);
+}
+
+function assertRetryProgress(events, label) {
+  const retries = events
+    .filter((event) => event.type === "model.retrying")
+    .map((event) => event.data)
+    .filter((data) => data && typeof data.attempt === "number")
+    .map((data) => [data.attempt, data.maximum]);
+  assert(
+    JSON.stringify(retries) === JSON.stringify([[1, 3], [2, 3], [3, 3]]),
+    `${label} did not persist ordered model.retrying progress: ${JSON.stringify(retries)}`,
+  );
 }
 
 function messageText(events) {

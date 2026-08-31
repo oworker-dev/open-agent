@@ -90,6 +90,8 @@ export function AssistantThreadSurface({
   historyLoading = false,
   inputDisabled,
   isBusy,
+  scrollToBottomOnInitialize = true,
+  scrollToBottomOnThreadSwitch = true,
   sessionTerminal,
   sessionSettled,
   onCancel,
@@ -128,6 +130,10 @@ export function AssistantThreadSurface({
   /** Locks the main composer without disabling assistant-ui's edit composer. */
   readonly inputDisabled?: boolean;
   readonly isBusy: boolean;
+  /** Avoid assistant-ui's mount-time bottom scroll during an edit remount. */
+  readonly scrollToBottomOnInitialize?: boolean;
+  /** Avoid thread-switch scroll during an edit remount. */
+  readonly scrollToBottomOnThreadSwitch?: boolean;
   /** True when Eve has durably completed or failed the current session. */
   readonly sessionTerminal?: boolean;
   /** Authoritative Eve session boundary; overrides a stale local hook state. */
@@ -157,6 +163,12 @@ export function AssistantThreadSurface({
   };
   readonly usage: AgentUsageSummary;
 }) {
+  // Entering assistant-ui's edit composer changes the external message store
+  // before our edit callback runs. Suppress mount/switch scrolling for that
+  // handoff so the user's current viewport is not pulled to the bottom.
+  const composerIsEditing = useAuiState((state) => state.composer.isEditing);
+  const viewportScrollOnInitialize = scrollToBottomOnInitialize && !composerIsEditing;
+  const viewportScrollOnThreadSwitch = scrollToBottomOnThreadSwitch && !composerIsEditing;
   const eveMessagesById = useMemo(
     () => new Map(eveMessages.map((message) => [message.id, message])),
     [eveMessages],
@@ -177,6 +189,8 @@ export function AssistantThreadSurface({
     >
       <ThreadPrimitive.Viewport
         aria-live="polite"
+        scrollToBottomOnInitialize={viewportScrollOnInitialize}
+        scrollToBottomOnThreadSwitch={viewportScrollOnThreadSwitch}
         turnAnchor="top"
         className="relative flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-auto px-3 pt-3 sm:px-4 sm:pt-4"
         data-slot="thread-viewport"

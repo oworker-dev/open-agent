@@ -6,6 +6,7 @@ import { useEveAgent, type EveMessage } from "eve/react";
 import { AssistantRuntimeProvider, unstable_defaultDirectiveFormatter, useExternalStoreRuntime, type AppendMessage, type ExternalStoreAdapter, type ExternalThreadQueueAdapter, type RespondToToolApprovalOptions } from "@assistant-ui/react";
 import { AlertCircleIcon, Clock3Icon, HammerIcon, LoaderCircleIcon, RotateCcwIcon, SearchIcon, ShieldCheckIcon, SparklesIcon, XIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { Button } from "../ui/button.js";
 import { cn } from "../utils.js";
 import { attachAgentSession, createAgentSession } from "./agent-client.js";
@@ -195,10 +196,22 @@ export function AgentThreadView({
   const [localInterruption, setLocalInterruption] = useState<LocalInterruption>();
   const [cancellationError, setCancellationError] = useState<string>();
   const [queueError, setQueueError] = useState<string>();
-  const [turnError, setTurnError] = useState<string | undefined>(() => latestTurnFailure(thread.events));
+  const [turnError, setTurnError] = useState<string | undefined>(() =>
+    // A persisted edit admission intentionally keeps the earlier transcript
+    // prefix, which may itself end in a failed turn. That historical failure
+    // must not seed the new edit with an error banner while it is clearing and
+    // resubmitting; the active turn will publish its own failure if needed.
+    isPendingTurnInFlight(thread.pendingTurn) ? undefined : latestTurnFailure(thread.events),
+  );
   const [providerRetry, setProviderRetry] = useState<ProviderRetryState | undefined>(undefined);
   const [optimisticPendingTurn, setOptimisticPendingTurn] = useState<AgentPendingTurn | undefined>(undefined);
   const [optimisticDisplayTurn, setOptimisticDisplayTurn] = useState<AgentPendingTurn | undefined>(undefined);
+  const [stagedEditEvents, setStagedEditEvents] = useState<readonly MessageStreamEvent[] | undefined>(undefined);
+  // Set before changing the external transcript. The edit path updates the
+  // assistant-ui store once before its parent remounts, so the durable
+  // pendingTurn flag is not available soon enough to suppress that first
+  // thread-switch scroll.
+  const [preserveViewportDuringEdit, setPreserveViewportDuringEdit] = useState(false);
   const providerRetryKeyRef = useRef<string | undefined>(undefined);
   const providerRetryAttemptRef = useRef(0);
   const providerRetryTimerRef = useRef<number | undefined>(undefined);
@@ -582,6 +595,8 @@ export function AgentThreadView({
   );
   const effectiveRenderEvents = isRecovering ? recoveryRenderEvents : renderEvents;
   const effectiveRenderMessages = isRecovering ? recoveryRenderMessages : renderMessages;
+  const projectionEvents = stagedEditEvents ?? effectiveRenderEvents;
+  const projectionMessages = stagedEditEvents ? messagesFromEvents(stagedEditEvents) : effectiveRenderMessages;
 
   const runtimeIsBusy = agent.status === "submitted" || agent.status === "streaming";
   const admissionPendingTurn = optimisticPendingTurn ?? thread.pendingTurn;
@@ -1407,7 +1422,7 @@ export function AgentThreadView({
     [localInterruption, thread.interruptedTurns],
   );
   const interruptedDisplayEvents = useMemo(() => {
-    const settled = dedupeThreadEvents(effectiveRenderEvents);
+    const settled = dedupeThreadEvents(projectionEvents);
     if (displayInterruptedTurns.length === 0) return settled;
     let visible: readonly MessageStreamEvent[] = settled.filter((event, index) =>
       !shouldSuppressInterruptedTurnDisplayEvent(event, index, displayInterruptedTurns)
@@ -1416,14 +1431,14 @@ export function AgentThreadView({
       visible = withLocalInterruptedBoundary(visible, interruptedTurn.turnId);
     }
     return visible;
-  }, [displayInterruptedTurns, effectiveRenderEvents]);
+  }, [displayInterruptedTurns, projectionEvents]);
   const projectedRuntimeMessages = useMemo(() => {
     const source = displayInterruptedTurns.length > 0
       ? messagesFromEvents(interruptedDisplayEvents)
-      : effectiveRenderMessages;
+      : projectionMessages;
     return normalizeSettledAgentMessages(source, interruptedDisplayEvents);
   },
-    [displayInterruptedTurns.length, effectiveRenderMessages, interruptedDisplayEvents]);
+    [displayInterruptedTurns.length, interruptedDisplayEvents, projectionMessages]);
   const displayMessageIdentityRef = useRef<DisplayMessageIdentityState>({
     assistantByTurn: new Map(),
     pendingRoot: undefined,
@@ -1446,9 +1461,9 @@ export function AgentThreadView({
   ), [admissionPendingTurn, displayPendingTurn, interruptedDisplayEvents, isBusy, optimisticPendingTurn, projectedRuntimeMessages, thread.queuedTurns]);
   const ungroupedVisibleMessages = useMemo(
     () => projectedMessages.filter((message) =>
-      !isProxiedInputOnlyMessage(message, effectiveRenderEvents),
+      !isProxiedInputOnlyMessage(message, projectionEvents),
     ),
-    [effectiveRenderEvents, projectedMessages],
+    [projectionEvents, projectedMessages],
   );
   const ungroupedDisplayEvents = interruptedDisplayEvents;
   const displayTimeline = useMemo(
@@ -1539,10 +1554,14 @@ export function AgentThreadView({
     };
     pendingEditedTurnOperations.add(`${pendingTurn.id}:clear`);
     const retainedEvents = eventsBeforeLastUserTurn(agent.events);
-    // Close assistant-ui's edit composer before replacing its external
-    // transcript. Updating both in one React commit can invalidate the message
-    // store and turn a valid click into a silent no-op.
-    queueMicrotask(() => {
+    // Apply the retained transcript before the parent revision update. This
+    // closes the one-render gap where the previous failed turn and the new
+    // optimistic edit would otherwise be rendered together.
+    flushSync(() => {
+      setPreserveViewportDuringEdit(true);
+      setStagedEditEvents(retainedEvents);
+      setOptimisticPendingTurn(pendingTurn);
+      setOptimisticDisplayTurn(pendingTurn);
       onChange({
         events: retainedEvents,
         retainedContext: rewriteContextFromEvents(retainedEvents, recoveryContextWindowTokens),
@@ -1557,6 +1576,9 @@ export function AgentThreadView({
         updatedAt: Date.now(),
       });
     });
+    pendingTurnRef.current = pendingTurn;
+    compactedEventsRef.current = [...retainedEvents];
+    compactedEventIdsRef.current = new Set(retainedEvents.map(eventIdentity));
   };
 
   const assetUploadAdapter = useMemo(
@@ -1654,7 +1676,6 @@ export function AgentThreadView({
         pendingEditedTurnOperations.add(`${pendingTurn.id}:resubmit`);
         onChange({
           pendingTurn: { ...pendingTurn, state: "resubmitting" },
-          revision: (thread.revision ?? 0) + 1,
           session: durableSession.state,
           status: "ready",
           updatedAt: Date.now(),
@@ -1665,6 +1686,10 @@ export function AgentThreadView({
         editStagePendingRef.current = false;
         editResubmitPendingRef.current = false;
         turnAdmissionBusyRef.current = false;
+        setPreserveViewportDuringEdit(false);
+        setOptimisticPendingTurn(undefined);
+        setOptimisticDisplayTurn(undefined);
+        setStagedEditEvents(undefined);
         onChange({ pendingTurn: { ...pendingTurn, state: "delivery-failed" }, status: "error" });
         setTurnError(error instanceof Error ? error.message : "Unable to resend this message.");
       } finally {
@@ -1908,6 +1933,12 @@ export function AgentThreadView({
           fallbackStartedAt={displayPendingTurn?.submittedAt}
           inputDisabled={inputLocked}
           isBusy={isBusy}
+          // Editing replaces the visible transcript through one deliberate
+          // revision remount. Do not let assistant-ui's mount-time or
+          // thread-switch bottom scroll override the user's current viewport
+          // during that hand-off.
+          scrollToBottomOnInitialize={!preserveViewportDuringEdit && thread.pendingTurn?.state !== "clearing" && thread.pendingTurn?.state !== "resubmitting"}
+          scrollToBottomOnThreadSwitch={!preserveViewportDuringEdit && thread.pendingTurn?.state !== "clearing" && thread.pendingTurn?.state !== "resubmitting"}
           sessionTerminal={sessionTerminal}
           sessionSettled={durableTurnSettled}
           onCancel={requestCancellation}
