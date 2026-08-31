@@ -188,6 +188,8 @@ export function AgentThreadView({
   const editResubmitPendingRef = useRef(false);
   const turnAdmissionBusyRef = useRef(false);
   const cancellationRecoveryRef = useRef<() => void>(() => undefined);
+  const stopAgentRef = useRef<() => void>(() => undefined);
+  const editClearControllerRef = useRef<AbortController | undefined>(undefined);
   const persistedThreadStatusRef = useRef<AgentThread["status"]>(thread.status);
   const cancellationIdleTimerRef = useRef<number | undefined>(undefined);
   const [cancellationState, setCancellationState] = useState<"idle" | "requested" | "cancelling">(
@@ -247,6 +249,12 @@ export function AgentThreadView({
     // Flush the append-only buffer before teardown so the last observed events
     // are not stranded in this component's refs.
     flushCheckpointRef.current();
+    // A component switch must release the Eve transport as well. Eve's store
+    // does not automatically abort an in-flight send when its React consumer
+    // unmounts; without this, every visited running thread can keep a live
+    // stream and stale callbacks in the background.
+    stopAgentRef.current();
+    editClearControllerRef.current?.abort();
   }, []);
 
   useEffect(() => {
@@ -523,6 +531,7 @@ export function AgentThreadView({
     ...(sessionRef.current ? { session: sessionRef.current } : {}),
   });
   const stopAgent = agent.stop;
+  stopAgentRef.current = stopAgent;
 
   // An initial ClientSession is attached before useEveAgent installs its
   // onSessionChange callback. A refresh during cancellation can therefore
@@ -1661,18 +1670,25 @@ export function AgentThreadView({
     if (!durableSession) return;
     const releaseOperation = claimEditedTurnOperation(pendingTurn.id, "clear");
     if (!releaseOperation) return;
+    let disposed = false;
+    const controller = new AbortController();
+    editClearControllerRef.current = controller;
     turnAdmissionBusyRef.current = true;
     prepareTurn();
     void (async () => {
       try {
         const clearResult = await durableSession.clear();
+        if (disposed || controller.signal.aborted) return;
         if (clearResult.status !== "accepted") throw new Error("The session is no longer active.");
         for await (const event of durableSession.stream({
           follow: true,
+          signal: controller.signal,
           streamReconnectPolicy: LONG_RUNNING_STREAM_RECONNECT_POLICY,
         })) {
+          if (disposed || controller.signal.aborted) return;
           if (isCurrentTurnBoundaryEvent(event)) break;
         }
+        if (disposed || controller.signal.aborted) return;
         pendingEditedTurnOperations.add(`${pendingTurn.id}:resubmit`);
         onChange({
           pendingTurn: { ...pendingTurn, state: "resubmitting" },
@@ -1683,6 +1699,7 @@ export function AgentThreadView({
         editStagePendingRef.current = false;
         editResubmitPendingRef.current = true;
       } catch (error) {
+        if (disposed || controller.signal.aborted) return;
         editStagePendingRef.current = false;
         editResubmitPendingRef.current = false;
         turnAdmissionBusyRef.current = false;
@@ -1693,9 +1710,14 @@ export function AgentThreadView({
         onChange({ pendingTurn: { ...pendingTurn, state: "delivery-failed" }, status: "error" });
         setTurnError(error instanceof Error ? error.message : "Unable to resend this message.");
       } finally {
+        if (editClearControllerRef.current === controller) editClearControllerRef.current = undefined;
         releaseOperation();
       }
     })();
+    return () => {
+      disposed = true;
+      controller.abort();
+    };
   }, [isRecovering, onChange, providerReady, runtimeIsBusy, thread.pendingTurn, thread.revision]);
 
   useEffect(() => {

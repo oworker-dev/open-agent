@@ -39,6 +39,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
     const [threads, setThreads] = useState([]);
     const threadsRef = useRef([]);
     const [activeThreadId, setActiveThreadId] = useState();
+    const activeThreadIdRef = useRef(undefined);
     const [activeSubagentSessionId, setActiveSubagentSessionId] = useState();
     const [isHydrated, setIsHydrated] = useState(false);
     const [recoveringIds, setRecoveringIds] = useState(new Set());
@@ -83,6 +84,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
     const messages = messagesFor(locale);
     const sidebarPanelRef = usePanelRef();
     const activeSessionScopeRef = useRef(undefined);
+    activeThreadIdRef.current = activeThreadId;
     useEffect(() => {
         const media = window.matchMedia("(min-width: 1024px)");
         const synchronizeLayout = () => {
@@ -346,6 +348,8 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
         }
     }, [client, onStorageError, storageKey, threadStorage, updateThread]);
     const inspectThreadRuntime = useCallback(async (thread) => {
+        if (activeThreadIdRef.current !== thread.id)
+            return;
         const runtimeCheckKey = runtimeInspectionKey(thread);
         if (!thread.session.sessionId ||
             runtimeChecksStarted.current.has(runtimeCheckKey))
@@ -366,6 +370,10 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
         }
         try {
             const boundary = await inspectSession(thread.session.sessionId);
+            if (activeThreadIdRef.current !== thread.id) {
+                runtimeChecksStarted.current.delete(runtimeCheckKey);
+                return;
+            }
             const hasQueuedAdmission = thread.queuedTurns.some((turn) => turn.delivery === "server" && Boolean(turn.mailboxItemId));
             if (boundary.state === "running" || hasQueuedAdmission || thread.status === "cancelling") {
                 setRecoveringIds((current) => new Set(current).add(thread.id));
@@ -434,15 +442,6 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
             return next;
         });
     }, [activeThreadId, deletingThreadIds, messages.newTask, onDeleteThread, onStorageError, stableDefaults, threads]);
-    const selectThread = useCallback((threadId) => {
-        setActiveThreadId(threadId);
-        setActiveSubagentSessionId(undefined);
-        if (!window.matchMedia("(min-width: 1024px)").matches)
-            setSidebarOpen(false);
-        const selected = threads.find((thread) => thread.id === threadId);
-        if (selected)
-            void inspectThreadRuntime(selected);
-    }, [inspectThreadRuntime, threads]);
     const finishWorkbenchTransition = useCallback((transition, nextMode) => {
         window.clearTimeout(workbenchTransitionTimer.current);
         workbenchTransitionTimer.current = window.setTimeout(() => {
@@ -512,6 +511,35 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
     const cancelThreadRecovery = useCallback((threadId) => {
         setRecoveryErrors((current) => withoutMapKey(current, threadId));
     }, []);
+    const suspendThreadRecovery = useCallback((threadId) => {
+        recoveryControllers.current.get(threadId)?.abort();
+        recoveryStarted.current.delete(threadId);
+        setRecoveringIds((current) => withoutSetValue(current, threadId));
+        setRecoveryErrors((current) => withoutMapKey(current, threadId));
+    }, []);
+    const selectThread = useCallback((threadId) => {
+        const previousThreadId = activeThreadIdRef.current;
+        if (previousThreadId && previousThreadId !== threadId) {
+            suspendThreadRecovery(previousThreadId);
+        }
+        activeThreadIdRef.current = threadId;
+        setActiveThreadId(threadId);
+        setActiveSubagentSessionId(undefined);
+        if (!window.matchMedia("(min-width: 1024px)").matches)
+            setSidebarOpen(false);
+    }, [suspendThreadRecovery]);
+    useEffect(() => {
+        for (const [threadId, controller] of recoveryControllers.current) {
+            if (threadId === activeThreadId)
+                continue;
+            controller.abort();
+            recoveryStarted.current.delete(threadId);
+        }
+        setRecoveringIds((current) => {
+            const next = new Set([...current].filter((threadId) => threadId === activeThreadId));
+            return next.size === current.size ? current : next;
+        });
+    }, [activeThreadId]);
     const activeThread = threads.find((thread) => thread.id === activeThreadId) ?? threads[0];
     activeSessionScopeRef.current = activeThread?.session.sessionId;
     const visibleThreads = threads.filter((thread) => !ephemeralThreadIds.has(thread.id));
@@ -839,6 +867,8 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
         if (inspectSession) {
             try {
                 const boundary = await inspectSession(session.state.sessionId);
+                if (activeThreadIdRef.current !== thread.id || controller.signal.aborted)
+                    return;
                 runtimeBoundaryState = boundary.state;
                 runtimeTailIndex = boundary.tailIndex;
                 if (boundary.state === "waiting" || boundary.state === "terminal") {
@@ -851,10 +881,12 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
             }
         }
         const refreshRuntimeBoundary = async () => {
-            if (!inspectSession)
+            if (!inspectSession || activeThreadIdRef.current !== thread.id || controller.signal.aborted)
                 return undefined;
             try {
                 const boundary = await inspectSession(session.state.sessionId);
+                if (activeThreadIdRef.current !== thread.id || controller.signal.aborted)
+                    return undefined;
                 runtimeBoundaryState = boundary.state;
                 runtimeTailIndex = boundary.tailIndex;
                 if (boundary.state === "waiting" || boundary.state === "terminal") {
@@ -995,6 +1027,8 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
             return status;
         };
         const flushRecoverySnapshot = (force = false) => {
+            if (recoveryControllers.current.get(thread.id) !== controller)
+                return;
             if (!force && !recoverySnapshotDirty && cursor === persistedCursor)
                 return;
             persistedCursor = cursor;
@@ -1225,6 +1259,8 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                 return;
             if (!settled)
                 throw new Error("The active Agent stream ended before reaching a durable boundary.");
+            if (recoveryControllers.current.get(thread.id) !== controller)
+                return;
             mergeLiveAdmissions();
             updateThread(thread.id, {
                 events: compactThreadEvents(events),
@@ -1242,18 +1278,23 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
         catch (error) {
             if (controller.signal.aborted || isAbortError(error))
                 return;
+            if (recoveryControllers.current.get(thread.id) !== controller)
+                return;
             updateThread(thread.id, { status: "error", updatedAt: Date.now() });
             setRecoveryErrors((current) => new Map(current).set(thread.id, error instanceof Error ? error.message : messages.recoveryFailed));
             console.error("Agent session recovery failed", error);
         }
         finally {
-            recoveryStarted.current.delete(thread.id);
-            recoveryControllers.current.delete(thread.id);
-            setRecoveringIds((current) => {
-                const next = new Set(current);
-                next.delete(thread.id);
-                return next;
-            });
+            const ownsRecovery = recoveryControllers.current.get(thread.id) === controller;
+            if (ownsRecovery) {
+                recoveryStarted.current.delete(thread.id);
+                recoveryControllers.current.delete(thread.id);
+                setRecoveringIds((current) => {
+                    const next = new Set(current);
+                    next.delete(thread.id);
+                    return next;
+                });
+            }
         }
     }, [client, inspectSession, mailbox, messages.recoveryFailed, onEvent, settleThreadHistory, updateThread]);
     useEffect(() => () => {

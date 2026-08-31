@@ -125,6 +125,7 @@ export function AgentWorkspace({
   const [threads, setThreads] = useState<AgentThread[]>([]);
   const threadsRef = useRef<readonly AgentThread[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<string>();
+  const activeThreadIdRef = useRef<string | undefined>(undefined);
   const [activeSubagentSessionId, setActiveSubagentSessionId] = useState<string>();
   const [isHydrated, setIsHydrated] = useState(false);
   const [recoveringIds, setRecoveringIds] = useState<Set<string>>(new Set());
@@ -169,6 +170,7 @@ export function AgentWorkspace({
   const messages = messagesFor(locale);
   const sidebarPanelRef = usePanelRef();
   const activeSessionScopeRef = useRef<string | undefined>(undefined);
+  activeThreadIdRef.current = activeThreadId;
 
   useEffect(() => {
     const media = window.matchMedia("(min-width: 1024px)");
@@ -495,6 +497,10 @@ export function AgentWorkspace({
   }, [client, onStorageError, storageKey, threadStorage, updateThread]);
 
   const inspectThreadRuntime = useCallback(async (thread: AgentThread) => {
+    // Runtime inspection and recovery are owned by the visible thread only.
+    // A hydration/selection race must not start a background stream for a
+    // thread the user has already left.
+    if (activeThreadIdRef.current !== thread.id) return;
     const runtimeCheckKey = runtimeInspectionKey(thread);
     if (
       !thread.session.sessionId ||
@@ -517,8 +523,12 @@ export function AgentWorkspace({
       setRecoveringIds((current) => new Set(current).add(thread.id));
       return;
     }
-    try {
-      const boundary = await inspectSession(thread.session.sessionId);
+      try {
+        const boundary = await inspectSession(thread.session.sessionId);
+        if (activeThreadIdRef.current !== thread.id) {
+          runtimeChecksStarted.current.delete(runtimeCheckKey);
+          return;
+        }
       const hasQueuedAdmission = thread.queuedTurns.some((turn) =>
         turn.delivery === "server" && Boolean(turn.mailboxItemId),
       );
@@ -593,14 +603,6 @@ export function AgentWorkspace({
       return next;
     });
   }, [activeThreadId, deletingThreadIds, messages.newTask, onDeleteThread, onStorageError, stableDefaults, threads]);
-
-  const selectThread = useCallback((threadId: string) => {
-    setActiveThreadId(threadId);
-    setActiveSubagentSessionId(undefined);
-    if (!window.matchMedia("(min-width: 1024px)").matches) setSidebarOpen(false);
-    const selected = threads.find((thread) => thread.id === threadId);
-    if (selected) void inspectThreadRuntime(selected);
-  }, [inspectThreadRuntime, threads]);
 
   const finishWorkbenchTransition = useCallback((transition: "collapsing" | "expanding", nextMode: "fullscreen" | "split") => {
     window.clearTimeout(workbenchTransitionTimer.current);
@@ -681,6 +683,42 @@ export function AgentWorkspace({
     // loop already observes the durable cancellation and settles itself.
     setRecoveryErrors((current) => withoutMapKey(current, threadId));
   }, []);
+
+  const suspendThreadRecovery = useCallback((threadId: string) => {
+    // Recovery belongs to the visible thread. When navigation leaves it,
+    // release its HTTP stream; the worker flushes the consumed cursor in its
+    // finally block, so reopening the thread can catch up from durable state.
+    recoveryControllers.current.get(threadId)?.abort();
+    recoveryStarted.current.delete(threadId);
+    setRecoveringIds((current) => withoutSetValue(current, threadId));
+    setRecoveryErrors((current) => withoutMapKey(current, threadId));
+  }, []);
+
+  const selectThread = useCallback((threadId: string) => {
+    const previousThreadId = activeThreadIdRef.current;
+    if (previousThreadId && previousThreadId !== threadId) {
+      suspendThreadRecovery(previousThreadId);
+    }
+    activeThreadIdRef.current = threadId;
+    setActiveThreadId(threadId);
+    setActiveSubagentSessionId(undefined);
+    if (!window.matchMedia("(min-width: 1024px)").matches) setSidebarOpen(false);
+  }, [suspendThreadRecovery]);
+
+  useEffect(() => {
+    // Navigation can happen through routing or host state, not only the
+    // sidebar callback. Enforce the same single-visible-thread ownership for
+    // every path and stop stale recovery workers before they accumulate.
+    for (const [threadId, controller] of recoveryControllers.current) {
+      if (threadId === activeThreadId) continue;
+      controller.abort();
+      recoveryStarted.current.delete(threadId);
+    }
+    setRecoveringIds((current) => {
+      const next = new Set([...current].filter((threadId) => threadId === activeThreadId));
+      return next.size === current.size ? current : next;
+    });
+  }, [activeThreadId]);
 
   const activeThread = threads.find((thread) => thread.id === activeThreadId) ?? threads[0];
   activeSessionScopeRef.current = activeThread?.session.sessionId;
@@ -1030,6 +1068,7 @@ export function AgentWorkspace({
     if (inspectSession) {
       try {
         const boundary = await inspectSession(session.state.sessionId);
+        if (activeThreadIdRef.current !== thread.id || controller.signal.aborted) return;
         runtimeBoundaryState = boundary.state;
         runtimeTailIndex = boundary.tailIndex;
         if (boundary.state === "waiting" || boundary.state === "terminal") {
@@ -1046,9 +1085,10 @@ export function AgentWorkspace({
       }
     }
     const refreshRuntimeBoundary = async (): Promise<typeof runtimeBoundaryState | undefined> => {
-      if (!inspectSession) return undefined;
+      if (!inspectSession || activeThreadIdRef.current !== thread.id || controller.signal.aborted) return undefined;
       try {
         const boundary = await inspectSession(session.state.sessionId);
+        if (activeThreadIdRef.current !== thread.id || controller.signal.aborted) return undefined;
         runtimeBoundaryState = boundary.state;
         runtimeTailIndex = boundary.tailIndex;
         if (boundary.state === "waiting" || boundary.state === "terminal") {
@@ -1223,6 +1263,10 @@ export function AgentWorkspace({
       return status;
     };
     const flushRecoverySnapshot = (force = false) => {
+      // A new recovery worker may have taken ownership after navigation back
+      // to this thread. The old worker can finish its aborted iterator, but it
+      // must not publish its stale snapshot over the newer worker's state.
+      if (recoveryControllers.current.get(thread.id) !== controller) return;
       if (!force && !recoverySnapshotDirty && cursor === persistedCursor) return;
       persistedCursor = cursor;
       recoverySnapshotDirty = false;
@@ -1495,6 +1539,7 @@ export function AgentWorkspace({
       }
       if (controller.signal.aborted) return;
       if (!settled) throw new Error("The active Agent stream ended before reaching a durable boundary.");
+      if (recoveryControllers.current.get(thread.id) !== controller) return;
       mergeLiveAdmissions();
       updateThread(thread.id, {
         events: compactThreadEvents(events),
@@ -1510,17 +1555,24 @@ export function AgentWorkspace({
       });
     } catch (error) {
       if (controller.signal.aborted || isAbortError(error)) return;
+      if (recoveryControllers.current.get(thread.id) !== controller) return;
       updateThread(thread.id, { status: "error", updatedAt: Date.now() });
       setRecoveryErrors((current) => new Map(current).set(thread.id, error instanceof Error ? error.message : messages.recoveryFailed));
       console.error("Agent session recovery failed", error);
     } finally {
-      recoveryStarted.current.delete(thread.id);
-      recoveryControllers.current.delete(thread.id);
-      setRecoveringIds((current) => {
-        const next = new Set(current);
-        next.delete(thread.id);
-        return next;
-      });
+      // A rapid switch away and back can replace this worker with a newer
+      // controller for the same thread. The old worker must not clear the new
+      // worker's ownership marker or make its stream look inactive.
+      const ownsRecovery = recoveryControllers.current.get(thread.id) === controller;
+      if (ownsRecovery) {
+        recoveryStarted.current.delete(thread.id);
+        recoveryControllers.current.delete(thread.id);
+        setRecoveringIds((current) => {
+          const next = new Set(current);
+          next.delete(thread.id);
+          return next;
+        });
+      }
     }
   }, [client, inspectSession, mailbox, messages.recoveryFailed, onEvent, settleThreadHistory, updateThread]);
 

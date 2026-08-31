@@ -77,6 +77,8 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     const editResubmitPendingRef = useRef(false);
     const turnAdmissionBusyRef = useRef(false);
     const cancellationRecoveryRef = useRef(() => undefined);
+    const stopAgentRef = useRef(() => undefined);
+    const editClearControllerRef = useRef(undefined);
     const persistedThreadStatusRef = useRef(thread.status);
     const cancellationIdleTimerRef = useRef(undefined);
     const [cancellationState, setCancellationState] = useState(thread.status === "cancelling" ? "cancelling" : "idle");
@@ -114,6 +116,8 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             window.clearTimeout(providerRetryTimerRef.current);
         }
         flushCheckpointRef.current();
+        stopAgentRef.current();
+        editClearControllerRef.current?.abort();
     }, []);
     useEffect(() => {
         preferencesRef.current = thread.preferences;
@@ -312,6 +316,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         ...(sessionRef.current ? { session: sessionRef.current } : {}),
     });
     const stopAgent = agent.stop;
+    stopAgentRef.current = stopAgent;
     useEffect(() => {
         const attachedSession = sessionRef.current;
         if (!cancellationRef.current.requested ||
@@ -1160,20 +1165,30 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         const releaseOperation = claimEditedTurnOperation(pendingTurn.id, "clear");
         if (!releaseOperation)
             return;
+        let disposed = false;
+        const controller = new AbortController();
+        editClearControllerRef.current = controller;
         turnAdmissionBusyRef.current = true;
         prepareTurn();
         void (async () => {
             try {
                 const clearResult = await durableSession.clear();
+                if (disposed || controller.signal.aborted)
+                    return;
                 if (clearResult.status !== "accepted")
                     throw new Error("The session is no longer active.");
                 for await (const event of durableSession.stream({
                     follow: true,
+                    signal: controller.signal,
                     streamReconnectPolicy: LONG_RUNNING_STREAM_RECONNECT_POLICY,
                 })) {
+                    if (disposed || controller.signal.aborted)
+                        return;
                     if (isCurrentTurnBoundaryEvent(event))
                         break;
                 }
+                if (disposed || controller.signal.aborted)
+                    return;
                 pendingEditedTurnOperations.add(`${pendingTurn.id}:resubmit`);
                 onChange({
                     pendingTurn: { ...pendingTurn, state: "resubmitting" },
@@ -1185,6 +1200,8 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
                 editResubmitPendingRef.current = true;
             }
             catch (error) {
+                if (disposed || controller.signal.aborted)
+                    return;
                 editStagePendingRef.current = false;
                 editResubmitPendingRef.current = false;
                 turnAdmissionBusyRef.current = false;
@@ -1196,9 +1213,15 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
                 setTurnError(error instanceof Error ? error.message : "Unable to resend this message.");
             }
             finally {
+                if (editClearControllerRef.current === controller)
+                    editClearControllerRef.current = undefined;
                 releaseOperation();
             }
         })();
+        return () => {
+            disposed = true;
+            controller.abort();
+        };
     }, [isRecovering, onChange, providerReady, runtimeIsBusy, thread.pendingTurn, thread.revision]);
     useEffect(() => {
         const pendingTurn = thread.pendingTurn;
