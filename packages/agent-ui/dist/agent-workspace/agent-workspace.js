@@ -850,14 +850,20 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
         setRecoveryErrors((current) => withoutMapKey(current, thread.id));
         const controller = new AbortController();
         recoveryControllers.current.set(thread.id, controller);
+        const releaseRecovery = () => {
+            if (recoveryControllers.current.get(thread.id) !== controller)
+                return false;
+            recoveryStarted.current.delete(thread.id);
+            recoveryControllers.current.delete(thread.id);
+            setRecoveringIds((current) => withoutSetValue(current, thread.id));
+            return true;
+        };
         const events = [...thread.events];
         const recoveredCursor = thread.session.streamIndex;
         const connection = createAgentSession(client, thread.preferences, { ...thread.session, streamIndex: recoveredCursor });
         const session = attachAgentSession(connection, connection.initialSession);
         if (!session) {
-            recoveryStarted.current.delete(thread.id);
-            recoveryControllers.current.delete(thread.id);
-            setRecoveringIds((current) => withoutSetValue(current, thread.id));
+            releaseRecovery();
             return;
         }
         let knownRuntimeBoundary;
@@ -867,13 +873,15 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
         if (inspectSession) {
             try {
                 const boundary = await inspectSession(session.state.sessionId);
-                if (activeThreadIdRef.current !== thread.id || controller.signal.aborted)
+                if (activeThreadIdRef.current !== thread.id || controller.signal.aborted) {
+                    releaseRecovery();
                     return;
+                }
                 runtimeBoundaryState = boundary.state;
                 runtimeTailIndex = boundary.tailIndex;
                 if (boundary.state === "waiting" || boundary.state === "terminal") {
                     await settleThreadHistory(thread, boundary);
-                    setRecoveringIds((current) => withoutSetValue(current, thread.id));
+                    releaseRecovery();
                     return;
                 }
             }
@@ -1287,13 +1295,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
         finally {
             const ownsRecovery = recoveryControllers.current.get(thread.id) === controller;
             if (ownsRecovery) {
-                recoveryStarted.current.delete(thread.id);
-                recoveryControllers.current.delete(thread.id);
-                setRecoveringIds((current) => {
-                    const next = new Set(current);
-                    next.delete(thread.id);
-                    return next;
-                });
+                releaseRecovery();
             }
         }
     }, [client, inspectSession, mailbox, messages.recoveryFailed, onEvent, settleThreadHistory, updateThread]);
