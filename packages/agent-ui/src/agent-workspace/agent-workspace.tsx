@@ -1037,15 +1037,23 @@ export function AgentWorkspace({
     setRecoveryErrors((current) => withoutMapKey(current, thread.id));
     const controller = new AbortController();
     recoveryControllers.current.set(thread.id, controller);
+    // Recovery can be cancelled while the initial lifecycle probe is still
+    // pending. Keep all exits idempotent and only release state owned by this
+    // worker so a fast switch away/back cannot tear down its replacement.
+    const releaseRecovery = () => {
+      if (recoveryControllers.current.get(thread.id) !== controller) return false;
+      recoveryStarted.current.delete(thread.id);
+      recoveryControllers.current.delete(thread.id);
+      setRecoveringIds((current) => withoutSetValue(current, thread.id));
+      return true;
+    };
     const events = [...thread.events];
 
     const recoveredCursor = thread.session.streamIndex;
     const connection = createAgentSession(client, thread.preferences, { ...thread.session, streamIndex: recoveredCursor });
     const session = attachAgentSession(connection, connection.initialSession);
     if (!session) {
-      recoveryStarted.current.delete(thread.id);
-      recoveryControllers.current.delete(thread.id);
-      setRecoveringIds((current) => withoutSetValue(current, thread.id));
+      releaseRecovery();
       return;
     }
     let knownRuntimeBoundary: { readonly state: "waiting" | "terminal"; readonly failed?: boolean } | undefined;
@@ -1068,7 +1076,10 @@ export function AgentWorkspace({
     if (inspectSession) {
       try {
         const boundary = await inspectSession(session.state.sessionId);
-        if (activeThreadIdRef.current !== thread.id || controller.signal.aborted) return;
+        if (activeThreadIdRef.current !== thread.id || controller.signal.aborted) {
+          releaseRecovery();
+          return;
+        }
         runtimeBoundaryState = boundary.state;
         runtimeTailIndex = boundary.tailIndex;
         if (boundary.state === "waiting" || boundary.state === "terminal") {
@@ -1076,7 +1087,7 @@ export function AgentWorkspace({
           // the settled lifecycle first, then read only a small tail window to
           // recover a missing turn boundary or final tool result.
           await settleThreadHistory(thread, boundary);
-          setRecoveringIds((current) => withoutSetValue(current, thread.id));
+          releaseRecovery();
           return;
         }
       } catch {
@@ -1565,13 +1576,7 @@ export function AgentWorkspace({
       // worker's ownership marker or make its stream look inactive.
       const ownsRecovery = recoveryControllers.current.get(thread.id) === controller;
       if (ownsRecovery) {
-        recoveryStarted.current.delete(thread.id);
-        recoveryControllers.current.delete(thread.id);
-        setRecoveringIds((current) => {
-          const next = new Set(current);
-          next.delete(thread.id);
-          return next;
-        });
+        releaseRecovery();
       }
     }
   }, [client, inspectSession, mailbox, messages.recoveryFailed, onEvent, settleThreadHistory, updateThread]);
