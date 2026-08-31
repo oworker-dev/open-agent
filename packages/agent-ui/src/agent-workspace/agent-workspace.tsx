@@ -690,6 +690,12 @@ export function AgentWorkspace({
     // finally block, so reopening the thread can catch up from durable state.
     recoveryControllers.current.get(threadId)?.abort();
     recoveryStarted.current.delete(threadId);
+    // The inspection guard is scoped to one visible recovery attempt. Once
+    // navigation aborts that attempt, allow the next visit to probe Eve again
+    // instead of reusing a stale "already inspected" marker.
+    for (const key of runtimeChecksStarted.current) {
+      if (key.startsWith(`${threadId}|`)) runtimeChecksStarted.current.delete(key);
+    }
     setRecoveringIds((current) => withoutSetValue(current, threadId));
     setRecoveryErrors((current) => withoutMapKey(current, threadId));
   }, []);
@@ -713,6 +719,9 @@ export function AgentWorkspace({
       if (threadId === activeThreadId) continue;
       controller.abort();
       recoveryStarted.current.delete(threadId);
+      for (const key of runtimeChecksStarted.current) {
+        if (key.startsWith(`${threadId}|`)) runtimeChecksStarted.current.delete(key);
+      }
     }
     setRecoveringIds((current) => {
       const next = new Set([...current].filter((threadId) => threadId === activeThreadId));

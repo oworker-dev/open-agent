@@ -514,6 +514,10 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
     const suspendThreadRecovery = useCallback((threadId) => {
         recoveryControllers.current.get(threadId)?.abort();
         recoveryStarted.current.delete(threadId);
+        for (const key of runtimeChecksStarted.current) {
+            if (key.startsWith(`${threadId}|`))
+                runtimeChecksStarted.current.delete(key);
+        }
         setRecoveringIds((current) => withoutSetValue(current, threadId));
         setRecoveryErrors((current) => withoutMapKey(current, threadId));
     }, []);
@@ -534,6 +538,10 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                 continue;
             controller.abort();
             recoveryStarted.current.delete(threadId);
+            for (const key of runtimeChecksStarted.current) {
+                if (key.startsWith(`${threadId}|`))
+                    runtimeChecksStarted.current.delete(key);
+            }
         }
         setRecoveringIds((current) => {
             const next = new Set([...current].filter((threadId) => threadId === activeThreadId));
