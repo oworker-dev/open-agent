@@ -56,6 +56,7 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
   // enough to skip this repair path.
   if (thread.transcriptCoverage?.authoritative === true &&
       thread.transcriptCoverage.complete &&
+      thread.transcriptCoverage.projection === "logical-edits-v1" &&
       thread.transcriptCoverage.endIndex >= thread.session.streamIndex) {
     return Response.json(
       { revision: record.revision, thread: null },
@@ -124,7 +125,14 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
     revision: (thread.revision ?? 0) + 1,
     session: { ...thread.session, streamIndex: rebuilt.endIndex },
     status: failed ? "error" : "ready",
-    transcriptCoverage: { authoritative: true, complete: true, endIndex: rebuilt.endIndex, startIndex: 0, version: 1 },
+    transcriptCoverage: {
+      authoritative: true,
+      complete: true,
+      endIndex: rebuilt.endIndex,
+      projection: "logical-edits-v1",
+      startIndex: 0,
+      version: 1,
+    },
     updatedAt: Date.now(),
   };
   const patch: ThreadCollectionPatchRecord = {
