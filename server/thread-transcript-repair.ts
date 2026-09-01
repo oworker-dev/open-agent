@@ -57,10 +57,21 @@ export function projectEditedBranches(
   for (const event of events) {
     if (event.type === "context.cleared") {
       const targetTurnId = event.data.turnId;
+      // Server-owned edits can retry the same exact target. Replace the
+      // earlier branch before projecting the new one so repaired transcripts
+      // cannot expose each retry as an independent interaction.
+      const previousClearIndex = projected.findLastIndex((candidate) =>
+        candidate.type === "context.cleared" && candidate.data.turnId === targetTurnId,
+      );
+      if (previousClearIndex >= 0) projected.splice(previousClearIndex);
       let userIndex = projected.findLastIndex((candidate) =>
         candidate.type === "message.received" && candidate.data.turnId === targetTurnId
       );
-      if (userIndex < 0) {
+      // Once an exact marker has already established this target's branch,
+      // its original user turn is intentionally gone from the projection.
+      // Do not apply the legacy positional fallback in that case, or a
+      // repeated exact edit would remove the preceding valid turn as well.
+      if (userIndex < 0 && previousClearIndex < 0) {
         userIndex = projected.findLastIndex((candidate) => candidate.type === "message.received");
       }
       if (userIndex >= 0) {

@@ -146,8 +146,7 @@ function mergeSummaryThread(
   // through transcript repair on every open. An explicit edit checkpoint is
   // the one normal operation that invalidates coverage before resubmission.
   const replacingEditedTurn = replacement.pendingTurn?.state === "clearing" ||
-    replacement.pendingTurn?.state === "resubmitting" ||
-    (replacement.pendingTurn?.state === "submitting" && replacement.pendingTurn.operation === "edit");
+    replacement.pendingTurn?.state === "resubmitting";
   if (replacingEditedTurn) {
     delete next.transcriptCoverage;
   } else if (replacement.transcriptCoverage?.authoritative === true) {

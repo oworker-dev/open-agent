@@ -1345,6 +1345,11 @@ export function AgentWorkspace({
       turn.delivery === "server" && mailboxTurnAwaitsAdmission(turn) && Boolean(turn.mailboxItemId),
     );
     const currentBoundarySettles = () => {
+      // A durable edit is admitted against the previous settled turn. The
+      // old transcript commonly ends in `session.waiting`; that boundary
+      // must not short-circuit recovery before the replacement turn's
+      // message.received and completion events arrive.
+      if (pendingTurn?.operation === "edit" && isPendingMailboxEdit(pendingTurn)) return false;
       const last = events.at(-1);
       if (knownRuntimeBoundary && runtimeBoundaryReady) {
         if (committedCatchUpTurns.size > 0 || hasPendingServerQueue()) return false;
@@ -1658,7 +1663,7 @@ export function AgentWorkspace({
       if (!settled) throw new Error("The active Agent stream ended before reaching a durable boundary.");
       if (recoveryControllers.current.get(thread.id) !== controller) return;
       mergeLiveAdmissions();
-      updateThread(thread.id, {
+      const recoveryPatch: AgentThreadPatch = {
         events: compactThreadEvents(events),
         interruptedTurns,
         pendingTurn,
@@ -1669,7 +1674,27 @@ export function AgentWorkspace({
           : knownRuntimeBoundary?.failed
             ? "error"
             : recoveryStatus(),
-      });
+      };
+      // The mounted Eve reducer is seeded only once. A recovery worker may
+      // consume a finite catch-up stream while the child remains mounted; if
+      // we simply flip `isRecovering` back to false, the stale live reducer
+      // would replace the freshly recovered transcript. Reseed exactly once
+      // at the durable handoff so edited replies remain visible after the
+      // recovery worker releases its stream.
+      if (activeThreadIdRef.current === thread.id && events.length > thread.events.length) {
+        flushSync(() => {
+          setThreadRuntimeSeeds((current) => {
+            const seed = `recovery:${thread.session.sessionId}:${cursor}`;
+            if (current.get(thread.id) === seed) return current;
+            const next = new Map(current);
+            next.set(thread.id, seed);
+            return next;
+          });
+          updateThread(thread.id, recoveryPatch);
+        });
+      } else {
+        updateThread(thread.id, recoveryPatch);
+      }
     } catch (error) {
       if (controller.signal.aborted || isAbortError(error)) return;
       if (recoveryControllers.current.get(thread.id) !== controller) return;
@@ -1702,7 +1727,11 @@ export function AgentWorkspace({
 
   const activeIsRecovering = activeThread ? recoveringIds.has(activeThread.id) : false;
   const activeThreadRuntimeKey = activeThread
-    ? `${activeThread.id}:${activeThread.transcriptWindow?.startIndex ?? 0}:${activeIsRecovering ? "recovering" : "ready"}:${threadRuntimeSeeds.get(activeThread.id) ?? "initial"}`
+    // Recovery state is a render mode, not a reducer identity. Including the
+    // transient `recovering` flag here remounted the thread once when recovery
+    // started and again when it settled, producing visible edit flashes. The
+    // durable seed is the only state that requires reseeding Eve's reducer.
+    ? `${activeThread.id}:${activeThread.transcriptWindow?.startIndex ?? 0}:${threadRuntimeSeeds.get(activeThread.id) ?? "initial"}`
     : "none";
   const activeIsHydrating = activeThread?.hydration === "summary";
   if (!isHydrated || !activeThread) return <div className="flex h-dvh items-center justify-center bg-background text-muted-foreground">{messages.loading}</div>;
@@ -2558,6 +2587,11 @@ function runtimeInspectionKey(thread: AgentThread): string {
     pending?.state ?? "",
     queued,
   ].join("|");
+}
+
+function isPendingMailboxEdit(turn: AgentPendingTurn): boolean {
+  return turn.operation === "edit" &&
+    (turn.state === "submitting" || turn.state === "clearing" || turn.state === "resubmitting");
 }
 
 function transcriptCoversSession(thread: AgentThread): boolean {

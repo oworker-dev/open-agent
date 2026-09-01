@@ -1033,7 +1033,7 @@ test("a normal composer message bypasses a pending Agent question", async ({ pag
   await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
     streamCalls += 1;
     await route.fulfill({
-      body: streamCalls === 1 ? mockQuestionTurn() : mockContinuationTurn("继续新的需求", "已进入新的请求。"),
+      body: streamCalls === 1 ? mockQuestionTurn("Help me choose a visual direction") : mockContinuationTurn("继续新的需求", "已进入新的请求。"),
       contentType: "application/x-ndjson",
       status: 200,
     });
@@ -5046,7 +5046,7 @@ function mockReasoningMarkdownTurn(): string {
   return `${events.map((event) => JSON.stringify(event)).join("\n")}\n`;
 }
 
-function mockQuestionTurn(): string {
+function mockQuestionTurn(message = "帮我确定网站的视觉方向"): string {
   const base = Date.now();
   const at = (offset: number) => new Date(base + offset).toISOString();
   const turnId = "turn_question";
@@ -5079,7 +5079,7 @@ function mockQuestionTurn(): string {
   const events = [
     { data: { runtime: { agentId: "open-agent", agentName: "open-agent", eveVersion: "test", modelId: "mock/model" } }, meta: { at: at(0) }, type: "session.started" },
     { data: { sequence: 0, turnId }, meta: { at: at(100) }, type: "turn.started" },
-    { data: { message: "帮我确定网站的视觉方向", parts: [{ text: "帮我确定网站的视觉方向", type: "text" }], sequence: 0, turnId }, meta: { at: at(200) }, type: "message.received" },
+    { data: { message, parts: [{ text: message, type: "text" }], sequence: 0, turnId }, meta: { at: at(200) }, type: "message.received" },
     { data: { sequence: 0, stepIndex: 0, turnId }, meta: { at: at(300) }, type: "step.started" },
     { data: { finishReason: "tool-calls", message: null, sequence: 0, stepIndex: 0, turnId }, meta: { at: at(400) }, type: "message.completed" },
     { data: { actions: [request.action], sequence: 0, stepIndex: 0, turnId }, meta: { at: at(500) }, type: "actions.requested" },

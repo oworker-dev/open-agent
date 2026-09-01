@@ -667,8 +667,7 @@ function isExplicitTranscriptReplacement(thread: Record<string, unknown>): boole
   const pending = isRecordValue(thread.pendingTurn) ? thread.pendingTurn : undefined;
   if (!pending) return false;
   return pending.state === "clearing" ||
-    pending.state === "resubmitting" ||
-    (pending.state === "submitting" && pending.operation === "edit");
+    pending.state === "resubmitting";
 }
 
 /** Keep summary metadata authoritative, including explicit clearing of

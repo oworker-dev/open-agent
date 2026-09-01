@@ -197,7 +197,7 @@ test("summary checkpoints cannot downgrade authoritative transcript coverage", (
   assert.equal(result.threads[0]?.transcriptCoverage?.authoritative, true);
 });
 
-test("an edit checkpoint in submitting state invalidates prior coverage", () => {
+test("an edit checkpoint in submitting state preserves prior coverage", () => {
   const first = {
     ...createAgentThread(1, "First"),
     events: [event("evt-first")],
@@ -228,7 +228,7 @@ test("an edit checkpoint in submitting state invalidates prior coverage", () => 
     { activeThreadId: first.id, threads: [first], version: 2 },
     patch,
   );
-  assert.equal(result.threads[0]?.transcriptCoverage, undefined);
+  assert.equal(result.threads[0]?.transcriptCoverage?.authoritative, true);
   assert.equal(result.threads[0]?.pendingTurn?.operation, "edit");
 });
 

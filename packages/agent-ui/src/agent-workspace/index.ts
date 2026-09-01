@@ -61,6 +61,7 @@ export {
   compactThreadEvents,
   createAgentThread,
   dedupeThreadEvents,
+  editOperationId,
   eventIdentity,
   mergeThreadCollectionsForConflict,
   parseThreadCollection,

@@ -417,6 +417,45 @@ test("rejects an explicit empty edit snapshot when durable history exists", asyn
   assert.equal(calls.at(-1), "rollback");
 });
 
+test("server-owned submitting edits update metadata without replacing the event log", async () => {
+  const calls: string[] = [];
+  const client = {
+    async query(sql: string) {
+      calls.push(sql);
+      if (sql === "begin" || sql === "commit" || sql === "rollback") return { rows: [] };
+      if (sql.includes("for update")) {
+        return {
+          rows: [{
+            collection: { threads: [{ id: "thread-1", events: [] }], version: 2 },
+            revision: "10",
+          }],
+        };
+      }
+      if (sql.includes("set collection = $4::jsonb")) return { rows: [] };
+      return { rows: [] };
+    },
+    release() {},
+  };
+  const pool = { async connect() { return client; } } as unknown as Pool;
+  const store = createPostgresThreadCollectionStore(config, pool);
+
+  const result = await store.patch?.("tenant-1", "principal-1", "workspace-1", 10, {
+    deletedThreadIds: [],
+    eventAppends: [],
+    upsertThreads: [{
+      events: [],
+      hydration: "summary",
+      id: "thread-1",
+      pendingTurn: { id: "edit-1", operation: "edit", state: "submitting", submittedAt: 1, text: "edited" },
+      status: "submitted",
+    }],
+  });
+
+  assert.equal(result?.status, "saved");
+  assert.equal(calls.some((sql) => sql.includes("max(event_index)")), false);
+  assert.equal(calls.at(-1), "commit");
+});
+
 test("empty append checkpoints do not query the event log", async () => {
   const calls: string[] = [];
   const client = {

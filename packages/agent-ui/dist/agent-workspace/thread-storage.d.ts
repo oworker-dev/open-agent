@@ -1,6 +1,7 @@
 import type { MessageStreamEvent } from "eve/client";
 import type { AgentPendingTurn, AgentThread, AgentThreadPreferences, AgentTranscriptWindow } from "./contracts.js";
 export declare const AGENT_THREAD_STORAGE_VERSION = 2;
+export declare function editOperationId(sessionId: string, beforeTurnId: string, text: string): string;
 export type AgentThreadCollection = {
     readonly activeThreadId?: string;
     readonly threads: readonly AgentThread[];

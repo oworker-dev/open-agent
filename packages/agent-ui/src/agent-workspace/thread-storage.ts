@@ -10,6 +10,35 @@ const FALLBACK_PREFERENCES: AgentThreadPreferences = {
   reasoning: "medium",
 };
 
+/**
+ * Returns the durable identity of one edit transaction.
+ *
+ * Editing is retried by both the mounted workspace and a freshly hydrated
+ * workspace. A random id makes those retries look like different mailbox
+ * messages, so the same edit can be admitted more than once. Keep the id
+ * deterministic for the exact session/turn/text tuple; the mailbox already
+ * rejects a changed payload under the same id.
+ */
+export function editOperationId(
+  sessionId: string,
+  beforeTurnId: string,
+  text: string,
+): string {
+  const input = `${sessionId.length}:${sessionId}|${beforeTurnId.length}:${beforeTurnId}|${text.length}:${text}`;
+  let first = 0x811c9dc5;
+  let second = 0x9e3779b9;
+  for (let index = 0; index < input.length; index += 1) {
+    const code = input.charCodeAt(index);
+    first = Math.imul(first ^ code, 0x01000193);
+    second = Math.imul(second ^ (code + index), 0x01000193);
+  }
+  return `edit-${toHex(first)}${toHex(second)}`;
+}
+
+function toHex(value: number): string {
+  return (value >>> 0).toString(16).padStart(8, "0");
+}
+
 export type AgentThreadCollection = {
   readonly activeThreadId?: string;
   readonly threads: readonly AgentThread[];
@@ -687,6 +716,14 @@ export function projectThreadEditBranches(
   for (const event of events) {
     if (event.type === "context.cleared") {
       const targetTurnId = event.data.turnId;
+      // A retried edit can emit another clear marker for the same durable
+      // target after its first replacement branch was already appended. Drop
+      // that prior replacement before applying the newest one; otherwise a
+      // refresh would present each retry as a separate conversation turn.
+      const previousClearIndex = projected.findLastIndex((candidate) =>
+        candidate.type === "context.cleared" && candidate.data.turnId === targetTurnId,
+      );
+      if (previousClearIndex >= 0) projected.splice(previousClearIndex);
       let targetIndex = projected.findLastIndex((candidate) =>
         eventTurnId(candidate) === targetTurnId
       );

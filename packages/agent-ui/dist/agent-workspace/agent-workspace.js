@@ -1091,6 +1091,8 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
         };
         const hasPendingServerQueue = () => queuedTurns.some((turn) => turn.delivery === "server" && mailboxTurnAwaitsAdmission(turn) && Boolean(turn.mailboxItemId));
         const currentBoundarySettles = () => {
+            if (pendingTurn?.operation === "edit" && isPendingMailboxEdit(pendingTurn))
+                return false;
             const last = events.at(-1);
             if (knownRuntimeBoundary && runtimeBoundaryReady) {
                 if (committedCatchUpTurns.size > 0 || hasPendingServerQueue())
@@ -1351,7 +1353,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
             if (recoveryControllers.current.get(thread.id) !== controller)
                 return;
             mergeLiveAdmissions();
-            updateThread(thread.id, {
+            const recoveryPatch = {
                 events: compactThreadEvents(events),
                 interruptedTurns,
                 pendingTurn,
@@ -1362,7 +1364,23 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                     : knownRuntimeBoundary?.failed
                         ? "error"
                         : recoveryStatus(),
-            });
+            };
+            if (activeThreadIdRef.current === thread.id && events.length > thread.events.length) {
+                flushSync(() => {
+                    setThreadRuntimeSeeds((current) => {
+                        const seed = `recovery:${thread.session.sessionId}:${cursor}`;
+                        if (current.get(thread.id) === seed)
+                            return current;
+                        const next = new Map(current);
+                        next.set(thread.id, seed);
+                        return next;
+                    });
+                    updateThread(thread.id, recoveryPatch);
+                });
+            }
+            else {
+                updateThread(thread.id, recoveryPatch);
+            }
         }
         catch (error) {
             if (controller.signal.aborted || isAbortError(error))
@@ -1396,7 +1414,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
     }, [isHydrated, recoverThread, recoveringIds, threads]);
     const activeIsRecovering = activeThread ? recoveringIds.has(activeThread.id) : false;
     const activeThreadRuntimeKey = activeThread
-        ? `${activeThread.id}:${activeThread.transcriptWindow?.startIndex ?? 0}:${activeIsRecovering ? "recovering" : "ready"}:${threadRuntimeSeeds.get(activeThread.id) ?? "initial"}`
+        ? `${activeThread.id}:${activeThread.transcriptWindow?.startIndex ?? 0}:${threadRuntimeSeeds.get(activeThread.id) ?? "initial"}`
         : "none";
     const activeIsHydrating = activeThread?.hydration === "summary";
     if (!isHydrated || !activeThread)
@@ -1813,6 +1831,10 @@ function runtimeInspectionKey(thread) {
         pending?.state ?? "",
         queued,
     ].join("|");
+}
+function isPendingMailboxEdit(turn) {
+    return turn.operation === "edit" &&
+        (turn.state === "submitting" || turn.state === "clearing" || turn.state === "resubmitting");
 }
 function transcriptCoversSession(thread) {
     return hasCompleteTranscriptCoverage(thread) || thread.session.streamIndex <= thread.events.length;

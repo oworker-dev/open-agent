@@ -157,6 +157,26 @@ test("repair keeps only the final branch after repeated edits while retaining th
   ), false);
 });
 
+test("repair replaces a repeated exact edit target instead of retaining both branches", async () => {
+  const source = events(
+    ...settledTurn("turn-0", 0, "Hello", "Hello reply"),
+    ...settledTurn("turn-1", 1, "Original", "Original reply"),
+    event("context.cleared", { sequence: 2, sessionId: "session-1", turnId: "turn-1" }),
+    ...settledTurn("turn-2", 2, "Edited once", "First edit reply"),
+    event("context.cleared", { sequence: 3, sessionId: "session-1", turnId: "turn-1" }),
+    ...settledTurn("turn-3", 3, "Edited twice", "Final edit reply"),
+  );
+
+  const rebuilt = await rebuildSettledThreadTranscript(source, 22);
+
+  assert.deepEqual(
+    rebuilt.events
+      .filter((item) => item.type === "message.received" || item.type === "message.completed")
+      .map((item) => item.data.message),
+    ["Hello", "Hello reply", "Edited twice", "Final edit reply"],
+  );
+});
+
 async function* largeSettledToolStream(partialCount: number): AsyncGenerator<MessageStreamEvent> {
   const turnId = "turn-large";
   yield event("turn.started", { sequence: 0, turnId });

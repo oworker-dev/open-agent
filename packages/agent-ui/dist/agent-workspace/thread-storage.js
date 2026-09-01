@@ -6,6 +6,20 @@ const FALLBACK_PREFERENCES = {
     modelId: "default",
     reasoning: "medium",
 };
+export function editOperationId(sessionId, beforeTurnId, text) {
+    const input = `${sessionId.length}:${sessionId}|${beforeTurnId.length}:${beforeTurnId}|${text.length}:${text}`;
+    let first = 0x811c9dc5;
+    let second = 0x9e3779b9;
+    for (let index = 0; index < input.length; index += 1) {
+        const code = input.charCodeAt(index);
+        first = Math.imul(first ^ code, 0x01000193);
+        second = Math.imul(second ^ (code + index), 0x01000193);
+    }
+    return `edit-${toHex(first)}${toHex(second)}`;
+}
+function toHex(value) {
+    return (value >>> 0).toString(16).padStart(8, "0");
+}
 export function mergeThreadCollectionsForConflict(local, remote) {
     const byId = new Map(remote.threads.map((thread) => [thread.id, thread]));
     for (const thread of local.threads) {
@@ -523,6 +537,9 @@ export function projectThreadEditBranches(events) {
     for (const event of events) {
         if (event.type === "context.cleared") {
             const targetTurnId = event.data.turnId;
+            const previousClearIndex = projected.findLastIndex((candidate) => candidate.type === "context.cleared" && candidate.data.turnId === targetTurnId);
+            if (previousClearIndex >= 0)
+                projected.splice(previousClearIndex);
             let targetIndex = projected.findLastIndex((candidate) => eventTurnId(candidate) === targetTurnId);
             if (targetIndex >= 0) {
                 const actualTargetTurnId = eventTurnId(projected[targetIndex]);

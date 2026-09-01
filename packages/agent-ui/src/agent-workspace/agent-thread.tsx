@@ -21,7 +21,7 @@ import {
   interruptedTurnContextFromEvents,
   interruptedTurnContextsFromEvents,
 } from "./retained-context.js";
-import { appendThreadEvent, appendThreadEventIndexed, dedupeThreadEvents, eventIdentity, projectPendingThreadEdit, projectThreadEditBranches, reconcilePendingTurnWithEvents, titleFromPrompt } from "./thread-storage.js";
+import { appendThreadEvent, appendThreadEventIndexed, dedupeThreadEvents, editOperationId, eventIdentity, projectPendingThreadEdit, projectThreadEditBranches, reconcilePendingTurnWithEvents, titleFromPrompt } from "./thread-storage.js";
 import {
   activeTurnIdAfterPendingSubmission,
   hasTerminalSessionBoundary,
@@ -612,7 +612,12 @@ export function AgentThreadView({
 
   const runtimeIsBusy = agent.status === "submitted" || agent.status === "streaming";
   const admissionPendingTurn = optimisticPendingTurn ?? thread.pendingTurn;
-  const displayPendingCandidate = optimisticDisplayTurn ?? optimisticPendingTurn ?? thread.pendingTurn;
+  // `stageEditedTurn` runs inside assistant-ui's external store callback. The
+  // parent state update is batched, so one render can occur before
+  // `optimisticDisplayTurn`/`thread.pendingTurn` are visible. Include the
+  // synchronous ref snapshot to suppress a synthetic thinking row in that
+  // handoff frame as well.
+  const displayPendingCandidate = optimisticDisplayTurn ?? optimisticPendingTurn ?? thread.pendingTurn ?? pendingTurnRef.current;
   // A failed durable edit never became the active conversation branch. Keep
   // its failure receipt for diagnostics/retry, but restore the original user
   // turn instead of rendering the edited text as an unacknowledged send.
@@ -686,6 +691,11 @@ export function AgentThreadView({
   useEffect(() => {
     const pending = optimisticDisplayTurn;
     if (!pending || !hasVisiblePendingUserMessage(pending, effectiveRenderMessages, authoritativeEvents)) return;
+    // Keep an edited turn's display root alive until the replacement assistant
+    // reaches its durable terminal boundary. Clearing this projection as soon
+    // as message.received arrives lets the final assistant snapshot fall back
+    // to Eve's raw id, which remounts the row and causes a visible flash.
+    if (pending.operation === "edit" && !pendingTurnHasSettledAssistant(pending, authoritativeEvents)) return;
     setOptimisticDisplayTurn(undefined);
   }, [authoritativeEvents, effectiveRenderMessages, optimisticDisplayTurn]);
 
@@ -696,6 +706,7 @@ export function AgentThreadView({
   useEffect(() => {
     const pending = optimisticPendingTurn;
     if (!pending || !hasVisiblePendingUserMessage(pending, effectiveRenderMessages, authoritativeEvents)) return;
+    if (pending.operation === "edit" && !pendingTurnHasSettledAssistant(pending, authoritativeEvents)) return;
     setOptimisticPendingTurn(undefined);
   }, [authoritativeEvents, effectiveRenderMessages, optimisticPendingTurn]);
 
@@ -1476,22 +1487,40 @@ export function AgentThreadView({
     assistantByTurn: new Map(),
     pendingRoot: undefined,
   });
-  const projectedMessages = useMemo(() => projectStagedUserMessages(
-    stabilizeDisplayMessageIdentities(
-      ensureActiveAssistantMessage(
-        projectedRuntimeMessages,
-        interruptedDisplayEvents,
-        isBusy || isPendingTurnInFlight(admissionPendingTurn) || Boolean(latestTurnFailure(interruptedDisplayEvents)),
+  const editAwaitingReceipt = isRecovering &&
+    displayPendingTurn?.operation === "edit" &&
+    !acceptedMessageReceivedEvent(displayPendingTurn, interruptedDisplayEvents);
+  // During a durable edit recovery, Eve may briefly expose the new turn's
+  // empty assistant snapshot before its first real part arrives. Rendering a
+  // synthetic "Thinking" row in that gap and then remounting it at the
+  // recovery handoff produces the visible double flash users reported. Keep
+  // the old branch hidden and wait for actual assistant progress instead.
+  const suppressEditPlaceholder = displayPendingTurn?.operation === "edit";
+  const projectedMessages = useMemo(() => {
+    const projected = projectStagedUserMessages(
+      stabilizeDisplayMessageIdentities(
+        ensureActiveAssistantMessage(
+          projectedRuntimeMessages,
+          projectionEvents,
+          (isBusy || isPendingTurnInFlight(admissionPendingTurn) || Boolean(latestTurnFailure(interruptedDisplayEvents))) && !editAwaitingReceipt && !suppressEditPlaceholder,
+          displayPendingTurn,
+          optimisticPendingTurn?.id === displayPendingTurn?.id,
+        ),
+        projectionEvents,
         displayPendingTurn,
-        optimisticPendingTurn?.id === displayPendingTurn?.id,
+        displayMessageIdentityRef.current,
       ),
+      thread.queuedTurns.filter((turn) => turn.intent === "post-cancellation"),
       interruptedDisplayEvents,
-      displayPendingTurn,
-      displayMessageIdentityRef.current,
-    ),
-    thread.queuedTurns.filter((turn) => turn.intent === "post-cancellation"),
-    interruptedDisplayEvents,
-  ), [admissionPendingTurn, displayPendingTurn, interruptedDisplayEvents, isBusy, optimisticPendingTurn, projectedRuntimeMessages, thread.queuedTurns]);
+    );
+    // Do not mount an empty assistant row for an edit while its durable
+    // replacement is still being recovered. The row would render the generic
+    // thinking label and then be replaced again when the first real part
+    // arrives, producing the flash seen during edit sends.
+    return suppressEditPlaceholder
+      ? projected.filter((message) => !(message.role === "assistant" && !hasSubstantiveAssistantPart(message)))
+      : projected;
+  }, [admissionPendingTurn, displayPendingTurn, editAwaitingReceipt, interruptedDisplayEvents, isBusy, optimisticPendingTurn, projectionEvents, projectedRuntimeMessages, suppressEditPlaceholder, thread.queuedTurns]);
   const ungroupedVisibleMessages = useMemo(
     () => projectedMessages.filter((message) =>
       !isProxiedInputOnlyMessage(message, projectionEvents),
@@ -1516,9 +1545,10 @@ export function AgentThreadView({
   // entire placeholder-to-Eve handoff.
   const visibleMessages = stabilizeDisplayMessageIdentities(
     orderedDisplayMessages,
-    displayEvents,
+    projectionEvents,
     displayPendingTurn,
     displayMessageIdentityRef.current,
+    thread.session.sessionId,
   );
   const assistantMessages = useMemo(
     () => convertEveMessages({ messages: visibleMessages }, {
@@ -1594,7 +1624,7 @@ export function AgentThreadView({
       beforeTurnId,
       delivery: "server" as const,
       eventCountAtSubmission: compactedEventsRef.current.length,
-      id: createPendingTurnId(),
+      id: editOperationId(sessionId, beforeTurnId, text),
       operation: "edit" as const,
       state: "submitting" as const,
       submittedAt: Date.now(),
@@ -1603,9 +1633,15 @@ export function AgentThreadView({
     pendingTurnRef.current = pendingTurn;
     setOptimisticPendingTurn(pendingTurn);
     setOptimisticDisplayTurn(pendingTurn);
+    const previousPrompt = [...thread.events].reverse().find((event) => {
+      return event.type === "message.received" && event.data.turnId === beforeTurnId;
+    });
+    const shouldUpdateTitle = previousPrompt?.type === "message.received" &&
+      thread.title === titleFromPrompt(previousPrompt.data.message);
     onChange({
       pendingTurn,
       status: "submitted",
+      ...(shouldUpdateTitle ? { title: titleFromPrompt(text) } : {}),
       updatedAt: Date.now(),
     });
   };
@@ -1954,6 +1990,13 @@ export function AgentThreadView({
   const visibleQueuedTurns = thread.queuedTurns.filter((turn) =>
     turn.intent !== "post-cancellation"
   );
+  // A mailbox edit intentionally reattaches the durable Eve stream after the
+  // server commits the rewind. That is normal turn execution, not a transport
+  // outage; exposing the internal recovery wording makes every edit look
+  // broken even while the replacement turn is progressing normally.
+  const recoveryStatusLabel = displayPendingTurn?.operation === "edit"
+    ? messages.thinking
+    : messages.reconnecting;
 
   return (
     <AssistantRuntimeProvider runtime={assistantRuntime}>
@@ -1968,7 +2011,7 @@ export function AgentThreadView({
               {isRecovering ? (
                 <div className="flex items-center gap-2 border-b border-border/60 px-1 pb-2 text-xs text-muted-foreground" data-agent-recovery-status role="status">
                   <LoaderCircleIcon className="size-3.5 animate-spin" />
-                  <span>{messages.reconnecting}</span>
+                  <span>{recoveryStatusLabel}</span>
                 </div>
               ) : null}
               {visibleQueuedTurns.length > 0 || queueError ? (
@@ -2144,6 +2187,13 @@ type DisplayMessageIdentityState = {
   pendingUserTurnId?: string;
 };
 
+function hasSubstantiveAssistantPart(message: EveMessage): boolean {
+  return message.parts.some((part) => {
+    if (part.type === "reasoning" || part.type === "text") return part.text.trim().length > 0;
+    return true;
+  });
+}
+
 /**
  * Keep assistant-ui's message identity stable while an admitted turn changes
  * from the browser's pending projection to Eve's durable message. The pending
@@ -2155,7 +2205,13 @@ function stabilizeDisplayMessageIdentities(
   events: readonly MessageStreamEvent[],
   pendingTurn: AgentThread["pendingTurn"] | undefined,
   state: DisplayMessageIdentityState,
+  sessionId?: string,
 ): readonly EveMessage[] {
+  // A recovery handoff can remount the Eve reducer after an edit boundary has
+  // already been persisted. Re-seed the same deterministic root on the new
+  // mount so the assistant row does not switch from the optimistic id to Eve's
+  // raw `<turnId>:assistant` id (which causes a visible second flash).
+  seedEditedTurnIdentities(events, sessionId, state);
   if (pendingTurn && state.pendingRoot !== pendingTurn.id) {
     // A new admission must not reuse the previous receipt anchor while its
     // own `message.received` event is still pending.
@@ -2176,9 +2232,30 @@ function stabilizeDisplayMessageIdentities(
   const receiptTurnId = state.pendingUserRoot === state.pendingRoot
     ? state.pendingUserTurnId
     : undefined;
+  const acceptedTurn = pendingTurn
+    ? acceptedMessageReceivedEvent(pendingTurn, events)
+    : undefined;
+  if (acceptedTurn?.type === "message.received" && state.pendingRoot) {
+    state.pendingUserRoot = state.pendingRoot;
+    state.pendingUserTurnId = acceptedTurn.data.turnId;
+  }
+  // The mailbox receipt and Eve's reduced assistant snapshot can arrive in
+  // separate renders. If the pending record is cleared between those renders,
+  // retain the optimistic assistant root by associating it with the newest
+  // durable turn rather than letting the final message remount from Eve's id.
+  const latestDurableTurnId = [...events].reverse().find((event) => event.type === "turn.started");
+  const inferredTurnId = latestDurableTurnId?.type === "turn.started"
+    ? latestDurableTurnId.data.turnId
+    : undefined;
   const activeTurnId = pendingTurn
-    ? activeTurnIdAfterPendingSubmission(events, pendingTurn) ?? receiptTurnId
-    : receiptTurnId;
+    ? activeTurnIdAfterPendingSubmission(events, pendingTurn) ?? receiptTurnId ??
+      (state.pendingRoot
+        ? ([...events].findLast((event, index) =>
+            event.type === "turn.started" &&
+            (pendingTurn.eventCountAtSubmission === undefined || index >= pendingTurn.eventCountAtSubmission),
+          ) as Extract<MessageStreamEvent, { type: "turn.started" }> | undefined)?.data.turnId
+        : undefined)
+    : receiptTurnId ?? (state.pendingRoot ? inferredTurnId : undefined);
   // Once the durable turn has been associated with the pending root, keep
   // that association after Eve acknowledges the message. The optimistic
   // pending record is intentionally cleared before the reducer's final
@@ -2210,6 +2287,27 @@ function stabilizeDisplayMessageIdentities(
   });
 
   return changed ? stabilized : messages;
+}
+
+function seedEditedTurnIdentities(
+  events: readonly MessageStreamEvent[],
+  sessionId: string | undefined,
+  state: DisplayMessageIdentityState,
+): void {
+  if (!sessionId) return;
+  for (let index = 0; index < events.length; index += 1) {
+    const boundary = events[index];
+    if (boundary?.type !== "context.cleared") continue;
+    const replacement = events.slice(index + 1).find((event) =>
+      event.type === "message.received" && event.data.turnId !== boundary.data.turnId,
+    );
+    if (replacement?.type !== "message.received") continue;
+    const clientMessageId = replacement.data.clientMessageId;
+    const root = typeof clientMessageId === "string" && clientMessageId.startsWith("edit-")
+      ? clientMessageId
+      : editOperationId(sessionId, boundary.data.turnId, replacement.data.message);
+    state.assistantByTurn.set(replacement.data.turnId, root);
+  }
 }
 
 function stableAssistantMessageId(sourceId: string, turnId: string, stableRoot: string): string {
@@ -2341,6 +2439,19 @@ function acceptedMessageReceivedEvent(
   if (receivedIndex < 0) return undefined;
   const received = events[receivedIndex];
   return received?.type === "message.received" ? received : undefined;
+}
+
+function pendingTurnHasSettledAssistant(
+  pendingTurn: AgentPendingTurn,
+  events: readonly MessageStreamEvent[],
+): boolean {
+  const received = acceptedMessageReceivedEvent(pendingTurn, events);
+  if (!received) return false;
+  const turnId = received.data.turnId;
+  return events.some((event) =>
+    (event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled") &&
+    event.data.turnId === turnId,
+  );
 }
 
 export function projectStagedUserMessages(

@@ -173,6 +173,13 @@ export function AssistantThreadSurface({
     () => new Map(eveMessages.map((message) => [message.id, message])),
     [eveMessages],
   );
+  const eveMessagesByTurnId = useMemo(
+    () => new Map(eveMessages.flatMap((message) => {
+      const turnId = typeof message.metadata?.turnId === "string" ? message.metadata.turnId : undefined;
+      return turnId ? [[turnId, message] as const] : [];
+    })),
+    [eveMessages],
+  );
   const lastAssistantMessageId = [...eveMessages].reverse().find((message) => message.role === "assistant")?.id;
   const canRespondToInputRequest = eveMessages.some((message) =>
     message.parts.some((part) =>
@@ -226,7 +233,12 @@ export function AssistantThreadSurface({
               isStreaming={isBusy && !runtimeError && message.id === lastAssistantMessageId}
               isTurnContinuation={isSteeringContinuationMessage(message, events)}
               locale={locale}
-              message={eveMessagesById.get(message.id)}
+              message={eveMessagesById.get(message.id) ?? (() => {
+                const turnId = typeof message.metadata?.custom?.turnId === "string"
+                  ? message.metadata.custom.turnId
+                  : undefined;
+                return turnId ? eveMessagesByTurnId.get(turnId) : undefined;
+              })()}
               messages={messages}
               onInputResponses={onInputResponses}
               onCloseInputRequest={onCloseInputRequest}

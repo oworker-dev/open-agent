@@ -6,6 +6,7 @@ import {
   appendThreadEventIndexed,
   compactThreadEvents,
   dedupeThreadEvents,
+  editOperationId,
   eventIdentity,
   mergeThreadCollectionsForConflict,
   parseThreadCollection,
@@ -14,6 +15,15 @@ import {
   reconcileHydratedPendingTurn,
   reconcilePendingTurnWithEvents,
 } from "@oworker/open-agent-ui/agent-workspace";
+
+test("edit operation ids are stable for replay and scoped to the edit tuple", () => {
+  const first = editOperationId("session-1", "turn-1", "Edited request");
+  assert.equal(first, editOperationId("session-1", "turn-1", "Edited request"));
+  assert.notEqual(first, editOperationId("session-1", "turn-1", "Edited request 2"));
+  assert.notEqual(first, editOperationId("session-1", "turn-2", "Edited request"));
+  assert.notEqual(first, editOperationId("session-2", "turn-1", "Edited request"));
+  assert.match(first, /^edit-[0-9a-f]{16}$/u);
+});
 
 function editEvent(type: string, data: Record<string, unknown>): MessageStreamEvent {
   return {
@@ -157,6 +167,29 @@ test("edit projection uses exact targets and keeps unaffected event arrays stabl
   assert.deepEqual(projected.filter((event) => event.type === "message.received").map((event) => event.data.message), [
     "First",
     "Edited latest",
+  ]);
+});
+
+test("edit projection keeps only the newest replacement for a repeated target", () => {
+  const turn0 = editTurnEvents("turn-0", "First", "First reply");
+  const turn1 = editTurnEvents("turn-1", "Original latest", "Original reply");
+  const firstClear = editEvent("context.cleared", { sequence: 2, sessionId: "session-1", turnId: "turn-1" });
+  const firstReplacement = editTurnEvents("turn-2", "Edited once", "First edit reply");
+  const secondClear = editEvent("context.cleared", { sequence: 3, sessionId: "session-1", turnId: "turn-1" });
+  const secondReplacement = editTurnEvents("turn-3", "Edited twice", "Final edit reply");
+
+  const projected = projectThreadEditBranches([
+    ...turn0,
+    ...turn1,
+    firstClear,
+    ...firstReplacement,
+    secondClear,
+    ...secondReplacement,
+  ]);
+
+  assert.deepEqual(projected.filter((event) => event.type === "message.received").map((event) => event.data.message), [
+    "First",
+    "Edited twice",
   ]);
 });
 

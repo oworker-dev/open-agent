@@ -15,7 +15,7 @@ import { sanitizeAgentError } from "./error-presentation.js";
 import { AgentMailboxHttpError } from "./http-agent-mailbox.js";
 import { messagesFor } from "./i18n.js";
 import { interruptedTurnContextFromEvents, interruptedTurnContextsFromEvents, } from "./retained-context.js";
-import { appendThreadEventIndexed, dedupeThreadEvents, eventIdentity, projectPendingThreadEdit, projectThreadEditBranches, reconcilePendingTurnWithEvents, titleFromPrompt } from "./thread-storage.js";
+import { appendThreadEventIndexed, dedupeThreadEvents, editOperationId, eventIdentity, projectPendingThreadEdit, projectThreadEditBranches, reconcilePendingTurnWithEvents, titleFromPrompt } from "./thread-storage.js";
 import { activeTurnIdAfterPendingSubmission, hasTerminalSessionBoundary, hasSettledLatestTurn, isRetryableAgentFailure, isProxiedInputOnlyMessage, normalizeSettledAgentMessages, projectAgentDisplayTimeline, shouldSuppressInterruptedTurnDisplayEvent, shouldSuppressInterruptedTurnStreamEvent, stableUserMessageId, unresolvedInputRequests, } from "./turn-presentation.js";
 import { summarizeUsage } from "./usage.js";
 const CANCELLATION_STREAM_REATTACH_AFTER_MS = 5_000;
@@ -369,7 +369,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         : effectiveRenderMessages, [effectiveRenderEvents, effectiveRenderMessages, pendingEditTurnId, projectionEvents]);
     const runtimeIsBusy = agent.status === "submitted" || agent.status === "streaming";
     const admissionPendingTurn = optimisticPendingTurn ?? thread.pendingTurn;
-    const displayPendingCandidate = optimisticDisplayTurn ?? optimisticPendingTurn ?? thread.pendingTurn;
+    const displayPendingCandidate = optimisticDisplayTurn ?? optimisticPendingTurn ?? thread.pendingTurn ?? pendingTurnRef.current;
     const failedEditOperationId = [optimisticPendingTurn, thread.pendingTurn].find((pending) => pending?.operation === "edit" && pending.state === "delivery-failed")?.id;
     const displayPendingTurn = displayPendingCandidate?.operation === "edit" &&
         (displayPendingCandidate.state === "delivery-failed" || displayPendingCandidate.id === failedEditOperationId)
@@ -408,11 +408,15 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         const pending = optimisticDisplayTurn;
         if (!pending || !hasVisiblePendingUserMessage(pending, effectiveRenderMessages, authoritativeEvents))
             return;
+        if (pending.operation === "edit" && !pendingTurnHasSettledAssistant(pending, authoritativeEvents))
+            return;
         setOptimisticDisplayTurn(undefined);
     }, [authoritativeEvents, effectiveRenderMessages, optimisticDisplayTurn]);
     useEffect(() => {
         const pending = optimisticPendingTurn;
         if (!pending || !hasVisiblePendingUserMessage(pending, effectiveRenderMessages, authoritativeEvents))
+            return;
+        if (pending.operation === "edit" && !pendingTurnHasSettledAssistant(pending, authoritativeEvents))
             return;
         setOptimisticPendingTurn(undefined);
     }, [authoritativeEvents, effectiveRenderMessages, optimisticPendingTurn]);
@@ -1041,13 +1045,22 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         assistantByTurn: new Map(),
         pendingRoot: undefined,
     });
-    const projectedMessages = useMemo(() => projectStagedUserMessages(stabilizeDisplayMessageIdentities(ensureActiveAssistantMessage(projectedRuntimeMessages, interruptedDisplayEvents, isBusy || isPendingTurnInFlight(admissionPendingTurn) || Boolean(latestTurnFailure(interruptedDisplayEvents)), displayPendingTurn, optimisticPendingTurn?.id === displayPendingTurn?.id), interruptedDisplayEvents, displayPendingTurn, displayMessageIdentityRef.current), thread.queuedTurns.filter((turn) => turn.intent === "post-cancellation"), interruptedDisplayEvents), [admissionPendingTurn, displayPendingTurn, interruptedDisplayEvents, isBusy, optimisticPendingTurn, projectedRuntimeMessages, thread.queuedTurns]);
+    const editAwaitingReceipt = isRecovering &&
+        displayPendingTurn?.operation === "edit" &&
+        !acceptedMessageReceivedEvent(displayPendingTurn, interruptedDisplayEvents);
+    const suppressEditPlaceholder = displayPendingTurn?.operation === "edit";
+    const projectedMessages = useMemo(() => {
+        const projected = projectStagedUserMessages(stabilizeDisplayMessageIdentities(ensureActiveAssistantMessage(projectedRuntimeMessages, projectionEvents, (isBusy || isPendingTurnInFlight(admissionPendingTurn) || Boolean(latestTurnFailure(interruptedDisplayEvents))) && !editAwaitingReceipt && !suppressEditPlaceholder, displayPendingTurn, optimisticPendingTurn?.id === displayPendingTurn?.id), projectionEvents, displayPendingTurn, displayMessageIdentityRef.current), thread.queuedTurns.filter((turn) => turn.intent === "post-cancellation"), interruptedDisplayEvents);
+        return suppressEditPlaceholder
+            ? projected.filter((message) => !(message.role === "assistant" && !hasSubstantiveAssistantPart(message)))
+            : projected;
+    }, [admissionPendingTurn, displayPendingTurn, editAwaitingReceipt, interruptedDisplayEvents, isBusy, optimisticPendingTurn, projectionEvents, projectedRuntimeMessages, suppressEditPlaceholder, thread.queuedTurns]);
     const ungroupedVisibleMessages = useMemo(() => projectedMessages.filter((message) => !isProxiedInputOnlyMessage(message, projectionEvents)), [projectionEvents, projectedMessages]);
     const ungroupedDisplayEvents = interruptedDisplayEvents;
     const displayTimeline = useMemo(() => projectAgentDisplayTimeline(ungroupedVisibleMessages, ungroupedDisplayEvents), [ungroupedDisplayEvents, ungroupedVisibleMessages]);
     const displayEvents = displayTimeline.events;
     const orderedDisplayMessages = orderPendingUserMessage(displayTimeline.messages, displayPendingTurn, displayEvents, displayMessageIdentityRef.current);
-    const visibleMessages = stabilizeDisplayMessageIdentities(orderedDisplayMessages, displayEvents, displayPendingTurn, displayMessageIdentityRef.current);
+    const visibleMessages = stabilizeDisplayMessageIdentities(orderedDisplayMessages, projectionEvents, displayPendingTurn, displayMessageIdentityRef.current, thread.session.sessionId);
     const assistantMessages = useMemo(() => convertEveMessages({ messages: visibleMessages }, {
         assetUrl: client?.assetUrl,
         error: agent.error,
@@ -1118,7 +1131,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             beforeTurnId,
             delivery: "server",
             eventCountAtSubmission: compactedEventsRef.current.length,
-            id: createPendingTurnId(),
+            id: editOperationId(sessionId, beforeTurnId, text),
             operation: "edit",
             state: "submitting",
             submittedAt: Date.now(),
@@ -1127,9 +1140,15 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         pendingTurnRef.current = pendingTurn;
         setOptimisticPendingTurn(pendingTurn);
         setOptimisticDisplayTurn(pendingTurn);
+        const previousPrompt = [...thread.events].reverse().find((event) => {
+            return event.type === "message.received" && event.data.turnId === beforeTurnId;
+        });
+        const shouldUpdateTitle = previousPrompt?.type === "message.received" &&
+            thread.title === titleFromPrompt(previousPrompt.data.message);
         onChange({
             pendingTurn,
             status: "submitted",
+            ...(shouldUpdateTitle ? { title: titleFromPrompt(text) } : {}),
             updatedAt: Date.now(),
         });
     };
@@ -1415,7 +1434,10 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     };
     const closeInputRequest = (requestId) => closeInputRequests([requestId]);
     const visibleQueuedTurns = thread.queuedTurns.filter((turn) => turn.intent !== "post-cancellation");
-    return (_jsx(AssistantRuntimeProvider, { runtime: assistantRuntime, children: _jsx("main", { className: "flex min-h-0 flex-1 flex-col overflow-hidden", children: _jsx(AssistantThreadSurface, { assetUrl: client?.assetUrl, approvalTakeover: approvalTakeover, cancellationState: cancellationState, commands: commands, composerTop: isRecovering || visibleQueuedTurns.length > 0 || queueError ? (_jsxs(_Fragment, { children: [isRecovering ? (_jsxs("div", { className: "flex items-center gap-2 border-b border-border/60 px-1 pb-2 text-xs text-muted-foreground", "data-agent-recovery-status": true, role: "status", children: [_jsx(LoaderCircleIcon, { className: "size-3.5 animate-spin" }), _jsx("span", { children: messages.reconnecting })] })) : null, visibleQueuedTurns.length > 0 || queueError ? (_jsx(FollowUpQueue, { error: queueError, messages: messages, onRemove: removeQueuedTurn, onRetry: markQueuedTurnForRetry, turns: visibleQueuedTurns })) : null] })) : undefined, draftStorageKey: draftStorageKey, historyHasMore: historyHasMore, historyLoading: historyLoading, events: displayEvents, eveMessages: visibleMessages, fallbackStartedAt: displayPendingTurn?.submittedAt, inputDisabled: inputLocked, isBusy: isBusy, sessionTerminal: sessionTerminal, sessionSettled: durableTurnSettled, onCancel: requestCancellation, locale: locale, mentions: mentions, messages: messages, models: models, onInputResponses: respond, onCloseInputRequest: closeInputRequest, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, onLoadEarlier: onLoadEarlier, onPreferencesChange: (preferences) => onChange({ preferences }), onDraftRestoreConsumed: (id) => {
+    const recoveryStatusLabel = displayPendingTurn?.operation === "edit"
+        ? messages.thinking
+        : messages.reconnecting;
+    return (_jsx(AssistantRuntimeProvider, { runtime: assistantRuntime, children: _jsx("main", { className: "flex min-h-0 flex-1 flex-col overflow-hidden", children: _jsx(AssistantThreadSurface, { assetUrl: client?.assetUrl, approvalTakeover: approvalTakeover, cancellationState: cancellationState, commands: commands, composerTop: isRecovering || visibleQueuedTurns.length > 0 || queueError ? (_jsxs(_Fragment, { children: [isRecovering ? (_jsxs("div", { className: "flex items-center gap-2 border-b border-border/60 px-1 pb-2 text-xs text-muted-foreground", "data-agent-recovery-status": true, role: "status", children: [_jsx(LoaderCircleIcon, { className: "size-3.5 animate-spin" }), _jsx("span", { children: recoveryStatusLabel })] })) : null, visibleQueuedTurns.length > 0 || queueError ? (_jsx(FollowUpQueue, { error: queueError, messages: messages, onRemove: removeQueuedTurn, onRetry: markQueuedTurnForRetry, turns: visibleQueuedTurns })) : null] })) : undefined, draftStorageKey: draftStorageKey, historyHasMore: historyHasMore, historyLoading: historyLoading, events: displayEvents, eveMessages: visibleMessages, fallbackStartedAt: displayPendingTurn?.submittedAt, inputDisabled: inputLocked, isBusy: isBusy, sessionTerminal: sessionTerminal, sessionSettled: durableTurnSettled, onCancel: requestCancellation, locale: locale, mentions: mentions, messages: messages, models: models, onInputResponses: respond, onCloseInputRequest: closeInputRequest, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, onLoadEarlier: onLoadEarlier, onPreferencesChange: (preferences) => onChange({ preferences }), onDraftRestoreConsumed: (id) => {
                     if (thread.draftRestore?.id === id)
                         onChange({ draftRestore: undefined });
                 }, onRetryRuntimeError: recoveryError ? onRetryRecovery : undefined, closedInputRequestIds: closedInputRequestIdsRef.current, preferences: thread.preferences, reasoningLevels: reasoningLevels, draftRestore: thread.draftRestore, runtimeFailure: runtimeFailure, runtimeError: runtimeError, runtimeRetry: providerRetry, usage: usage }) }) }));
@@ -1489,7 +1511,15 @@ function ensureActiveAssistantMessage(messages, events, isBusy, pendingTurn, opt
         },
     ];
 }
-function stabilizeDisplayMessageIdentities(messages, events, pendingTurn, state) {
+function hasSubstantiveAssistantPart(message) {
+    return message.parts.some((part) => {
+        if (part.type === "reasoning" || part.type === "text")
+            return part.text.trim().length > 0;
+        return true;
+    });
+}
+function stabilizeDisplayMessageIdentities(messages, events, pendingTurn, state, sessionId) {
+    seedEditedTurnIdentities(events, sessionId, state);
     if (pendingTurn && state.pendingRoot !== pendingTurn.id) {
         state.pendingUserRoot = undefined;
         state.pendingUserTurnId = undefined;
@@ -1498,9 +1528,24 @@ function stabilizeDisplayMessageIdentities(messages, events, pendingTurn, state)
     const receiptTurnId = state.pendingUserRoot === state.pendingRoot
         ? state.pendingUserTurnId
         : undefined;
+    const acceptedTurn = pendingTurn
+        ? acceptedMessageReceivedEvent(pendingTurn, events)
+        : undefined;
+    if (acceptedTurn?.type === "message.received" && state.pendingRoot) {
+        state.pendingUserRoot = state.pendingRoot;
+        state.pendingUserTurnId = acceptedTurn.data.turnId;
+    }
+    const latestDurableTurnId = [...events].reverse().find((event) => event.type === "turn.started");
+    const inferredTurnId = latestDurableTurnId?.type === "turn.started"
+        ? latestDurableTurnId.data.turnId
+        : undefined;
     const activeTurnId = pendingTurn
-        ? activeTurnIdAfterPendingSubmission(events, pendingTurn) ?? receiptTurnId
-        : receiptTurnId;
+        ? activeTurnIdAfterPendingSubmission(events, pendingTurn) ?? receiptTurnId ??
+            (state.pendingRoot
+                ? [...events].findLast((event, index) => event.type === "turn.started" &&
+                    (pendingTurn.eventCountAtSubmission === undefined || index >= pendingTurn.eventCountAtSubmission))?.data.turnId
+                : undefined)
+        : receiptTurnId ?? (state.pendingRoot ? inferredTurnId : undefined);
     if (pendingTurn && state.pendingRoot) {
         for (const [turnId, root] of state.assistantByTurn) {
             if (root === state.pendingRoot && turnId !== activeTurnId) {
@@ -1526,6 +1571,23 @@ function stabilizeDisplayMessageIdentities(messages, events, pendingTurn, state)
         return { ...message, id };
     });
     return changed ? stabilized : messages;
+}
+function seedEditedTurnIdentities(events, sessionId, state) {
+    if (!sessionId)
+        return;
+    for (let index = 0; index < events.length; index += 1) {
+        const boundary = events[index];
+        if (boundary?.type !== "context.cleared")
+            continue;
+        const replacement = events.slice(index + 1).find((event) => event.type === "message.received" && event.data.turnId !== boundary.data.turnId);
+        if (replacement?.type !== "message.received")
+            continue;
+        const clientMessageId = replacement.data.clientMessageId;
+        const root = typeof clientMessageId === "string" && clientMessageId.startsWith("edit-")
+            ? clientMessageId
+            : editOperationId(sessionId, boundary.data.turnId, replacement.data.message);
+        state.assistantByTurn.set(replacement.data.turnId, root);
+    }
 }
 function stableAssistantMessageId(sourceId, turnId, stableRoot) {
     const prefix = `${turnId}:assistant`;
@@ -1619,6 +1681,14 @@ function acceptedMessageReceivedEvent(pendingTurn, events) {
         return undefined;
     const received = events[receivedIndex];
     return received?.type === "message.received" ? received : undefined;
+}
+function pendingTurnHasSettledAssistant(pendingTurn, events) {
+    const received = acceptedMessageReceivedEvent(pendingTurn, events);
+    if (!received)
+        return false;
+    const turnId = received.data.turnId;
+    return events.some((event) => (event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled") &&
+        event.data.turnId === turnId);
 }
 export function projectStagedUserMessages(messages, turns, events = []) {
     if (turns.length === 0)
