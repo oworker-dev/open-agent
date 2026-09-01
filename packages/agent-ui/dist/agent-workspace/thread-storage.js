@@ -561,6 +561,19 @@ export function projectPendingThreadEdit(events, beforeTurnId) {
     const turnStartIndex = events.findLastIndex((event, index) => index <= targetIndex && event.type === "turn.started" && event.data.turnId === beforeTurnId);
     return events.slice(0, turnStartIndex >= 0 ? turnStartIndex : targetIndex);
 }
+export function latestEditableTurnId(events) {
+    const conflictTurns = new Set(events.flatMap((event) => event.type === "turn.failed" && event.data.code === "turn_revert_conflict"
+        ? [event.data.turnId]
+        : []));
+    for (const event of [...events].reverse()) {
+        if (event.type !== "message.received" || typeof event.data.turnId !== "string")
+            continue;
+        if (conflictTurns.has(event.data.turnId))
+            continue;
+        return event.data.turnId;
+    }
+    return undefined;
+}
 function eventTurnId(event) {
     return "data" in event && "turnId" in event.data && typeof event.data.turnId === "string"
         ? event.data.turnId

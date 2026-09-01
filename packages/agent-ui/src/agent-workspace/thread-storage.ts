@@ -763,6 +763,31 @@ export function projectPendingThreadEdit(
   return events.slice(0, turnStartIndex >= 0 ? turnStartIndex : targetIndex);
 }
 
+/**
+ * Returns the latest user turn that can be used as an edit checkpoint.
+ *
+ * The rendered assistant-ui message may carry a stable display alias after
+ * one or more edits, so its sourceId is not a durable Eve turn id. The latest
+ * accepted receipt in the projected event stream is authoritative instead.
+ * A turn that failed with Eve's revert-conflict marker never established a
+ * checkpoint and must not be selected again on a retry.
+ */
+export function latestEditableTurnId(
+  events: readonly MessageStreamEvent[],
+): string | undefined {
+  const conflictTurns = new Set(events.flatMap((event) =>
+    event.type === "turn.failed" && event.data.code === "turn_revert_conflict"
+      ? [event.data.turnId]
+      : [],
+  ));
+  for (const event of [...events].reverse()) {
+    if (event.type !== "message.received" || typeof event.data.turnId !== "string") continue;
+    if (conflictTurns.has(event.data.turnId)) continue;
+    return event.data.turnId;
+  }
+  return undefined;
+}
+
 function eventTurnId(event: MessageStreamEvent): string | undefined {
   return "data" in event && "turnId" in event.data && typeof event.data.turnId === "string"
     ? event.data.turnId

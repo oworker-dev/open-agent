@@ -63,6 +63,7 @@ export {
   dedupeThreadEvents,
   editOperationId,
   eventIdentity,
+  latestEditableTurnId,
   mergeThreadCollectionsForConflict,
   parseThreadCollection,
   projectPendingThreadEdit,

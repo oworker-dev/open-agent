@@ -21,7 +21,7 @@ import {
   interruptedTurnContextFromEvents,
   interruptedTurnContextsFromEvents,
 } from "./retained-context.js";
-import { appendThreadEvent, appendThreadEventIndexed, dedupeThreadEvents, editOperationId, eventIdentity, projectPendingThreadEdit, projectThreadEditBranches, reconcilePendingTurnWithEvents, titleFromPrompt } from "./thread-storage.js";
+import { appendThreadEvent, appendThreadEventIndexed, dedupeThreadEvents, editOperationId, eventIdentity, latestEditableTurnId, projectPendingThreadEdit, projectThreadEditBranches, reconcilePendingTurnWithEvents, titleFromPrompt } from "./thread-storage.js";
 import {
   activeTurnIdAfterPendingSubmission,
   hasTerminalSessionBoundary,
@@ -1583,7 +1583,11 @@ export function AgentThreadView({
   const stageEditedTurn = (message: AppendMessage) => {
     const prompt = promptFromAssistantMessage(getEveMessageContent(message));
     if (!prompt.text && prompt.files.length === 0) return;
-    const beforeTurnId = editedTurnId(message, displayMessageIdentityRef.current);
+    // assistant-ui sourceId is the rendered message id. After an edit we may
+    // intentionally stabilize that id to an older display root, so resolve
+    // the durable checkpoint from Eve's latest projected receipt first.
+    const beforeTurnId = latestEditableTurnId(projectionEvents) ??
+      editedTurnId(message, displayMessageIdentityRef.current);
     if (!beforeTurnId) {
       setTurnError(locale === "zh-CN"
         ? "无法确定要编辑的消息，请刷新会话后重试。"

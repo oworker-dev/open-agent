@@ -8,6 +8,7 @@ import {
   dedupeThreadEvents,
   editOperationId,
   eventIdentity,
+  latestEditableTurnId,
   mergeThreadCollectionsForConflict,
   parseThreadCollection,
   projectPendingThreadEdit,
@@ -191,6 +192,34 @@ test("edit projection keeps only the newest replacement for a repeated target", 
     "First",
     "Edited twice",
   ]);
+});
+
+test("latest editable turn follows a chain of edits instead of a display alias", () => {
+  const turn0 = editTurnEvents("turn-0", "First", "First reply");
+  const turn1 = editTurnEvents("turn-1", "Original latest", "Original reply");
+  const turn2 = editTurnEvents("turn-2", "Edited once", "First edit reply");
+  const turn3 = editTurnEvents("turn-3", "Edited twice", "Second edit reply");
+  const projected = projectThreadEditBranches([
+    ...turn0,
+    ...turn1,
+    editEvent("context.cleared", { sequence: 2, sessionId: "session-1", turnId: "turn-1" }),
+    ...turn2,
+    editEvent("context.cleared", { sequence: 3, sessionId: "session-1", turnId: "turn-2" }),
+    ...turn3,
+  ]);
+
+  assert.equal(latestEditableTurnId(projected), "turn-3");
+});
+
+test("latest editable turn skips an Eve revert-conflict turn", () => {
+  const turn0 = editTurnEvents("turn-0", "First", "First reply");
+  const failed = [
+    editEvent("turn.started", { sequence: 1, turnId: "turn-1" }),
+    editEvent("message.received", { message: "Stale edit", parts: [{ text: "Stale edit", type: "text" }], sequence: 1, turnId: "turn-1" }),
+    editEvent("turn.failed", { code: "turn_revert_conflict", message: "Conflict", sequence: 1, turnId: "turn-1" }),
+  ];
+
+  assert.equal(latestEditableTurnId([...turn0, ...failed]), "turn-0");
 });
 
 test("unknown clear markers never guess and remove a preceding turn", () => {

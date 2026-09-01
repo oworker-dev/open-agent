@@ -15,7 +15,7 @@ import { sanitizeAgentError } from "./error-presentation.js";
 import { AgentMailboxHttpError } from "./http-agent-mailbox.js";
 import { messagesFor } from "./i18n.js";
 import { interruptedTurnContextFromEvents, interruptedTurnContextsFromEvents, } from "./retained-context.js";
-import { appendThreadEventIndexed, dedupeThreadEvents, editOperationId, eventIdentity, projectPendingThreadEdit, projectThreadEditBranches, reconcilePendingTurnWithEvents, titleFromPrompt } from "./thread-storage.js";
+import { appendThreadEventIndexed, dedupeThreadEvents, editOperationId, eventIdentity, latestEditableTurnId, projectPendingThreadEdit, projectThreadEditBranches, reconcilePendingTurnWithEvents, titleFromPrompt } from "./thread-storage.js";
 import { activeTurnIdAfterPendingSubmission, hasTerminalSessionBoundary, hasSettledLatestTurn, isRetryableAgentFailure, isProxiedInputOnlyMessage, normalizeSettledAgentMessages, projectAgentDisplayTimeline, shouldSuppressInterruptedTurnDisplayEvent, shouldSuppressInterruptedTurnStreamEvent, stableUserMessageId, unresolvedInputRequests, } from "./turn-presentation.js";
 import { summarizeUsage } from "./usage.js";
 const CANCELLATION_STREAM_REATTACH_AFTER_MS = 5_000;
@@ -1090,7 +1090,8 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         const prompt = promptFromAssistantMessage(getEveMessageContent(message));
         if (!prompt.text && prompt.files.length === 0)
             return;
-        const beforeTurnId = editedTurnId(message, displayMessageIdentityRef.current);
+        const beforeTurnId = latestEditableTurnId(projectionEvents) ??
+            editedTurnId(message, displayMessageIdentityRef.current);
         if (!beforeTurnId) {
             setTurnError(locale === "zh-CN"
                 ? "无法确定要编辑的消息，请刷新会话后重试。"
