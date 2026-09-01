@@ -9,9 +9,31 @@ import {
   eventIdentity,
   mergeThreadCollectionsForConflict,
   parseThreadCollection,
+  projectPendingThreadEdit,
+  projectThreadEditBranches,
   reconcileHydratedPendingTurn,
   reconcilePendingTurnWithEvents,
 } from "@oworker/open-agent-ui/agent-workspace";
+
+function editEvent(type: string, data: Record<string, unknown>): MessageStreamEvent {
+  return {
+    data,
+    meta: { at: new Date().toISOString(), id: `evt-${type}-${String(data.turnId ?? data.sequence ?? "event")}` },
+    type,
+  } as unknown as MessageStreamEvent;
+}
+
+function editTurnEvents(turnId: string, message: string, reply: string): readonly MessageStreamEvent[] {
+  const sequence = Number.parseInt(turnId.replace(/\D/gu, ""), 10) || 0;
+  return [
+    editEvent("turn.started", { sequence, turnId }),
+    editEvent("message.received", { message, parts: [{ text: message, type: "text" }], sequence, turnId }),
+    editEvent("step.started", { sequence, stepIndex: 0, turnId }),
+    editEvent("message.completed", { finishReason: "stop", message: reply, sequence, stepIndex: 0, turnId }),
+    editEvent("step.completed", { finishReason: "stop", sequence, stepIndex: 0, turnId }),
+    editEvent("turn.completed", { sequence, turnId }),
+  ];
+}
 
 test("deduplicates exact replayed events without collapsing distinct lifecycle events", () => {
   const at = new Date().toISOString();
@@ -107,6 +129,56 @@ test("hydration never silently resends an unacknowledged submitting turn", () =>
     type: "message.received" as const,
   }] as unknown as MessageStreamEvent[];
   assert.equal(reconcileHydratedPendingTurn(pending, history)?.state, "delivery-failed");
+});
+
+test("hydration preserves a server-owned edit operation for idempotent recovery", () => {
+  const pending = {
+    beforeTurnId: "turn-1",
+    delivery: "server" as const,
+    id: "pending-edit-1",
+    mailboxItemId: "mail-edit-1",
+    operation: "edit" as const,
+    state: "submitting" as const,
+    submittedAt: Date.now(),
+    text: "Edited request",
+  };
+  assert.equal(reconcileHydratedPendingTurn(pending, []), pending);
+});
+
+test("edit projection uses exact targets and keeps unaffected event arrays stable", () => {
+  const turn0 = editTurnEvents("turn-0", "First", "First reply");
+  const turn1 = editTurnEvents("turn-1", "Original latest", "Original reply");
+  const clear = editEvent("context.cleared", { sequence: 2, sessionId: "session-1", turnId: "turn-1" });
+  const turn2 = editTurnEvents("turn-2", "Edited latest", "Edited reply");
+  const untouched = [...turn0, ...turn1];
+
+  assert.equal(projectThreadEditBranches(untouched), untouched);
+  const projected = projectThreadEditBranches([...turn0, ...turn1, clear, ...turn2]);
+  assert.deepEqual(projected.filter((event) => event.type === "message.received").map((event) => event.data.message), [
+    "First",
+    "Edited latest",
+  ]);
+});
+
+test("unknown clear markers never guess and remove a preceding turn", () => {
+  const turn0 = editTurnEvents("turn-0", "Original", "Original reply");
+  const clear = editEvent("context.cleared", { sequence: 1, sessionId: "session-1", turnId: "clear-1" });
+  const turn1 = editTurnEvents("turn-1", "Edited", "Edited reply");
+  const projected = projectThreadEditBranches([...turn0, clear, ...turn1]);
+
+  assert.equal(projected.some((event) => {
+    if (!("data" in event)) return false;
+    const data = event.data as { readonly turnId?: unknown };
+    return data.turnId === "turn-0";
+  }), true);
+  assert.deepEqual(projected.filter((event) => event.type === "message.received").map((event) => event.data.message), ["Original", "Edited"]);
+});
+
+test("pending edit hides only its addressed branch until Eve commits the revert", () => {
+  const turn0 = editTurnEvents("turn-0", "First", "First reply");
+  const turn1 = editTurnEvents("turn-1", "Original latest", "Original reply");
+  const pending = projectPendingThreadEdit([...turn0, ...turn1], "turn-1");
+  assert.deepEqual(pending.filter((event) => event.type === "message.received").map((event) => event.data.message), ["First"]);
 });
 
 test("compacts legacy cumulative deltas without changing the absolute stream cursor", () => {

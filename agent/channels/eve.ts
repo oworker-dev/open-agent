@@ -270,6 +270,9 @@ const mailboxRoute = POST(MAILBOX_ROUTE, async (request, {
         ? { clientMessageId: input.clientMessageId, expectedTurnId: input.expectedTurnId }
         : undefined
       : undefined;
+    const revert = input.operationKind === "edit" && input.beforeTurnId
+      ? { beforeTurnId: input.beforeTurnId, clientMessageId: input.clientMessageId }
+      : undefined;
     if (boundary.state === "running" && input.operationKind === "steer" && !steer) {
       return mailboxProblem(400, "mailbox_expected_turn_missing", "A steering message requires the active turn id.");
     }
@@ -278,6 +281,7 @@ const mailboxRoute = POST(MAILBOX_ROUTE, async (request, {
       {
         auth: mailboxSessionAuth(input),
         ...(input.clientContext ? { clientContext: input.clientContext } : {}),
+        ...(revert ? { revert } : {}),
         ...(steer ? { steer } : {}),
       },
     );
@@ -340,6 +344,7 @@ type MailboxControlRequest =
 
 type MailboxDeliverRequest = {
   readonly action: "deliver";
+  readonly beforeTurnId?: string;
   readonly clientMessageId: string;
   readonly clientContext?: readonly string[];
   readonly executionMode?: AgentRunPolicy["executionMode"];
@@ -411,13 +416,17 @@ function parseMailboxRequest(body: string): MailboxInspectRequest | MailboxTrans
       value.operationKind !== "steer" &&
       value.operationKind !== "edit" ||
     value.expectedTurnId !== undefined && !validText(value.expectedTurnId, 512) ||
+    value.beforeTurnId !== undefined && !validText(value.beforeTurnId, 512) ||
     value.operationKind === "steer" &&
       (typeof value.operationId !== "string" || typeof value.expectedTurnId !== "string") ||
+    value.operationKind === "edit" &&
+      (typeof value.operationId !== "string" || typeof value.beforeTurnId !== "string") ||
     value.operationId !== undefined && typeof value.operationKind !== "string" ||
     value.clientContext !== undefined && !validClientContext(value.clientContext)
   ) return undefined;
   return {
     action: "deliver",
+    ...(value.beforeTurnId ? { beforeTurnId: value.beforeTurnId } : {}),
     clientMessageId: value.clientMessageId,
     ...(value.clientContext ? { clientContext: value.clientContext } : {}),
     ...(value.executionMode ? { executionMode: value.executionMode } : {}),

@@ -127,6 +127,36 @@ test("repair preserves a reasoning anchor when Eve completes it after tool resul
   ]);
 });
 
+test("repair keeps only the final branch after repeated edits while retaining the Eve cursor", async () => {
+  const source = events(
+    ...settledTurn("turn-0", 0, "Hello", "Hello reply"),
+    ...settledTurn("turn-1", 1, "What are you doing?", "First reply"),
+    event("context.cleared", { sequence: 2, turnId: "clear-1" }),
+    event("session.waiting", {}),
+    ...settledTurn("turn-2", 2, "What are you doing?", "Second reply"),
+    event("context.cleared", { sequence: 3, turnId: "clear-2" }),
+    event("session.waiting", {}),
+    ...settledTurn("turn-3", 3, "What are you doing?", "Final reply"),
+  );
+  const expectedEndIndex = 24;
+
+  const rebuilt = await rebuildSettledThreadTranscript(source, expectedEndIndex);
+
+  assert.equal(rebuilt.endIndex, expectedEndIndex);
+  assert.deepEqual(
+    rebuilt.events
+      .filter((item) => item.type === "message.received" || item.type === "message.completed")
+      .map((item) => item.type === "message.received" ? item.data.message : item.data.message),
+    ["Hello", "Hello reply", "What are you doing?", "Final reply"],
+  );
+  assert.equal(rebuilt.events.some((item) =>
+    item.type === "message.completed" && item.data.message === "First reply"
+  ), false);
+  assert.equal(rebuilt.events.some((item) =>
+    item.type === "message.completed" && item.data.message === "Second reply"
+  ), false);
+});
+
 async function* largeSettledToolStream(partialCount: number): AsyncGenerator<MessageStreamEvent> {
   const turnId = "turn-large";
   yield event("turn.started", { sequence: 0, turnId });
@@ -168,6 +198,32 @@ async function* largeSettledToolStream(partialCount: number): AsyncGenerator<Mes
 
 async function* events(...items: readonly MessageStreamEvent[]): AsyncGenerator<MessageStreamEvent> {
   yield* items;
+}
+
+function settledTurn(
+  turnId: string,
+  sequence: number,
+  request: string,
+  reply: string,
+): readonly MessageStreamEvent[] {
+  return [
+    event("turn.started", { sequence, turnId }),
+    event("message.received", {
+      message: request,
+      parts: [{ text: request, type: "text" }],
+      sequence,
+      turnId,
+    }),
+    event("message.completed", {
+      finishReason: "stop",
+      message: reply,
+      sequence,
+      stepIndex: 0,
+      turnId,
+    }),
+    event("turn.completed", { sequence, turnId }),
+    event("session.waiting", {}),
+  ] as readonly MessageStreamEvent[];
 }
 
 let eventSequence = 0;

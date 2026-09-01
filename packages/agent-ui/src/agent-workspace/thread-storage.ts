@@ -278,6 +278,7 @@ function parseTranscriptCoverage(value: unknown): AgentTranscriptCoverage | unde
     ...(value.authoritative === true ? { authoritative: true } : {}),
     complete: value.complete,
     endIndex: value.endIndex,
+    ...(value.projection === "logical-edits-v1" ? { projection: value.projection } : {}),
     startIndex: value.startIndex,
     version: 1,
   };
@@ -372,12 +373,29 @@ function parsePendingTurn(value: unknown): AgentPendingTurn | undefined {
   ) {
     return undefined;
   }
+  const beforeTurnId = typeof value.beforeTurnId === "string" && value.beforeTurnId
+    ? value.beforeTurnId
+    : undefined;
+  const mailboxItemId = typeof value.mailboxItemId === "string" && value.mailboxItemId
+    ? value.mailboxItemId
+    : undefined;
+  if (value.operation === "edit" && (!beforeTurnId || value.delivery !== "server")) {
+    return undefined;
+  }
   return {
+    ...(beforeTurnId ? { beforeTurnId } : {}),
+    ...(value.delivery === "browser" || value.delivery === "server"
+      ? { delivery: value.delivery }
+      : {}),
     ...(typeof value.eventCountAtSubmission === "number" && Number.isInteger(value.eventCountAtSubmission) && value.eventCountAtSubmission >= 0
       ? { eventCountAtSubmission: value.eventCountAtSubmission }
       : {}),
     ...(files.length > 0 ? { files } : {}),
     id: value.id,
+    ...(mailboxItemId ? { mailboxItemId } : {}),
+    ...(value.operation === "edit" || value.operation === "send"
+      ? { operation: value.operation }
+      : {}),
     state: value.state,
     submittedAt: value.submittedAt,
     text: value.text,
@@ -641,12 +659,77 @@ export function reconcileHydratedPendingTurn(
 ): AgentPendingTurn | undefined {
   const reconciled = reconcilePendingTurnWithEvents(pendingTurn, events);
   if (!reconciled) return undefined;
+  // Mailbox edits are server-owned idempotent operations. Refresh may inspect
+  // or re-enqueue the same operation id, but must not downgrade it into the
+  // legacy browser retry path that could submit a second model turn.
+  if (reconciled.operation === "edit" && reconciled.delivery === "server") {
+    return reconciled;
+  }
   // Hydration is read-only. A stale browser admission must never become a
   // fresh model request merely because the page was refreshed. If Eve did not
   // durably acknowledge it with message.received, expose a retryable failure;
   // the user can explicitly resend after inspecting the state.
   if (reconciled.state !== "clearing" && reconciled.state !== "resubmitting" && reconciled.state !== "submitting") return reconciled;
   return { ...reconciled, state: "delivery-failed" };
+}
+
+/**
+ * Projects append-only Eve audit events onto the active logical conversation.
+ * A context.cleared event carrying a settled turn id is Open Agent's durable
+ * edit boundary: that turn and its descendants are superseded, while the audit
+ * stream and absolute cursor remain untouched.
+ */
+export function projectThreadEditBranches(
+  events: readonly MessageStreamEvent[],
+): readonly MessageStreamEvent[] {
+  if (!events.some((event) => event.type === "context.cleared")) return events;
+  const projected: MessageStreamEvent[] = [];
+  for (const event of events) {
+    if (event.type === "context.cleared") {
+      const targetTurnId = event.data.turnId;
+      let targetIndex = projected.findLastIndex((candidate) =>
+        eventTurnId(candidate) === targetTurnId
+      );
+      // A durable edit always carries the exact `beforeTurnId`. Do not guess
+      // a target for older/foreign clear markers: deleting the last user turn
+      // by position can silently remove valid history after a refresh. The
+      // marker remains in the append-only projection and the runtime's
+      // authoritative branch metadata decides whether an older branch is
+      // superseded.
+      if (targetIndex >= 0) {
+        const actualTargetTurnId = eventTurnId(projected[targetIndex]!);
+        const turnStartIndex = projected.findLastIndex((candidate, index) =>
+          index <= targetIndex && candidate.type === "turn.started" &&
+          candidate.data.turnId === actualTargetTurnId
+        );
+        projected.splice(turnStartIndex >= 0 ? turnStartIndex : targetIndex);
+      }
+    }
+    projected.push(event);
+  }
+  return projected;
+}
+
+/** Hides the addressed latest turn while its durable edit is still queued. */
+export function projectPendingThreadEdit(
+  events: readonly MessageStreamEvent[],
+  beforeTurnId?: string,
+): readonly MessageStreamEvent[] {
+  if (!beforeTurnId || events.some((event) =>
+    event.type === "context.cleared" && event.data.turnId === beforeTurnId
+  )) return events;
+  const targetIndex = events.findIndex((event) => eventTurnId(event) === beforeTurnId);
+  if (targetIndex < 0) return events;
+  const turnStartIndex = events.findLastIndex((event, index) =>
+    index <= targetIndex && event.type === "turn.started" && event.data.turnId === beforeTurnId
+  );
+  return events.slice(0, turnStartIndex >= 0 ? turnStartIndex : targetIndex);
+}
+
+function eventTurnId(event: MessageStreamEvent): string | undefined {
+  return "data" in event && "turnId" in event.data && typeof event.data.turnId === "string"
+    ? event.data.turnId
+    : undefined;
 }
 
 /** Remove exact stream replays while preserving incremental/completed pairs. */

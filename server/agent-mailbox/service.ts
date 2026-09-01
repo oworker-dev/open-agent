@@ -60,6 +60,7 @@ export class AgentMailboxAdmissionError extends Error {
 }
 
 export async function enqueueAgentMailboxMessage(options: {
+  readonly beforeTurnId?: string;
   readonly clientMessageId: string;
   readonly clientContext?: AgentMailboxPayload["clientContext"];
   readonly expectedTurnId?: string;
@@ -75,6 +76,7 @@ export async function enqueueAgentMailboxMessage(options: {
   const sessionId = parseSessionId(options.sessionId);
   const message = parseMessage(options.message);
   const operation = parseOperation({
+    beforeTurnId: options.beforeTurnId,
     expectedTurnId: options.expectedTurnId,
     operationId: options.operationId,
     operationKind: options.operationKind,
@@ -267,11 +269,12 @@ function parseMessage(value: string): string {
 }
 
 function parseOperation(input: {
+  readonly beforeTurnId?: string;
   readonly expectedTurnId?: string;
   readonly operationId?: string;
   readonly operationKind?: "send" | "steer" | "edit";
 }): NonNullable<AgentMailboxPayload["operation"]> | undefined {
-  if (input.operationId === undefined && input.operationKind === undefined && input.expectedTurnId === undefined) {
+  if (input.operationId === undefined && input.operationKind === undefined && input.expectedTurnId === undefined && input.beforeTurnId === undefined) {
     return undefined;
   }
   if (input.operationId === undefined || !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,199}$/.test(input.operationId)) {
@@ -283,11 +286,19 @@ function parseOperation(input: {
   if (input.operationKind === "steer" && input.expectedTurnId === undefined) {
     throw new Error("expectedTurnId is required for a steering operation.");
   }
+  if (input.operationKind === "edit" && input.beforeTurnId === undefined) {
+    throw new Error("beforeTurnId is required for an edit operation.");
+  }
   if (input.expectedTurnId !== undefined &&
       !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,511}$/.test(input.expectedTurnId)) {
     throw new Error("expectedTurnId must contain up to 512 URL-safe identifier characters.");
   }
+  if (input.beforeTurnId !== undefined &&
+      !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,511}$/.test(input.beforeTurnId)) {
+    throw new Error("beforeTurnId must contain up to 512 URL-safe identifier characters.");
+  }
   return {
+    ...(input.beforeTurnId ? { beforeTurnId: input.beforeTurnId } : {}),
     ...(input.expectedTurnId ? { expectedTurnId: input.expectedTurnId } : {}),
     kind: input.operationKind,
     operationId: input.operationId,

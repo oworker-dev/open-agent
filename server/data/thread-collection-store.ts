@@ -32,6 +32,19 @@ export type ThreadCollectionWriteResult<TCollection> =
   | { readonly record: StoredThreadCollection<TCollection>; readonly status: "saved" }
   | { readonly currentRevision: number; readonly status: "conflict" };
 
+/**
+ * Raised when a client attempts to replace an existing transcript with a
+ * snapshot that cannot be proven to be the durable prefix. Callers should
+ * surface this as a retryable client error; the existing event log is left
+ * untouched.
+ */
+export class UnsafeThreadTranscriptReplacementError extends Error {
+  constructor(message = "The thread transcript is incomplete; reload it before editing.") {
+    super(message);
+    this.name = "UnsafeThreadTranscriptReplacementError";
+  }
+}
+
 /** The transport-neutral shape used by the HTTP thread PATCH contract. */
 export type ThreadCollectionPatchRecord = {
   /** Undefined preserves the stored selection; null explicitly clears it. */
@@ -161,7 +174,6 @@ function postgresThreadCollectionStore<TCollection>(
                     'session', thread->'session',
                     'status', thread->'status',
                     'transcriptCoverage', thread->'transcriptCoverage',
-                    'transcriptWindow', thread->'transcriptWindow',
                     'title', thread->'title',
                     'updatedAt', thread->'updatedAt'
                   ) order by coalesce((thread->>'updatedAt')::double precision, 0) desc)
@@ -223,7 +235,7 @@ function postgresThreadCollectionStore<TCollection>(
     }>(
       `with target as (
        select
-           (thread - 'events' - 'hydration') as metadata,
+           (thread - 'events' - 'hydration' - 'transcriptWindow') as metadata,
            thread->'events' as legacy_events,
            collection_row.revision::text as revision
            from ${table} collection_row,
@@ -407,8 +419,16 @@ function postgresThreadCollectionStore<TCollection>(
         for (const thread of input.upsertThreads) {
           if (typeof thread.id !== "string") continue;
           const events = threadEvents(thread);
-          if (events.length === 0) continue;
-          await replaceThreadEvents(connection, eventTable, tenantId, principalId, storageKey, thread.id, events);
+          if (events.length === 0 && !isExplicitTranscriptReplacement(thread)) continue;
+          await replaceThreadEvents(
+            connection,
+            eventTable,
+            tenantId,
+            principalId,
+            storageKey,
+            thread.id,
+            events,
+          );
         }
         for (const append of input.eventAppends) {
           await appendThreadEvents(connection, eventTable, tenantId, principalId, storageKey, append);
@@ -475,7 +495,8 @@ function postgresThreadCollectionStore<TCollection>(
             : [];
           for (const thread of persistedThreads) {
             const events = threadEvents(thread);
-            if (typeof thread.id === "string" && events.length > 0) {
+            if (typeof thread.id === "string" &&
+                (events.length > 0 || isExplicitTranscriptReplacement(thread))) {
               await replaceThreadEvents(
                 connection,
                 eventTable,
@@ -532,7 +553,8 @@ function postgresThreadCollectionStore<TCollection>(
         if (typeof (pool as Pool & { connect?: unknown }).connect === "function") {
           for (const thread of persistedThreads) {
             const events = threadEvents(thread);
-            if (typeof thread.id === "string" && events.length > 0) {
+            if (typeof thread.id === "string" &&
+                (events.length > 0 || isExplicitTranscriptReplacement(thread))) {
               await replaceThreadEvents(
                 pool,
                 eventTable,
@@ -641,6 +663,14 @@ function threadEvents(thread: Record<string, unknown>): readonly Record<string, 
   return Array.isArray(thread.events) ? thread.events.filter(isRecordValue) : [];
 }
 
+function isExplicitTranscriptReplacement(thread: Record<string, unknown>): boolean {
+  const pending = isRecordValue(thread.pendingTurn) ? thread.pendingTurn : undefined;
+  if (!pending) return false;
+  return pending.state === "clearing" ||
+    pending.state === "resubmitting" ||
+    (pending.state === "submitting" && pending.operation === "edit");
+}
+
 /** Keep summary metadata authoritative, including explicit clearing of
  * optional browser transaction state such as pendingTurn. */
 function mergeSummaryThread(
@@ -658,10 +688,11 @@ function mergeSummaryThread(
     title: replacement.title,
     updatedAt: replacement.updatedAt,
   };
-  for (const key of ["draftRestore", "interruptedTurns", "pendingTurn", "retainedContext", "transcriptWindow"] as const) {
+  for (const key of ["draftRestore", "interruptedTurns", "pendingTurn", "retainedContext"] as const) {
     if (Object.prototype.hasOwnProperty.call(replacement, key)) next[key] = replacement[key];
     else delete next[key];
   }
+  delete next.transcriptWindow;
   const replacementCoverage = isRecordValue(replacement.transcriptCoverage)
     ? replacement.transcriptCoverage
     : undefined;
@@ -670,7 +701,9 @@ function mergeSummaryThread(
     : undefined;
   const replacingEditedTurn = isRecordValue(replacement.pendingTurn) &&
     (replacement.pendingTurn.state === "clearing" || replacement.pendingTurn.state === "resubmitting");
-  if (replacementCoverage?.authoritative === true) {
+  if (replacingEditedTurn) {
+    delete next.transcriptCoverage;
+  } else if (replacementCoverage?.authoritative === true) {
     next.transcriptCoverage = replacementCoverage;
   } else if (Object.prototype.hasOwnProperty.call(replacement, "transcriptCoverage") && replacementCoverage) {
     if (currentCoverage?.authoritative === true) {
@@ -679,11 +712,8 @@ function mergeSummaryThread(
       next.transcriptCoverage = replacementCoverage;
     }
   } else if (Object.prototype.hasOwnProperty.call(replacement, "transcriptCoverage") && !replacement.transcriptCoverage) {
-    if (replacingEditedTurn) delete next.transcriptCoverage;
-    else if (currentCoverage) next.transcriptCoverage = currentCoverage;
+    if (currentCoverage) next.transcriptCoverage = currentCoverage;
     else delete next.transcriptCoverage;
-  } else if (replacingEditedTurn) {
-    delete next.transcriptCoverage;
   } else if (currentCoverage) {
     next.transcriptCoverage = currentCoverage;
   } else {
@@ -701,6 +731,15 @@ async function replaceThreadEvents(
   threadId: string,
   events: readonly Record<string, unknown>[],
 ): Promise<void> {
+  await assertReplacementPrefix(
+    connection,
+    eventTable,
+    tenantId,
+    principalId,
+    storageKey,
+    threadId,
+    events,
+  );
   await connection.query(
     `delete from ${eventTable}
       where tenant_id = $1 and principal_id = $2 and storage_key = $3 and thread_id = $4`,
@@ -708,6 +747,72 @@ async function replaceThreadEvents(
   );
   await insertThreadEvents(connection, eventTable, tenantId, principalId, storageKey, threadId,
     events.map((event, index) => ({ event, eventIndex: index })));
+}
+
+/**
+ * Validate an edit snapshot against the currently locked durable event log
+ * before deleting anything. Stable Eve event ids let us prove that the
+ * submitted events are the exact prefix the edit intends to retain. A stale
+ * bounded tail (or reordered snapshot) therefore fails closed instead of
+ * truncating earlier turns.
+ */
+async function assertReplacementPrefix(
+  connection: ThreadEventQueryExecutor,
+  eventTable: string,
+  tenantId: string,
+  principalId: string,
+  storageKey: string,
+  threadId: string,
+  events: readonly Record<string, unknown>[],
+): Promise<void> {
+  const countResult = await connection.query<{ total: string }>(
+    `select coalesce(max(event_index) + 1, 0)::text as total
+       from ${eventTable}
+      where tenant_id = $1 and principal_id = $2 and storage_key = $3 and thread_id = $4`,
+    [tenantId, principalId, storageKey, threadId],
+  );
+  const total = parseRevision(countResult.rows[0]?.total ?? "0");
+  if (total === 0) return;
+  if (events.length === 0) {
+    // An edit must always prove the retained prefix. An empty snapshot cannot
+    // prove that the browser saw the earlier turns, even when the edit marker
+    // is present; accepting it would delete durable history on a stale or
+    // partially hydrated client. A genuinely new thread has total === 0 and
+    // remains valid above.
+    throw new UnsafeThreadTranscriptReplacementError();
+  }
+  if (events.length > total) throw new UnsafeThreadTranscriptReplacementError();
+
+  const prefixResult = await connection.query<{ event_id: string; event_index: string }>(
+    `select event_index::text, event_id
+       from ${eventTable}
+      where tenant_id = $1 and principal_id = $2 and storage_key = $3
+        and thread_id = $4 and event_index < $5
+      order by event_index asc`,
+    [tenantId, principalId, storageKey, threadId, events.length],
+  );
+  if (prefixResult.rows.length !== events.length) {
+    throw new UnsafeThreadTranscriptReplacementError();
+  }
+  for (let index = 0; index < events.length; index += 1) {
+    const rawMeta = events[index]?.meta;
+    // Migrations used `legacy:<index>` for events that predated Eve event
+    // ids, while newer append checkpoints include the thread id in their
+    // fallback key. Accept either deterministic legacy form; neither can
+    // match a different event at the same absolute index.
+    const eventId = isRecordValue(rawMeta) && typeof rawMeta.id === "string"
+      ? rawMeta.id
+      : undefined;
+    const stored = prefixResult.rows[index];
+    const legacyIds = eventId
+      ? []
+      : [`legacy:${index}`, `legacy:${threadId}:${index}`];
+    if (!stored || parseRevision(stored.event_index) !== index ||
+      (!eventId && !legacyIds.includes(stored.event_id)) ||
+      (eventId && stored.event_id !== eventId)) {
+      throw new UnsafeThreadTranscriptReplacementError();
+    }
+  }
 }
 
 async function appendThreadEvents(

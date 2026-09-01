@@ -1,6 +1,6 @@
 import type { AgentThreadCollection } from "@oworker/open-agent-ui/agent-workspace";
 import { AGENT_THREAD_STORAGE_VERSION } from "@oworker/open-agent-ui/agent-workspace";
-import { createPostgresThreadCollectionStoreFromEnvironment, type ThreadCollectionPatchRecord } from "@/server/data/thread-collection-store";
+import { createPostgresThreadCollectionStoreFromEnvironment, UnsafeThreadTranscriptReplacementError, type ThreadCollectionPatchRecord } from "@/server/data/thread-collection-store";
 import { authenticateHostRequest } from "@/server/http/host-request-auth";
 import {
   applyThreadCollectionPatch,
@@ -154,13 +154,21 @@ export async function PUT(request: Request, context: RouteContext): Promise<Resp
   }
 
   const { storageKey } = await context.params;
-  const result = await store.save(
-    authenticated.identity.tenantId,
-    authenticated.identity.principalId,
-    storageKey,
-    expectedRevision,
-    collection,
-  );
+  let result;
+  try {
+    result = await store.save(
+      authenticated.identity.tenantId,
+      authenticated.identity.principalId,
+      storageKey,
+      expectedRevision,
+      collection,
+    );
+  } catch (error) {
+    if (error instanceof UnsafeThreadTranscriptReplacementError) {
+      return problem(422, "incomplete_thread_transcript", error.message);
+    }
+    throw error;
+  }
   if (result.status === "conflict") {
     return problem(
       409,
@@ -192,15 +200,23 @@ export async function PATCH(request: Request, context: RouteContext): Promise<Re
   }
 
   const { storageKey } = await context.params;
-  const result = store.patch
-    ? await store.patch(
-        authenticated.identity.tenantId,
-        authenticated.identity.principalId,
-        storageKey,
-        expectedRevision,
-        patch as ThreadCollectionPatchRecord,
-      )
-    : await saveMetadataPatch(store, authenticated.identity.tenantId, authenticated.identity.principalId, storageKey, expectedRevision, patch);
+  let result;
+  try {
+    result = store.patch
+      ? await store.patch(
+          authenticated.identity.tenantId,
+          authenticated.identity.principalId,
+          storageKey,
+          expectedRevision,
+          patch as ThreadCollectionPatchRecord,
+        )
+      : await saveMetadataPatch(store, authenticated.identity.tenantId, authenticated.identity.principalId, storageKey, expectedRevision, patch);
+  } catch (error) {
+    if (error instanceof UnsafeThreadTranscriptReplacementError) {
+      return problem(422, "incomplete_thread_transcript", error.message);
+    }
+    throw error;
+  }
   if (result.status === "conflict") {
     return problem(
       409,

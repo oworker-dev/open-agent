@@ -5,6 +5,7 @@ import type { Pool, QueryResult } from "pg";
 import {
   createPostgresThreadCollectionStore,
   normalizeJsonbValue,
+  UnsafeThreadTranscriptReplacementError,
   type ThreadCollectionPatchRecord,
 } from "../../server/data/thread-collection-store.ts";
 
@@ -274,6 +275,146 @@ test("replacement appends truncate from their cursor without reading the current
   assert.equal(result?.status, "saved");
   assert.equal(calls.some((sql) => sql.includes("max(event_index)")), false);
   assert.equal(calls.some((sql) => sql.includes("event_index >= $5")), true);
+});
+
+test("rejects an edit replacement whose events are not the durable prefix", async () => {
+  const calls: string[] = [];
+  const client = {
+    async query(sql: string, parameters?: readonly unknown[]) {
+      calls.push(sql);
+      if (sql === "begin" || sql === "commit" || sql === "rollback") return { rows: [] };
+      if (sql.includes("for update")) {
+        return {
+          rows: [{
+            collection: { threads: [{ id: "thread-1", events: [] }], version: 2 },
+            revision: "8",
+          }],
+        };
+      }
+      if (sql.includes("set collection = $4::jsonb")) {
+        return { rows: [] };
+      }
+      if (sql.includes("max(event_index)")) return { rows: [{ total: "4" }] };
+      if (sql.includes("event_index <")) {
+        return { rows: [{ event_index: "0", event_id: "evt-original" }] };
+      }
+      return { rows: [] };
+    },
+    release() {},
+  };
+  const pool = { async connect() { return client; } } as unknown as Pool;
+  const store = createPostgresThreadCollectionStore(config, pool);
+
+  await assert.rejects(
+    async () => {
+      if (!store.patch) throw new Error("patch is unavailable");
+      await store.patch("tenant-1", "principal-1", "workspace-1", 8, {
+        deletedThreadIds: [],
+        eventAppends: [],
+        upsertThreads: [{
+          events: [{ meta: { id: "evt-tail-only" }, type: "message.completed" }],
+          id: "thread-1",
+          pendingTurn: { id: "edit-1", state: "clearing", submittedAt: 1, text: "edited" },
+          status: "ready",
+        }],
+      });
+    },
+    (error: unknown) => error instanceof UnsafeThreadTranscriptReplacementError,
+  );
+  assert.equal(calls.some((sql) => sql.startsWith("delete from")), false);
+  assert.equal(calls.at(-1), "rollback");
+});
+
+test("allows an explicit edit to retain a verified event prefix", async () => {
+  const calls: string[] = [];
+  const client = {
+    async query(sql: string, parameters?: readonly unknown[]) {
+      calls.push(sql);
+      if (sql === "begin" || sql === "commit" || sql === "rollback") return { rows: [] };
+      if (sql.includes("for update")) {
+        return {
+          rows: [{
+            collection: { threads: [{ id: "thread-1", events: [] }], version: 2 },
+            revision: "8",
+          }],
+        };
+      }
+      if (sql.includes("set collection = $4::jsonb")) {
+        return { rows: [] };
+      }
+      if (sql.includes("max(event_index)")) return { rows: [{ total: "2" }] };
+      if (sql.includes("event_index <")) {
+        return {
+          rows: [
+            { event_index: "0", event_id: "evt-first" },
+            { event_index: "1", event_id: "evt-second" },
+          ],
+        };
+      }
+      return { rows: [] };
+    },
+    release() {},
+  };
+  const pool = { async connect() { return client; } } as unknown as Pool;
+  const store = createPostgresThreadCollectionStore(config, pool);
+
+  const result = await store.patch?.("tenant-1", "principal-1", "workspace-1", 8, {
+    deletedThreadIds: [],
+    eventAppends: [],
+    upsertThreads: [{
+      events: [
+        { meta: { id: "evt-first" }, type: "message.received" },
+        { meta: { id: "evt-second" }, type: "message.completed" },
+      ],
+      id: "thread-1",
+      pendingTurn: { id: "edit-1", state: "clearing", submittedAt: 1, text: "edited" },
+      status: "ready",
+    }],
+  });
+
+  assert.equal(result?.status, "saved");
+  assert.equal(calls.filter((sql) => sql.startsWith("delete from")).length, 1);
+  assert.equal(calls.at(-1), "commit");
+});
+
+test("rejects an explicit empty edit snapshot when durable history exists", async () => {
+  const calls: string[] = [];
+  const client = {
+    async query(sql: string) {
+      calls.push(sql);
+      if (sql === "begin" || sql === "commit" || sql === "rollback") return { rows: [] };
+      if (sql.includes("for update")) {
+        return {
+          rows: [{
+            collection: { threads: [{ id: "thread-1", events: [] }], version: 2 },
+            revision: "9",
+          }],
+        };
+      }
+      if (sql.includes("set collection = $4::jsonb")) return { rows: [] };
+      if (sql.includes("max(event_index)")) return { rows: [{ total: "6" }] };
+      return { rows: [] };
+    },
+    release() {},
+  };
+  const pool = { async connect() { return client; } } as unknown as Pool;
+  const store = createPostgresThreadCollectionStore(config, pool);
+
+  await assert.rejects(
+    async () => await store.patch?.("tenant-1", "principal-1", "workspace-1", 9, {
+      deletedThreadIds: [],
+      eventAppends: [],
+      upsertThreads: [{
+        events: [],
+        id: "thread-1",
+        pendingTurn: { id: "edit-1", state: "resubmitting", submittedAt: 1, text: "edited" },
+        status: "ready",
+      }],
+    }),
+    (error: unknown) => error instanceof UnsafeThreadTranscriptReplacementError,
+  );
+  assert.equal(calls.some((sql) => sql.startsWith("delete from")), false);
+  assert.equal(calls.at(-1), "rollback");
 });
 
 test("empty append checkpoints do not query the event log", async () => {

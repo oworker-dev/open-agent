@@ -64,6 +64,8 @@ export {
   eventIdentity,
   mergeThreadCollectionsForConflict,
   parseThreadCollection,
+  projectPendingThreadEdit,
+  projectThreadEditBranches,
   reconcileHydratedPendingTurn,
   reconcilePendingTurnWithEvents,
 } from "./thread-storage.js";

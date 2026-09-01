@@ -71,6 +71,37 @@ test("mailbox enqueue preserves a forbidden ownership result", async () => {
   });
 });
 
+test("mailbox HTTP rejects an edit without an exact target turn", async () => {
+  const response = await enqueueAgentMailboxHttpRequest({
+    owner,
+    ownershipStore: ownershipOnlyStore("owned"),
+    request: new Request("https://agent.test/api/standalone/mailbox", {
+      body: JSON.stringify({
+        clientMessageId: "message-edit-1",
+        message: "Edited request",
+        operationId: "operation-edit-1",
+        operationKind: "edit",
+        preferences: {
+          modelId: DEFAULT_AGENT_RUNTIME_CONFIG.defaultModelId,
+          reasoning: "high",
+        },
+        sessionId: "session-1",
+      }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    }),
+    runtimeConfig: DEFAULT_AGENT_RUNTIME_CONFIG,
+    store: enqueueOnlyStore([]),
+  });
+
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), {
+    code: "mailbox_request_invalid",
+    error: "beforeTurnId is required for an edit operation.",
+    ok: false,
+  });
+});
+
 function mailboxRequest(): Request {
   return new Request("https://agent.test/api/standalone/mailbox", {
     body: JSON.stringify({

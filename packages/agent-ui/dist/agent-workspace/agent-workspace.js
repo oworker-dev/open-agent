@@ -3,6 +3,7 @@ import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-run
 import { ClientError } from "eve/client";
 import { AlertCircleIcon, ArrowLeftIcon, MenuIcon, PanelLeftCloseIcon, PanelLeftIcon, PanelRightIcon, ServerOffIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { Button } from "../ui/button.js";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "../ui/resizable.js";
 import { usePanelRef, } from "react-resizable-panels";
@@ -47,6 +48,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
     const [hydratingThreadIds, setHydratingThreadIds] = useState(new Set());
     const [threadHydrationErrors, setThreadHydrationErrors] = useState(new Map());
     const [threadHistoryLoading, setThreadHistoryLoading] = useState(new Set());
+    const [threadRuntimeSeeds, setThreadRuntimeSeeds] = useState(new Map());
     const [sidebarOpen, setSidebarOpen] = useState(false);
     const [workbenchMode, setWorkbenchMode] = useState("split");
     const [panelResizing, setPanelResizing] = useState(false);
@@ -253,28 +255,70 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
     const settleThreadHistory = useCallback(async (thread, boundary) => {
         const failed = boundary.state === "terminal" && boundary.terminalStatus === "failed";
         const settledStatus = failed ? "error" : "ready";
-        const settledCursor = boundary.tailIndex === undefined
+        const authoritativeTailExclusive = boundary.tailIndex === undefined
             ? thread.session.streamIndex
-            : Math.max(thread.session.streamIndex, boundary.tailIndex + 1);
+            : boundary.tailIndex + 1;
+        let settledCursor = thread.session.streamIndex;
+        let settledEvents = compactThreadEvents(thread.events);
+        let caughtUpSettledRange = false;
+        if (boundary.tailIndex !== undefined &&
+            authoritativeTailExclusive > settledCursor &&
+            thread.session.sessionId) {
+            const connection = createAgentSession(client, thread.preferences, thread.session);
+            const session = attachAgentSession(connection, connection.initialSession);
+            if (!session)
+                throw new Error("The settled Agent session could not be attached.");
+            const missing = await readSettledRange(session, settledCursor, boundary.tailIndex, AbortSignal.timeout(RECOVERY_FOLLOW_IDLE_TIMEOUT_MS));
+            if (missing.length !== authoritativeTailExclusive - settledCursor) {
+                throw new Error("The settled Agent history ended before the authoritative tail.");
+            }
+            const merged = [...settledEvents];
+            const eventIds = new Set(merged.map(eventIdentity));
+            for (const event of missing)
+                appendThreadEventIndexed(merged, eventIds, event);
+            settledEvents = compactThreadEvents(merged);
+            settledCursor = authoritativeTailExclusive;
+            caughtUpSettledRange = true;
+        }
+        else {
+            settledCursor = Math.max(settledCursor, authoritativeTailExclusive);
+        }
         const settledSession = {
             ...thread.session,
             streamIndex: settledCursor,
         };
-        const settledEvents = compactThreadEvents(thread.events);
+        const settledPendingTurn = reconcileHydratedPendingTurn(thread.pendingTurn, settledEvents);
         const settledCoverage = hasCompleteTranscriptCoverage(thread, settledCursor)
             ? thread.transcriptCoverage
             : undefined;
-        updateThread(thread.id, {
-            ...(settledEvents.length !== thread.events.length ? { events: settledEvents } : {}),
+        const settledPatch = {
+            events: settledEvents,
             ...(settledCoverage
                 ? { transcriptCoverage: settledCoverage }
                 : { transcriptCoverage: undefined }),
+            ...(settledPendingTurn ? { pendingTurn: settledPendingTurn } : { pendingTurn: undefined }),
             session: settledSession,
             status: settledStatus,
             updatedAt: Date.now(),
-        });
+        };
+        if (caughtUpSettledRange && activeThreadIdRef.current === thread.id) {
+            flushSync(() => {
+                setThreadRuntimeSeeds((current) => {
+                    const seed = `settled:${thread.session.sessionId}:${settledCursor}`;
+                    if (current.get(thread.id) === seed)
+                        return current;
+                    const next = new Map(current);
+                    next.set(thread.id, seed);
+                    return next;
+                });
+                updateThread(thread.id, settledPatch);
+            });
+        }
+        else {
+            updateThread(thread.id, settledPatch);
+        }
         const transcriptComplete = hasCompleteTranscriptCoverage(thread, settledCursor) ||
-            settledCursor <= thread.events.length;
+            settledCursor <= settledEvents.length;
         if (!transcriptComplete &&
             !thread.transcriptWindow &&
             serverHydrationThreads.current.has(thread.id) &&
@@ -306,7 +350,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
             boundary.tailIndex + 1 <= SETTLED_TAIL_EVENTS;
         const boundaryOnly = !transcriptComplete && !safeShortPrefix;
         if (boundary.tailIndex === undefined ||
-            (thread.events.at(-1) && isRecoveryBoundary(thread.events.at(-1))) ||
+            (settledEvents.at(-1) && isRecoveryBoundary(settledEvents.at(-1))) ||
             !thread.session.sessionId)
             return;
         const connection = createAgentSession(client, thread.preferences, settledSession);
@@ -317,7 +361,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
             const tailEvents = await readSettledTail(session, boundary.tailIndex, AbortSignal.timeout(RECOVERY_TAIL_LOOKUP_TIMEOUT_MS * 2));
             if (tailEvents.length === 0)
                 return;
-            const latestVisibleTurnId = [...thread.events].reverse().find((event) => event.type === "turn.started");
+            const latestVisibleTurnId = [...settledEvents].reverse().find((event) => event.type === "turn.started");
             const eventsToMerge = boundaryOnly
                 ? tailEvents.filter((event) => event.type === "session.waiting" ||
                     event.type === "session.completed" ||
@@ -338,6 +382,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                 ...(settledCoverage
                     ? { transcriptCoverage: settledCoverage }
                     : { transcriptCoverage: undefined }),
+                ...(settledPendingTurn ? { pendingTurn: settledPendingTurn } : { pendingTurn: undefined }),
                 revision: (thread.revision ?? 0) + 1,
                 session: settledSession,
                 status: settledStatus,
@@ -370,7 +415,10 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
         }
         try {
             const boundary = await inspectSession(thread.session.sessionId);
-            if (activeThreadIdRef.current !== thread.id) {
+            const currentThread = threadsRef.current.find((candidate) => candidate.id === thread.id);
+            if (activeThreadIdRef.current !== thread.id ||
+                !currentThread ||
+                runtimeInspectionKey(currentThread) !== runtimeCheckKey) {
                 runtimeChecksStarted.current.delete(runtimeCheckKey);
                 return;
             }
@@ -714,7 +762,25 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                 const windowed = await threadStorage.loadThreadWindow(storageKey, thread.id);
                 if (!windowed)
                     return undefined;
-                return { thread: windowed.thread, window: windowed.window };
+                const windowedThread = { ...windowed.thread, transcriptWindow: windowed.window };
+                if (threadStorage.repairThread &&
+                    windowedThread.session.sessionId &&
+                    windowedThread.status !== "streaming" &&
+                    windowedThread.status !== "submitted" &&
+                    windowedThread.status !== "cancelling" &&
+                    !pendingTurnInFlight(windowedThread.pendingTurn) &&
+                    shouldRepairServerTranscript(windowedThread)) {
+                    try {
+                        const repaired = await threadStorage.repairThread(storageKey, thread.id);
+                        if (repaired)
+                            return { thread: repaired };
+                    }
+                    catch (error) {
+                        if (!(error instanceof AgentThreadStorageHttpError) || error.status !== 409)
+                            throw error;
+                    }
+                }
+                return { thread: windowedThread, window: windowed.window };
             }
             if (!threadStorage.loadThread)
                 return undefined;
@@ -724,6 +790,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
             if (threadStorage.repairThread &&
                 hydrated.session.sessionId &&
                 !hydrated.transcriptWindow &&
+                !pendingTurnInFlight(hydrated.pendingTurn) &&
                 shouldRepairServerTranscript(hydrated)) {
                 try {
                     const repaired = await threadStorage.repairThread(storageKey, thread.id);
@@ -833,7 +900,12 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
         if (!isHydrated || !activeThread || activeThread.hydration === "summary")
             return;
         void inspectThreadRuntime(activeThread);
-    }, [activeThread?.id, activeThread?.hydration, inspectThreadRuntime, isHydrated]);
+    }, [
+        activeThread?.hydration,
+        activeThread?.id,
+        inspectThreadRuntime,
+        isHydrated,
+    ]);
     const activeSubagent = activeThread && activeSubagentSessionId
         ? findSubagentSession(activeThread.events, activeSubagentSessionId, locale, durableSubagents)
         : undefined;
@@ -844,8 +916,9 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
     }, [activeThread, locale]);
     const closeSubagent = useCallback(() => setActiveSubagentSessionId(undefined), []);
     const changeActiveThread = useCallback((patch) => {
-        if (activeThreadId)
-            updateThread(activeThreadId, patch);
+        if (!activeThreadId)
+            return;
+        updateThread(activeThreadId, patch);
     }, [activeThreadId, updateThread]);
     const recoverActiveThread = useCallback(() => {
         if (activeThreadId)
@@ -1322,6 +1395,9 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
         }
     }, [isHydrated, recoverThread, recoveringIds, threads]);
     const activeIsRecovering = activeThread ? recoveringIds.has(activeThread.id) : false;
+    const activeThreadRuntimeKey = activeThread
+        ? `${activeThread.id}:${activeThread.transcriptWindow?.startIndex ?? 0}:${activeIsRecovering ? "recovering" : "ready"}:${threadRuntimeSeeds.get(activeThread.id) ?? "initial"}`
+        : "none";
     const activeIsHydrating = activeThread?.hydration === "summary";
     if (!isHydrated || !activeThread)
         return _jsx("div", { className: "flex h-dvh items-center justify-center bg-background text-muted-foreground", children: messages.loading });
@@ -1332,7 +1408,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                                 setPanelResizing(true);
                         } }) : null, _jsx(ResizablePanel, { className: "min-w-0 p-0", "data-workbench-panel": true, defaultSize: "100%", id: "agent-workbench", minSize: "0px", children: _jsxs(ResizablePanelGroup, { className: "h-full", orientation: "horizontal", children: [_jsx(ResizablePanel, { className: cn("min-w-0", secondaryOpen && !desktopLayout && "hidden"), defaultSize: secondaryOpen && !desktopLayout ? "0%" : secondaryOpen ? "70%" : "100%", id: "agent-primary", minSize: "0px", children: _jsxs("section", { className: "flex h-full min-w-0 flex-col overflow-hidden bg-card", "data-slot": "agent-workbench", children: [_jsxs("header", { className: "flex h-12 shrink-0 items-center justify-between border-b border-border/70 px-3 lg:h-13 lg:px-4", children: [_jsxs("div", { className: "flex min-w-0 items-center gap-2", children: [_jsx(Button, { "aria-label": messages.openNavigation, className: "lg:hidden", onClick: () => setSidebarOpen(true), size: "icon-sm", variant: "ghost", children: _jsx(MenuIcon, { className: "size-4" }) }), _jsx(Button, { "aria-label": messages.toggleNavigation, className: "hidden lg:inline-flex", disabled: workbenchTransitioning, onClick: toggleDesktopSidebar, size: "icon-sm", variant: "ghost", children: workbenchMode === "split" ? _jsx(PanelLeftCloseIcon, { className: "size-4" }) : _jsx(PanelLeftIcon, { className: "size-4" }) }), activeSubagentSessionId ? (_jsx(Button, { "aria-label": messages.backToTask, onClick: closeSubagent, size: "icon-sm", variant: "ghost", children: _jsx(ArrowLeftIcon, { className: "size-4" }) })) : null, _jsx("h2", { className: "truncate font-medium text-[15px]", children: activeSubagentSessionId ? activeSubagent?.label ?? messages.subagentSession : activeThread.title })] }), _jsxs("div", { className: "flex items-center gap-1", children: [_jsx(Button, { "aria-label": secondaryOpen ? messages.closeSecondaryView : messages.openSecondaryView, onClick: () => setSecondaryOpen((open) => !open), size: "icon-sm", variant: "ghost", children: _jsx(PanelRightIcon, { className: "size-4" }) }), _jsx(AgentSubagentMenu, { activeSessionId: activeSubagentSessionId, durableSessions: durableSubagents, events: activeThread.events, locale: locale, onControl: controlSubagent, onOpen: openSubagent }), hostSlots?.threadHeaderEnd] })] }), deletionIssue ? (_jsxs("div", { className: "flex shrink-0 items-center gap-3 border-b border-destructive/30 bg-destructive/5 px-4 py-2.5 text-sm", role: "alert", children: [_jsx(AlertCircleIcon, { className: "size-4 shrink-0 text-destructive" }), _jsx("p", { className: "min-w-0 flex-1 text-foreground", children: messages.deleteUnavailable }), _jsx(Button, { onClick: () => setDeletionIssue(false), size: "sm", variant: "outline", children: messages.dismiss })] })) : null, runtimeStatus.provider !== "ready" ? (_jsxs("div", { className: "flex shrink-0 items-start gap-3 border-b border-amber-500/30 bg-amber-500/8 px-4 py-2.5 text-sm", role: "status", children: [_jsx(ServerOffIcon, { className: "mt-0.5 size-4 shrink-0 text-amber-700 dark:text-amber-300" }), _jsx("p", { className: "min-w-0 flex-1 text-foreground", children: runtimeStatus.provider === "mock" ? messages.mockProvider : messages.providerUnconfigured })] })) : null, activeIsHydrating ? (_jsx("main", { className: "flex min-h-0 flex-1 items-center justify-center bg-background px-6", children: threadHydrationErrors.has(activeThread.id) ? (_jsxs("div", { className: "max-w-md text-center", role: "alert", children: [_jsx(AlertCircleIcon, { className: "mx-auto size-5 text-destructive" }), _jsx("p", { className: "mt-3 text-sm text-muted-foreground", children: threadHydrationErrors.get(activeThread.id) ?? messages.recoveryFailed }), _jsx(Button, { className: "mt-4", onClick: () => hydrateThread(activeThread), size: "sm", variant: "outline", children: messages.retry })] })) : (_jsx("p", { className: "text-sm text-muted-foreground", role: "status", children: messages.loading })) })) : activeSubagentSessionId ? (activeSubagent ? (_jsx(AgentChildSessionView, { client: client, commands: commands, locale: locale, mailbox: mailbox, mentions: mentions, models: models, onEvent: onEvent, onOpenDeliverable: openDeliverable, onOpenSubagent: openSubagent, onStorageError: onStorageError, preferences: activeThread.preferences, providerReady: runtimeStatus.provider !== "unconfigured", reasoningLevels: reasoningLevels, sessionId: activeSubagentSessionId, storageKey: storageKey, threadStorage: threadStorage })) : (_jsx(UnavailableSubagentView, { locale: locale, onBack: closeSubagent }))) : (_jsx("div", { className: "flex min-h-0 flex-1 flex-col", children: _jsx(AgentThreadView, { client: client, commands: commands, draftStorageKey: ephemeralThreadIds.has(activeThread.id)
                                                         ? `${storageKey}:draft:new`
-                                                        : `${storageKey}:draft:${activeThread.id}`, isRecovering: activeIsRecovering, historyHasMore: activeThread.transcriptWindow?.hasMoreBefore === true, historyLoading: threadHistoryLoading.has(activeThread.id), locale: locale, mailbox: mailbox, mentions: mentions, models: models, onCancelRecovery: () => cancelThreadRecovery(activeThread.id), onChange: changeActiveThread, onEvent: onEvent, onOpenDeliverable: openDeliverable, onOpenSubagent: openSubagent, onLoadEarlier: () => loadEarlierThreadEvents(activeThread.id), onRetryRecovery: () => requestThreadRecovery(activeThread.id), onRecoveryNeeded: recoverActiveThread, providerReady: runtimeStatus.provider !== "unconfigured", recoveryError: recoveryErrors.get(activeThread.id), reasoningLevels: reasoningLevels, thread: activeThread }, `${activeThread.id}:${activeThread.revision ?? 0}:${activeIsRecovering ? "recovering" : "ready"}`) }))] }) }), secondaryOpen ? (_jsxs(_Fragment, { children: [desktopLayout ? _jsx(ResizableHandle, { className: "flex bg-transparent after:w-2", "data-secondary-resize-handle": true }) : null, _jsx(ResizablePanel, { className: "min-w-0 border-l border-border/70", defaultSize: desktopLayout ? "30%" : "100%", id: "agent-secondary", maxSize: desktopLayout ? "50%" : "100%", minSize: desktopLayout ? "260px" : "0px", children: _jsx(AgentSecondaryView, { assetUrl: client?.assetUrl, assets: sessionAssets, assetsError: assetsError, assetsLoading: assetsLoading, deliverables: deliverablesError ? undefined : sessionDeliverables, deliverablesError: deliverablesError, deliverablesLoading: deliverablesLoading, children: activeThread ? subagentsForThread(activeThread.events, durableSubagents) : [], childContent: secondaryChildSessionId && activeThread ? (_jsx(AgentChildSessionView, { client: client, commands: commands, locale: locale, mailbox: mailbox, mentions: mentions, models: models, onEvent: onEvent, onOpenDeliverable: openDeliverable, onOpenSubagent: openSubagent, onStorageError: onStorageError, preferences: activeThread.preferences, providerReady: runtimeStatus.provider !== "unconfigured", reasoningLevels: reasoningLevels, sessionId: secondaryChildSessionId, storageKey: storageKey, threadStorage: threadStorage })) : undefined, locale: locale, onClose: () => setSecondaryOpen(false), onOpenAsset: onOpenAsset ? (asset) => onOpenAsset(asset) : undefined, onOpenDeliverable: onOpenDeliverable, onOpenChild: (sessionId) => {
+                                                        : `${storageKey}:draft:${activeThread.id}`, isRecovering: activeIsRecovering, historyHasMore: activeThread.transcriptWindow?.hasMoreBefore === true, historyLoading: threadHistoryLoading.has(activeThread.id), locale: locale, mailbox: mailbox, mentions: mentions, models: models, onCancelRecovery: () => cancelThreadRecovery(activeThread.id), onChange: changeActiveThread, onEvent: onEvent, onOpenDeliverable: openDeliverable, onOpenSubagent: openSubagent, onLoadEarlier: () => loadEarlierThreadEvents(activeThread.id), onRetryRecovery: () => requestThreadRecovery(activeThread.id), onRecoveryNeeded: recoverActiveThread, providerReady: runtimeStatus.provider !== "unconfigured", recoveryError: recoveryErrors.get(activeThread.id), reasoningLevels: reasoningLevels, thread: activeThread }, activeThreadRuntimeKey) }))] }) }), secondaryOpen ? (_jsxs(_Fragment, { children: [desktopLayout ? _jsx(ResizableHandle, { className: "flex bg-transparent after:w-2", "data-secondary-resize-handle": true }) : null, _jsx(ResizablePanel, { className: "min-w-0 border-l border-border/70", defaultSize: desktopLayout ? "30%" : "100%", id: "agent-secondary", maxSize: desktopLayout ? "50%" : "100%", minSize: desktopLayout ? "260px" : "0px", children: _jsx(AgentSecondaryView, { assetUrl: client?.assetUrl, assets: sessionAssets, assetsError: assetsError, assetsLoading: assetsLoading, deliverables: deliverablesError ? undefined : sessionDeliverables, deliverablesError: deliverablesError, deliverablesLoading: deliverablesLoading, children: activeThread ? subagentsForThread(activeThread.events, durableSubagents) : [], childContent: secondaryChildSessionId && activeThread ? (_jsx(AgentChildSessionView, { client: client, commands: commands, locale: locale, mailbox: mailbox, mentions: mentions, models: models, onEvent: onEvent, onOpenDeliverable: openDeliverable, onOpenSubagent: openSubagent, onStorageError: onStorageError, preferences: activeThread.preferences, providerReady: runtimeStatus.provider !== "unconfigured", reasoningLevels: reasoningLevels, sessionId: secondaryChildSessionId, storageKey: storageKey, threadStorage: threadStorage })) : undefined, locale: locale, onClose: () => setSecondaryOpen(false), onOpenAsset: onOpenAsset ? (asset) => onOpenAsset(asset) : undefined, onOpenDeliverable: onOpenDeliverable, onOpenChild: (sessionId) => {
                                                     setSecondaryChildSessionId(sessionId);
                                                 }, onRefreshAssets: refreshAssets, onRefreshDeliverables: refreshDeliverables, onSelectTab: setSecondaryTab, requestedDeliverable: requestedDeliverable?.deliverable, requestedDeliverableRequestId: requestedDeliverable?.requestId, tab: secondaryTab }, `secondary:${activeThread?.id ?? "empty"}:${activeThread?.session.sessionId ?? "draft"}`) })] })) : null] }) })] }), workbenchFullscreen ? (_jsx(FloatingAgentSidebar, { activeThreadId: activeThread.id, brand: productName, deletingThreadIds: deletingThreadIds, hostFooter: hostSlots?.sidebarFooter, locale: locale, messages: messages, onDelete: deleteThread, onNew: createThread, onRename: renameThread, onSelect: selectThread, onSettings: () => setSettingsOpen(true), threads: visibleThreads })) : null, _jsx(AgentSettingsDialog, { extensions: extensions, locale: locale, messages: messages, onLocaleChange: setLocale, onOpenChange: setSettingsOpen, open: settingsOpen })] }));
 }
@@ -1503,6 +1579,23 @@ async function readSettledTail(session, tailIndex, signal) {
     }
     return events;
 }
+async function readSettledRange(session, startIndex, tailIndex, signal) {
+    const expectedEvents = Math.max(0, tailIndex - startIndex + 1);
+    const events = [];
+    if (expectedEvents === 0)
+        return events;
+    for await (const event of session.stream({
+        follow: false,
+        signal,
+        startIndex,
+        streamReconnectPolicy: { reconnect: false },
+    })) {
+        events.push(event);
+        if (events.length >= expectedEvents)
+            break;
+    }
+    return events;
+}
 async function watchRecoveryDurableProgress({ client, getCursor, onProgress, sessionId, signal, }) {
     if (!await waitForRecoveryProbe(signal, RECOVERY_PROGRESS_PROBE_DELAY_MS))
         return;
@@ -1654,6 +1747,11 @@ function withoutMapKey(source, key) {
     next.delete(key);
     return next;
 }
+function pendingTurnInFlight(pendingTurn) {
+    return pendingTurn?.state === "clearing" ||
+        pendingTurn?.state === "resubmitting" ||
+        pendingTurn?.state === "submitting";
+}
 function threadNeedsRecovery(thread) {
     if (thread.hydration === "summary")
         return false;
@@ -1703,14 +1801,14 @@ function threadNeedsRuntimeInspection(thread) {
         thread.pendingTurn?.state === "submitting";
 }
 function runtimeInspectionKey(thread) {
-    const pending = thread.pendingTurn;
+    const pending = reconcilePendingTurnWithEvents(thread.pendingTurn, thread.events);
     const queued = thread.queuedTurns
         .map((turn) => `${turn.id}:${turn.state}`)
         .join(",");
     return [
         thread.id,
         thread.session.sessionId ?? "",
-        thread.status,
+        thread.status === "cancelling" ? "cancelling" : "",
         pending?.id ?? "",
         pending?.state ?? "",
         queued,
@@ -1728,10 +1826,14 @@ function shouldRepairServerTranscript(thread) {
 }
 function hasCompleteTranscriptCoverage(thread, endIndex = thread.session.streamIndex) {
     const coverage = thread.transcriptCoverage;
-    return coverage?.authoritative === true &&
+    const complete = coverage?.authoritative === true &&
         coverage.complete === true &&
         coverage.startIndex === 0 &&
         coverage.endIndex >= endIndex;
+    if (!complete)
+        return false;
+    return coverage.projection === "logical-edits-v1" ||
+        !thread.events.some((event) => event.type === "context.cleared");
 }
 function isEmptyDraftThread(thread) {
     return thread.events.length === 0 &&
@@ -1880,6 +1982,7 @@ function samePendingTurn(left, right) {
     if (!left || !right)
         return left === right;
     return left.id === right.id &&
+        left.operation === right.operation &&
         left.state === right.state &&
         left.eventCountAtSubmission === right.eventCountAtSubmission &&
         left.submittedAt === right.submittedAt &&

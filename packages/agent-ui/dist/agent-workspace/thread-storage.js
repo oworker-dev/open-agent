@@ -224,6 +224,7 @@ function parseTranscriptCoverage(value) {
         ...(value.authoritative === true ? { authoritative: true } : {}),
         complete: value.complete,
         endIndex: value.endIndex,
+        ...(value.projection === "logical-edits-v1" ? { projection: value.projection } : {}),
         startIndex: value.startIndex,
         version: 1,
     };
@@ -307,12 +308,29 @@ function parsePendingTurn(value) {
         (value.state !== "clearing" && value.state !== "submitting" && value.state !== "resubmitting" && value.state !== "delivery-failed" && value.state !== "interrupted")) {
         return undefined;
     }
+    const beforeTurnId = typeof value.beforeTurnId === "string" && value.beforeTurnId
+        ? value.beforeTurnId
+        : undefined;
+    const mailboxItemId = typeof value.mailboxItemId === "string" && value.mailboxItemId
+        ? value.mailboxItemId
+        : undefined;
+    if (value.operation === "edit" && (!beforeTurnId || value.delivery !== "server")) {
+        return undefined;
+    }
     return {
+        ...(beforeTurnId ? { beforeTurnId } : {}),
+        ...(value.delivery === "browser" || value.delivery === "server"
+            ? { delivery: value.delivery }
+            : {}),
         ...(typeof value.eventCountAtSubmission === "number" && Number.isInteger(value.eventCountAtSubmission) && value.eventCountAtSubmission >= 0
             ? { eventCountAtSubmission: value.eventCountAtSubmission }
             : {}),
         ...(files.length > 0 ? { files } : {}),
         id: value.id,
+        ...(mailboxItemId ? { mailboxItemId } : {}),
+        ...(value.operation === "edit" || value.operation === "send"
+            ? { operation: value.operation }
+            : {}),
         state: value.state,
         submittedAt: value.submittedAt,
         text: value.text,
@@ -491,9 +509,45 @@ export function reconcileHydratedPendingTurn(pendingTurn, events) {
     const reconciled = reconcilePendingTurnWithEvents(pendingTurn, events);
     if (!reconciled)
         return undefined;
+    if (reconciled.operation === "edit" && reconciled.delivery === "server") {
+        return reconciled;
+    }
     if (reconciled.state !== "clearing" && reconciled.state !== "resubmitting" && reconciled.state !== "submitting")
         return reconciled;
     return { ...reconciled, state: "delivery-failed" };
+}
+export function projectThreadEditBranches(events) {
+    if (!events.some((event) => event.type === "context.cleared"))
+        return events;
+    const projected = [];
+    for (const event of events) {
+        if (event.type === "context.cleared") {
+            const targetTurnId = event.data.turnId;
+            let targetIndex = projected.findLastIndex((candidate) => eventTurnId(candidate) === targetTurnId);
+            if (targetIndex >= 0) {
+                const actualTargetTurnId = eventTurnId(projected[targetIndex]);
+                const turnStartIndex = projected.findLastIndex((candidate, index) => index <= targetIndex && candidate.type === "turn.started" &&
+                    candidate.data.turnId === actualTargetTurnId);
+                projected.splice(turnStartIndex >= 0 ? turnStartIndex : targetIndex);
+            }
+        }
+        projected.push(event);
+    }
+    return projected;
+}
+export function projectPendingThreadEdit(events, beforeTurnId) {
+    if (!beforeTurnId || events.some((event) => event.type === "context.cleared" && event.data.turnId === beforeTurnId))
+        return events;
+    const targetIndex = events.findIndex((event) => eventTurnId(event) === beforeTurnId);
+    if (targetIndex < 0)
+        return events;
+    const turnStartIndex = events.findLastIndex((event, index) => index <= targetIndex && event.type === "turn.started" && event.data.turnId === beforeTurnId);
+    return events.slice(0, turnStartIndex >= 0 ? turnStartIndex : targetIndex);
+}
+function eventTurnId(event) {
+    return "data" in event && "turnId" in event.data && typeof event.data.turnId === "string"
+        ? event.data.turnId
+        : undefined;
 }
 export function dedupeThreadEvents(events) {
     const seen = new Set();

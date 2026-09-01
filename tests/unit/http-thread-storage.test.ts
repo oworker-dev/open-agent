@@ -260,7 +260,10 @@ test("maps cumulative replacements from a bounded window to absolute event index
     session: { sessionId: "session-1", streamIndex: 9 },
     transcriptWindow: { endIndex: 9, hasMoreBefore: true, startIndex: 8, total: 20 },
   };
-  let patch: { readonly eventAppends?: readonly { readonly replaceFrom?: number }[] } | undefined;
+  let patch: {
+    readonly eventAppends?: readonly { readonly replaceFrom?: number }[];
+    readonly upsertThreads?: readonly { readonly transcriptWindow?: unknown }[];
+  } | undefined;
   const storage = createHttpAgentThreadStorage({
     fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
@@ -294,6 +297,7 @@ test("maps cumulative replacements from a bounded window to absolute event index
   });
 
   assert.equal(patch?.eventAppends?.[0]?.replaceFrom, 8);
+  assert.equal(Object.prototype.hasOwnProperty.call(patch?.upsertThreads?.[0] ?? {}, "transcriptWindow"), false);
 });
 
 test("a server transcript repair advances the revision used by the next metadata save", async () => {
@@ -450,6 +454,39 @@ test("does not treat a reordered snapshot as an append or replacement delta", as
   const patch = server.lastPatch();
   assert.equal(patch?.eventAppends?.length, 0);
   assert.deepEqual(patch?.upsertThreads?.[0]?.events, []);
+});
+
+test("appends unseen events from a reordered reconnect snapshot instead of dropping them", async () => {
+  const server = fakeThreadServer();
+  const storage = createHttpAgentThreadStorage({
+    fetch: server.fetch,
+    getAccessToken: () => "test-token",
+  });
+  const initial = await storage.load("workspace-unseen-reconnect");
+  const event = (id: string, type: "step.started" | "message.appended") => ({
+    data: { messageDelta: id, messageSoFar: id, sequence: 0, stepIndex: 0, turnId: "turn-0" },
+    meta: { at: new Date(0).toISOString(), id },
+    type,
+  } as MessageStreamEvent);
+  const first = event("event-first", "message.appended");
+  const second = event("event-second", "step.started");
+  const third = event("event-third", "message.appended");
+  const thread = { ...createAgentThread(100, "Unseen reconnect"), events: [first, second, third] };
+  await storage.save("workspace-unseen-reconnect", {
+    ...initial,
+    activeThreadId: thread.id,
+    threads: [thread],
+  });
+
+  await storage.save("workspace-unseen-reconnect", {
+    activeThreadId: thread.id,
+    threads: [{ ...thread, events: [event("event-new", "step.started"), third, first], updatedAt: 200 }],
+    version: AGENT_THREAD_STORAGE_VERSION,
+  });
+
+  const patch = server.lastPatch();
+  assert.equal(patch?.eventAppends?.length, 1);
+  assert.equal(patch?.eventAppends?.[0]?.events[0]?.meta.id, "event-new");
 });
 
 function fakeThreadServer() {

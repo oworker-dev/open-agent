@@ -19,10 +19,16 @@ export type AgentThreadPreferences = {
 };
 
 export type AgentPendingTurn = {
+  /** Exact durable user turn replaced by an edit operation. */
+  readonly beforeTurnId?: string;
+  readonly delivery?: "browser" | "server";
   /** Number of locally observed Eve events when this admission was created. */
   readonly eventCountAtSubmission?: number;
   readonly files?: PromptInputMessage["files"];
   readonly id: string;
+  readonly mailboxItemId?: string;
+  /** Distinguishes an explicit last-message edit from a normal admission. */
+  readonly operation?: "edit" | "send";
   readonly state: "clearing" | "delivery-failed" | "interrupted" | "resubmitting" | "submitting";
   readonly submittedAt: number;
   readonly text: string;
@@ -86,10 +92,11 @@ export interface AgentWorkspaceMailbox {
   enqueue(input: {
     readonly clientMessageId: string;
     readonly clientContext?: readonly string[];
+    readonly beforeTurnId?: string;
     readonly expectedTurnId?: string;
     readonly message: string;
     readonly operationId: string;
-    readonly operationKind: "send" | "steer";
+    readonly operationKind: "edit" | "send" | "steer";
     readonly preferences: AgentThreadPreferences;
     readonly sessionId: string;
   }): Promise<AgentMailboxReceipt>;
@@ -178,6 +185,8 @@ export type AgentTranscriptCoverage = {
   readonly authoritative?: boolean;
   readonly complete: boolean;
   readonly endIndex: number;
+  /** Identifies server transcripts that already applied edit/clear branches. */
+  readonly projection?: "logical-edits-v1";
   readonly startIndex: number;
   readonly version: 1;
 };

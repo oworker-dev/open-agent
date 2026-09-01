@@ -49,6 +49,7 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
   // deliberately not considered complete and must not bypass this check.
   if (parsed.transcriptCoverage?.authoritative === true &&
       parsed.transcriptCoverage.complete &&
+      parsed.transcriptCoverage.projection === "logical-edits-v1" &&
       parsed.transcriptCoverage.endIndex >= parsed.session.streamIndex) {
     return Response.json({ revision: record.revision, thread: null }, { headers: responseHeaders(record.revision) });
   }
@@ -96,7 +97,14 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
     revision: (parsed.revision ?? 0) + 1,
     session: { ...parsed.session, streamIndex: rebuilt.endIndex },
     status: failed ? "error" : "ready",
-    transcriptCoverage: { authoritative: true, complete: true, endIndex: rebuilt.endIndex, startIndex: 0, version: 1 },
+    transcriptCoverage: {
+      authoritative: true,
+      complete: true,
+      endIndex: rebuilt.endIndex,
+      projection: "logical-edits-v1",
+      startIndex: 0,
+      version: 1,
+    },
     updatedAt: Date.now(),
   };
   const patch: ThreadCollectionPatchRecord = {

@@ -150,6 +150,9 @@ export function createEveAgentMailboxRuntime(
       try {
         result = await request({
           action: "deliver",
+          ...(input.payload.operation?.beforeTurnId
+            ? { beforeTurnId: input.payload.operation.beforeTurnId }
+            : {}),
           clientMessageId: input.clientMessageId,
           ...(input.payload.clientContext ? { clientContext: input.payload.clientContext } : {}),
           itemId: input.itemId,

@@ -73,6 +73,43 @@ test("Eve mailbox runtime reads a finite authoritative transcript", async () => 
   assert.equal(received[1]?.type, "session.waiting");
 });
 
+test("Eve mailbox runtime forwards the exact edit target and operation identity", async () => {
+  let requestBody: unknown;
+  const runtime = createEveAgentMailboxRuntime(environment, async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body));
+    return Response.json({ ok: true, sessionId: "session-1" }, { status: 202 });
+  });
+
+  await runtime.deliver({
+    clientMessageId: "message-edit-1",
+    itemId: "mail-edit-1",
+    owner: owner(),
+    payload: {
+      message: "Edited latest request",
+      operation: {
+        beforeTurnId: "turn-latest",
+        kind: "edit",
+        operationId: "operation-edit-1",
+      },
+    },
+    sessionId: "session-1",
+  });
+
+  assert.deepEqual(requestBody, {
+    action: "deliver",
+    beforeTurnId: "turn-latest",
+    clientMessageId: "message-edit-1",
+    itemId: "mail-edit-1",
+    message: "Edited latest request",
+    operationId: "operation-edit-1",
+    operationKind: "edit",
+    principalId: "user-1",
+    principalType: "user",
+    sessionId: "session-1",
+    tenantId: "tenant-1",
+  });
+});
+
 
 test("Eve mailbox runtime retains the active turn identity", async () => {
   const runtime = createEveAgentMailboxRuntime(environment, async () =>

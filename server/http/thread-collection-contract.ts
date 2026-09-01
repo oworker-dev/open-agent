@@ -136,17 +136,21 @@ function mergeSummaryThread(
     title: replacement.title,
     updatedAt: replacement.updatedAt,
   };
-  for (const key of ["draftRestore", "interruptedTurns", "pendingTurn", "retainedContext", "transcriptWindow"] as const) {
+  for (const key of ["draftRestore", "interruptedTurns", "pendingTurn", "retainedContext"] as const) {
     if (Object.prototype.hasOwnProperty.call(replacement, key)) next[key] = replacement[key];
     else delete next[key];
   }
+  delete next.transcriptWindow;
   // A server repair establishes a monotonic, authoritative coverage marker.
   // Stale browser summaries must not erase it and force a completed session
   // through transcript repair on every open. An explicit edit checkpoint is
   // the one normal operation that invalidates coverage before resubmission.
   const replacingEditedTurn = replacement.pendingTurn?.state === "clearing" ||
-    replacement.pendingTurn?.state === "resubmitting";
-  if (replacement.transcriptCoverage?.authoritative === true) {
+    replacement.pendingTurn?.state === "resubmitting" ||
+    (replacement.pendingTurn?.state === "submitting" && replacement.pendingTurn.operation === "edit");
+  if (replacingEditedTurn) {
+    delete next.transcriptCoverage;
+  } else if (replacement.transcriptCoverage?.authoritative === true) {
     next.transcriptCoverage = replacement.transcriptCoverage;
   } else if (Object.prototype.hasOwnProperty.call(replacement, "transcriptCoverage") && replacement.transcriptCoverage) {
     // Browser checkpoints are observations, not proof that the finite Eve
@@ -154,11 +158,8 @@ function mergeSummaryThread(
     if (current.transcriptCoverage?.authoritative === true) next.transcriptCoverage = current.transcriptCoverage;
     else next.transcriptCoverage = replacement.transcriptCoverage;
   } else if (Object.prototype.hasOwnProperty.call(replacement, "transcriptCoverage") && !replacement.transcriptCoverage) {
-    if (replacingEditedTurn) delete next.transcriptCoverage;
-    else if (current.transcriptCoverage) next.transcriptCoverage = current.transcriptCoverage;
+    if (current.transcriptCoverage) next.transcriptCoverage = current.transcriptCoverage;
     else delete next.transcriptCoverage;
-  } else if (replacingEditedTurn) {
-    delete next.transcriptCoverage;
   } else if (current.transcriptCoverage) {
     next.transcriptCoverage = current.transcriptCoverage;
   } else {
@@ -203,7 +204,6 @@ export function summarizeThreadCollection(
           session: thread.session,
           status: thread.status,
           ...(thread.transcriptCoverage ? { transcriptCoverage: thread.transcriptCoverage } : {}),
-          ...(thread.transcriptWindow ? { transcriptWindow: thread.transcriptWindow } : {}),
           title: thread.title,
           updatedAt: thread.updatedAt,
         };

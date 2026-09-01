@@ -111,6 +111,9 @@ function parseEnqueueRequest(
   if (value.expectedTurnId !== undefined && !validText(value.expectedTurnId)) {
     return { error: "expectedTurnId must be a non-empty string.", ok: false };
   }
+  if (value.beforeTurnId !== undefined && !validText(value.beforeTurnId)) {
+    return { error: "beforeTurnId must be a non-empty string.", ok: false };
+  }
   if (operationKind !== undefined && operationKind !== "send" && operationKind !== "steer" && operationKind !== "edit") {
     return { error: "operationKind must be send, steer, or edit.", ok: false };
   }
@@ -119,6 +122,9 @@ function parseEnqueueRequest(
   }
   if (operationKind === "steer" && !validText(value.expectedTurnId)) {
     return { error: "expectedTurnId is required for a steering operation.", ok: false };
+  }
+  if (operationKind === "edit" && !validText(value.beforeTurnId)) {
+    return { error: "beforeTurnId is required for an edit operation.", ok: false };
   }
   const modelId = value.preferences.modelId;
   const reasoning = value.preferences.reasoning;
@@ -136,6 +142,7 @@ function parseEnqueueRequest(
     ok: true,
     value: {
       clientMessageId: value.clientMessageId,
+      ...(validText(value.beforeTurnId) ? { beforeTurnId: value.beforeTurnId } : {}),
       ...(clientContext ? { clientContext } : {}),
       ...(validText(value.operationId) ? { operationId: value.operationId } : {}),
       ...(validText(value.expectedTurnId) ? { expectedTurnId: value.expectedTurnId } : {}),
@@ -164,6 +171,9 @@ function mailboxResponse(
       disposition,
       item: {
         clientMessageId: item.clientMessageId,
+        ...(item.payload.operation?.beforeTurnId
+          ? { beforeTurnId: item.payload.operation.beforeTurnId }
+          : {}),
         itemId: item.itemId,
         ...(item.payload.operation?.expectedTurnId
           ? { expectedTurnId: item.payload.operation.expectedTurnId }

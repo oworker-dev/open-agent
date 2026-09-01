@@ -32,5 +32,7 @@ export declare function eventIdentity(event: MessageStreamEvent): string;
 export declare function compactThreadEvents(events: readonly MessageStreamEvent[]): readonly MessageStreamEvent[];
 export declare function reconcilePendingTurnWithEvents(pendingTurn: AgentPendingTurn | undefined, events: readonly MessageStreamEvent[]): AgentPendingTurn | undefined;
 export declare function reconcileHydratedPendingTurn(pendingTurn: AgentPendingTurn | undefined, events: readonly MessageStreamEvent[]): AgentPendingTurn | undefined;
+export declare function projectThreadEditBranches(events: readonly MessageStreamEvent[]): readonly MessageStreamEvent[];
+export declare function projectPendingThreadEdit(events: readonly MessageStreamEvent[], beforeTurnId?: string): readonly MessageStreamEvent[];
 export declare function dedupeThreadEvents(events: readonly MessageStreamEvent[]): readonly MessageStreamEvent[];
 //# sourceMappingURL=thread-storage.d.ts.map

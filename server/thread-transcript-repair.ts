@@ -34,12 +34,50 @@ export async function rebuildSettledThreadTranscript(
   }
   return {
     endIndex,
-    // The server transcript is the durable audit history. Keep lifecycle
-    // boundaries and failed tool attempts here; the UI applies its settled
-    // projection when rendering and must not turn a display cleanup into data
-    // loss during repair.
-    events: compactThreadEvents(events),
+    // Eve remains the append-only audit source. The thread store is the
+    // logical UI transcript, so an edit boundary removes the superseded turn
+    // while the absolute Eve cursor above continues to cover the full stream.
+    events: compactThreadEvents(projectEditedBranches(events)),
   };
+}
+
+/**
+ * Applies Open Agent's edit semantics to a complete Eve audit stream.
+ *
+ * New edit boundaries address the superseded turn exactly. Legacy Open Agent
+ * clear() events carried a clear-turn id instead, so they fall back to the
+ * immediately preceding user turn. Processing boundaries in order also
+ * handles repeated edits without deleting the earlier retained prefix.
+ */
+export function projectEditedBranches(
+  events: readonly MessageStreamEvent[],
+): readonly MessageStreamEvent[] {
+  const projected: MessageStreamEvent[] = [];
+
+  for (const event of events) {
+    if (event.type === "context.cleared") {
+      const targetTurnId = event.data.turnId;
+      let userIndex = projected.findLastIndex((candidate) =>
+        candidate.type === "message.received" && candidate.data.turnId === targetTurnId
+      );
+      if (userIndex < 0) {
+        userIndex = projected.findLastIndex((candidate) => candidate.type === "message.received");
+      }
+      if (userIndex >= 0) {
+        const userEvent = projected[userIndex];
+        const turnId = userEvent?.type === "message.received" ? userEvent.data.turnId : undefined;
+        const turnStartIndex = turnId
+          ? projected.findLastIndex((candidate, index) =>
+              index <= userIndex && candidate.type === "turn.started" && candidate.data.turnId === turnId
+            )
+          : -1;
+        projected.splice(turnStartIndex >= 0 ? turnStartIndex : userIndex);
+      }
+    }
+    projected.push(event);
+  }
+
+  return projected;
 }
 
 export class ThreadTranscriptCoverageError extends Error {

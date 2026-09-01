@@ -101,7 +101,7 @@ test.beforeEach(async ({ page }, testInfo) => {
           .map((thread) => {
             const replacement = replacements.get(thread.id);
             const next = replacement?.hydration === "summary"
-              ? { ...thread, ...replacement, events: thread.events, hydration: undefined }
+              ? mergeFakeSummaryThread(thread, replacement)
               : replacement ?? thread;
             const appended = appends.get(thread.id);
             return appended && appended.events.length > 0
@@ -491,6 +491,102 @@ test("the thread index hydrates only the transcript selected from the sidebar", 
   await page.locator("aside").getByRole("button", { name: /Stored history/ }).click();
   await expect(page.getByText("Stored response", { exact: true })).toBeVisible();
   expect(transcriptRequests.filter((search) => !search.includes("view=index"))).toHaveLength(1);
+});
+
+test("editing a bounded transcript waits instead of clearing a partial history", async ({ page }) => {
+  const threadId = "bounded-edit-thread";
+  const sessionId = "bounded-edit-session";
+  const now = Date.now();
+  const events = mockSuccessfulTurn("Original request", "Original response")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as MessageStreamEvent);
+  setFakeThreadCollection(page, {
+    activeThreadId: threadId,
+    threads: [{
+      closedInputRequestIds: [],
+      createdAt: now,
+      events,
+      id: threadId,
+      preferences: { executionMode: "standard", modelId: "gpt-5.6-sol", reasoning: "medium" },
+      queuedTurns: [],
+      // Keep the Eve cursor ahead of the compact event window so the app
+      // exercises the production summary -> bounded hydration path.
+      session: { sessionId, streamIndex: events.length + 1 },
+      status: "ready",
+      title: "Bounded history",
+      updatedAt: now,
+    }],
+    version: 2,
+  });
+  let clearRequests = 0;
+  await page.route("**/api/standalone/thread-collections/**", async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    if (request.method() === "GET" && url.searchParams.get("threadId") === threadId && url.searchParams.get("view") === "index") {
+      const store = threadStores.get(page);
+      const thread = store?.collection.threads.find((candidate) => candidate.id === threadId);
+      await route.fulfill({
+        body: JSON.stringify({
+          collection: {
+            activeThreadId: threadId,
+            threads: thread ? [{ ...thread, events: [], hydration: "summary" }] : [],
+            version: 2,
+          },
+          revision: store?.revision ?? 0,
+        }),
+        contentType: "application/json",
+        headers: { etag: `"${store?.revision ?? 0}"` },
+        status: 200,
+      });
+      return;
+    }
+    if (request.method() === "GET" && url.searchParams.get("threadId") === threadId && url.searchParams.get("eventWindow") === "1") {
+      const store = threadStores.get(page);
+      const thread = store?.collection.threads.find((candidate) => candidate.id === threadId);
+      await route.fulfill({
+        body: JSON.stringify({
+          eventWindow: { endIndex: events.length, hasMoreBefore: true, startIndex: 1, total: events.length + 1 },
+          revision: store?.revision ?? 0,
+          thread,
+        }),
+        contentType: "application/json",
+        headers: { etag: `"${store?.revision ?? 0}"` },
+        status: 200,
+      });
+      return;
+    }
+    await route.fallback();
+  });
+  await page.route(`**/eve/v1/session/${sessionId}/clear`, async (route) => {
+    clearRequests += 1;
+    await route.fulfill({ body: JSON.stringify({ status: "accepted" }), contentType: "application/json", status: 202 });
+  });
+  // Hydration is a settled display-only scenario. Prevent the generic test
+  // harness response (state: running) from opening a real Eve recovery stream.
+  await page.route(`**/api/standalone/sessions/${sessionId}`, async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({ ok: true, state: "waiting" }),
+      contentType: "application/json",
+      status: 200,
+    });
+  });
+
+  await page.goto(`/threads/${threadId}`);
+  await expect(page.getByText("Original response", { exact: true })).toBeVisible();
+  const edit = page.getByRole("button", { name: "Edit message", exact: true }).last();
+  await expect(edit).toBeVisible();
+  await edit.click();
+  const composer = page.locator("[data-agent-edit-composer]");
+  await composer.getByRole("textbox").fill("Edited request");
+  await composer.getByRole("button", { name: "Send", exact: true }).click();
+
+  // The runtime surfaces the guard through its existing request-error slot;
+  // the invariant under test is that the partial window is never cleared and
+  // the already hydrated transcript remains intact.
+  await expect(page.locator("[data-agent-failure-alert]")).toBeVisible();
+  await expect(page.getByText("Original response", { exact: true })).toBeVisible();
+  expect(clearRequests).toBe(0);
 });
 
 test("a settled transcript with stale coverage is not replayed from Eve", async ({ page }) => {
@@ -1325,7 +1421,8 @@ for (const editScenario of [
     sessionId: "mock-edit-unchanged-session",
   },
 ] as const) {
-test(`editing the latest user turn with ${editScenario.label} waits for clear and resends on the same session`, async ({ page }) => {
+test(`editing the latest user turn with ${editScenario.label} submits one durable revert transaction`, async ({ page }) => {
+  test.skip(!process.env.AGENT_DATABASE_URL, "Requires the server-backed mailbox/edit boundary.");
   const { editedReply, editedRequest, sessionId } = editScenario;
   await page.addInitScript(() => {
     const nativeScrollTo = HTMLElement.prototype.scrollTo;
@@ -1362,20 +1459,18 @@ test(`editing the latest user turn with ${editScenario.label} waits for clear an
       else invokeNativeScrollTo.call(this, optionsOrX);
     };
   });
-  let streamCalls = 0;
+  const originalEvents = eventsFromNdjson(mockSuccessfulTurn("Original request", "Original delivery."));
+  const editedEvents = eventsFromNdjson(mockContinuationTurn(editedRequest, editedReply, 1));
+  const clearEvent = {
+    data: { sequence: 1, sessionId, turnId: "turn_0" },
+    meta: { at: new Date().toISOString(), id: `evt-${sessionId}-edit-boundary` },
+    type: "context.cleared" as const,
+  } as MessageStreamEvent;
+  let mailboxAccepted = false;
+  let mailboxBody: Record<string, unknown> | undefined;
+  let mailboxCalls = 0;
   let clearCalls = 0;
-  let clearBoundaryPending = false;
-  let clearStreamStartIndex = -1;
-  const resendStreamStartIndexes: number[] = [];
   let turnCalls = 0;
-  let releaseClear: (() => void) | undefined;
-  let releaseEditedStream: (() => void) | undefined;
-  const clearMayComplete = new Promise<void>((resolve) => {
-    releaseClear = resolve;
-  });
-  const editedStreamMayComplete = new Promise<void>((resolve) => {
-    releaseEditedStream = resolve;
-  });
   await page.route("**/eve/v1/session", async (route) => {
     await route.fulfill({
       body: JSON.stringify({ sessionId }),
@@ -1386,12 +1481,10 @@ test(`editing the latest user turn with ${editScenario.label} waits for clear an
   });
   await page.route(`**/eve/v1/session/${sessionId}/clear`, async (route) => {
     clearCalls += 1;
-    clearBoundaryPending = true;
-    await clearMayComplete;
     await route.fulfill({
-      body: JSON.stringify({ ok: true, sessionId, status: "accepted" }),
+      body: JSON.stringify({ code: "unexpected_clear", error: "Browser clear is forbidden for message edits." }),
       contentType: "application/json",
-      status: 200,
+      status: 500,
     });
   });
   await page.route(`**/eve/v1/session/${sessionId}`, async (route) => {
@@ -1402,23 +1495,52 @@ test(`editing the latest user turn with ${editScenario.label} waits for clear an
       status: 200,
     });
   });
-  await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
-    streamCalls += 1;
-    const url = new URL(route.request().url());
-    if (clearBoundaryPending && !url.searchParams.has("includeTailIndex")) {
-      clearBoundaryPending = false;
-      clearStreamStartIndex = Number(url.searchParams.get("startIndex") ?? "0");
-      const at = new Date().toISOString();
-      await route.fulfill({
-        body: `${[
-          { data: { sequence: 1, sessionId, turnId: "clear_1" }, meta: { at }, type: "context.cleared" },
-          { data: { wait: "next-user-message" }, meta: { at }, type: "session.waiting" },
-        ].map((event) => JSON.stringify(event)).join("\n")}\n`,
-        contentType: "application/x-ndjson",
-        status: 200,
-      });
+  await page.route("**/api/standalone/mailbox", async (route) => {
+    mailboxCalls += 1;
+    mailboxBody = route.request().postDataJSON() as Record<string, unknown>;
+    mailboxAccepted = true;
+    await route.fulfill({
+      body: JSON.stringify({
+        disposition: "created",
+        item: {
+          clientMessageId: mailboxBody.clientMessageId,
+          itemId: `mail-${sessionId}`,
+          status: "committed",
+        },
+        ok: true,
+      }),
+      contentType: "application/json",
+      status: 202,
+    });
+  });
+  await page.route("**/api/standalone/mailbox/*", async (route) => {
+    if (route.request().method() !== "GET") {
+      await route.continue();
       return;
     }
+    await route.fulfill({
+      body: JSON.stringify({
+        item: {
+          clientMessageId: mailboxBody?.clientMessageId,
+          itemId: `mail-${sessionId}`,
+          status: mailboxAccepted ? "committed" : "queued",
+        },
+        ok: true,
+      }),
+      contentType: "application/json",
+      status: 200,
+    });
+  });
+  await page.route(`**/api/standalone/sessions/${sessionId}`, async (route) => {
+    const events = mailboxAccepted ? [...originalEvents, clearEvent, ...editedEvents] : originalEvents;
+    await route.fulfill({
+      body: JSON.stringify({ ok: true, state: "waiting", tailIndex: events.length - 1 }),
+      contentType: "application/json",
+      status: 200,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
+    const url = new URL(route.request().url());
     if (url.searchParams.get("startIndex") === "-1") {
       const at = new Date().toISOString();
       await route.fulfill({
@@ -1429,16 +1551,13 @@ test(`editing the latest user turn with ${editScenario.label} waits for clear an
       return;
     }
     const startIndex = Number(url.searchParams.get("startIndex") ?? "0");
-    if (turnCalls > 0) resendStreamStartIndexes.push(startIndex);
-    if (turnCalls > 0) await editedStreamMayComplete;
-    const body = startIndex === 0
-      ? mockSuccessfulTurn("Original request", "Original delivery.")
-      : mockContinuationTurn(editedRequest, editedReply, 1);
+    const events = mailboxAccepted ? [...originalEvents, clearEvent, ...editedEvents] : originalEvents;
+    const body = ndjson(events.slice(startIndex));
     await route.fulfill({
       body,
       contentType: "application/x-ndjson",
       ...(url.searchParams.has("includeTailIndex")
-        ? { headers: { "x-eve-stream-tail-index": String(startIndex + eventsFromNdjson(body).length - 1) } }
+        ? { headers: { "x-eve-stream-tail-index": String(events.length - 1) } }
         : {}),
       status: 200,
     });
@@ -1451,7 +1570,7 @@ test(`editing the latest user turn with ${editScenario.label} waits for clear an
   await expect(page.getByText("Original delivery.", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Send", exact: true })).toHaveCount(1);
 
-  const original = page.getByRole("log").getByText("Original request", { exact: true });
+  const original = page.getByRole("log").getByText("Original request", { exact: true }).last();
   await original.hover();
   await page.getByRole("button", { name: "Edit message" }).click();
   const editComposer = page.locator("[data-agent-edit-composer]");
@@ -1476,12 +1595,11 @@ test(`editing the latest user turn with ${editScenario.label} waits for clear an
   });
   await editComposer.getByRole("button", { name: "Send", exact: true }).click();
 
-  // The visible revision changes atomically; Eve's clear/rebuild transport may
-  // continue in the background without making the edited message disappear.
-  await expect(page.getByRole("log").getByText(editedRequest, { exact: true })).toBeVisible({ timeout: 300 });
+  // The old branch is hidden optimistically while the server-owned edit waits
+  // for its exact context.cleared boundary.
+  await expect(page.getByRole("log").getByText(editedRequest, { exact: true })).toBeVisible({ timeout: 15_000 });
   await expect(page.getByRole("log").getByText("Original delivery.", { exact: true })).toHaveCount(0);
-  releaseClear?.();
-  await expect.poll(() => turnCalls).toBe(1);
+  await expect.poll(() => mailboxCalls).toBe(1);
   await page.waitForTimeout(250);
   await expect(page.getByRole("log").getByText(editedRequest, { exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { name: editedRequest, exact: true })).toBeVisible();
@@ -1497,27 +1615,35 @@ test(`editing the latest user turn with ${editScenario.label} waits for clear an
   });
   expect(editRemounts.viewportChanges).toBeLessThanOrEqual(1);
   expect(editRemounts.assistantChanges).toBeLessThanOrEqual(1);
-  releaseEditedStream?.();
   await expect(page.getByText(editedReply, { exact: true })).toBeVisible();
   await expect(page.getByRole("log").getByText("Original delivery.", { exact: true })).toHaveCount(0);
   await expect(page.getByRole("log").getByText(editedRequest, { exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { name: editedRequest, exact: true })).toBeVisible();
-  await expect.poll(() => clearCalls).toBe(1);
-  await page.waitForTimeout(250);
-  expect(clearCalls).toBe(1);
-  expect(resendStreamStartIndexes).toContain(clearStreamStartIndex + 2);
-  expect(turnCalls).toBe(1);
-  expect(streamCalls).toBeGreaterThanOrEqual(2);
+  expect(clearCalls).toBe(0);
+  expect(turnCalls).toBe(0);
+  expect(mailboxBody).toMatchObject({
+    beforeTurnId: "turn_0",
+    message: editedRequest,
+    operationKind: "edit",
+    sessionId,
+  });
+  expect(mailboxBody?.operationId).toBe(mailboxBody?.clientMessageId);
+
+  await page.reload();
+  await expect(page.getByRole("log").getByText(editedRequest, { exact: true })).toHaveCount(1);
+  await expect(page.getByText(editedReply, { exact: true })).toHaveCount(1);
+  await expect(page.getByRole("log").getByText("Original delivery.", { exact: true })).toHaveCount(0);
 });
 }
 
-test("editing after a final failure removes the stale assistant row before resend", async ({ page }) => {
+test("editing after a final failure uses one durable revert transaction", async ({ page }) => {
+  test.skip(!process.env.AGENT_DATABASE_URL, "Requires the server-backed mailbox/edit boundary.");
   const sessionId = "failed-edit-transition-session";
   const failedEvents = eventsFromNdjson(mockProviderFailureTurn("Original request", {
     retryAttempts: 3,
     statusCode: 404,
   }));
-  setFakeThreadCollection(page, {
+  const failedCollection: FakeThreadCollection = {
     activeThreadId: "failed-edit-transition-thread",
     threads: [{
       createdAt: Date.now(),
@@ -1527,18 +1653,75 @@ test("editing after a final failure removes the stale assistant row before resen
       session: { sessionId, streamIndex: failedEvents.length },
       status: "error",
       title: "Original request",
+      transcriptCoverage: {
+        authoritative: true,
+        complete: true,
+        endIndex: failedEvents.length,
+        projection: "logical-edits-v1",
+        startIndex: 0,
+        version: 1,
+      },
       updatedAt: Date.now(),
     }],
     version: 2,
-  });
+  };
+  setFakeThreadCollection(page, failedCollection);
+  // Development intentionally falls back to browser storage when PostgreSQL
+  // is not configured, while production uses the HTTP store intercepted by
+  // the shared fixture. Seed both boundaries so this UI regression test does
+  // not depend on how the Playwright web server was started.
+  await page.addInitScript((collection) => {
+    window.localStorage.setItem("open-agent:threads:v1", JSON.stringify(collection));
+  }, failedCollection);
 
+  let mailboxAccepted = false;
+  let mailboxBody: Record<string, unknown> | undefined;
+  let mailboxCalls = 0;
   let clearRequested = false;
+  await page.route("**/api/standalone/mailbox", async (route) => {
+    mailboxCalls += 1;
+    mailboxBody = route.request().postDataJSON() as Record<string, unknown>;
+    mailboxAccepted = true;
+    await route.fulfill({
+      body: JSON.stringify({
+        disposition: "created",
+        item: {
+          beforeTurnId: mailboxBody.beforeTurnId,
+          clientMessageId: mailboxBody.clientMessageId,
+          itemId: "mail-failed-edit-transition",
+          status: "committed",
+        },
+        ok: true,
+      }),
+      contentType: "application/json",
+      status: 202,
+    });
+  });
+  await page.route("**/api/standalone/mailbox/*", async (route) => {
+    if (route.request().method() !== "GET") {
+      await route.continue();
+      return;
+    }
+    await route.fulfill({
+      body: JSON.stringify({
+        item: {
+          beforeTurnId: mailboxBody?.beforeTurnId,
+          clientMessageId: mailboxBody?.clientMessageId,
+          itemId: "mail-failed-edit-transition",
+          status: mailboxAccepted ? "committed" : "queued",
+        },
+        ok: true,
+      }),
+      contentType: "application/json",
+      status: 200,
+    });
+  });
   await page.route(`**/eve/v1/session/${sessionId}/clear`, async (route) => {
     clearRequested = true;
     await route.fulfill({
-      body: JSON.stringify({ ok: true, sessionId, status: "accepted" }),
+      body: JSON.stringify({ code: "unexpected_clear", error: "Browser clear is forbidden for message edits." }),
       contentType: "application/json",
-      status: 202,
+      status: 500,
     });
   });
   await page.route(`**/eve/v1/session/${sessionId}`, async (route) => {
@@ -1549,21 +1732,17 @@ test("editing after a final failure removes the stale assistant row before resen
     });
   });
   await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
-    if (clearRequested) {
-      clearRequested = false;
-      const at = new Date().toISOString();
-      await route.fulfill({
-        body: `${[
-          { data: { sequence: 1, sessionId, turnId: "clear_1" }, meta: { at }, type: "context.cleared" },
-          { data: { wait: "next-user-message" }, meta: { at }, type: "session.waiting" },
-        ].map((event) => JSON.stringify(event)).join("\n")}\n`,
-        contentType: "application/x-ndjson",
-        status: 200,
-      });
-      return;
-    }
+    if (clearRequested) clearRequested = false;
+    const clearEvent = {
+      data: { sequence: 1, sessionId, turnId: "turn_provider_failure" },
+      meta: { at: new Date().toISOString() },
+      type: "context.cleared" as const,
+    };
+    const events = mailboxAccepted
+      ? [clearEvent, ...eventsFromNdjson(mockContinuationTurn("Edited request", "Edited delivery.", 1))]
+      : [{ data: { wait: "next-user-message" }, meta: { at: new Date().toISOString() }, type: "session.waiting" }];
     await route.fulfill({
-      body: mockContinuationTurn("Edited request", "Edited delivery.", 1),
+      body: ndjson(events),
       contentType: "application/x-ndjson",
       status: 200,
     });
@@ -1577,11 +1756,19 @@ test("editing after a final failure removes the stale assistant row before resen
   await editComposer.getByRole("textbox").fill("Edited request");
   await editComposer.getByRole("button", { name: "Send", exact: true }).click();
 
-  // The stale terminal assistant message must be gone during the clear
-  // handshake; only the edited optimistic user message remains visible.
+  // The stale terminal assistant message must be projected away at the exact
+  // server-owned context.cleared boundary; the browser never calls clear().
   await expect(page.getByText("Retry failed", { exact: true })).toHaveCount(0);
   await expect(page.getByRole("log").getByText("Edited request", { exact: true })).toBeVisible();
   await expect(page.getByText("Edited delivery.", { exact: true })).toBeVisible();
+  await expect.poll(() => mailboxCalls).toBe(1);
+  expect(clearRequested).toBe(false);
+  expect(mailboxBody).toMatchObject({
+    beforeTurnId: "turn_provider_failure",
+    message: "Edited request",
+    operationKind: "edit",
+    sessionId,
+  });
 });
 
 test("Codex apply_patch envelopes render with the assistant-ui diff viewer and live counts", async ({ page }) => {
@@ -3518,6 +3705,264 @@ test("a settled Eve session never opens an unbounded recovery stream", async ({ 
   expect(streamRequests.every((search) => !search.includes("follow=true"))).toBeTruthy();
 });
 
+test("settled recovery consumes events after the previous waiting boundary before becoming ready", async ({ page }) => {
+  const sessionId = "mock-stale-waiting-cursor-session";
+  const firstTurn = eventsFromNdjson(mockSuccessfulTurn("你好", "你好，我在。", 0));
+  const secondTurn = eventsFromNdjson(mockContinuationTurn("在干嘛", "正在处理你的请求。", 1));
+  const durableEvents = [...firstTurn, ...secondTurn];
+  const requestedStarts: number[] = [];
+
+  await page.route(`**/api/standalone/sessions/${sessionId}`, (route) => route.fulfill({
+    body: JSON.stringify({ ok: true, state: "waiting", tailIndex: durableEvents.length - 1 }),
+    contentType: "application/json",
+    status: 200,
+  }));
+  await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
+    const startIndex = Number(new URL(route.request().url()).searchParams.get("startIndex") ?? "0");
+    requestedStarts.push(startIndex);
+    await route.fulfill({
+      body: ndjson(durableEvents.slice(startIndex)),
+      contentType: "application/x-ndjson",
+      headers: { "x-eve-stream-tail-index": String(durableEvents.length - 1) },
+      status: 200,
+    });
+  });
+
+  const now = Date.now();
+  setFakeThreadCollection(page, {
+    activeThreadId: "stale-waiting-cursor-thread",
+    threads: [{
+      closedInputRequestIds: [],
+      createdAt: now,
+      events: firstTurn,
+      id: "stale-waiting-cursor-thread",
+      pendingTurn: {
+        eventCountAtSubmission: firstTurn.length,
+        id: "pending-second-turn",
+        operation: "send",
+        state: "submitting",
+        submittedAt: now - 1_000,
+        text: "在干嘛",
+      },
+      preferences: { executionMode: "standard", modelId: "gpt-5.6-sol", reasoning: "medium" },
+      queuedTurns: [],
+      session: { sessionId, streamIndex: firstTurn.length },
+      status: "submitted",
+      title: "刷新恢复",
+      updatedAt: now,
+    }],
+    version: 2,
+  });
+
+  await page.goto("/threads/stale-waiting-cursor-thread");
+  await expect(page.getByText("你好，我在。", { exact: true })).toBeVisible();
+  await expect(page.getByText("正在处理你的请求。", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Send", exact: true })).toBeVisible();
+  await expect.poll(() => firstStoredThread(page)?.pendingTurn).toBeUndefined();
+  await expect.poll(() => firstStoredThread(page)?.session?.streamIndex).toBe(durableEvents.length);
+  expect(requestedStarts).toContain(firstTurn.length);
+});
+
+test("an accepted edited turn keeps prior history and recovers its latest reply after refresh", async ({ page }) => {
+  const sessionId = "mock-accepted-edit-refresh-session";
+  const firstTurn = eventsFromNdjson(mockSuccessfulTurn("第一轮", "第一轮回复。", 0));
+  const at = new Date().toISOString();
+  const editedTurnId = "turn_edited_refresh";
+  const clearBoundary = [
+    { data: { sequence: 1, sessionId, turnId: "clear_edit_refresh" }, meta: { at, id: "evt-edit-clear" }, type: "context.cleared" },
+    { data: { wait: "next-user-message" }, meta: { at, id: "evt-edit-clear-waiting" }, type: "session.waiting" },
+  ];
+  const acceptedPrefix = [
+    { data: { sequence: 2, turnId: editedTurnId }, meta: { at, id: "evt-edit-turn" }, type: "turn.started" },
+    {
+      data: {
+        clientMessageId: "accepted-edit-message",
+        message: "编辑后的请求",
+        parts: [{ text: "编辑后的请求", type: "text" }],
+        sequence: 2,
+        turnId: editedTurnId,
+      },
+      meta: { at, id: "evt-edit-user" },
+      type: "message.received",
+    },
+    { data: { sequence: 2, stepIndex: 0, turnId: editedTurnId }, meta: { at, id: "evt-edit-step" }, type: "step.started" },
+    {
+      data: {
+        messageDelta: "新的回复正在生成",
+        messageSoFar: "新的回复正在生成",
+        sequence: 2,
+        stepIndex: 0,
+        turnId: editedTurnId,
+      },
+      meta: { at, id: "evt-edit-partial" },
+      type: "message.appended",
+    },
+  ];
+  const completedSuffix = [
+    {
+      data: {
+        finishReason: "stop",
+        message: "编辑后的最终回复。",
+        sequence: 2,
+        stepIndex: 0,
+        turnId: editedTurnId,
+      },
+      meta: { at, id: "evt-edit-completed" },
+      type: "message.completed",
+    },
+    {
+      data: {
+        finishReason: "stop",
+        sequence: 2,
+        stepIndex: 0,
+        turnId: editedTurnId,
+        usage: { inputTokens: 2, outputTokens: 2 },
+      },
+      meta: { at, id: "evt-edit-step-completed" },
+      type: "step.completed",
+    },
+    { data: { sequence: 2, turnId: editedTurnId }, meta: { at, id: "evt-edit-turn-completed" }, type: "turn.completed" },
+    { data: { wait: "next-user-message" }, meta: { at, id: "evt-edit-waiting" }, type: "session.waiting" },
+  ];
+  const persistedEvents = [...firstTurn, ...clearBoundary, ...acceptedPrefix];
+  const durableEvents = [...persistedEvents, ...completedSuffix];
+
+  await page.route(`**/api/standalone/sessions/${sessionId}`, (route) => route.fulfill({
+    body: JSON.stringify({ ok: true, state: "waiting", tailIndex: durableEvents.length - 1 }),
+    contentType: "application/json",
+    status: 200,
+  }));
+  await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
+    const startIndex = Number(new URL(route.request().url()).searchParams.get("startIndex") ?? "0");
+    await route.fulfill({
+      body: ndjson(durableEvents.slice(startIndex)),
+      contentType: "application/x-ndjson",
+      headers: { "x-eve-stream-tail-index": String(durableEvents.length - 1) },
+      status: 200,
+    });
+  });
+
+  const now = Date.now();
+  setFakeThreadCollection(page, {
+    activeThreadId: "accepted-edit-refresh-thread",
+    threads: [{
+      closedInputRequestIds: [],
+      createdAt: now,
+      events: persistedEvents,
+      id: "accepted-edit-refresh-thread",
+      pendingTurn: {
+        eventCountAtSubmission: firstTurn.length + clearBoundary.length,
+        id: "accepted-edit-message",
+        operation: "edit",
+        state: "submitting",
+        submittedAt: now - 1_000,
+        text: "编辑后的请求",
+      },
+      preferences: { executionMode: "standard", modelId: "gpt-5.6-sol", reasoning: "medium" },
+      queuedTurns: [],
+      session: { sessionId, streamIndex: persistedEvents.length },
+      status: "streaming",
+      title: "编辑刷新恢复",
+      updatedAt: now,
+    }],
+    version: 2,
+  });
+
+  await page.goto("/threads/accepted-edit-refresh-thread");
+  await expect(page.getByText("第一轮回复。", { exact: true })).toBeVisible();
+  await expect(page.getByText("编辑后的最终回复。", { exact: true })).toBeVisible();
+  await expect(page.getByText("新的回复正在生成", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Send", exact: true })).toBeVisible();
+
+  await page.reload();
+  await expect(page.getByText("第一轮回复。", { exact: true })).toBeVisible();
+  await expect(page.getByText("编辑后的最终回复。", { exact: true })).toHaveCount(1);
+});
+
+test("editing an unacknowledged optimistic message requires durable mailbox support", async ({ page }) => {
+  const sessionId = "mock-unacknowledged-edit-session";
+  const firstTurn = eventsFromNdjson(mockSuccessfulTurn("你好", "第一轮已完成。", 0));
+  const editedTurn = eventsFromNdjson(mockContinuationTurn("现在在做什么", "这是编辑后的首次有效回复。", 1));
+  let clearCalls = 0;
+  let messageCalls = 0;
+
+  await page.route(`**/api/standalone/sessions/${sessionId}`, (route) => route.fulfill({
+    body: JSON.stringify({ ok: true, state: "waiting", tailIndex: firstTurn.length - 1 }),
+    contentType: "application/json",
+    status: 200,
+  }));
+  await page.route(`**/eve/v1/session/${sessionId}/clear`, async (route) => {
+    clearCalls += 1;
+    await route.fulfill({
+      body: JSON.stringify({ ok: true, sessionId, status: "accepted" }),
+      contentType: "application/json",
+      status: 200,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}`, async (route) => {
+    messageCalls += 1;
+    await route.fulfill({
+      body: JSON.stringify({ sessionId }),
+      contentType: "application/json",
+      headers: { "x-eve-session-id": sessionId },
+      status: 200,
+    });
+  });
+  await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
+    const startIndex = Number(new URL(route.request().url()).searchParams.get("startIndex") ?? "0");
+    await route.fulfill({
+      body: startIndex >= firstTurn.length ? ndjson(editedTurn) : "",
+      contentType: "application/x-ndjson",
+      headers: { "x-eve-stream-tail-index": String(firstTurn.length + editedTurn.length - 1) },
+      status: 200,
+    });
+  });
+
+  const now = Date.now();
+  setFakeThreadCollection(page, {
+    activeThreadId: "unacknowledged-edit-thread",
+    threads: [{
+      closedInputRequestIds: [],
+      createdAt: now,
+      events: firstTurn,
+      id: "unacknowledged-edit-thread",
+      pendingTurn: {
+        eventCountAtSubmission: firstTurn.length,
+        id: "never-accepted-message",
+        operation: "send",
+        state: "delivery-failed",
+        submittedAt: now - 1_000,
+        text: "在干嘛",
+      },
+      preferences: { executionMode: "standard", modelId: "gpt-5.6-sol", reasoning: "medium" },
+      queuedTurns: [],
+      session: { sessionId, streamIndex: firstTurn.length },
+      status: "error",
+      title: "未确认消息",
+      updatedAt: now,
+    }],
+    version: 2,
+  });
+
+  await page.goto("/threads/unacknowledged-edit-thread");
+  const pendingMessage = page.getByRole("log").getByText("在干嘛", { exact: true });
+  await pendingMessage.hover();
+  await page.getByRole("button", { name: "Edit message", exact: true }).click();
+  const editComposer = page.locator("[data-agent-edit-composer]");
+  await editComposer.getByRole("textbox").fill("现在在做什么");
+  await editComposer.getByRole("button", { name: "Send", exact: true }).click();
+
+  // Browser storage intentionally has no durable edit boundary. Editing must
+  // fail closed instead of falling back to clear() plus a second normal send,
+  // which could duplicate or fork the session after a refresh.
+  await expect(page.locator("[data-agent-failure-alert]")).toBeVisible();
+  await expect(page.getByText("第一轮已完成。", { exact: true })).toBeVisible();
+  await expect(page.getByText("这是编辑后的首次有效回复。", { exact: true })).toHaveCount(0);
+  expect(clearCalls).toBe(0);
+  expect(messageCalls).toBe(0);
+  await expect.poll(() => JSON.stringify(threadEvents(page))).toContain("第一轮已完成。");
+});
+
 test("a settled runtime clears a stale partial tool state", async ({ page }) => {
   const sessionId = "mock-settled-partial-session";
   const turnId = "turn_stale_partial";
@@ -4825,6 +5270,24 @@ function setFakeThreadCollection(page: Page, collection: FakeThreadCollection): 
   if (!store) throw new Error("The fake Agent thread store was not installed.");
   store.collection = collection;
   store.revision += 1;
+}
+
+function mergeFakeSummaryThread(
+  current: FakeStoredThread,
+  replacement: FakeStoredThread,
+): FakeStoredThread {
+  const next: Record<string, unknown> = {
+    ...current,
+    ...replacement,
+    events: current.events,
+  };
+  delete next.hydration;
+  // Match the production PATCH contract: omitted optional browser transaction
+  // fields are explicit clears, not "keep the previous value".
+  for (const key of ["draftRestore", "interruptedTurns", "pendingTurn", "retainedContext", "transcriptWindow"]) {
+    if (!Object.prototype.hasOwnProperty.call(replacement, key)) delete next[key];
+  }
+  return next as FakeStoredThread;
 }
 
 function firstStoredThread(page: Page): FakeStoredThread | undefined {

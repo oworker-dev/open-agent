@@ -168,6 +168,7 @@ export function createHttpAgentThreadStorage(
           ...(baseline?.threads ?? []).filter((thread) => thread.id !== hydrated.id),
           {
             ...hydrated,
+            transcriptWindow: body.eventWindow,
             // Keep previously fetched pages in the optimistic baseline so a
             // metadata checkpoint never mistakes a prepend for a truncation.
             events: [...hydrated.events, ...baselineEvents].filter((event, index, all) =>
@@ -255,7 +256,14 @@ export function createHttpAgentThreadStorage(
       }
       await requireOk(response);
       revisions.set(storageKey, await readRevisionResponse(response));
-      baselines.set(storageKey, savedCollection);
+      // The server stores stream events in the append-only event table. When a
+      // reconnect exposes a reordered/shorter snapshot, the patch deliberately
+      // appends only event identities that were not in the previous baseline;
+      // keep those durable events in the next diff baseline as well. Setting
+      // the raw (incomplete) browser snapshot here would cause every following
+      // checkpoint to rediscover the same history as missing and could make a
+      // later edit replace the wrong prefix.
+      baselines.set(storageKey, baselineAfterPatch(baseline, savedCollection, patch));
     },
   };
 }
@@ -274,6 +282,46 @@ function snapshotCollection(collection: AgentThreadCollection): AgentThreadColle
   };
 }
 
+function baselineAfterPatch(
+  previous: AgentThreadCollection,
+  next: AgentThreadCollection,
+  patch: ReturnType<typeof createCollectionPatch>,
+): AgentThreadCollection {
+  const appends = new Map(patch.eventAppends.map((entry) => [entry.threadId, entry]));
+  const previousThreads = new Map(previous.threads.map((thread) => [thread.id, thread]));
+  const deleted = new Set(patch.deletedThreadIds);
+  return {
+    ...(next.activeThreadId ? { activeThreadId: next.activeThreadId } : {}),
+    threads: next.threads
+      .filter((thread) => !deleted.has(thread.id))
+      .map((thread) => {
+        const prior = previousThreads.get(thread.id);
+        if (!prior) return thread;
+        if (isExplicitTranscriptReplacement(thread)) return thread;
+        const append = appends.get(thread.id);
+        if (!append || append.events.length === 0) {
+          return { ...thread, events: [...prior.events] };
+        }
+        if (append.replaceFrom === undefined) {
+          const seen = new Set(prior.events.map(eventIdentity));
+          const merged = [...prior.events];
+          for (const event of append.events) {
+            if (seen.has(eventIdentity(event))) continue;
+            seen.add(eventIdentity(event));
+            merged.push(event);
+          }
+          return { ...thread, events: merged };
+        }
+        // A replacement checkpoint carried the complete local transcript (or
+        // a bounded window with an absolute cursor). The browser snapshot is
+        // the best baseline for that operation; the server validates its
+        // prefix before applying it.
+        return thread;
+      }),
+    version: next.version,
+  };
+}
+
 function withoutSummaryHydration(thread: AgentThread): AgentThread {
   const { hydration: _summaryMarker, ...hydrated } = thread;
   return hydrated;
@@ -287,6 +335,7 @@ function createCollectionPatch(
   readonly deletedThreadIds: readonly string[];
   readonly eventAppends: readonly {
     readonly events: AgentThreadCollection["threads"][number]["events"];
+    readonly replaceFrom?: number;
     readonly threadId: string;
   }[];
   readonly upsertThreads: AgentThreadCollection["threads"];
@@ -301,7 +350,7 @@ function createCollectionPatch(
   }[] = [];
   const upsertThreads = collection.threads.flatMap((thread) => {
     const previous = previousThreads.get(thread.id);
-    if (!previous) return [thread];
+    if (!previous) return [withoutTranscriptWindow(thread)];
     const delta = appendOnlyEventDelta(previous.events, thread.events);
     if (delta) {
       if (delta.events.length > 0) eventAppends.push({
@@ -315,19 +364,32 @@ function createCollectionPatch(
         }),
         threadId: thread.id,
       });
-      return [{ ...thread, events: [], hydration: "summary" as const }];
+      return [withoutTranscriptWindow({ ...thread, events: [], hydration: "summary" as const })];
     }
     if (sameEventIds(previous.events, thread.events)) {
-      return [{ ...thread, events: [], hydration: "summary" as const }];
+      return [withoutTranscriptWindow({ ...thread, events: [], hydration: "summary" as const })];
     }
     // A reconnect/remount can temporarily expose a shorter in-memory snapshot
     // than the server's append-only transcript. Never let that stale view
     // replace durable history. Only the explicit edit/resubmit transaction is
     // allowed to truncate the event log.
     if (!isExplicitTranscriptReplacement(thread)) {
-      return [{ ...thread, events: [], hydration: "summary" as const }];
+      // A reconnect can expose a snapshot whose ordering/length no longer
+      // matches the last local baseline. Do not silently turn that change into
+      // a metadata-only checkpoint: retain every event identity that is new to
+      // the baseline and append it in stream order. Existing durable events
+      // remain untouched, so this path is lossless even when the snapshot is
+      // only a partial tail.
+      const unseen = thread.events.filter((event) => {
+        const identity = eventIdentity(event);
+        return !previous.events.some((candidate) => eventIdentity(candidate) === identity);
+      });
+      if (unseen.length > 0) {
+        eventAppends.push({ events: unseen, threadId: thread.id });
+      }
+      return [withoutTranscriptWindow({ ...thread, events: [], hydration: "summary" as const })];
     }
-    return [thread];
+    return [withoutTranscriptWindow(thread)];
   });
   return {
     activeThreadId: collection.activeThreadId ?? null,
@@ -341,9 +403,18 @@ function createCollectionPatch(
   };
 }
 
+function withoutTranscriptWindow(thread: AgentThread): AgentThread {
+  const { transcriptWindow: _derivedWindow, ...persisted } = thread;
+  return persisted;
+}
+
 function isExplicitTranscriptReplacement(thread: AgentThread): boolean {
-  return thread.pendingTurn?.state === "clearing" ||
-    thread.pendingTurn?.state === "resubmitting";
+  const pending = thread.pendingTurn;
+  if (!pending) return false;
+  // Only legacy browser clear/resubmit snapshots may carry a shortened event
+  // array. Server-owned edits keep Eve's append-only audit stream intact.
+  return pending.state === "clearing" ||
+    pending.state === "resubmitting";
 }
 
 function appendOnlyEventDelta(

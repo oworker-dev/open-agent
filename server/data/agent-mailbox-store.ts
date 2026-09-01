@@ -23,6 +23,7 @@ export type AgentMailboxPayload = {
   readonly message: string;
   /** Stable product operation metadata. Eve treats the message as opaque text. */
   readonly operation?: {
+    readonly beforeTurnId?: string;
     readonly expectedTurnId?: string;
     readonly kind: "send" | "steer" | "edit";
     readonly operationId: string;

@@ -96,6 +96,35 @@ test("dispatcher admits a steer for the exact active Eve turn", async () => {
   assert.equal(runtime.deliveries.length, 1);
 });
 
+test("edit admission is deferred while running and delivered once at the waiting boundary", async () => {
+  const store = new MemoryMailboxStore();
+  await enqueueAgentMailboxMessage({
+    beforeTurnId: "turn-latest",
+    clientMessageId: "message-edit-1",
+    message: "Edited latest request",
+    operationId: "operation-edit-1",
+    operationKind: "edit",
+    owner,
+    sessionId: "session-1",
+    store,
+  });
+  const runtime = new FakeMailboxRuntime({ state: "running", turnId: "turn-latest" });
+
+  assert.equal((await dispatchNextAgentMailboxMessage({ runtime, store })).status, "deferred");
+  assert.equal(runtime.deliveries.length, 0);
+
+  runtime.boundary = { state: "waiting" };
+  assert.equal((await dispatchNextAgentMailboxMessage({ runtime, store })).status, "accepted");
+  assert.equal((await dispatchNextAgentMailboxMessage({ runtime, store })).status, "idle");
+  assert.deepEqual(runtime.deliveries, [{
+    beforeTurnId: "turn-latest",
+    clientMessageId: "message-edit-1",
+    itemId: "mail-1",
+    message: "Edited latest request",
+    sessionId: "session-1",
+  }]);
+});
+
 test("cancelling a leased message wins before admission begins", async () => {
   const store = await queuedStore();
   const runtime: AgentMailboxRuntime = {
@@ -235,6 +264,7 @@ async function queuedStore(): Promise<MemoryMailboxStore> {
 class FakeMailboxRuntime implements AgentMailboxRuntime {
   boundary: AgentMailboxBoundary;
   deliveries: Array<{
+    beforeTurnId?: string;
     clientMessageId: string;
     itemId: string;
     message: string;
@@ -252,6 +282,9 @@ class FakeMailboxRuntime implements AgentMailboxRuntime {
 
   async deliver(input: Parameters<AgentMailboxRuntime["deliver"]>[0]) {
     this.deliveries.push({
+      ...(input.payload.operation?.beforeTurnId
+        ? { beforeTurnId: input.payload.operation.beforeTurnId }
+        : {}),
       clientMessageId: input.clientMessageId,
       itemId: input.itemId,
       message: input.payload.message,
@@ -461,5 +494,50 @@ test("steering metadata remains part of the durable mailbox payload", async () =
     expectedTurnId: "turn-1",
     kind: "steer",
     operationId: "operation-steer-1",
+  });
+});
+
+test("edit targets are validated and participate in mailbox idempotency", async () => {
+  const store = new MemoryMailboxStore();
+  await assert.rejects(
+    enqueueAgentMailboxMessage({
+      clientMessageId: "message-edit-2",
+      message: "Edited request",
+      operationId: "operation-edit-2",
+      operationKind: "edit",
+      owner,
+      sessionId: "session-1",
+      store,
+    }),
+    /beforeTurnId is required/i,
+  );
+
+  const first = await enqueueAgentMailboxMessage({
+    beforeTurnId: "turn-1",
+    clientMessageId: "message-edit-2",
+    message: "Edited request",
+    operationId: "operation-edit-2",
+    operationKind: "edit",
+    owner,
+    sessionId: "session-1",
+    store,
+  });
+  const conflict = await enqueueAgentMailboxMessage({
+    beforeTurnId: "turn-2",
+    clientMessageId: "message-edit-2",
+    message: "Edited request",
+    operationId: "operation-edit-2",
+    operationKind: "edit",
+    owner,
+    sessionId: "session-1",
+    store,
+  });
+
+  assert.equal(first.status, "created");
+  assert.equal(conflict.status, "conflict");
+  assert.deepEqual(first.item.payload.operation, {
+    beforeTurnId: "turn-1",
+    kind: "edit",
+    operationId: "operation-edit-2",
   });
 });

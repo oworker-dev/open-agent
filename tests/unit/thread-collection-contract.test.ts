@@ -197,6 +197,41 @@ test("summary checkpoints cannot downgrade authoritative transcript coverage", (
   assert.equal(result.threads[0]?.transcriptCoverage?.authoritative, true);
 });
 
+test("an edit checkpoint in submitting state invalidates prior coverage", () => {
+  const first = {
+    ...createAgentThread(1, "First"),
+    events: [event("evt-first")],
+    session: { sessionId: "session-first", streamIndex: 1 },
+    transcriptCoverage: { authoritative: true, complete: true, endIndex: 1, startIndex: 0, version: 1 as const },
+  };
+  const replacement = {
+    ...first,
+    pendingTurn: {
+      beforeTurnId: "turn-0",
+      delivery: "server" as const,
+      id: "edit-1",
+      operation: "edit" as const,
+      state: "submitting" as const,
+      submittedAt: 2,
+      text: "edited",
+    },
+    updatedAt: 2,
+  };
+  const patch = parseThreadCollectionPatch({
+    activeThreadId: first.id,
+    deletedThreadIds: [],
+    upsertThreads: [{ ...replacement, events: [], hydration: "summary" }],
+    version: 2,
+  });
+  assert.ok(patch);
+  const result = applyThreadCollectionPatch(
+    { activeThreadId: first.id, threads: [first], version: 2 },
+    patch,
+  );
+  assert.equal(result.threads[0]?.transcriptCoverage, undefined);
+  assert.equal(result.threads[0]?.pendingTurn?.operation, "edit");
+});
+
 function event(id: string) {
   return {
     data: {

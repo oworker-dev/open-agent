@@ -1,11 +1,10 @@
 "use client";
 import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-runtime";
-import { ClientError, defaultMessageReducer, isCurrentTurnBoundaryEvent } from "eve/client";
+import { ClientError, defaultMessageReducer } from "eve/client";
 import { useEveAgent } from "eve/react";
 import { AssistantRuntimeProvider, unstable_defaultDirectiveFormatter, useExternalStoreRuntime } from "@assistant-ui/react";
 import { Clock3Icon, HammerIcon, LoaderCircleIcon, RotateCcwIcon, SearchIcon, ShieldCheckIcon, SparklesIcon, XIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { flushSync } from "react-dom";
 import { Button } from "../ui/button.js";
 import { cn } from "../utils.js";
 import { attachAgentSession, createAgentSession } from "./agent-client.js";
@@ -15,12 +14,10 @@ import { AssistantThreadSurface } from "./assistant-thread-surface.js";
 import { sanitizeAgentError } from "./error-presentation.js";
 import { AgentMailboxHttpError } from "./http-agent-mailbox.js";
 import { messagesFor } from "./i18n.js";
-import { interruptedTurnContextFromEvents, interruptedTurnContextsFromEvents, rewriteContextFromEvents, } from "./retained-context.js";
-import { appendThreadEventIndexed, dedupeThreadEvents, eventIdentity, reconcilePendingTurnWithEvents, titleFromPrompt } from "./thread-storage.js";
-import { activeTurnIdAfterPendingSubmission, eventsBeforeLastUserTurn, hasTerminalSessionBoundary, hasSettledLatestTurn, isRetryableAgentFailure, isProxiedInputOnlyMessage, normalizeSettledAgentMessages, projectAgentDisplayTimeline, shouldSuppressInterruptedTurnDisplayEvent, shouldSuppressInterruptedTurnStreamEvent, stableUserMessageId, unresolvedInputRequests, } from "./turn-presentation.js";
+import { interruptedTurnContextFromEvents, interruptedTurnContextsFromEvents, } from "./retained-context.js";
+import { appendThreadEventIndexed, dedupeThreadEvents, eventIdentity, projectPendingThreadEdit, projectThreadEditBranches, reconcilePendingTurnWithEvents, titleFromPrompt } from "./thread-storage.js";
+import { activeTurnIdAfterPendingSubmission, hasTerminalSessionBoundary, hasSettledLatestTurn, isRetryableAgentFailure, isProxiedInputOnlyMessage, normalizeSettledAgentMessages, projectAgentDisplayTimeline, shouldSuppressInterruptedTurnDisplayEvent, shouldSuppressInterruptedTurnStreamEvent, stableUserMessageId, unresolvedInputRequests, } from "./turn-presentation.js";
 import { summarizeUsage } from "./usage.js";
-const activeEditedTurnOperations = new Set();
-const pendingEditedTurnOperations = new Set();
 const CANCELLATION_STREAM_REATTACH_AFTER_MS = 5_000;
 const MAX_PROVIDER_SUBMISSION_RETRIES = 3;
 const LIVE_CHECKPOINT_INTERVAL_MS = 250;
@@ -73,12 +70,9 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     const closedInputRequestIdsRef = useRef(new Set(thread.closedInputRequestIds));
     const dispatchingQueuedTurnIdRef = useRef(undefined);
     const mailboxEnqueueIdsRef = useRef(new Set());
-    const editStagePendingRef = useRef(false);
-    const editResubmitPendingRef = useRef(false);
     const turnAdmissionBusyRef = useRef(false);
     const cancellationRecoveryRef = useRef(() => undefined);
     const stopAgentRef = useRef(() => undefined);
-    const editClearControllerRef = useRef(undefined);
     const persistedThreadStatusRef = useRef(thread.status);
     const cancellationIdleTimerRef = useRef(undefined);
     const [cancellationState, setCancellationState] = useState(thread.status === "cancelling" ? "cancelling" : "idle");
@@ -89,8 +83,6 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     const [providerRetry, setProviderRetry] = useState(undefined);
     const [optimisticPendingTurn, setOptimisticPendingTurn] = useState(undefined);
     const [optimisticDisplayTurn, setOptimisticDisplayTurn] = useState(undefined);
-    const [stagedEditEvents, setStagedEditEvents] = useState(undefined);
-    const [preserveViewportDuringEdit, setPreserveViewportDuringEdit] = useState(false);
     const providerRetryKeyRef = useRef(undefined);
     const providerRetryAttemptRef = useRef(0);
     const providerRetryTimerRef = useRef(undefined);
@@ -117,7 +109,6 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         }
         flushCheckpointRef.current();
         stopAgentRef.current();
-        editClearControllerRef.current?.abort();
     }, []);
     useEffect(() => {
         preferencesRef.current = thread.preferences;
@@ -135,6 +126,12 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         if (durable && (durable.id !== optimisticPendingTurn.id || durable.state === "delivery-failed")) {
             setOptimisticPendingTurn(undefined);
         }
+    }, [optimisticPendingTurn, thread.pendingTurn]);
+    useEffect(() => {
+        const failedEditId = [thread.pendingTurn, optimisticPendingTurn].find((pending) => pending?.operation === "edit" && pending.state === "delivery-failed")?.id;
+        if (!failedEditId)
+            return;
+        setOptimisticDisplayTurn((current) => current?.id === failedEditId ? undefined : current);
     }, [optimisticPendingTurn, thread.pendingTurn]);
     useEffect(() => {
         interruptedTurnsRef.current = thread.interruptedTurns ?? [];
@@ -361,11 +358,23 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     const recoveryRenderMessages = useMemo(() => isRecovering ? messagesFromEvents(recoveryRenderEvents) : [], [isRecovering, recoveryRenderEvents]);
     const effectiveRenderEvents = isRecovering ? recoveryRenderEvents : renderEvents;
     const effectiveRenderMessages = isRecovering ? recoveryRenderMessages : renderMessages;
-    const projectionEvents = stagedEditEvents ?? effectiveRenderEvents;
-    const projectionMessages = stagedEditEvents ? messagesFromEvents(stagedEditEvents) : effectiveRenderMessages;
+    const pendingEditOperation = optimisticPendingTurn ?? thread.pendingTurn;
+    const pendingEditTurnId = pendingEditOperation?.operation === "edit" &&
+        isPendingTurnInFlight(pendingEditOperation)
+        ? pendingEditOperation.beforeTurnId
+        : undefined;
+    const projectionEvents = useMemo(() => projectPendingThreadEdit(projectThreadEditBranches(effectiveRenderEvents), pendingEditTurnId), [effectiveRenderEvents, pendingEditTurnId]);
+    const projectionMessages = useMemo(() => pendingEditTurnId || projectionEvents !== effectiveRenderEvents
+        ? messagesFromEvents(projectionEvents)
+        : effectiveRenderMessages, [effectiveRenderEvents, effectiveRenderMessages, pendingEditTurnId, projectionEvents]);
     const runtimeIsBusy = agent.status === "submitted" || agent.status === "streaming";
     const admissionPendingTurn = optimisticPendingTurn ?? thread.pendingTurn;
-    const displayPendingTurn = optimisticDisplayTurn ?? optimisticPendingTurn ?? thread.pendingTurn;
+    const displayPendingCandidate = optimisticDisplayTurn ?? optimisticPendingTurn ?? thread.pendingTurn;
+    const failedEditOperationId = [optimisticPendingTurn, thread.pendingTurn].find((pending) => pending?.operation === "edit" && pending.state === "delivery-failed")?.id;
+    const displayPendingTurn = displayPendingCandidate?.operation === "edit" &&
+        (displayPendingCandidate.state === "delivery-failed" || displayPendingCandidate.id === failedEditOperationId)
+        ? undefined
+        : displayPendingCandidate;
     latestEventsRef.current = agent.events;
     const durableSessionSettled = hasSettledSessionBoundary(thread.events);
     const localSessionSettled = hasSettledSessionBoundary(agent.events);
@@ -401,6 +410,12 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             return;
         setOptimisticDisplayTurn(undefined);
     }, [authoritativeEvents, effectiveRenderMessages, optimisticDisplayTurn]);
+    useEffect(() => {
+        const pending = optimisticPendingTurn;
+        if (!pending || !hasVisiblePendingUserMessage(pending, effectiveRenderMessages, authoritativeEvents))
+            return;
+        setOptimisticPendingTurn(undefined);
+    }, [authoritativeEvents, effectiveRenderMessages, optimisticPendingTurn]);
     const admissionBusy = pendingTurnInFlight || (!durableTurnSettled &&
         (runtimeIsBusy || isRecovering || cancellationSettling));
     const pendingInputRequests = unresolvedInputRequests(authoritativeEvents, closedInputRequestIdsRef.current);
@@ -953,6 +968,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
                 ...(message.files.length > 0 ? { files: message.files } : {}),
                 eventCountAtSubmission: compactedEventsRef.current.length,
                 id: createPendingTurnId(),
+                operation: "send",
                 state: "submitting",
                 submittedAt: Date.now(),
                 text,
@@ -1060,59 +1076,62 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         },
         steerItems: [],
     }), [thread.queuedTurns]);
-    const stageEditedTurn = (prompt) => {
+    const stageEditedTurn = (message) => {
+        const prompt = promptFromAssistantMessage(getEveMessageContent(message));
         if (!prompt.text && prompt.files.length === 0)
             return;
+        const beforeTurnId = editedTurnId(message);
+        if (!beforeTurnId) {
+            setTurnError(locale === "zh-CN"
+                ? "无法确定要编辑的消息，请刷新会话后重试。"
+                : "The edited message has no durable turn identity. Reload and try again.");
+            return;
+        }
+        if (!mailbox) {
+            setTurnError(locale === "zh-CN"
+                ? "当前宿主未配置耐久消息编辑服务。"
+                : "This host does not provide durable message editing.");
+            return;
+        }
         if (sessionTerminal)
             return;
-        const durableSession = sessionRef.current ?? attachAgentSession(connection, agent.session);
-        if (!durableSession) {
-            if (thread.pendingTurn?.state === "interrupted" || thread.pendingTurn?.state === "delivery-failed") {
-                void submit(prompt);
-                return;
-            }
+        const sessionId = sessionRef.current?.state.sessionId ?? agent.session?.sessionId;
+        if (!sessionId) {
             setTurnError("The Agent session is not available. Reload this conversation and try again.");
             return;
         }
-        if (admissionBusy || editStagePendingRef.current) {
+        if (admissionBusy) {
             setTurnError("The latest message cannot be edited until the current Agent turn reaches a durable boundary.");
             return;
         }
-        editStagePendingRef.current = true;
-        editResubmitPendingRef.current = false;
-        sessionRef.current = durableSession;
+        const text = mailboxPromptText(prompt);
+        if (text === undefined) {
+            setTurnError(locale === "zh-CN"
+                ? "包含内联附件的消息暂时无法编辑。"
+                : "Messages with inline attachments cannot be edited yet.");
+            return;
+        }
+        prepareTurn();
+        turnAdmissionBusyRef.current = true;
         setTurnError(undefined);
         const pendingTurn = {
-            ...(prompt.files.length > 0 ? { files: prompt.files } : {}),
+            beforeTurnId,
+            delivery: "server",
+            eventCountAtSubmission: compactedEventsRef.current.length,
             id: createPendingTurnId(),
-            state: "clearing",
+            operation: "edit",
+            state: "submitting",
             submittedAt: Date.now(),
-            text: prompt.text,
+            text,
         };
-        pendingEditedTurnOperations.add(`${pendingTurn.id}:clear`);
-        const retainedEvents = eventsBeforeLastUserTurn(agent.events);
-        flushSync(() => {
-            setPreserveViewportDuringEdit(true);
-            setStagedEditEvents(retainedEvents);
-            setOptimisticPendingTurn(pendingTurn);
-            setOptimisticDisplayTurn(pendingTurn);
-            onChange({
-                events: retainedEvents,
-                retainedContext: rewriteContextFromEvents(retainedEvents, recoveryContextWindowTokens),
-                pendingTurn,
-                queuedTurns: [],
-                revision: (thread.revision ?? 0) + 1,
-                session: durableSession.state,
-                status: "ready",
-                ...(!retainedEvents.some((event) => event.type === "message.received")
-                    ? { title: titleFromPrompt(prompt.text) }
-                    : {}),
-                updatedAt: Date.now(),
-            });
-        });
         pendingTurnRef.current = pendingTurn;
-        compactedEventsRef.current = [...retainedEvents];
-        compactedEventIdsRef.current = new Set(retainedEvents.map(eventIdentity));
+        setOptimisticPendingTurn(pendingTurn);
+        setOptimisticDisplayTurn(pendingTurn);
+        onChange({
+            pendingTurn,
+            status: "submitted",
+            updatedAt: Date.now(),
+        });
     };
     const assetUploadAdapter = useMemo(() => client?.assetUpload ?? createHttpAgentAssetUploadAdapter(client), [client]);
     const attachmentAdapter = useMemo(() => createBrowserAttachmentAdapter(assetUploadAdapter, () => sessionRef.current?.state.sessionId ?? thread.session.sessionId), [assetUploadAdapter, thread.session.sessionId]);
@@ -1125,7 +1144,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     runtimeCallbacksRef.current = {
         cancel: requestCancellation,
         edit: (message) => {
-            stageEditedTurn(promptFromAssistantMessage(getEveMessageContent(message)));
+            stageEditedTurn(message);
         },
         newMessage: (message) => submit(promptFromAssistantMessage(getEveMessageContent(message))),
         respondToToolApproval: async (response) => {
@@ -1154,103 +1173,106 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     const assistantRuntime = useExternalStoreRuntime(assistantRuntimeAdapter);
     useEffect(() => {
         const pendingTurn = thread.pendingTurn;
-        if (pendingTurn?.state !== "clearing" ||
+        for (const operationId of mailboxEnqueueIdsRef.current) {
+            if (operationId !== pendingTurn?.id)
+                mailboxEnqueueIdsRef.current.delete(operationId);
+        }
+        if (pendingTurn?.operation !== "edit" ||
+            pendingTurn.delivery !== "server" ||
+            pendingTurn.state !== "submitting" ||
+            pendingTurn.mailboxItemId ||
+            !pendingTurn.beforeTurnId ||
+            !mailbox ||
             !providerReady ||
-            isRecovering ||
-            (!editStagePendingRef.current && !pendingEditedTurnOperations.has(`${pendingTurn.id}:clear`)))
+            mailboxEnqueueIdsRef.current.has(pendingTurn.id))
             return;
-        const durableSession = sessionRef.current;
-        if (!durableSession)
+        const sessionId = sessionRef.current?.state.sessionId ?? agent.session?.sessionId;
+        if (!sessionId)
             return;
-        const releaseOperation = claimEditedTurnOperation(pendingTurn.id, "clear");
-        if (!releaseOperation)
-            return;
-        let disposed = false;
-        const controller = new AbortController();
-        editClearControllerRef.current = controller;
-        turnAdmissionBusyRef.current = true;
-        prepareTurn();
-        void (async () => {
-            try {
-                const clearResult = await durableSession.clear();
-                if (disposed || controller.signal.aborted)
-                    return;
-                if (clearResult.status !== "accepted")
-                    throw new Error("The session is no longer active.");
-                for await (const event of durableSession.stream({
-                    follow: true,
-                    signal: controller.signal,
-                    streamReconnectPolicy: LONG_RUNNING_STREAM_RECONNECT_POLICY,
-                })) {
-                    if (disposed || controller.signal.aborted)
-                        return;
-                    if (isCurrentTurnBoundaryEvent(event))
-                        break;
-                }
-                if (disposed || controller.signal.aborted)
-                    return;
-                pendingEditedTurnOperations.add(`${pendingTurn.id}:resubmit`);
-                onChange({
-                    pendingTurn: { ...pendingTurn, state: "resubmitting" },
-                    session: durableSession.state,
-                    status: "ready",
-                    updatedAt: Date.now(),
-                });
-                editStagePendingRef.current = false;
-                editResubmitPendingRef.current = true;
-            }
-            catch (error) {
-                if (disposed || controller.signal.aborted)
-                    return;
-                editStagePendingRef.current = false;
-                editResubmitPendingRef.current = false;
+        mailboxEnqueueIdsRef.current.add(pendingTurn.id);
+        void mailbox.enqueue({
+            beforeTurnId: pendingTurn.beforeTurnId,
+            clientMessageId: pendingTurn.id,
+            ...(thread.retainedContext ? { clientContext: thread.retainedContext } : {}),
+            message: pendingTurn.text,
+            operationId: pendingTurn.id,
+            operationKind: "edit",
+            preferences: preferencesRef.current,
+            sessionId,
+        }).then((receipt) => {
+            if (pendingTurnRef.current?.id !== pendingTurn.id)
+                return;
+            if (receipt.status === "failed" || receipt.status === "cancelled") {
+                const failed = { ...pendingTurn, mailboxItemId: receipt.itemId, state: "delivery-failed" };
+                pendingTurnRef.current = failed;
                 turnAdmissionBusyRef.current = false;
-                setPreserveViewportDuringEdit(false);
-                setOptimisticPendingTurn(undefined);
-                setOptimisticDisplayTurn(undefined);
-                setStagedEditEvents(undefined);
-                onChange({ pendingTurn: { ...pendingTurn, state: "delivery-failed" }, status: "error" });
-                setTurnError(error instanceof Error ? error.message : "Unable to resend this message.");
+                setOptimisticPendingTurn(failed);
+                onChange({ pendingTurn: failed, status: "error", updatedAt: Date.now() });
+                setTurnError(receipt.lastError ?? messages.queueDeliveryFailed);
+                return;
             }
-            finally {
-                if (editClearControllerRef.current === controller)
-                    editClearControllerRef.current = undefined;
-                releaseOperation();
-            }
-        })();
-        return () => {
-            disposed = true;
-            controller.abort();
-        };
-    }, [isRecovering, onChange, providerReady, runtimeIsBusy, thread.pendingTurn, thread.revision]);
+            const admitted = { ...pendingTurn, mailboxItemId: receipt.itemId };
+            pendingTurnRef.current = admitted;
+            onChange({ pendingTurn: admitted, status: "submitted", updatedAt: Date.now() });
+            if (receipt.status === "committed")
+                requestRecovery();
+        }).catch((error) => {
+            if (pendingTurnRef.current?.id !== pendingTurn.id)
+                return;
+            const failed = { ...pendingTurn, state: "delivery-failed" };
+            pendingTurnRef.current = failed;
+            turnAdmissionBusyRef.current = false;
+            setOptimisticPendingTurn(failed);
+            onChange({ pendingTurn: failed, status: "error", updatedAt: Date.now() });
+            setTurnError(error instanceof Error ? error.message : messages.queueDeliveryFailed);
+        });
+    }, [
+        agent.session?.sessionId,
+        mailbox,
+        messages.queueDeliveryFailed,
+        onChange,
+        providerReady,
+        requestRecovery,
+        thread.pendingTurn,
+        thread.retainedContext,
+    ]);
     useEffect(() => {
         const pendingTurn = thread.pendingTurn;
-        if (pendingTurn?.state !== "resubmitting" ||
-            !providerReady ||
-            isRecovering ||
-            (!editResubmitPendingRef.current && !pendingEditedTurnOperations.has(`${pendingTurn.id}:resubmit`)))
+        if (pendingTurn?.operation !== "edit" ||
+            pendingTurn.delivery !== "server" ||
+            pendingTurn.state !== "submitting" ||
+            !pendingTurn.mailboxItemId ||
+            !mailbox)
             return;
-        const releaseOperation = claimEditedTurnOperation(pendingTurn.id, "resubmit");
-        if (!releaseOperation)
-            return;
-        editResubmitPendingRef.current = false;
-        const claimedTurn = { ...pendingTurn, state: "submitting" };
-        prepareTurn();
-        pendingTurnRef.current = claimedTurn;
-        turnAdmissionBusyRef.current = true;
-        onChange({ pendingTurn: claimedTurn });
-        void sendPrompt(agent.send, {
-            files: pendingTurn.files ?? [],
-            text: pendingTurn.text,
-        }, thread.retainedContext).catch((error) => {
-            editResubmitPendingRef.current = false;
-            turnAdmissionBusyRef.current = false;
-            onChange({ pendingTurn: { ...pendingTurn, state: "delivery-failed" }, status: "error" });
-            setTurnError(error instanceof Error ? error.message : "Unable to resend this message.");
-        }).finally(() => {
-            releaseOperation();
-        });
-    }, [isRecovering, onChange, providerReady, runtimeIsBusy, thread.pendingTurn]);
+        let disposed = false;
+        const inspect = async () => {
+            try {
+                const receipt = await mailbox.inspect(pendingTurn.mailboxItemId);
+                if (disposed || pendingTurnRef.current?.id !== pendingTurn.id)
+                    return;
+                if (receipt.status === "committed") {
+                    requestRecovery();
+                    return;
+                }
+                if (receipt.status === "failed" || receipt.status === "cancelled") {
+                    const failed = { ...pendingTurn, state: "delivery-failed" };
+                    pendingTurnRef.current = failed;
+                    turnAdmissionBusyRef.current = false;
+                    setOptimisticPendingTurn(failed);
+                    onChange({ pendingTurn: failed, status: "error", updatedAt: Date.now() });
+                    setTurnError(receipt.lastError ?? messages.queueDeliveryFailed);
+                }
+            }
+            catch {
+            }
+        };
+        void inspect();
+        const timer = window.setInterval(() => void inspect(), MAILBOX_STATUS_POLL_MS);
+        return () => {
+            disposed = true;
+            window.clearInterval(timer);
+        };
+    }, [mailbox, messages.queueDeliveryFailed, onChange, requestRecovery, thread.pendingTurn]);
     useEffect(() => {
         if (!mailbox || !agent.session?.sessionId)
             return;
@@ -1356,6 +1378,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             pendingTurn: {
                 eventCountAtSubmission: compactedEventsRef.current.length,
                 id: next.id,
+                operation: "send",
                 state: "submitting",
                 submittedAt: next.submittedAt,
                 text: next.text,
@@ -1363,6 +1386,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         });
         pendingTurnRef.current = {
             id: next.id,
+            operation: "send",
             state: "submitting",
             submittedAt: next.submittedAt,
             text: next.text,
@@ -1391,7 +1415,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     };
     const closeInputRequest = (requestId) => closeInputRequests([requestId]);
     const visibleQueuedTurns = thread.queuedTurns.filter((turn) => turn.intent !== "post-cancellation");
-    return (_jsx(AssistantRuntimeProvider, { runtime: assistantRuntime, children: _jsx("main", { className: "flex min-h-0 flex-1 flex-col overflow-hidden", children: _jsx(AssistantThreadSurface, { assetUrl: client?.assetUrl, approvalTakeover: approvalTakeover, cancellationState: cancellationState, commands: commands, composerTop: isRecovering || visibleQueuedTurns.length > 0 || queueError ? (_jsxs(_Fragment, { children: [isRecovering ? (_jsxs("div", { className: "flex items-center gap-2 border-b border-border/60 px-1 pb-2 text-xs text-muted-foreground", "data-agent-recovery-status": true, role: "status", children: [_jsx(LoaderCircleIcon, { className: "size-3.5 animate-spin" }), _jsx("span", { children: messages.reconnecting })] })) : null, visibleQueuedTurns.length > 0 || queueError ? (_jsx(FollowUpQueue, { error: queueError, messages: messages, onRemove: removeQueuedTurn, onRetry: markQueuedTurnForRetry, turns: visibleQueuedTurns })) : null] })) : undefined, draftStorageKey: draftStorageKey, historyHasMore: historyHasMore, historyLoading: historyLoading, events: displayEvents, eveMessages: visibleMessages, fallbackStartedAt: displayPendingTurn?.submittedAt, inputDisabled: inputLocked, isBusy: isBusy, scrollToBottomOnInitialize: !preserveViewportDuringEdit && thread.pendingTurn?.state !== "clearing" && thread.pendingTurn?.state !== "resubmitting", scrollToBottomOnThreadSwitch: !preserveViewportDuringEdit && thread.pendingTurn?.state !== "clearing" && thread.pendingTurn?.state !== "resubmitting", sessionTerminal: sessionTerminal, sessionSettled: durableTurnSettled, onCancel: requestCancellation, locale: locale, mentions: mentions, messages: messages, models: models, onInputResponses: respond, onCloseInputRequest: closeInputRequest, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, onLoadEarlier: onLoadEarlier, onPreferencesChange: (preferences) => onChange({ preferences }), onDraftRestoreConsumed: (id) => {
+    return (_jsx(AssistantRuntimeProvider, { runtime: assistantRuntime, children: _jsx("main", { className: "flex min-h-0 flex-1 flex-col overflow-hidden", children: _jsx(AssistantThreadSurface, { assetUrl: client?.assetUrl, approvalTakeover: approvalTakeover, cancellationState: cancellationState, commands: commands, composerTop: isRecovering || visibleQueuedTurns.length > 0 || queueError ? (_jsxs(_Fragment, { children: [isRecovering ? (_jsxs("div", { className: "flex items-center gap-2 border-b border-border/60 px-1 pb-2 text-xs text-muted-foreground", "data-agent-recovery-status": true, role: "status", children: [_jsx(LoaderCircleIcon, { className: "size-3.5 animate-spin" }), _jsx("span", { children: messages.reconnecting })] })) : null, visibleQueuedTurns.length > 0 || queueError ? (_jsx(FollowUpQueue, { error: queueError, messages: messages, onRemove: removeQueuedTurn, onRetry: markQueuedTurnForRetry, turns: visibleQueuedTurns })) : null] })) : undefined, draftStorageKey: draftStorageKey, historyHasMore: historyHasMore, historyLoading: historyLoading, events: displayEvents, eveMessages: visibleMessages, fallbackStartedAt: displayPendingTurn?.submittedAt, inputDisabled: inputLocked, isBusy: isBusy, sessionTerminal: sessionTerminal, sessionSettled: durableTurnSettled, onCancel: requestCancellation, locale: locale, mentions: mentions, messages: messages, models: models, onInputResponses: respond, onCloseInputRequest: closeInputRequest, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, onLoadEarlier: onLoadEarlier, onPreferencesChange: (preferences) => onChange({ preferences }), onDraftRestoreConsumed: (id) => {
                     if (thread.draftRestore?.id === id)
                         onChange({ draftRestore: undefined });
                 }, onRetryRuntimeError: recoveryError ? onRetryRecovery : undefined, closedInputRequestIds: closedInputRequestIdsRef.current, preferences: thread.preferences, reasoningLevels: reasoningLevels, draftRestore: thread.draftRestore, runtimeFailure: runtimeFailure, runtimeError: runtimeError, runtimeRetry: providerRetry, usage: usage }) }) }));
@@ -1671,14 +1695,6 @@ function createPendingTurnId() {
         ? crypto.randomUUID()
         : `pending-${Date.now()}`;
 }
-function claimEditedTurnOperation(turnId, operation) {
-    const key = `${turnId}:${operation}`;
-    if (activeEditedTurnOperations.has(key))
-        return undefined;
-    activeEditedTurnOperations.add(key);
-    pendingEditedTurnOperations.delete(key);
-    return () => activeEditedTurnOperations.delete(key);
-}
 function withLocalInterruptedBoundary(events, turnId) {
     const hasTerminalBoundary = events.some((event) => (event.type === "turn.cancelled" || event.type === "turn.completed" || event.type === "turn.failed") &&
         event.data.turnId === turnId);
@@ -1721,6 +1737,26 @@ function promptFromAssistantMessage(content) {
     });
     return { files, text };
 }
+function editedTurnId(message) {
+    const metadataTurnId = message.metadata?.custom?.turnId;
+    if (typeof metadataTurnId === "string" && metadataTurnId.trim())
+        return metadataTurnId;
+    if (!message.sourceId)
+        return undefined;
+    const userSuffix = message.sourceId.indexOf(":user");
+    return userSuffix > 0 ? message.sourceId.slice(0, userSuffix) : undefined;
+}
+function mailboxPromptText(prompt) {
+    if (prompt.files.some((file) => !file.assetId))
+        return undefined;
+    return serializedPromptText(prompt);
+}
+function serializedPromptText(prompt) {
+    const assetNotes = prompt.files
+        .filter((file) => file.assetId)
+        .map((file) => `[open-agent-asset ${JSON.stringify({ id: file.assetId, mediaType: file.mediaType, name: file.filename ?? "file", ...(file.sizeBytes ? { size: file.sizeBytes } : {}) })}] Attached asset ${file.filename ?? "file"}. Use import_asset before inspecting or processing it.`);
+    return [prompt.text, ...assetNotes].filter((value) => value.trim().length > 0).join("\n\n");
+}
 function retainedContextOptions(context) {
     return {
         ...(context && context.length > 0 ? { clientContext: context } : {}),
@@ -1728,10 +1764,7 @@ function retainedContextOptions(context) {
     };
 }
 async function sendPrompt(send, prompt, context) {
-    const assetNotes = prompt.files
-        .filter((file) => file.assetId)
-        .map((file) => `[open-agent-asset ${JSON.stringify({ id: file.assetId, mediaType: file.mediaType, name: file.filename ?? "file", ...(file.sizeBytes ? { size: file.sizeBytes } : {}) })}] Attached asset ${file.filename ?? "file"}. Use import_asset before inspecting or processing it.`);
-    const text = [prompt.text, ...assetNotes].filter((value) => value.trim().length > 0).join("\n\n");
+    const text = serializedPromptText(prompt);
     const inlineFiles = prompt.files.filter((file) => !file.assetId);
     if (inlineFiles.length === 0) {
         await send(text, retainedContextOptions(context));
