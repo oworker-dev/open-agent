@@ -356,6 +356,7 @@ export function AgentWorkspace({
   const settleThreadHistory = useCallback(async (
     thread: AgentThread,
     boundary: AgentSessionBoundary,
+    preserveRuntimeIdentity = false,
   ) => {
     const failed = boundary.state === "terminal" && boundary.terminalStatus === "failed";
     const settledStatus: AgentThread["status"] = failed ? "error" : "ready";
@@ -424,7 +425,7 @@ export function AgentWorkspace({
       status: settledStatus,
       updatedAt: Date.now(),
     };
-    if (caughtUpSettledRange && activeThreadIdRef.current === thread.id) {
+    if (caughtUpSettledRange && activeThreadIdRef.current === thread.id && !preserveRuntimeIdentity) {
       // Eve's reducer seeds `initialEvents` once. A finite settled catch-up is
       // therefore a real recovery handoff, not an ordinary metadata update:
       // remount exactly once with the caught-up snapshot so the old reducer
@@ -599,7 +600,7 @@ export function AgentWorkspace({
         setRecoveringIds((current) => new Set(current).add(thread.id));
         return;
       }
-      await settleThreadHistory(thread, boundary);
+      await settleThreadHistory(thread, boundary, thread.pendingTurn?.operation === "edit");
     } catch {
       // A failed lifecycle probe is not evidence that a completed session is
       // running, so recovery will start with bounded catch-up only. This also
@@ -1143,6 +1144,10 @@ export function AgentWorkspace({
     setRecoveryErrors((current) => withoutMapKey(current, thread.id));
     const controller = new AbortController();
     recoveryControllers.current.set(thread.id, controller);
+    // An edit recovery is a replacement of the current transcript branch. Do
+    // not remount assistant-ui when its bounded catch-up completes; keeping
+    // the existing runtime identity avoids replacing the thinking row twice.
+    const editRecovery = thread.pendingTurn?.operation === "edit";
     // Recovery can be cancelled while the initial lifecycle probe is still
     // pending. Keep all exits idempotent and only release state owned by this
     // worker so a fast switch away/back cannot tear down its replacement.
@@ -1192,7 +1197,7 @@ export function AgentWorkspace({
           // A settled runtime is history, never a recovery stream. Publish
           // the settled lifecycle first, then read only a small tail window to
           // recover a missing turn boundary or final tool result.
-          await settleThreadHistory(thread, boundary);
+          await settleThreadHistory(thread, boundary, editRecovery);
           releaseRecovery();
           return;
         }
@@ -1681,7 +1686,7 @@ export function AgentWorkspace({
       // would replace the freshly recovered transcript. Reseed exactly once
       // at the durable handoff so edited replies remain visible after the
       // recovery worker releases its stream.
-      if (activeThreadIdRef.current === thread.id && events.length > thread.events.length) {
+      if (activeThreadIdRef.current === thread.id && events.length > thread.events.length && !editRecovery) {
         flushSync(() => {
           setThreadRuntimeSeeds((current) => {
             const seed = `recovery:${thread.session.sessionId}:${cursor}`;

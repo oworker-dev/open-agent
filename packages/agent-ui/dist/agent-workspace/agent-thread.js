@@ -355,9 +355,12 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     const renderEvents = liveRenderSnapshot.events;
     const renderMessages = liveRenderSnapshot.messages;
     const recoveryRenderEvents = useThrottledSnapshot(thread.events, 75);
-    const recoveryRenderMessages = useMemo(() => isRecovering ? messagesFromEvents(recoveryRenderEvents) : [], [isRecovering, recoveryRenderEvents]);
-    const effectiveRenderEvents = isRecovering ? recoveryRenderEvents : renderEvents;
-    const effectiveRenderMessages = isRecovering ? recoveryRenderMessages : renderMessages;
+    const recoveryRenderMessages = useMemo(() => messagesFromEvents(recoveryRenderEvents), [recoveryRenderEvents]);
+    const durableEditBoundary = thread.events.some((event) => event.type === "context.cleared");
+    const liveEditBoundary = agent.events.some((event) => event.type === "context.cleared");
+    const durableSnapshotAhead = durableEditBoundary && (!liveEditBoundary || thread.session.streamIndex > (agent.session?.streamIndex ?? -1));
+    const effectiveRenderEvents = isRecovering || durableSnapshotAhead ? recoveryRenderEvents : renderEvents;
+    const effectiveRenderMessages = isRecovering || durableSnapshotAhead ? recoveryRenderMessages : renderMessages;
     const pendingEditOperation = optimisticPendingTurn ?? thread.pendingTurn;
     const pendingEditTurnId = pendingEditOperation?.operation === "edit" &&
         isPendingTurnInFlight(pendingEditOperation)
@@ -378,7 +381,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     latestEventsRef.current = agent.events;
     const durableSessionSettled = hasSettledSessionBoundary(thread.events);
     const localSessionSettled = hasSettledSessionBoundary(agent.events);
-    const authoritativeEvents = isRecovering || (durableSessionSettled && !localSessionSettled)
+    const authoritativeEvents = isRecovering || durableSnapshotAhead || (durableSessionSettled && !localSessionSettled)
         ? thread.events
         : agent.events;
     const sessionHasResumableBoundary = hasSettledSessionBoundary(authoritativeEvents) &&
@@ -1045,16 +1048,10 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         assistantByTurn: new Map(),
         pendingRoot: undefined,
     });
-    const editAwaitingReceipt = isRecovering &&
-        displayPendingTurn?.operation === "edit" &&
-        !acceptedMessageReceivedEvent(displayPendingTurn, interruptedDisplayEvents);
-    const suppressEditPlaceholder = displayPendingTurn?.operation === "edit";
     const projectedMessages = useMemo(() => {
-        const projected = projectStagedUserMessages(stabilizeDisplayMessageIdentities(ensureActiveAssistantMessage(projectedRuntimeMessages, projectionEvents, (isBusy || isPendingTurnInFlight(admissionPendingTurn) || Boolean(latestTurnFailure(interruptedDisplayEvents))) && !editAwaitingReceipt && !suppressEditPlaceholder, displayPendingTurn, optimisticPendingTurn?.id === displayPendingTurn?.id), projectionEvents, displayPendingTurn, displayMessageIdentityRef.current), thread.queuedTurns.filter((turn) => turn.intent === "post-cancellation"), interruptedDisplayEvents);
-        return suppressEditPlaceholder
-            ? projected.filter((message) => !(message.role === "assistant" && !hasSubstantiveAssistantPart(message)))
-            : projected;
-    }, [admissionPendingTurn, displayPendingTurn, editAwaitingReceipt, interruptedDisplayEvents, isBusy, optimisticPendingTurn, projectionEvents, projectedRuntimeMessages, suppressEditPlaceholder, thread.queuedTurns]);
+        const projected = projectStagedUserMessages(stabilizeDisplayMessageIdentities(ensureActiveAssistantMessage(projectedRuntimeMessages, projectionEvents, isBusy || isPendingTurnInFlight(admissionPendingTurn) || Boolean(latestTurnFailure(interruptedDisplayEvents)), displayPendingTurn, optimisticPendingTurn?.id === displayPendingTurn?.id, displayMessageIdentityRef.current), projectionEvents, displayPendingTurn, displayMessageIdentityRef.current, thread.session.sessionId), thread.queuedTurns.filter((turn) => turn.intent === "post-cancellation"), interruptedDisplayEvents);
+        return projected;
+    }, [admissionPendingTurn, displayPendingTurn, interruptedDisplayEvents, isBusy, optimisticPendingTurn, projectionEvents, projectedRuntimeMessages, thread.queuedTurns, thread.session.sessionId]);
     const ungroupedVisibleMessages = useMemo(() => projectedMessages.filter((message) => !isProxiedInputOnlyMessage(message, projectionEvents)), [projectionEvents, projectedMessages]);
     const ungroupedDisplayEvents = interruptedDisplayEvents;
     const displayTimeline = useMemo(() => projectAgentDisplayTimeline(ungroupedVisibleMessages, ungroupedDisplayEvents), [ungroupedDisplayEvents, ungroupedVisibleMessages]);
@@ -1434,10 +1431,8 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     };
     const closeInputRequest = (requestId) => closeInputRequests([requestId]);
     const visibleQueuedTurns = thread.queuedTurns.filter((turn) => turn.intent !== "post-cancellation");
-    const recoveryStatusLabel = displayPendingTurn?.operation === "edit"
-        ? messages.thinking
-        : messages.reconnecting;
-    return (_jsx(AssistantRuntimeProvider, { runtime: assistantRuntime, children: _jsx("main", { className: "flex min-h-0 flex-1 flex-col overflow-hidden", children: _jsx(AssistantThreadSurface, { assetUrl: client?.assetUrl, approvalTakeover: approvalTakeover, cancellationState: cancellationState, commands: commands, composerTop: isRecovering || visibleQueuedTurns.length > 0 || queueError ? (_jsxs(_Fragment, { children: [isRecovering ? (_jsxs("div", { className: "flex items-center gap-2 border-b border-border/60 px-1 pb-2 text-xs text-muted-foreground", "data-agent-recovery-status": true, role: "status", children: [_jsx(LoaderCircleIcon, { className: "size-3.5 animate-spin" }), _jsx("span", { children: recoveryStatusLabel })] })) : null, visibleQueuedTurns.length > 0 || queueError ? (_jsx(FollowUpQueue, { error: queueError, messages: messages, onRemove: removeQueuedTurn, onRetry: markQueuedTurnForRetry, turns: visibleQueuedTurns })) : null] })) : undefined, draftStorageKey: draftStorageKey, historyHasMore: historyHasMore, historyLoading: historyLoading, events: displayEvents, eveMessages: visibleMessages, fallbackStartedAt: displayPendingTurn?.submittedAt, inputDisabled: inputLocked, isBusy: isBusy, sessionTerminal: sessionTerminal, sessionSettled: durableTurnSettled, onCancel: requestCancellation, locale: locale, mentions: mentions, messages: messages, models: models, onInputResponses: respond, onCloseInputRequest: closeInputRequest, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, onLoadEarlier: onLoadEarlier, onPreferencesChange: (preferences) => onChange({ preferences }), onDraftRestoreConsumed: (id) => {
+    const showRecoveryStatus = isRecovering && displayPendingTurn?.operation !== "edit";
+    return (_jsx(AssistantRuntimeProvider, { runtime: assistantRuntime, children: _jsx("main", { className: "flex min-h-0 flex-1 flex-col overflow-hidden", children: _jsx(AssistantThreadSurface, { assetUrl: client?.assetUrl, approvalTakeover: approvalTakeover, cancellationState: cancellationState, commands: commands, composerTop: showRecoveryStatus || visibleQueuedTurns.length > 0 || queueError ? (_jsxs(_Fragment, { children: [showRecoveryStatus ? (_jsxs("div", { className: "flex items-center gap-2 border-b border-border/60 px-1 pb-2 text-xs text-muted-foreground", "data-agent-recovery-status": true, role: "status", children: [_jsx(LoaderCircleIcon, { className: "size-3.5 animate-spin" }), _jsx("span", { children: messages.reconnecting })] })) : null, visibleQueuedTurns.length > 0 || queueError ? (_jsx(FollowUpQueue, { error: queueError, messages: messages, onRemove: removeQueuedTurn, onRetry: markQueuedTurnForRetry, turns: visibleQueuedTurns })) : null] })) : undefined, draftStorageKey: draftStorageKey, historyHasMore: historyHasMore, historyLoading: historyLoading, events: displayEvents, eveMessages: visibleMessages, fallbackStartedAt: displayPendingTurn?.submittedAt, inputDisabled: inputLocked, isBusy: isBusy, sessionTerminal: sessionTerminal, sessionSettled: durableTurnSettled, onCancel: requestCancellation, locale: locale, mentions: mentions, messages: messages, models: models, onInputResponses: respond, onCloseInputRequest: closeInputRequest, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, onLoadEarlier: onLoadEarlier, onPreferencesChange: (preferences) => onChange({ preferences }), onDraftRestoreConsumed: (id) => {
                     if (thread.draftRestore?.id === id)
                         onChange({ draftRestore: undefined });
                 }, onRetryRuntimeError: recoveryError ? onRetryRecovery : undefined, closedInputRequestIds: closedInputRequestIdsRef.current, preferences: thread.preferences, reasoningLevels: reasoningLevels, draftRestore: thread.draftRestore, runtimeFailure: runtimeFailure, runtimeError: runtimeError, runtimeRetry: providerRetry, usage: usage }) }) }));
@@ -1459,7 +1454,7 @@ function expandPromptDirectives(value, commands, mentions) {
 export function FollowUpQueue({ error, messages, onRemove, onRetry, turns, }) {
     return (_jsxs("div", { className: "border-b border-border/60 px-1 pb-2 text-sm", "data-agent-steer-queue": true, children: [_jsxs("div", { className: "flex items-center gap-2 px-1 pb-1 text-xs text-muted-foreground", children: [_jsx(Clock3Icon, { className: "size-3.5" }), _jsx("span", { children: messages.queuedFollowUps }), turns.length > 0 ? _jsx("span", { children: turns.length }) : null] }), _jsx("div", { className: "space-y-0.5", children: turns.map((turn) => (_jsxs("div", { className: "flex min-w-0 items-center gap-2 rounded-lg px-1 py-1 hover:bg-muted/55", children: [_jsx("span", { className: cn("size-1.5 shrink-0 rounded-full", turn.state === "delivery-failed" ? "bg-destructive" : "bg-amber-500") }), _jsx("span", { className: "min-w-0 flex-1 truncate text-[13px]", children: turn.text }), turn.state === "delivery-failed" ? _jsx("span", { className: "shrink-0 text-xs text-destructive", children: messages.queueDeliveryFailed }) : turn.state === "admission-ambiguous" ? _jsx("span", { className: "shrink-0 text-xs text-amber-700 dark:text-amber-300", children: messages.queueAdmissionAmbiguous }) : turn.state === "delivering" ? _jsx("span", { className: "shrink-0 text-xs text-muted-foreground", children: messages.queueDelivering }) : turn.state === "accepted" || turn.state === "committed" ? _jsx("span", { className: "shrink-0 text-xs text-muted-foreground", children: messages.queueAccepted }) : null, turn.state === "delivery-failed" ? _jsx(Button, { "aria-label": messages.retryQueuedMessage, className: "size-7", onClick: () => onRetry(turn.id), size: "icon-sm", variant: "ghost", children: _jsx(RotateCcwIcon, { className: "size-3.5" }) }) : null, mailboxTurnIsCancellable(turn) ? _jsx(Button, { "aria-label": messages.removeQueuedMessage, className: "size-7", onClick: () => onRemove(turn.id), size: "icon-sm", variant: "ghost", children: _jsx(XIcon, { className: "size-3.5" }) }) : null] }, turn.id))) }), error ? _jsx("p", { className: "px-1 pt-1 text-xs text-destructive", role: "alert", children: error }) : null] }));
 }
-function ensureActiveAssistantMessage(messages, events, isBusy, pendingTurn, optimisticPending = false) {
+function ensureActiveAssistantMessage(messages, events, isBusy, pendingTurn, optimisticPending = false, identityState) {
     const projectedMessages = projectPendingUserMessage(messages, pendingTurn, events, optimisticPending);
     const terminalFailure = latestTurnFailure(events);
     if (!isBusy && !terminalFailure)
@@ -1470,11 +1465,13 @@ function ensureActiveAssistantMessage(messages, events, isBusy, pendingTurn, opt
         ? projectedMessages.findIndex((message) => message.id === `${pendingTurn.id}:user`)
         : -1;
     const sessionSettled = hasSettledLatestTurn(events);
-    const activeTurnId = pendingUserIndex >= 0 && sessionSettled
-        ? undefined
-        : pendingTurn
-            ? activeTurnIdAfterPendingSubmission(events, pendingTurn)
-            : turnId;
+    const pendingReceipt = pendingTurn
+        ? acceptedMessageReceivedEvent(pendingTurn, events)
+        : undefined;
+    const activeTurnId = pendingTurn
+        ? activeTurnIdAfterPendingSubmission(events, pendingTurn) ?? pendingReceipt?.data.turnId ??
+            (pendingUserIndex >= 0 && sessionSettled ? undefined : turnId)
+        : turnId;
     if (activeTurnId && projectedMessages.some((message) => message.role === "assistant" && message.metadata?.turnId === activeTurnId)) {
         return projectedMessages;
     }
@@ -1496,7 +1493,10 @@ function ensureActiveAssistantMessage(messages, events, isBusy, pendingTurn, opt
     }
     if (!activeTurnId && !pendingTurn && projectedMessages.at(-1)?.role === "assistant")
         return projectedMessages;
-    const placeholderId = activeTurnId ?? pendingTurn?.id ?? "pending-turn";
+    const editPlaceholderRoot = pendingTurn?.operation === "edit" && pendingTurn.beforeTurnId
+        ? identityState?.pendingAssistantRoot ?? pendingTurn.beforeTurnId
+        : undefined;
+    const placeholderId = activeTurnId ?? editPlaceholderRoot ?? pendingTurn?.id ?? "pending-turn";
     const displayTurnId = activeTurnId ?? (terminalFailure ? placeholderId : undefined);
     return [
         ...projectedMessages,
@@ -1511,19 +1511,15 @@ function ensureActiveAssistantMessage(messages, events, isBusy, pendingTurn, opt
         },
     ];
 }
-function hasSubstantiveAssistantPart(message) {
-    return message.parts.some((part) => {
-        if (part.type === "reasoning" || part.type === "text")
-            return part.text.trim().length > 0;
-        return true;
-    });
-}
 function stabilizeDisplayMessageIdentities(messages, events, pendingTurn, state, sessionId) {
     seedEditedTurnIdentities(events, sessionId, state);
     if (pendingTurn && state.pendingRoot !== pendingTurn.id) {
         state.pendingUserRoot = undefined;
         state.pendingUserTurnId = undefined;
         state.pendingRoot = pendingTurn.id;
+        state.pendingAssistantRoot = pendingTurn.operation === "edit" && pendingTurn.beforeTurnId
+            ? pendingTurn.beforeTurnId
+            : undefined;
     }
     const receiptTurnId = state.pendingUserRoot === state.pendingRoot
         ? state.pendingUserTurnId
@@ -1538,9 +1534,9 @@ function stabilizeDisplayMessageIdentities(messages, events, pendingTurn, state,
     const latestDurableTurnId = [...events].reverse().find((event) => event.type === "turn.started");
     const inferredTurnId = latestDurableTurnId?.type === "turn.started"
         ? latestDurableTurnId.data.turnId
-        : undefined;
+        : [...messages].reverse().find((message) => message.role === "assistant" && typeof message.metadata?.turnId === "string")?.metadata?.turnId;
     const activeTurnId = pendingTurn
-        ? activeTurnIdAfterPendingSubmission(events, pendingTurn) ?? receiptTurnId ??
+        ? activeTurnIdAfterPendingSubmission(events, pendingTurn) ?? receiptTurnId ?? acceptedTurn?.data.turnId ??
             (state.pendingRoot
                 ? [...events].findLast((event, index) => event.type === "turn.started" &&
                     (pendingTurn.eventCountAtSubmission === undefined || index >= pendingTurn.eventCountAtSubmission))?.data.turnId
@@ -1554,7 +1550,7 @@ function stabilizeDisplayMessageIdentities(messages, events, pendingTurn, state,
         }
     }
     if (activeTurnId && state.pendingRoot) {
-        state.assistantByTurn.set(activeTurnId, state.pendingRoot);
+        state.assistantByTurn.set(activeTurnId, state.pendingAssistantRoot ?? state.pendingRoot);
     }
     let changed = false;
     const stabilized = messages.map((message) => {
@@ -1582,10 +1578,7 @@ function seedEditedTurnIdentities(events, sessionId, state) {
         const replacement = events.slice(index + 1).find((event) => event.type === "message.received" && event.data.turnId !== boundary.data.turnId);
         if (replacement?.type !== "message.received")
             continue;
-        const clientMessageId = replacement.data.clientMessageId;
-        const root = typeof clientMessageId === "string" && clientMessageId.startsWith("edit-")
-            ? clientMessageId
-            : editOperationId(sessionId, boundary.data.turnId, replacement.data.message);
+        const root = state.pendingAssistantRoot ?? boundary.data.turnId;
         state.assistantByTurn.set(replacement.data.turnId, root);
     }
 }
@@ -1668,7 +1661,10 @@ function acceptedMessageReceivedEvent(pendingTurn, events) {
             return true;
         if (event.data.clientMessageId)
             return false;
-        const isAfterSubmission = pendingTurn.eventCountAtSubmission === undefined ||
+        const projectedEditBoundary = pendingTurn.operation === "edit" &&
+            events.some((candidate) => candidate.type === "context.cleared");
+        const isAfterSubmission = projectedEditBoundary ||
+            pendingTurn.eventCountAtSubmission === undefined ||
             eventIndex >= pendingTurn.eventCountAtSubmission;
         const eventAt = event.meta.at ? Date.parse(event.meta.at) : Number.NaN;
         const eventCanAcknowledge = Number.isFinite(eventAt)

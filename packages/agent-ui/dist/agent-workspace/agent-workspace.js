@@ -252,7 +252,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
             return next;
         });
     }, []);
-    const settleThreadHistory = useCallback(async (thread, boundary) => {
+    const settleThreadHistory = useCallback(async (thread, boundary, preserveRuntimeIdentity = false) => {
         const failed = boundary.state === "terminal" && boundary.terminalStatus === "failed";
         const settledStatus = failed ? "error" : "ready";
         const authoritativeTailExclusive = boundary.tailIndex === undefined
@@ -301,7 +301,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
             status: settledStatus,
             updatedAt: Date.now(),
         };
-        if (caughtUpSettledRange && activeThreadIdRef.current === thread.id) {
+        if (caughtUpSettledRange && activeThreadIdRef.current === thread.id && !preserveRuntimeIdentity) {
             flushSync(() => {
                 setThreadRuntimeSeeds((current) => {
                     const seed = `settled:${thread.session.sessionId}:${settledCursor}`;
@@ -427,7 +427,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                 setRecoveringIds((current) => new Set(current).add(thread.id));
                 return;
             }
-            await settleThreadHistory(thread, boundary);
+            await settleThreadHistory(thread, boundary, thread.pendingTurn?.operation === "edit");
         }
         catch {
             runtimeChecksStarted.current.delete(runtimeCheckKey);
@@ -931,6 +931,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
         setRecoveryErrors((current) => withoutMapKey(current, thread.id));
         const controller = new AbortController();
         recoveryControllers.current.set(thread.id, controller);
+        const editRecovery = thread.pendingTurn?.operation === "edit";
         const releaseRecovery = () => {
             if (recoveryControllers.current.get(thread.id) !== controller)
                 return false;
@@ -961,7 +962,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                 runtimeBoundaryState = boundary.state;
                 runtimeTailIndex = boundary.tailIndex;
                 if (boundary.state === "waiting" || boundary.state === "terminal") {
-                    await settleThreadHistory(thread, boundary);
+                    await settleThreadHistory(thread, boundary, editRecovery);
                     releaseRecovery();
                     return;
                 }
@@ -1365,7 +1366,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                         ? "error"
                         : recoveryStatus(),
             };
-            if (activeThreadIdRef.current === thread.id && events.length > thread.events.length) {
+            if (activeThreadIdRef.current === thread.id && events.length > thread.events.length && !editRecovery) {
                 flushSync(() => {
                     setThreadRuntimeSeeds((current) => {
                         const seed = `recovery:${thread.session.sessionId}:${cursor}`;
