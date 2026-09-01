@@ -361,7 +361,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     const durableSnapshotAhead = durableEditBoundary && (!liveEditBoundary || thread.session.streamIndex > (agent.session?.streamIndex ?? -1));
     const effectiveRenderEvents = isRecovering || durableSnapshotAhead ? recoveryRenderEvents : renderEvents;
     const effectiveRenderMessages = isRecovering || durableSnapshotAhead ? recoveryRenderMessages : renderMessages;
-    const pendingEditOperation = optimisticPendingTurn ?? thread.pendingTurn;
+    const pendingEditOperation = optimisticPendingTurn ?? optimisticDisplayTurn ?? thread.pendingTurn;
     const pendingEditTurnId = pendingEditOperation?.operation === "edit" &&
         isPendingTurnInFlight(pendingEditOperation)
         ? pendingEditOperation.beforeTurnId

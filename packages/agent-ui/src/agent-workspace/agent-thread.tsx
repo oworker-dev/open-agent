@@ -600,7 +600,13 @@ export function AgentThreadView({
   );
   const effectiveRenderEvents = isRecovering || durableSnapshotAhead ? recoveryRenderEvents : renderEvents;
   const effectiveRenderMessages = isRecovering || durableSnapshotAhead ? recoveryRenderMessages : renderMessages;
-  const pendingEditOperation = optimisticPendingTurn ?? thread.pendingTurn;
+  // Keep an accepted edit's superseded branch hidden until the replacement
+  // assistant settles. `optimisticPendingTurn` is cleared at Eve's
+  // message.received acknowledgement to release admission state, while the
+  // display-only copy intentionally survives until the assistant terminal
+  // boundary. Dropping both from this projection lets the old assistant row
+  // reappear for one render between those two snapshots.
+  const pendingEditOperation = optimisticPendingTurn ?? optimisticDisplayTurn ?? thread.pendingTurn;
   const pendingEditTurnId = pendingEditOperation?.operation === "edit" &&
     isPendingTurnInFlight(pendingEditOperation)
     ? pendingEditOperation.beforeTurnId
