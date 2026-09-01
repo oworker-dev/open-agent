@@ -1557,7 +1557,7 @@ export function AgentThreadView({
   const stageEditedTurn = (message: AppendMessage) => {
     const prompt = promptFromAssistantMessage(getEveMessageContent(message));
     if (!prompt.text && prompt.files.length === 0) return;
-    const beforeTurnId = editedTurnId(message);
+    const beforeTurnId = editedTurnId(message, displayMessageIdentityRef.current);
     if (!beforeTurnId) {
       setTurnError(locale === "zh-CN"
         ? "无法确定要编辑的消息，请刷新会话后重试。"
@@ -2503,10 +2503,30 @@ function promptFromAssistantMessage(content: Parameters<ClientSession["send"]>[0
   return { files, text };
 }
 
-function editedTurnId(message: AppendMessage): string | undefined {
-  const metadataTurnId = message.metadata?.custom?.turnId;
+function editedTurnId(
+  message: AppendMessage,
+  identities?: DisplayMessageIdentityState,
+): string | undefined {
+  const metadataTurnId = message.metadata?.custom?.turnId ??
+    (message.metadata as { readonly turnId?: unknown } | undefined)?.turnId;
   if (typeof metadataTurnId === "string" && metadataTurnId.trim()) return metadataTurnId;
   if (!message.sourceId) return undefined;
+
+  // assistant-ui's edit composer preserves the displayed message id as
+  // `sourceId`, but our live handoff intentionally replaces Eve's
+  // `<turnId>:user` id with a stable optimistic root. Resolve that alias back
+  // to Eve's durable turn before submitting the revert transaction. Without
+  // this reverse lookup an edit targets `pending-...` and Eve correctly
+  // rejects the revert precondition, which can look like a normal duplicate
+  // send after refresh.
+  if (identities) {
+    for (const [turnId, stableRoot] of identities.assistantByTurn) {
+      if (message.sourceId === `${stableRoot}:user` ||
+          message.sourceId.startsWith(`${stableRoot}:user:`)) {
+        return turnId;
+      }
+    }
+  }
   const userSuffix = message.sourceId.indexOf(":user");
   return userSuffix > 0 ? message.sourceId.slice(0, userSuffix) : undefined;
 }

@@ -1080,7 +1080,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         const prompt = promptFromAssistantMessage(getEveMessageContent(message));
         if (!prompt.text && prompt.files.length === 0)
             return;
-        const beforeTurnId = editedTurnId(message);
+        const beforeTurnId = editedTurnId(message, displayMessageIdentityRef.current);
         if (!beforeTurnId) {
             setTurnError(locale === "zh-CN"
                 ? "无法确定要编辑的消息，请刷新会话后重试。"
@@ -1737,12 +1737,21 @@ function promptFromAssistantMessage(content) {
     });
     return { files, text };
 }
-function editedTurnId(message) {
-    const metadataTurnId = message.metadata?.custom?.turnId;
+function editedTurnId(message, identities) {
+    const metadataTurnId = message.metadata?.custom?.turnId ??
+        message.metadata?.turnId;
     if (typeof metadataTurnId === "string" && metadataTurnId.trim())
         return metadataTurnId;
     if (!message.sourceId)
         return undefined;
+    if (identities) {
+        for (const [turnId, stableRoot] of identities.assistantByTurn) {
+            if (message.sourceId === `${stableRoot}:user` ||
+                message.sourceId.startsWith(`${stableRoot}:user:`)) {
+                return turnId;
+            }
+        }
+    }
     const userSuffix = message.sourceId.indexOf(":user");
     return userSuffix > 0 ? message.sourceId.slice(0, userSuffix) : undefined;
 }
