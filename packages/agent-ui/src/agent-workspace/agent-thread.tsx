@@ -1504,7 +1504,6 @@ export function AgentThreadView({
           projectionEvents,
           isBusy || isPendingTurnInFlight(admissionPendingTurn) || Boolean(latestTurnFailure(interruptedDisplayEvents)),
           displayPendingTurn,
-          optimisticPendingTurn?.id === displayPendingTurn?.id,
           displayMessageIdentityRef.current,
         ),
         projectionEvents,
@@ -2120,10 +2119,9 @@ function ensureActiveAssistantMessage(
   events: readonly MessageStreamEvent[],
   isBusy: boolean,
   pendingTurn?: AgentThread["pendingTurn"],
-  optimisticPending = false,
   identityState?: DisplayMessageIdentityState,
 ): readonly EveMessage[] {
-  const projectedMessages = projectPendingUserMessage(messages, pendingTurn, events, optimisticPending);
+  const projectedMessages = projectPendingUserMessage(messages, pendingTurn, events);
   const terminalFailure = latestTurnFailure(events);
   if (!isBusy && !terminalFailure) return projectedMessages;
   const started = [...events].reverse().find((event) => event.type === "turn.started");
@@ -2336,17 +2334,19 @@ function projectPendingUserMessage(
   messages: readonly EveMessage[],
   pendingTurn?: AgentThread["pendingTurn"],
   events: readonly MessageStreamEvent[] = [],
-  optimisticPending = false,
 ): readonly EveMessage[] {
   if (!pendingTurn) return messages;
   if (messages.some((message) =>
     message.role === "user" &&
     (message.id === `${pendingTurn.id}:user` || message.id.startsWith(`${pendingTurn.id}:user:`)),
   )) return messages;
-  // The receipt can arrive one render before Eve's reduced user message. Once
-  // the latter is present, keep the durable row and suppress the optimistic
-  // copy regardless of whether the browser admission flag has settled yet.
-  if (!optimisticPending && hasVisiblePendingUserMessage(pendingTurn, messages, events)) return messages;
+  // The receipt can arrive one render before Eve's reduced user message. Keep
+  // the optimistic row for that narrow gap, but once both the durable receipt
+  // and its rendered user row exist, always prefer the durable row. The
+  // admission flag may remain optimistic until the replacement assistant
+  // settles; gating this on `optimisticPending` would render two copies of an
+  // edited message during that normal streaming window.
+  if (hasVisiblePendingUserMessage(pendingTurn, messages, events)) return messages;
   return [
     ...messages,
     {

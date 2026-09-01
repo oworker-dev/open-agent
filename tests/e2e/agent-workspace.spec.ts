@@ -1598,6 +1598,7 @@ test(`editing the latest user turn with ${editScenario.label} submits one durabl
   // The old branch is hidden optimistically while the server-owned edit waits
   // for its exact context.cleared boundary.
   await expect(page.getByRole("log").getByText(editedRequest, { exact: true })).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByRole("log").getByText(editedRequest, { exact: true })).toHaveCount(1);
   await expect(page.getByRole("log").getByText("Original delivery.", { exact: true })).toHaveCount(0);
   await expect.poll(() => mailboxCalls).toBe(1);
   await page.waitForTimeout(250);

@@ -1049,7 +1049,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         pendingRoot: undefined,
     });
     const projectedMessages = useMemo(() => {
-        const projected = projectStagedUserMessages(stabilizeDisplayMessageIdentities(ensureActiveAssistantMessage(projectedRuntimeMessages, projectionEvents, isBusy || isPendingTurnInFlight(admissionPendingTurn) || Boolean(latestTurnFailure(interruptedDisplayEvents)), displayPendingTurn, optimisticPendingTurn?.id === displayPendingTurn?.id, displayMessageIdentityRef.current), projectionEvents, displayPendingTurn, displayMessageIdentityRef.current, thread.session.sessionId), thread.queuedTurns.filter((turn) => turn.intent === "post-cancellation"), interruptedDisplayEvents);
+        const projected = projectStagedUserMessages(stabilizeDisplayMessageIdentities(ensureActiveAssistantMessage(projectedRuntimeMessages, projectionEvents, isBusy || isPendingTurnInFlight(admissionPendingTurn) || Boolean(latestTurnFailure(interruptedDisplayEvents)), displayPendingTurn, displayMessageIdentityRef.current), projectionEvents, displayPendingTurn, displayMessageIdentityRef.current, thread.session.sessionId), thread.queuedTurns.filter((turn) => turn.intent === "post-cancellation"), interruptedDisplayEvents);
         return projected;
     }, [admissionPendingTurn, displayPendingTurn, interruptedDisplayEvents, isBusy, optimisticPendingTurn, projectionEvents, projectedRuntimeMessages, thread.queuedTurns, thread.session.sessionId]);
     const ungroupedVisibleMessages = useMemo(() => projectedMessages.filter((message) => !isProxiedInputOnlyMessage(message, projectionEvents)), [projectionEvents, projectedMessages]);
@@ -1455,8 +1455,8 @@ function expandPromptDirectives(value, commands, mentions) {
 export function FollowUpQueue({ error, messages, onRemove, onRetry, turns, }) {
     return (_jsxs("div", { className: "border-b border-border/60 px-1 pb-2 text-sm", "data-agent-steer-queue": true, children: [_jsxs("div", { className: "flex items-center gap-2 px-1 pb-1 text-xs text-muted-foreground", children: [_jsx(Clock3Icon, { className: "size-3.5" }), _jsx("span", { children: messages.queuedFollowUps }), turns.length > 0 ? _jsx("span", { children: turns.length }) : null] }), _jsx("div", { className: "space-y-0.5", children: turns.map((turn) => (_jsxs("div", { className: "flex min-w-0 items-center gap-2 rounded-lg px-1 py-1 hover:bg-muted/55", children: [_jsx("span", { className: cn("size-1.5 shrink-0 rounded-full", turn.state === "delivery-failed" ? "bg-destructive" : "bg-amber-500") }), _jsx("span", { className: "min-w-0 flex-1 truncate text-[13px]", children: turn.text }), turn.state === "delivery-failed" ? _jsx("span", { className: "shrink-0 text-xs text-destructive", children: messages.queueDeliveryFailed }) : turn.state === "admission-ambiguous" ? _jsx("span", { className: "shrink-0 text-xs text-amber-700 dark:text-amber-300", children: messages.queueAdmissionAmbiguous }) : turn.state === "delivering" ? _jsx("span", { className: "shrink-0 text-xs text-muted-foreground", children: messages.queueDelivering }) : turn.state === "accepted" || turn.state === "committed" ? _jsx("span", { className: "shrink-0 text-xs text-muted-foreground", children: messages.queueAccepted }) : null, turn.state === "delivery-failed" ? _jsx(Button, { "aria-label": messages.retryQueuedMessage, className: "size-7", onClick: () => onRetry(turn.id), size: "icon-sm", variant: "ghost", children: _jsx(RotateCcwIcon, { className: "size-3.5" }) }) : null, mailboxTurnIsCancellable(turn) ? _jsx(Button, { "aria-label": messages.removeQueuedMessage, className: "size-7", onClick: () => onRemove(turn.id), size: "icon-sm", variant: "ghost", children: _jsx(XIcon, { className: "size-3.5" }) }) : null] }, turn.id))) }), error ? _jsx("p", { className: "px-1 pt-1 text-xs text-destructive", role: "alert", children: error }) : null] }));
 }
-function ensureActiveAssistantMessage(messages, events, isBusy, pendingTurn, optimisticPending = false, identityState) {
-    const projectedMessages = projectPendingUserMessage(messages, pendingTurn, events, optimisticPending);
+function ensureActiveAssistantMessage(messages, events, isBusy, pendingTurn, identityState) {
+    const projectedMessages = projectPendingUserMessage(messages, pendingTurn, events);
     const terminalFailure = latestTurnFailure(events);
     if (!isBusy && !terminalFailure)
         return projectedMessages;
@@ -1592,13 +1592,13 @@ function stableAssistantMessageId(sourceId, turnId, stableRoot) {
     }
     return `${stableRoot}:assistant`;
 }
-function projectPendingUserMessage(messages, pendingTurn, events = [], optimisticPending = false) {
+function projectPendingUserMessage(messages, pendingTurn, events = []) {
     if (!pendingTurn)
         return messages;
     if (messages.some((message) => message.role === "user" &&
         (message.id === `${pendingTurn.id}:user` || message.id.startsWith(`${pendingTurn.id}:user:`))))
         return messages;
-    if (!optimisticPending && hasVisiblePendingUserMessage(pendingTurn, messages, events))
+    if (hasVisiblePendingUserMessage(pendingTurn, messages, events))
         return messages;
     return [
         ...messages,
