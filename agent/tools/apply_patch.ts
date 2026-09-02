@@ -93,17 +93,19 @@ export default defineTool({
     }
 
     // Commit only states whose final value differs from their initial value.
-    // writeAtomicTextFile uses a same-directory temp file plus mv on real
-    // sandboxes, preventing readers from observing a partial text file. Once
-    // this phase starts it is intentionally non-cancellable: stopping between
-    // files would turn a validated multi-file patch into a partial commit.
+    // Each file is still replaced atomically, while the active turn's abort
+    // signal is honoured between files and by every sandbox I/O. A multi-file
+    // patch can therefore stop promptly without ever exposing a half-written
+    // individual file; Eve's durable event stream records the changes that did
+    // commit before the cooperative cancellation boundary.
     abortSignal?.throwIfAborted();
     for (const [path, state] of states) {
+      abortSignal?.throwIfAborted();
       if (state.value === state.original) continue;
       if (state.value === null) {
-        await sandbox.removePath({ force: true, path });
+        await sandbox.removePath({ abortSignal, force: true, path });
       } else {
-        await writeAtomicTextFile(sandbox, path, state.value);
+        await writeAtomicTextFile(sandbox, path, state.value, abortSignal);
       }
     }
 
@@ -294,16 +296,20 @@ async function writeAtomicTextFile(
   sandbox: SandboxSession,
   path: string,
   content: string,
+  abortSignal?: AbortSignal,
 ): Promise<void> {
   if (typeof sandbox.run !== "function") {
-    await sandbox.writeTextFile({ content, path });
+    await sandbox.writeTextFile({ content, path, ...(abortSignal ? { abortSignal } : {}) });
     return;
   }
   const slash = path.lastIndexOf("/");
   const temporary = `${path.slice(0, slash + 1)}.${path.slice(slash + 1)}.open-agent-${randomUUID()}.tmp`;
-  await sandbox.writeTextFile({ content, path: temporary });
+  await sandbox.writeTextFile({ content, path: temporary, ...(abortSignal ? { abortSignal } : {}) });
   try {
-    const result = await sandbox.run({ command: `mv -f -- ${shellQuote(temporary)} ${shellQuote(path)}` });
+    const result = await sandbox.run({
+      command: `mv -f -- ${shellQuote(temporary)} ${shellQuote(path)}`,
+      ...(abortSignal ? { abortSignal } : {}),
+    });
     if (result.exitCode !== 0) throw new Error(`Atomic patch write failed for ${path}: ${result.stderr || "rename command failed"}`);
   } catch (error) {
     // Cleanup must outlive the turn cancellation signal; otherwise an abort

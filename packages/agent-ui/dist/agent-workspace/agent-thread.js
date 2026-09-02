@@ -520,8 +520,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
                 return;
             durableProbeInFlightRef.current = true;
             try {
-                const consumedEvents = Math.max(0, agent.events.length - initialEventCountRef.current);
-                const cursor = initialStreamIndexRef.current + consumedEvents;
+                const cursor = consumedStreamIndexRef.current;
                 const probeSession = connection.client.sessions.attach(sessionId, { streamIndex: cursor });
                 const durableProgress = await hasDurableProgressAfter(probeSession, cursor);
                 if (durableProgress)
@@ -823,8 +822,6 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             : queuedTurnsRef.current.map((candidate) => candidate.id === turnId
                 ? { ...candidate, mailboxItemId: receipt.itemId, state }
                 : candidate));
-        if (state === "committed")
-            requestRecovery();
     }
     const withdrawLatestQueuedFollowUp = async () => {
         const turn = queuedTurnsRef.current.findLast((candidate) => candidate.intent === "active-turn" && mailboxTurnIsCancellable(candidate));
@@ -1280,10 +1277,8 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
                 const receipt = await mailbox.inspect(pendingTurn.mailboxItemId);
                 if (disposed || pendingTurnRef.current?.id !== pendingTurn.id)
                     return;
-                if (receipt.status === "committed") {
-                    requestRecovery();
+                if (receipt.status === "committed")
                     return;
-                }
                 if (receipt.status === "failed" || receipt.status === "cancelled") {
                     const failed = { ...pendingTurn, state: "delivery-failed" };
                     pendingTurnRef.current = failed;
@@ -1391,8 +1386,10 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         const parkedDelivery = !admissionBusy && serverTurns.some((turn) => turn.state === "queued" || turn.state === "delivering" || turn.state === "accepted");
         if (!committedAdmission && !parkedDelivery)
             return;
+        if (runtimeIsBusy)
+            return;
         requestRecovery();
-    }, [admissionBusy, inputLocked, isRecovering, mailbox, requestRecovery, thread.queuedTurns]);
+    }, [admissionBusy, inputLocked, isRecovering, mailbox, requestRecovery, runtimeIsBusy, thread.queuedTurns]);
     useEffect(() => {
         if (admissionBusy || runtimeIsBusy || inputLocked || !providerReady ||
             dispatchingQueuedTurnIdRef.current ||

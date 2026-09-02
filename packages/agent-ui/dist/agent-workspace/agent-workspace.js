@@ -925,6 +925,9 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
             requestThreadRecovery(activeThreadId);
     }, [activeThreadId, requestThreadRecovery]);
     const recoverThread = useCallback(async (thread) => {
+        const latestThread = threadsRef.current.find((candidate) => candidate.id === thread.id);
+        if (latestThread && latestThread.updatedAt >= thread.updatedAt)
+            thread = latestThread;
         if (!thread.session.sessionId || recoveryStarted.current.has(thread.id))
             return;
         recoveryStarted.current.add(thread.id);

@@ -843,8 +843,12 @@ export function AgentThreadView({
       if (disposed || durableProbeInFlightRef.current || recoveryRequestedRef.current) return;
       durableProbeInFlightRef.current = true;
       try {
-        const consumedEvents = Math.max(0, agent.events.length - initialEventCountRef.current);
-        const cursor = initialStreamIndexRef.current + consumedEvents;
+        // The Eve session cursor is advanced for every stream position, even
+        // when the reducer deduplicates an event or the presentation layer
+        // suppresses it. Deriving this from the reduced event-array length can
+        // point the probe at an already-consumed event and trigger an
+        // unnecessary recovery handoff (which replaces the live transcript).
+        const cursor = consumedStreamIndexRef.current;
         // A bounded read mutates its ClientSession cursor. Never probe with
         // the session that owns the live turn or its cursor can advance past
         // events React has not consumed, making recovery permanently skip
@@ -1230,7 +1234,11 @@ export function AgentThreadView({
             ? { ...candidate, mailboxItemId: receipt.itemId, state }
             : candidate,
         ));
-    if (state === "committed") requestRecovery();
+    // A committed steering admission is already part of the live Eve session.
+    // Do not tear down the active stream here: the mailbox commit is emitted
+    // from the same durable `message.received` boundary that the stream is
+    // consuming. Reattaching at this point used to swap in a shorter recovery
+    // snapshot and made the already-rendered transcript disappear briefly.
   }
 
   const withdrawLatestQueuedFollowUp = async (): Promise<string | undefined> => {
@@ -1818,10 +1826,7 @@ export function AgentThreadView({
       try {
         const receipt = await mailbox.inspect(pendingTurn.mailboxItemId!);
         if (disposed || pendingTurnRef.current?.id !== pendingTurn.id) return;
-        if (receipt.status === "committed") {
-          requestRecovery();
-          return;
-        }
+        if (receipt.status === "committed") return;
         if (receipt.status === "failed" || receipt.status === "cancelled") {
           const failed = { ...pendingTurn, state: "delivery-failed" as const };
           pendingTurnRef.current = failed;
@@ -1946,8 +1951,15 @@ export function AgentThreadView({
       turn.state === "queued" || turn.state === "delivering" || turn.state === "accepted"
     );
     if (!committedAdmission && !parkedDelivery) return;
+    // While Eve's response stream is healthy it will consume the same-turn
+    // steering continuation itself. A recovery handoff during that stream
+    // replaces the live reducer with a stale finite snapshot, which is the
+    // source of the transient message-list loss after follow-up admission.
+    // Recovery remains enabled once the live stream has actually gone idle or
+    // disconnected, where the normal stream/recovery guards take over.
+    if (runtimeIsBusy) return;
     requestRecovery();
-  }, [admissionBusy, inputLocked, isRecovering, mailbox, requestRecovery, thread.queuedTurns]);
+  }, [admissionBusy, inputLocked, isRecovering, mailbox, requestRecovery, runtimeIsBusy, thread.queuedTurns]);
 
   useEffect(() => {
     if (

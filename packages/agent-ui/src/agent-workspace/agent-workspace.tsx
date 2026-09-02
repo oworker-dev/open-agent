@@ -1139,6 +1139,13 @@ export function AgentWorkspace({
   }, [activeThreadId, requestThreadRecovery]);
 
   const recoverThread = useCallback(async (thread: AgentThread) => {
+    // Recovery is scheduled by a state update, so the object captured by the
+    // effect can be one render behind the live checkpoint that requested it.
+    // Always seed the worker from the newest thread snapshot; otherwise a
+    // recovery started by mailbox steering can publish an older prefix and
+    // make already-visible messages disappear until the next reconnect.
+    const latestThread = threadsRef.current.find((candidate) => candidate.id === thread.id);
+    if (latestThread && latestThread.updatedAt >= thread.updatedAt) thread = latestThread;
     if (!thread.session.sessionId || recoveryStarted.current.has(thread.id)) return;
     recoveryStarted.current.add(thread.id);
     setRecoveryErrors((current) => withoutMapKey(current, thread.id));
