@@ -338,7 +338,11 @@ export function AgentWorkspace({
     }, saveDelay);
   }, [activeThreadId, ephemeralThreadIds, isHydrated, onStorageError, storageKey, threadStorage, threads]);
 
-  const updateThread = useCallback((threadId: string, patch: AgentThreadPatch) => {
+  const updateThread = useCallback((
+    threadId: string,
+    patch: AgentThreadPatch,
+    options?: { readonly allowCursorRewind?: boolean },
+  ) => {
     if (patch.pendingTurn || patch.events?.length || patch.session?.sessionId) {
       setEphemeralThreadIds((current) => withoutSetValue(current, threadId));
     }
@@ -352,7 +356,12 @@ export function AgentWorkspace({
         // Recovery workers are intentionally replaceable. An older worker can
         // finish after a newer live stream and publish a lower cursor; that
         // snapshot is stale and must never roll the transcript or queue back.
-        if (incomingCursor !== undefined && incomingCursor < currentCursor && !explicitTranscriptReplacement) return thread;
+        if (
+          incomingCursor !== undefined &&
+          incomingCursor < currentCursor &&
+          !explicitTranscriptReplacement &&
+          options?.allowCursorRewind !== true
+        ) return thread;
 
         let effectivePatch = patch;
         if (patch.events && thread.events.length > 0) {
@@ -380,7 +389,9 @@ export function AgentWorkspace({
             ? {
                 ...thread.session,
                 ...effectivePatch.session,
-                streamIndex: Math.max(thread.session.streamIndex, effectivePatch.session.streamIndex),
+                streamIndex: options?.allowCursorRewind === true
+                  ? effectivePatch.session.streamIndex
+                  : Math.max(thread.session.streamIndex, effectivePatch.session.streamIndex),
               }
             : thread.session,
           updatedAt: patch.updatedAt ?? Math.max(Date.now(), thread.updatedAt + 1),
@@ -1281,6 +1292,7 @@ export function AgentWorkspace({
     let recoveryEventsSinceFlush = 0;
     let lastRecoveryFlushAt = Date.now();
     let checkedTailBoundary = false;
+    let recoveryCursorReconciled = false;
     let needsBoundedCatchUp = true;
     let reconnectAttempt = 0;
     let runtimeBoundaryReady = false;
@@ -1461,7 +1473,7 @@ export function AgentWorkspace({
         status: cancellationPending
           ? "cancelling"
           : recoveryStatus(),
-      });
+      }, recoveryCursorReconciled ? { allowCursorRewind: true } : undefined);
     };
 
     try {
@@ -1472,6 +1484,12 @@ export function AgentWorkspace({
         events,
         controller.signal,
       );
+      // A stale browser checkpoint may contain an absolute cursor ahead of
+      // the visible event prefix. Once the probe locates the last persisted
+      // event, recovery is allowed to publish the corrected lower cursor;
+      // this is an explicit repair, not an older worker rolling back a newer
+      // live stream.
+      recoveryCursorReconciled = cursor !== recoveryStartCursor;
       while (!settled && !controller.signal.aborted) {
         try {
           await refreshMailboxQueue();
@@ -1749,10 +1767,18 @@ export function AgentWorkspace({
             next.set(thread.id, seed);
             return next;
           });
-          updateThread(thread.id, recoveryPatch);
+          updateThread(
+            thread.id,
+            recoveryPatch,
+            recoveryCursorReconciled ? { allowCursorRewind: true } : undefined,
+          );
         });
       } else {
-        updateThread(thread.id, recoveryPatch);
+        updateThread(
+          thread.id,
+          recoveryPatch,
+          recoveryCursorReconciled ? { allowCursorRewind: true } : undefined,
+        );
       }
     } catch (error) {
       if (controller.signal.aborted || isAbortError(error)) return;

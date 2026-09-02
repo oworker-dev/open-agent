@@ -236,7 +236,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
             });
         }, saveDelay);
     }, [activeThreadId, ephemeralThreadIds, isHydrated, onStorageError, storageKey, threadStorage, threads]);
-    const updateThread = useCallback((threadId, patch) => {
+    const updateThread = useCallback((threadId, patch, options) => {
         if (patch.pendingTurn || patch.events?.length || patch.session?.sessionId) {
             setEphemeralThreadIds((current) => withoutSetValue(current, threadId));
         }
@@ -248,7 +248,10 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                 const currentCursor = thread.session.streamIndex;
                 const explicitTranscriptReplacement = patch.pendingTurn?.state === "clearing" ||
                     patch.pendingTurn?.state === "resubmitting";
-                if (incomingCursor !== undefined && incomingCursor < currentCursor && !explicitTranscriptReplacement)
+                if (incomingCursor !== undefined &&
+                    incomingCursor < currentCursor &&
+                    !explicitTranscriptReplacement &&
+                    options?.allowCursorRewind !== true)
                     return thread;
                 let effectivePatch = patch;
                 if (patch.events && thread.events.length > 0) {
@@ -270,7 +273,9 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                         ? {
                             ...thread.session,
                             ...effectivePatch.session,
-                            streamIndex: Math.max(thread.session.streamIndex, effectivePatch.session.streamIndex),
+                            streamIndex: options?.allowCursorRewind === true
+                                ? effectivePatch.session.streamIndex
+                                : Math.max(thread.session.streamIndex, effectivePatch.session.streamIndex),
                         }
                         : thread.session,
                     updatedAt: patch.updatedAt ?? Math.max(Date.now(), thread.updatedAt + 1),
@@ -1032,6 +1037,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
         let recoveryEventsSinceFlush = 0;
         let lastRecoveryFlushAt = Date.now();
         let checkedTailBoundary = false;
+        let recoveryCursorReconciled = false;
         let needsBoundedCatchUp = true;
         let reconnectAttempt = 0;
         let runtimeBoundaryReady = false;
@@ -1171,10 +1177,11 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                 status: cancellationPending
                     ? "cancelling"
                     : recoveryStatus(),
-            });
+            }, recoveryCursorReconciled ? { allowCursorRewind: true } : undefined);
         };
         try {
             cursor = await reconcileRecoveryCursor(connection.client, session.state.sessionId, recoveryStartCursor, events, controller.signal);
+            recoveryCursorReconciled = cursor !== recoveryStartCursor;
             while (!settled && !controller.signal.aborted) {
                 try {
                     await refreshMailboxQueue();
@@ -1412,11 +1419,11 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                         next.set(thread.id, seed);
                         return next;
                     });
-                    updateThread(thread.id, recoveryPatch);
+                    updateThread(thread.id, recoveryPatch, recoveryCursorReconciled ? { allowCursorRewind: true } : undefined);
                 });
             }
             else {
-                updateThread(thread.id, recoveryPatch);
+                updateThread(thread.id, recoveryPatch, recoveryCursorReconciled ? { allowCursorRewind: true } : undefined);
             }
         }
         catch (error) {

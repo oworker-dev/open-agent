@@ -2300,7 +2300,7 @@ test("a queued follow-up does not replace a healthy stream during prolonged Prov
   await expect(page.getByText("Reconnecting to the active run...")).toHaveCount(0);
 });
 
-test("a follow-up is admitted into the active turn at the next model boundary", async ({ page }) => {
+test("a follow-up is delivered as a FIFO turn after the active session parks", async ({ page }) => {
   const sessionId = "mock-follow-up-session";
   let continuationRequests = 0;
   let continuationAvailable = false;
@@ -2373,12 +2373,11 @@ test("a follow-up is admitted into the active turn at the next model boundary", 
     const availableEvents = continuationAvailable
       ? [
           ...initialEvents,
-          ...mockSteeredTurnRemainder(
-            "turn_tool",
-            mailboxBody?.clientMessageId,
+          ...eventsFromNdjson(mockContinuationTurn(
             "Add the requested footer",
             "Footer added.",
-          ),
+            1,
+          )),
         ]
       : initialEvents;
     await route.fulfill({
@@ -2399,18 +2398,17 @@ test("a follow-up is admitted into the active turn at the next model boundary", 
   await expect(page.getByRole("button", { name: "Queue follow-up" })).toBeVisible();
   await composer.press("Enter");
 
-  await expect(page.locator("[data-agent-steer-queue]")).toContainText("Queued follow-ups");
   await expect(page.getByText("Add the requested footer", { exact: true })).toBeVisible();
   await expect(page.getByText("Footer added.", { exact: true })).toBeVisible({ timeout: 10_000 });
-  await expect(page.locator("[data-agent-steer-queue]")).toBeHidden();
+  await expect(page.locator("[data-agent-steer-queue]")).toHaveCount(0);
   expect(continuationRequests).toBe(0);
   expect(mailboxRequests).toBe(1);
   expect(mailboxBody).toMatchObject({
-    expectedTurnId: "turn_tool",
     message: "Add the requested footer",
-    operationKind: "steer",
+    operationKind: "send",
     sessionId,
   });
+  expect(mailboxBody).not.toHaveProperty("expectedTurnId");
   expect(mailboxBody?.operationId).toBe(mailboxBody?.clientMessageId);
 });
 
