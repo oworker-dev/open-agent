@@ -1396,6 +1396,10 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
                 try {
                     const receipt = await mailbox.inspect(turn.mailboxItemId);
                     const state = mailboxTurnState(receipt.status);
+                    if (turn.state === "committed" && state !== "cancelled") {
+                        updates.set(turn.id, "committed");
+                        return;
+                    }
                     updates.set(turn.id, state === "cancelled" ? "remove" : state);
                 }
                 catch {

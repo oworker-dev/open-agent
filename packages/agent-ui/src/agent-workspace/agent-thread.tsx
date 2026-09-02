@@ -2007,6 +2007,14 @@ export function AgentThreadView({
         try {
           const receipt = await mailbox.inspect(turn.mailboxItemId!);
           const state = mailboxTurnState(receipt.status);
+          // The stream has already acknowledged this item with
+          // `message.received`. Mailbox status may still lag behind that
+          // event; never downgrade the committed marker back to accepted or
+          // delivering while Eve's reducer is publishing the user row.
+          if (turn.state === "committed" && state !== "cancelled") {
+            updates.set(turn.id, "committed");
+            return;
+          }
           updates.set(turn.id, state === "cancelled" ? "remove" : state);
         } catch {
           // Keep the last durable UI snapshot while mailbox inspection is unavailable.
