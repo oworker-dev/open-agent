@@ -22,12 +22,43 @@ import {
   projectAgentDisplayTimeline,
   reasoningContentForStep,
   sanitizeSettledThreadEvents,
+  shouldSuppressInterruptedTurnDisplayEvent,
   stableUserMessageId,
 } from "../../packages/agent-ui/src/agent-workspace/turn-presentation.ts";
 import { summarizeUsage } from "../../packages/agent-ui/src/agent-workspace/usage.ts";
 
 const startedAt = "2026-08-06T01:00:00.000Z";
 const endedAt = "2026-08-06T01:00:09.000Z";
+
+test("a locally requested cancellation keeps post-request events visible until Eve confirms it", () => {
+  const turnId = "turn-cancel-pending";
+  const eventAfterCancel = event("message.appended", endedAt, {
+    messageSoFar: "still streaming",
+    sequence: 0,
+    stepIndex: 0,
+    turnId,
+  });
+
+  assert.equal(
+    shouldSuppressInterruptedTurnDisplayEvent(eventAfterCancel, 3, [{
+      eventCount: 3,
+      settled: false,
+      streamIndex: 3,
+      turnId,
+    }]),
+    false,
+  );
+  // Legacy records without `settled` are authoritative historical markers and
+  // continue to suppress the post-cancellation tail after a refresh.
+  assert.equal(
+    shouldSuppressInterruptedTurnDisplayEvent(eventAfterCancel, 3, [{
+      eventCount: 3,
+      streamIndex: 3,
+      turnId,
+    }]),
+    true,
+  );
+});
 
 test("failure classification keeps transient provider errors out of the generic turn failure label", () => {
   assert.equal(classifyAgentFailure({ code: "provider_rate_limit", message: "HTTP 429" }), "provider");

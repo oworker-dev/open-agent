@@ -409,10 +409,12 @@ export function AgentThreadView({
           return isAfterSubmission && event.data.message.trim() === current.text.trim() ? undefined : current;
         });
 
-        // Consume a queued admission at the receipt boundary as well. The
-        // reducer snapshot and the parent thread checkpoint are intentionally
-        // asynchronous; waiting for the next React effect leaves an accepted
-        // message rendered both in the transcript and in the follow-up queue.
+        // Mark a queued admission as accepted at the receipt boundary, but do
+        // not remove it yet. Eve publishes `message.received` before its
+        // React reducer snapshot; removing the staged row in this callback
+        // creates a one-frame hole (and can make a live transcript appear to
+        // disappear). A small reconciliation effect below removes the queue
+        // item only after the matching durable user row is actually visible.
         // Prefer Eve's client id, then the browser dispatch lane. Do not fall
         // back to text matching because repeated prompts are valid turns.
         const clientMessageId = event.data.clientMessageId;
@@ -423,11 +425,18 @@ export function AgentThreadView({
             ? dispatchedId
             : undefined;
         if (acceptedQueuedId) {
-          queuedTurnsRef.current = queuedTurnsRef.current.filter((turn) => turn.id !== acceptedQueuedId);
+          const acceptedTurn = queuedTurnsRef.current.find((turn) => turn.id === acceptedQueuedId);
+          const acceptedState: AgentQueuedTurn["state"] = acceptedTurn?.delivery === "server" ? "committed" : "accepted";
+          const nextQueuedTurns = acceptedTurn
+            ? queuedTurnsRef.current.map((turn) => turn.id === acceptedQueuedId
+              ? { ...turn, state: acceptedState }
+              : turn)
+            : queuedTurnsRef.current;
+          queuedTurnsRef.current = nextQueuedTurns;
           if (dispatchingQueuedTurnIdRef.current === acceptedQueuedId) {
             dispatchingQueuedTurnIdRef.current = undefined;
           }
-          onChange({ queuedTurns: queuedTurnsRef.current, updatedAt: Date.now() });
+          onChange({ queuedTurns: nextQueuedTurns, updatedAt: Date.now() });
         }
       }
       if (event.type === "turn.failed" || event.type === "session.failed") {
@@ -652,6 +661,24 @@ export function AgentThreadView({
       : effectiveRenderMessages,
     [effectiveRenderEvents, effectiveRenderMessages, pendingEditTurnId, projectionEvents],
   );
+
+  // Eve emits the durable admission event before the external-store reducer
+  // publishes its corresponding user message. Keep an accepted queue item as
+  // the temporary transcript row during that handoff, then remove it only
+  // after the raw reducer snapshot contains the matching user message. This
+  // closes the race where a follow-up briefly vanished (and its prior
+  // assistant output appeared to move into a new execution group).
+  useEffect(() => {
+    const removableIds = queuedTurnsRef.current
+      .filter((turn) =>
+        (turn.state === "accepted" || turn.state === "committed") &&
+        hasDurableQueuedTurnMessage(turn, effectiveRenderMessages, effectiveRenderEvents),
+      )
+      .map((turn) => turn.id);
+    if (removableIds.length === 0) return;
+    const ids = new Set(removableIds);
+    updateQueuedTurns(queuedTurnsRef.current.filter((turn) => !ids.has(turn.id)));
+  }, [effectiveRenderEvents, effectiveRenderMessages, thread.queuedTurns]);
 
   const runtimeIsBusy = agent.status === "submitted" || agent.status === "streaming";
   const admissionPendingTurn = optimisticPendingTurn ?? thread.pendingTurn;
@@ -978,9 +1005,15 @@ export function AgentThreadView({
     for (const event of acceptedMessages) {
       const clientMessageId = event.data.clientMessageId;
       if (clientMessageId) {
-        const queueLength = queuedTurnsRef.current.length;
-        queuedTurnsRef.current = queuedTurnsRef.current.filter((turn) => turn.id !== clientMessageId);
-        acceptedQueuedTurn ||= queuedTurnsRef.current.length !== queueLength;
+        const queuedTurn = queuedTurnsRef.current.find((turn) => turn.id === clientMessageId);
+        if (queuedTurn) {
+          const acceptedState: AgentQueuedTurn["state"] = queuedTurn.delivery === "server" ? "committed" : "accepted";
+          const nextQueuedTurns = queuedTurnsRef.current.map((turn) => turn.id === clientMessageId
+            ? { ...turn, state: acceptedState }
+            : turn);
+          acceptedQueuedTurn ||= nextQueuedTurns.some((turn, index) => turn.state !== queuedTurnsRef.current[index]?.state);
+          queuedTurnsRef.current = nextQueuedTurns;
+        }
         if (dispatchingQueuedTurnIdRef.current === clientMessageId) {
           dispatchingQueuedTurnIdRef.current = undefined;
         }
@@ -993,9 +1026,16 @@ export function AgentThreadView({
 
       const dispatchedId = dispatchingQueuedTurnIdRef.current;
       if (dispatchedId) {
-        queuedTurnsRef.current = queuedTurnsRef.current.filter((turn) => turn.id !== dispatchedId);
+        const queuedTurn = queuedTurnsRef.current.find((turn) => turn.id === dispatchedId);
+        if (queuedTurn) {
+          const acceptedState: AgentQueuedTurn["state"] = queuedTurn.delivery === "server" ? "committed" : "accepted";
+          const nextQueuedTurns = queuedTurnsRef.current.map((turn) => turn.id === dispatchedId
+            ? { ...turn, state: acceptedState }
+            : turn);
+          acceptedQueuedTurn ||= nextQueuedTurns.some((turn, index) => turn.state !== queuedTurnsRef.current[index]?.state);
+          queuedTurnsRef.current = nextQueuedTurns;
+        }
         dispatchingQueuedTurnIdRef.current = undefined;
-        acceptedQueuedTurn = true;
       }
       if (pendingTurnRef.current) {
         const pending = pendingTurnRef.current;
@@ -1309,9 +1349,20 @@ export function AgentThreadView({
       pendingAtInterruption?.text,
     );
     retainedContextRef.current = retainedContext;
-    const interruptionStreamIndex = initialStreamIndexRef.current + Math.max(
-      0,
-      latestEventsRef.current.length - initialEventCountRef.current,
+    // Eve's cursor advances for every stream position, including cumulative
+    // snapshots that the compact transcript replaces and events that the
+    // presentation layer may hide.  Deriving this boundary from the reduced
+    // event-array length can point cancellation at an older position; after
+    // a follow-up is queued that causes the recovery projection to hide the
+    // already-rendered tail until the run settles.  Use the same absolute
+    // cursor consumed by the live event handler and durable checkpoints.
+    // A recovery worker can consume a bounded page outside the mounted Eve
+    // reducer. Its checkpoint is then the freshest absolute cursor available
+    // to this view; use the maximum so cancellation never rewinds the boundary
+    // and suppresses events that were already recovered on the server.
+    const interruptionStreamIndex = Math.max(
+      consumedStreamIndexRef.current,
+      thread.session.streamIndex,
     );
     const interruptedTurn = {
       eventCount: compactedEventsRef.current.length,
@@ -1521,11 +1572,24 @@ export function AgentThreadView({
 
   const displayInterruptedTurns = useMemo(
     () => localInterruption
-      ? upsertInterruptedTurn(thread.interruptedTurns ?? [], {
-          eventCount: localInterruption.events.length,
-          streamIndex: localInterruption.streamIndex,
-          turnId: localInterruption.turnId,
-        })
+      ? (() => {
+          const persisted = (thread.interruptedTurns ?? []).find((turn) =>
+            turn.turnId === localInterruption.turnId,
+          );
+          return upsertInterruptedTurn(thread.interruptedTurns ?? [], {
+            // A local interruption is only a UI intent. Preserve an already
+            // settled durable record when one exists, and explicitly mark a
+            // fresh local record as unsettled so stream events remain visible
+            // while Eve processes the asynchronous cancel request.
+            eventCount: persisted?.eventCount ?? compactedEventsRef.current.length,
+            streamIndex: Math.max(
+              persisted?.streamIndex ?? 0,
+              localInterruption.streamIndex,
+            ),
+            turnId: localInterruption.turnId,
+            settled: persisted?.settled ?? false,
+          });
+        })()
       : thread.interruptedTurns ?? [],
     [localInterruption, thread.interruptedTurns],
   );
@@ -2051,7 +2115,9 @@ export function AgentThreadView({
   const closeInputRequest = (requestId: string) => closeInputRequests([requestId]);
 
   const visibleQueuedTurns = thread.queuedTurns.filter((turn) =>
-    turn.intent !== "post-cancellation"
+    turn.intent !== "post-cancellation" &&
+    turn.state !== "accepted" &&
+    turn.state !== "committed"
   );
   // A mailbox edit intentionally reattaches the durable Eve stream after the
   // server commits the rewind. That is normal turn execution, not a transport
@@ -2541,6 +2607,38 @@ function pendingTurnHasSettledAssistant(
   );
 }
 
+function queuedTurnReceipt(
+  turn: AgentQueuedTurn,
+  events: readonly MessageStreamEvent[],
+): Extract<MessageStreamEvent, { type: "message.received" }> | undefined {
+  const received = events.findLast((event) => {
+    if (event.type !== "message.received") return false;
+    if (event.data.clientMessageId === turn.id) return true;
+    // Browser-delivered follow-ups do not carry a client id. Their admission
+    // is still unambiguous when the server event has the same text and was
+    // emitted after the browser queued the prompt. Do not use text alone: a
+    // repeated prompt from an earlier turn must never acknowledge this one.
+    if (event.data.clientMessageId || event.data.message.trim() !== turn.text.trim()) return false;
+    const eventAt = Date.parse(event.meta.at);
+    return Number.isFinite(eventAt) && eventAt >= turn.submittedAt - 5_000;
+  });
+  return received?.type === "message.received" ? received : undefined;
+}
+
+function hasDurableQueuedTurnMessage(
+  turn: AgentQueuedTurn,
+  messages: readonly EveMessage[],
+  events: readonly MessageStreamEvent[],
+): boolean {
+  const receipt = queuedTurnReceipt(turn, events);
+  if (!receipt) return false;
+  return messages.some((message) =>
+    message.role === "user" &&
+    messageBelongsToTurn(message, receipt.data.turnId) &&
+    message.parts.some((part) => part.type === "text" && part.text.trim() === turn.text.trim()),
+  );
+}
+
 export function projectStagedUserMessages(
   messages: readonly EveMessage[],
   turns: readonly AgentQueuedTurn[],
@@ -2555,9 +2653,7 @@ export function projectStagedUserMessages(
     // necessarily published. Keep the staged row visible through that one
     // frame; remove it only once the durable user row is present, otherwise a
     // successful follow-up briefly disappears from the transcript.
-    const receipt = events.findLast((event) =>
-      event.type === "message.received" && event.data.clientMessageId === turn.id,
-    );
+    const receipt = queuedTurnReceipt(turn, events);
     if (receipt?.type === "message.received" && projected.some((message) =>
       message.role === "user" &&
       messageBelongsToTurn(message, receipt.data.turnId) &&
