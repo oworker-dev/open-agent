@@ -1069,9 +1069,13 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                     const receipt = await mailbox.inspect(turn.mailboxItemId);
                     const state = mailboxQueueState(receipt.status);
                     if (state === "committed") {
-                        if (!mailboxMessageWasObserved(events, turn))
+                        if (!mailboxMessageWasObserved(events, turn)) {
                             committedCatchUpTurns.set(turn.id, turn);
-                        updates.set(turn.id, "remove");
+                            updates.set(turn.id, "committed");
+                        }
+                        else {
+                            updates.set(turn.id, "remove");
+                        }
                     }
                     else {
                         updates.set(turn.id, state === "cancelled" ? "remove" : state);

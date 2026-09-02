@@ -1334,8 +1334,16 @@ export function AgentWorkspace({
           const receipt = await mailbox.inspect(turn.mailboxItemId);
           const state = mailboxQueueState(receipt.status);
           if (state === "committed") {
-            if (!mailboxMessageWasObserved(events, turn)) committedCatchUpTurns.set(turn.id, turn);
-            updates.set(turn.id, "remove");
+            // A mailbox commit can win the race with the recovery stream.
+            // Keep the staged turn until its durable `message.received` event
+            // is present in `events`; removing it here would make a refreshed
+            // conversation briefly lose the user's message before catch-up.
+            if (!mailboxMessageWasObserved(events, turn)) {
+              committedCatchUpTurns.set(turn.id, turn);
+              updates.set(turn.id, "committed");
+            } else {
+              updates.set(turn.id, "remove");
+            }
           } else {
             updates.set(turn.id, state === "cancelled" ? "remove" : state);
           }
