@@ -594,7 +594,16 @@ export function AgentThreadView({
   const durableSnapshotAhead = durableEditBoundary && (
     !liveEditBoundary || thread.session.streamIndex > (agent.session?.streamIndex ?? -1)
   );
-  const useRecoverySnapshot = isRecovering || durableSnapshotAhead;
+  // Keep the mounted Eve reducer authoritative until the recovery worker has
+  // actually observed newer durable progress. `isRecovering` flips before
+  // the first catch-up event; switching snapshots in that gap makes the live
+  // transcript disappear briefly (most visible after a follow-up is queued).
+  // Once the worker advances the absolute cursor, its checkpoint is safe to
+  // merge/render even if the compact event count stayed unchanged because a
+  // cumulative delta was replaced in place.
+  const recoveryHasNewDurableProgress = thread.session.streamIndex > (agent.session?.streamIndex ?? -1) ||
+    recoveryRenderEvents.length > renderEvents.length;
+  const useRecoverySnapshot = durableSnapshotAhead || (isRecovering && recoveryHasNewDurableProgress);
   const recoveryMergedRenderEvents = useMemo(
     () => useRecoverySnapshot
       ? mergeThreadEventSnapshots(renderEvents, recoveryRenderEvents)
@@ -706,6 +715,14 @@ export function AgentThreadView({
   const durableTurnSettled = !pendingTurnInFlight &&
     hasSettledLatestTurn(authoritativeEvents) &&
     hasSettledSessionBoundary(authoritativeEvents);
+  // The Eve hook can briefly report `ready`/`idle` between provider frames,
+  // while its in-memory event list already contains a started turn that has
+  // not reached a terminal boundary. Treat that live turn as authoritative
+  // for composer/recovery decisions. Without this guard the mailbox effect
+  // starts a recovery handoff in the idle gap, replacing the live reducer with
+  // an older checkpoint; follow-up messages then disappear until the run
+  // settles and the next refresh catches them up.
+  const liveTurnOpen = hasOpenLatestTurn(agent.events);
   // A bounded Eve stream can close at its current durable tail while the
   // session is still executing. In that window `agent.status` may already be
   // idle even though the latest persisted turn has no terminal boundary. Keep
@@ -715,7 +732,7 @@ export function AgentThreadView({
     thread.status !== "ready" && thread.status !== "error" &&
     authoritativeEvents.some((event) => event.type === "turn.started");
   const cancellationSettling = cancellationRef.current.requested || thread.status === "cancelling";
-  const agentIsBusy = (runtimeIsBusy || durableTurnOpen) && !localInterruption && !cancellationSettling && !durableTurnSettled;
+  const agentIsBusy = (runtimeIsBusy || durableTurnOpen || liveTurnOpen) && !localInterruption && !cancellationSettling && !durableTurnSettled;
   const isBusy = pendingTurnInFlight || agentIsBusy ||
     (isRecovering && !localInterruption && !cancellationSettling && !durableTurnSettled);
 
@@ -745,7 +762,7 @@ export function AgentThreadView({
   }, [authoritativeEvents, effectiveRenderMessages, optimisticPendingTurn]);
 
   const admissionBusy = pendingTurnInFlight || (!durableTurnSettled &&
-    (runtimeIsBusy || isRecovering || cancellationSettling));
+    (runtimeIsBusy || durableTurnOpen || liveTurnOpen || isRecovering || cancellationSettling));
   const pendingInputRequests = unresolvedInputRequests(authoritativeEvents, closedInputRequestIdsRef.current);
   const approvalRequest = pendingInputRequests.find((request) => request.kind === "tool-approval");
   const approvalTakeover: AgentApprovalTakeover | undefined = approvalRequest
@@ -814,6 +831,11 @@ export function AgentThreadView({
 
   useEffect(() => {
     const lastEvent = agent.events.at(-1);
+    // A live turn can momentarily look idle while the provider is between
+    // frames. Never hand that stream to recovery just because the latest
+    // event is not a lifecycle boundary; the recovery worker may only attach
+    // after the durable turn has actually gone idle/disconnected.
+    if (liveTurnOpen) return;
     if (
       agent.session?.sessionId &&
       !isRecovering &&
@@ -832,11 +854,11 @@ export function AgentThreadView({
     ) {
       requestRecovery();
     }
-  }, [agent.events, agent.session?.sessionId, isBusy, isRecovering, requestRecovery, thread.pendingTurn?.state, thread.status]);
+  }, [agent.events, agent.session?.sessionId, isBusy, isRecovering, liveTurnOpen, requestRecovery, thread.pendingTurn?.state, thread.status]);
 
   useEffect(() => {
     const sessionId = agent.session?.sessionId;
-    if (isRecovering || !agentIsBusy || !sessionId || recoveryRequestedRef.current) return;
+    if (isRecovering || (!agentIsBusy && !liveTurnOpen) || !sessionId || recoveryRequestedRef.current) return;
     let disposed = false;
     let timer: number | undefined;
     const probe = async () => {
@@ -875,7 +897,7 @@ export function AgentThreadView({
       disposed = true;
       window.clearTimeout(timer);
     };
-  }, [agent.events.length, agent.session?.sessionId, agentIsBusy, connection.client, isRecovering, requestRecovery]);
+  }, [agent.events.length, agent.session?.sessionId, agentIsBusy, connection.client, isRecovering, liveTurnOpen, requestRecovery]);
 
   useEffect(() => {
     if (isRecovering) return;
@@ -1957,9 +1979,14 @@ export function AgentThreadView({
     // source of the transient message-list loss after follow-up admission.
     // Recovery remains enabled once the live stream has actually gone idle or
     // disconnected, where the normal stream/recovery guards take over.
-    if (runtimeIsBusy) return;
+    // `agent.status` can briefly be idle between provider frames even though
+    // the durable Eve turn is still open. Starting recovery in that window
+    // swaps the live reducer for an older thread checkpoint and makes the
+    // already-rendered transcript disappear. Keep the live turn authoritative
+    // until its durable lifecycle boundary has settled.
+    if (runtimeIsBusy || durableTurnOpen || liveTurnOpen) return;
     requestRecovery();
-  }, [admissionBusy, inputLocked, isRecovering, mailbox, requestRecovery, runtimeIsBusy, thread.queuedTurns]);
+  }, [admissionBusy, durableTurnOpen, inputLocked, isRecovering, liveTurnOpen, mailbox, requestRecovery, runtimeIsBusy, thread.queuedTurns]);
 
   useEffect(() => {
     if (
@@ -2985,6 +3012,25 @@ function hasSettledSessionBoundary(events: readonly MessageStreamEvent[]): boole
   // boundary. The boundary is still authoritative as long as it belongs to
   // the latest turn; only a newer turn invalidates it.
   return latestBoundaryIndex > latestTurnIndex;
+}
+
+/**
+ * Return true while the latest in-memory Eve turn has no terminal boundary.
+ * This intentionally ignores `agent.status`: the hook may publish an idle
+ * snapshot between provider frames even though the durable turn is still
+ * open. Recovery must never replace that live snapshot with an older
+ * checkpoint during the gap.
+ */
+function hasOpenLatestTurn(events: readonly MessageStreamEvent[]): boolean {
+  const started = events.findLast((event) => event.type === "turn.started");
+  if (!started || started.type !== "turn.started") return false;
+  const turnId = started.data.turnId;
+  const startedIndex = events.lastIndexOf(started);
+  return !events.slice(startedIndex + 1).some((event) =>
+    event.type === "session.failed" ||
+    (event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled") &&
+      event.data.turnId === turnId,
+  );
 }
 
 function latestTurnFailure(events: readonly MessageStreamEvent[]): string | undefined {

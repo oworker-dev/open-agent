@@ -358,7 +358,9 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     const durableEditBoundary = thread.events.some((event) => event.type === "context.cleared");
     const liveEditBoundary = agent.events.some((event) => event.type === "context.cleared");
     const durableSnapshotAhead = durableEditBoundary && (!liveEditBoundary || thread.session.streamIndex > (agent.session?.streamIndex ?? -1));
-    const useRecoverySnapshot = isRecovering || durableSnapshotAhead;
+    const recoveryHasNewDurableProgress = thread.session.streamIndex > (agent.session?.streamIndex ?? -1) ||
+        recoveryRenderEvents.length > renderEvents.length;
+    const useRecoverySnapshot = durableSnapshotAhead || (isRecovering && recoveryHasNewDurableProgress);
     const recoveryMergedRenderEvents = useMemo(() => useRecoverySnapshot
         ? mergeThreadEventSnapshots(renderEvents, recoveryRenderEvents)
         : renderEvents, [recoveryRenderEvents, renderEvents, useRecoverySnapshot]);
@@ -413,11 +415,12 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     const durableTurnSettled = !pendingTurnInFlight &&
         hasSettledLatestTurn(authoritativeEvents) &&
         hasSettledSessionBoundary(authoritativeEvents);
+    const liveTurnOpen = hasOpenLatestTurn(agent.events);
     const durableTurnOpen = !pendingTurnInFlight && !durableTurnSettled &&
         thread.status !== "ready" && thread.status !== "error" &&
         authoritativeEvents.some((event) => event.type === "turn.started");
     const cancellationSettling = cancellationRef.current.requested || thread.status === "cancelling";
-    const agentIsBusy = (runtimeIsBusy || durableTurnOpen) && !localInterruption && !cancellationSettling && !durableTurnSettled;
+    const agentIsBusy = (runtimeIsBusy || durableTurnOpen || liveTurnOpen) && !localInterruption && !cancellationSettling && !durableTurnSettled;
     const isBusy = pendingTurnInFlight || agentIsBusy ||
         (isRecovering && !localInterruption && !cancellationSettling && !durableTurnSettled);
     useEffect(() => {
@@ -437,7 +440,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         setOptimisticPendingTurn(undefined);
     }, [authoritativeEvents, effectiveRenderMessages, optimisticPendingTurn]);
     const admissionBusy = pendingTurnInFlight || (!durableTurnSettled &&
-        (runtimeIsBusy || isRecovering || cancellationSettling));
+        (runtimeIsBusy || durableTurnOpen || liveTurnOpen || isRecovering || cancellationSettling));
     const pendingInputRequests = unresolvedInputRequests(authoritativeEvents, closedInputRequestIdsRef.current);
     const approvalRequest = pendingInputRequests.find((request) => request.kind === "tool-approval");
     const approvalTakeover = approvalRequest
@@ -496,6 +499,8 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     }, [agent.events.length, agent.session?.sessionId, cancellationSettling, isRecovering, requestRecovery]);
     useEffect(() => {
         const lastEvent = agent.events.at(-1);
+        if (liveTurnOpen)
+            return;
         if (agent.session?.sessionId &&
             !isRecovering &&
             thread.status !== "ready" &&
@@ -508,10 +513,10 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             !isSessionBoundary(lastEvent)) {
             requestRecovery();
         }
-    }, [agent.events, agent.session?.sessionId, isBusy, isRecovering, requestRecovery, thread.pendingTurn?.state, thread.status]);
+    }, [agent.events, agent.session?.sessionId, isBusy, isRecovering, liveTurnOpen, requestRecovery, thread.pendingTurn?.state, thread.status]);
     useEffect(() => {
         const sessionId = agent.session?.sessionId;
-        if (isRecovering || !agentIsBusy || !sessionId || recoveryRequestedRef.current)
+        if (isRecovering || (!agentIsBusy && !liveTurnOpen) || !sessionId || recoveryRequestedRef.current)
             return;
         let disposed = false;
         let timer;
@@ -538,7 +543,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             disposed = true;
             window.clearTimeout(timer);
         };
-    }, [agent.events.length, agent.session?.sessionId, agentIsBusy, connection.client, isRecovering, requestRecovery]);
+    }, [agent.events.length, agent.session?.sessionId, agentIsBusy, connection.client, isRecovering, liveTurnOpen, requestRecovery]);
     useEffect(() => {
         if (isRecovering)
             return;
@@ -1386,10 +1391,10 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         const parkedDelivery = !admissionBusy && serverTurns.some((turn) => turn.state === "queued" || turn.state === "delivering" || turn.state === "accepted");
         if (!committedAdmission && !parkedDelivery)
             return;
-        if (runtimeIsBusy)
+        if (runtimeIsBusy || durableTurnOpen || liveTurnOpen)
             return;
         requestRecovery();
-    }, [admissionBusy, inputLocked, isRecovering, mailbox, requestRecovery, runtimeIsBusy, thread.queuedTurns]);
+    }, [admissionBusy, durableTurnOpen, inputLocked, isRecovering, liveTurnOpen, mailbox, requestRecovery, runtimeIsBusy, thread.queuedTurns]);
     useEffect(() => {
         if (admissionBusy || runtimeIsBusy || inputLocked || !providerReady ||
             dispatchingQueuedTurnIdRef.current ||
@@ -2055,6 +2060,16 @@ function hasSettledSessionBoundary(events) {
         event.type === "session.completed" ||
         event.type === "session.failed");
     return latestBoundaryIndex > latestTurnIndex;
+}
+function hasOpenLatestTurn(events) {
+    const started = events.findLast((event) => event.type === "turn.started");
+    if (!started || started.type !== "turn.started")
+        return false;
+    const turnId = started.data.turnId;
+    const startedIndex = events.lastIndexOf(started);
+    return !events.slice(startedIndex + 1).some((event) => event.type === "session.failed" ||
+        (event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled") &&
+            event.data.turnId === turnId);
 }
 function latestTurnFailure(events) {
     if (latestTurnOutcome(events) !== "failed")
