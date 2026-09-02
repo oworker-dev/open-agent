@@ -77,6 +77,28 @@ test("dispatcher does not hand a message to Eve while the addressed turn is runn
   assert.equal(runtime.deliveries.length, 0);
 });
 
+test("a normal FIFO follow-up waits for session.waiting and keeps send semantics", async () => {
+  const store = new MemoryMailboxStore();
+  await enqueueAgentMailboxMessage({
+    clientMessageId: "message-follow-up-1",
+    message: "Continue after the current turn.",
+    operationId: "operation-follow-up-1",
+    operationKind: "send",
+    owner,
+    sessionId: "session-1",
+    store,
+  });
+  const runtime = new FakeMailboxRuntime({ state: "running", turnId: "turn-active" });
+
+  assert.equal((await dispatchNextAgentMailboxMessage({ runtime, store })).status, "deferred");
+  assert.equal(runtime.deliveries.length, 0);
+
+  runtime.boundary = { state: "waiting" };
+  assert.equal((await dispatchNextAgentMailboxMessage({ runtime, store })).status, "accepted");
+  assert.equal(store.items[0]?.payload.operation?.kind, "send");
+  assert.equal(runtime.deliveries.length, 1);
+});
+
 test("dispatcher admits a steer for the exact active Eve turn", async () => {
   const store = new MemoryMailboxStore();
   await enqueueAgentMailboxMessage({
