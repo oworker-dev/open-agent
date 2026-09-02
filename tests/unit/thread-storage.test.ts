@@ -9,6 +9,7 @@ import {
   editOperationId,
   eventIdentity,
   latestEditableTurnId,
+  mergeThreadEventSnapshots,
   mergeThreadCollectionsForConflict,
   parseThreadCollection,
   projectPendingThreadEdit,
@@ -24,6 +25,37 @@ test("edit operation ids are stable for replay and scoped to the edit tuple", ()
   assert.notEqual(first, editOperationId("session-1", "turn-2", "Edited request"));
   assert.notEqual(first, editOperationId("session-2", "turn-1", "Edited request"));
   assert.match(first, /^edit-[0-9a-f]{16}$/u);
+});
+
+test("recovery snapshot merge never drops live events", () => {
+  const live = [
+    editEvent("turn.started", { sequence: 0, turnId: "turn-1" }),
+    editEvent("message.received", { message: "hello", sequence: 0, turnId: "turn-1" }),
+  ];
+  const recovery = [live[0]!];
+  const merged = mergeThreadEventSnapshots(live, recovery);
+  assert.deepEqual(merged.map(eventIdentity), live.map(eventIdentity));
+});
+
+test("recovery snapshot merge retains events unique to either snapshot", () => {
+  const live = [
+    editEvent("turn.started", { sequence: 0, turnId: "turn-merge-live" }),
+    editEvent("step.started", { sequence: 0, stepIndex: 0, turnId: "turn-merge-live" }),
+  ];
+  const recovery = [
+    live[0]!,
+    editEvent("message.received", {
+      message: "Continue",
+      sequence: 0,
+      turnId: "turn-merge-live",
+    }),
+  ];
+  const merged = mergeThreadEventSnapshots(live, recovery);
+  assert.deepEqual(merged.map(eventIdentity), [
+    eventIdentity(live[0]!),
+    eventIdentity(live[1]!),
+    eventIdentity(recovery[1]!),
+  ]);
 });
 
 function editEvent(type: string, data: Record<string, unknown>): MessageStreamEvent {

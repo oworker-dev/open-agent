@@ -15,7 +15,7 @@ import { sanitizeAgentError } from "./error-presentation.js";
 import { AgentMailboxHttpError } from "./http-agent-mailbox.js";
 import { messagesFor } from "./i18n.js";
 import { interruptedTurnContextFromEvents, interruptedTurnContextsFromEvents, } from "./retained-context.js";
-import { appendThreadEventIndexed, dedupeThreadEvents, editOperationId, eventIdentity, latestEditableTurnId, projectPendingThreadEdit, projectThreadEditBranches, reconcilePendingTurnWithEvents, titleFromPrompt } from "./thread-storage.js";
+import { appendThreadEventIndexed, dedupeThreadEvents, editOperationId, eventIdentity, latestEditableTurnId, mergeThreadEventSnapshots, projectPendingThreadEdit, projectThreadEditBranches, reconcilePendingTurnWithEvents, titleFromPrompt } from "./thread-storage.js";
 import { activeTurnIdAfterPendingSubmission, hasTerminalSessionBoundary, hasSettledLatestTurn, isRetryableAgentFailure, isProxiedInputOnlyMessage, normalizeSettledAgentMessages, projectAgentDisplayTimeline, shouldSuppressInterruptedTurnDisplayEvent, shouldSuppressInterruptedTurnStreamEvent, stableUserMessageId, unresolvedInputRequests, } from "./turn-presentation.js";
 import { summarizeUsage } from "./usage.js";
 const CANCELLATION_STREAM_REATTACH_AFTER_MS = 5_000;
@@ -355,12 +355,25 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     const renderEvents = liveRenderSnapshot.events;
     const renderMessages = liveRenderSnapshot.messages;
     const recoveryRenderEvents = useThrottledSnapshot(thread.events, 75);
-    const recoveryRenderMessages = useMemo(() => messagesFromEvents(recoveryRenderEvents), [recoveryRenderEvents]);
     const durableEditBoundary = thread.events.some((event) => event.type === "context.cleared");
     const liveEditBoundary = agent.events.some((event) => event.type === "context.cleared");
     const durableSnapshotAhead = durableEditBoundary && (!liveEditBoundary || thread.session.streamIndex > (agent.session?.streamIndex ?? -1));
-    const effectiveRenderEvents = isRecovering || durableSnapshotAhead ? recoveryRenderEvents : renderEvents;
-    const effectiveRenderMessages = isRecovering || durableSnapshotAhead ? recoveryRenderMessages : renderMessages;
+    const useRecoverySnapshot = isRecovering || durableSnapshotAhead;
+    const recoveryMergedRenderEvents = useMemo(() => useRecoverySnapshot
+        ? mergeThreadEventSnapshots(renderEvents, recoveryRenderEvents)
+        : renderEvents, [recoveryRenderEvents, renderEvents, useRecoverySnapshot]);
+    const recoveryRenderMessages = useMemo(() => messagesFromEvents(recoveryRenderEvents), [recoveryRenderEvents]);
+    const recoveryMergedRenderMessages = useMemo(() => recoveryMergedRenderEvents === renderEvents
+        ? renderMessages
+        : recoveryMergedRenderEvents === recoveryRenderEvents
+            ? recoveryRenderMessages
+            : messagesFromEvents(recoveryMergedRenderEvents), [recoveryMergedRenderEvents, recoveryRenderEvents, recoveryRenderMessages, renderEvents, renderMessages]);
+    const effectiveRenderEvents = useRecoverySnapshot
+        ? recoveryMergedRenderEvents
+        : renderEvents;
+    const effectiveRenderMessages = useRecoverySnapshot
+        ? recoveryMergedRenderMessages
+        : renderMessages;
     const pendingEditOperation = optimisticPendingTurn ?? optimisticDisplayTurn ?? thread.pendingTurn;
     const pendingEditTurnId = pendingEditOperation?.operation === "edit" &&
         isPendingTurnInFlight(pendingEditOperation)
@@ -1432,7 +1445,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     };
     const closeInputRequest = (requestId) => closeInputRequests([requestId]);
     const visibleQueuedTurns = thread.queuedTurns.filter((turn) => turn.intent !== "post-cancellation");
-    const showRecoveryStatus = isRecovering && displayPendingTurn?.operation !== "edit";
+    const showRecoveryStatus = isRecovering && !durableTurnOpen && !runtimeIsBusy && displayPendingTurn?.operation !== "edit";
     return (_jsx(AssistantRuntimeProvider, { runtime: assistantRuntime, children: _jsx("main", { className: "flex min-h-0 flex-1 flex-col overflow-hidden", children: _jsx(AssistantThreadSurface, { assetUrl: client?.assetUrl, approvalTakeover: approvalTakeover, cancellationState: cancellationState, commands: commands, composerTop: showRecoveryStatus || visibleQueuedTurns.length > 0 || queueError ? (_jsxs(_Fragment, { children: [showRecoveryStatus ? (_jsxs("div", { className: "flex items-center gap-2 border-b border-border/60 px-1 pb-2 text-xs text-muted-foreground", "data-agent-recovery-status": true, role: "status", children: [_jsx(LoaderCircleIcon, { className: "size-3.5 animate-spin" }), _jsx("span", { children: messages.reconnecting })] })) : null, visibleQueuedTurns.length > 0 || queueError ? (_jsx(FollowUpQueue, { error: queueError, messages: messages, onRemove: removeQueuedTurn, onRetry: markQueuedTurnForRetry, turns: visibleQueuedTurns })) : null] })) : undefined, draftStorageKey: draftStorageKey, historyHasMore: historyHasMore, historyLoading: historyLoading, events: displayEvents, eveMessages: visibleMessages, fallbackStartedAt: displayPendingTurn?.submittedAt, inputDisabled: inputLocked, isBusy: isBusy, sessionTerminal: sessionTerminal, sessionSettled: durableTurnSettled, onCancel: requestCancellation, locale: locale, mentions: mentions, messages: messages, models: models, onInputResponses: respond, onCloseInputRequest: closeInputRequest, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, onLoadEarlier: onLoadEarlier, onPreferencesChange: (preferences) => onChange({ preferences }), onDraftRestoreConsumed: (id) => {
                     if (thread.draftRestore?.id === id)
                         onChange({ draftRestore: undefined });
@@ -1700,11 +1713,20 @@ export function projectStagedUserMessages(messages, turns, events = []) {
             messageBelongsToTurn(message, receipt.data.turnId) &&
             message.parts.some((part) => part.type === "text" && part.text.trim() === turn.text.trim())))
             continue;
-        projected.push({
+        const stagedMessage = {
             id,
             parts: [{ text: turn.text, type: "text" }],
             role: "user",
-        });
+        };
+        const receiptTurnId = receipt?.type === "message.received" ? receipt.data.turnId : undefined;
+        const targetTurnId = turn.expectedTurnId ?? receiptTurnId;
+        const targetIndex = targetTurnId
+            ? projected.reduce((last, message, index) => messageBelongsToTurn(message, targetTurnId) ? index : last, -1)
+            : -1;
+        if (targetIndex >= 0)
+            projected.splice(targetIndex + 1, 0, stagedMessage);
+        else
+            projected.push(stagedMessage);
     }
     return projected;
 }

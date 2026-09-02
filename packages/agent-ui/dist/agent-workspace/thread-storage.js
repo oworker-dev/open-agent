@@ -403,6 +403,25 @@ export function appendThreadEventIndexed(events, eventIds, event) {
     events.push(event);
     return true;
 }
+export function mergeThreadEventSnapshots(left, right) {
+    if (left.length === 0)
+        return right;
+    if (right.length === 0)
+        return left;
+    const leftIds = new Set(left.map(eventIdentity));
+    const rightIds = new Set(right.map(eventIdentity));
+    if (left.length >= right.length && [...rightIds].every((id) => leftIds.has(id)))
+        return left;
+    if (right.length >= left.length && [...leftIds].every((id) => rightIds.has(id)))
+        return right;
+    const base = left.length >= right.length ? left : right;
+    const additions = base === left ? right : left;
+    const merged = [...base];
+    const ids = new Set(merged.map(eventIdentity));
+    for (const event of additions)
+        appendThreadEventIndexed(merged, ids, event);
+    return compactThreadEvents(merged);
+}
 const cumulativeIndexesByEvents = new WeakMap();
 function cumulativeIndexFor(events) {
     const existing = cumulativeIndexesByEvents.get(events);

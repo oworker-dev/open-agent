@@ -1401,6 +1401,62 @@ test("an unanchored HITL continuation stays in the owning execution", () => {
   assert.equal(projection.messages.find((message) => message.role === "assistant")?.metadata?.turnId, "turn-root");
 });
 
+test("HITL continuation snapshots keep an earlier approval response", () => {
+  const messages: EveMessage[] = [
+    {
+      id: "turn-root:assistant",
+      metadata: { status: "complete", turnId: "turn-root" },
+      parts: [approvalPart("request-tool", "call-tool")],
+      role: "assistant",
+    },
+    {
+      id: "turn-resume:assistant",
+      metadata: { status: "complete", turnId: "turn-resume" },
+      parts: [{
+        input: { command: "npm test" },
+        output: "passed",
+        state: "output-available",
+        stepIndex: 0,
+        toolCallId: "call-tool",
+        toolName: "bash",
+        type: "dynamic-tool",
+      }],
+      role: "assistant",
+    },
+  ];
+  const first = messages[0]!.parts[0];
+  if (first?.type !== "dynamic-tool") throw new Error("expected a dynamic tool part");
+  const withResponse = {
+    ...first,
+    toolMetadata: {
+      ...first.toolMetadata,
+      eve: {
+        ...first.toolMetadata?.eve,
+        kind: first.toolMetadata?.eve?.kind ?? "tool-call",
+        name: first.toolMetadata?.eve?.name ?? first.toolName,
+        inputResponse: { optionId: "approve", requestId: "request-tool" },
+      },
+    },
+  };
+  messages[0] = { ...messages[0]!, parts: [withResponse] };
+
+  const events = [
+    event("turn.started", startedAt, { sequence: 0, turnId: "turn-root" }),
+    event("message.received", startedAt, { message: "Run the command", sequence: 0, turnId: "turn-root" }),
+    event("step.started", startedAt, { sequence: 0, stepIndex: 0, turnId: "turn-root" }),
+    event("input.requested", endedAt, { requests: [], sequence: 0, stepIndex: 0, turnId: "turn-root" }),
+    event("turn.started", endedAt, { sequence: 1, turnId: "turn-resume" }),
+    event("step.started", endedAt, { sequence: 1, stepIndex: 0, turnId: "turn-resume" }),
+  ];
+  const projection = projectAgentDisplayTimeline(messages, events);
+  const merged = projection.messages.find((message) => message.role === "assistant");
+  assert.ok(merged);
+  const tool = merged.parts.find((part) => part.type === "dynamic-tool");
+  assert.equal(tool?.type, "dynamic-tool");
+  assert.equal(tool?.state, "output-available");
+  assert.equal(tool?.toolMetadata?.eve?.inputResponse?.optionId, "approve");
+});
+
 test("same-turn steering scopes tool process groups to their assistant segment", () => {
   const steeredAt = "2026-08-06T01:00:05.000Z";
   const deliveredAt = "2026-08-06T01:00:12.000Z";

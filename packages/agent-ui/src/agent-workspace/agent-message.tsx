@@ -231,7 +231,10 @@ export function AgentMessage({
               ))}
               fallbackStartedAt={fallbackStartedAt}
               locale={locale}
-              showTrigger={Boolean(task)}
+              // Same-turn steering is rendered as a continuation of the
+              // existing execution. Keep its process content mounted, but do
+              // not add a second collapsible header/timer for the same turn.
+              showTrigger={Boolean(task) && !isTurnContinuation}
               task={executionTask}
             >
               <div className={isTurnContinuation ? "space-y-2" : undefined}>
@@ -1692,11 +1695,25 @@ function toolFileChange(
   if (newContent === undefined) return undefined;
   const path = firstString(output, ["path", "filePath", "file", "filename"])
     ?? firstString(input, ["path", "filePath", "file", "filename"]);
+  const partialPath = partialPathFromText(part.inputText);
+  const resolvedPath = path ?? partialPath;
   const oldContent = firstString(output, ["oldContent", "old_content", "old_string", "before"])
     ?? firstString(input, ["oldContent", "old_content", "old_string", "before"])
-    ?? previousFileContent(events, path, part.toolCallId)
+    ?? previousFileContent(events, resolvedPath, part.toolCallId)
     ?? "";
-  return { newContent, oldContent, ...(path ? { path } : {}) };
+  return { newContent, oldContent, ...(resolvedPath ? { path: resolvedPath } : {}) };
+}
+
+/** Recover a path from an incomplete JSON tool argument stream. */
+function partialPathFromText(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const match = value.match(/"(?:path|filePath|file|filename)"\s*:\s*"((?:\\.|[^"\\])*)/u);
+  if (!match?.[1]) return undefined;
+  try {
+    return JSON.parse(`"${match[1]}"`);
+  } catch {
+    return match[1];
+  }
 }
 
 function previousFileContent(

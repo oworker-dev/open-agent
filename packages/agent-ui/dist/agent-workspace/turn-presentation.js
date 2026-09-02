@@ -1230,7 +1230,7 @@ function mergeAssistantMessages(left, right) {
         if (part.type === "dynamic-tool") {
             const existing = parts.findIndex((candidate) => candidate.type === "dynamic-tool" && candidate.toolCallId === part.toolCallId);
             if (existing >= 0) {
-                parts[existing] = part;
+                parts[existing] = mergeDynamicToolParts(parts[existing], part);
                 continue;
             }
         }
@@ -1250,6 +1250,43 @@ function mergeAssistantMessages(left, right) {
             status: right.metadata?.status ?? left.metadata?.status,
         },
         parts,
+    };
+}
+function mergeDynamicToolParts(left, right) {
+    const rank = (part) => {
+        switch (part.state) {
+            case "input-streaming": return 0;
+            case "input-available": return 1;
+            case "approval-requested": return 2;
+            case "approval-responded": return 3;
+            case "output-error":
+            case "output-denied": return 4;
+            case "output-available": return part.partial === true ? 3 : 5;
+        }
+    };
+    const selected = rank(right) >= rank(left) ? right : left;
+    const eveLeft = left.toolMetadata?.eve;
+    const eveRight = right.toolMetadata?.eve;
+    const inputResponse = eveRight?.inputResponse ?? eveLeft?.inputResponse;
+    const inputRequest = eveRight?.inputRequest ?? eveLeft?.inputRequest;
+    const toolMetadata = eveLeft || eveRight
+        ? {
+            ...(left.toolMetadata ?? {}),
+            ...(right.toolMetadata ?? {}),
+            eve: {
+                ...(eveLeft ?? {}),
+                ...(eveRight ?? {}),
+                ...(inputRequest ? { inputRequest } : {}),
+                ...(inputResponse ? { inputResponse } : {}),
+            },
+        }
+        : undefined;
+    return {
+        ...selected,
+        ...(left.input !== undefined && right.input === undefined ? { input: left.input } : {}),
+        ...(left.inputText !== undefined && right.inputText === undefined ? { inputText: left.inputText } : {}),
+        ...(left.approval && !right.approval ? { approval: left.approval } : {}),
+        ...(toolMetadata ? { toolMetadata } : {}),
     };
 }
 function modelOutputBoundaryTime(events) {

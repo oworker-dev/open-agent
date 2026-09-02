@@ -21,7 +21,7 @@ import {
   interruptedTurnContextFromEvents,
   interruptedTurnContextsFromEvents,
 } from "./retained-context.js";
-import { appendThreadEvent, appendThreadEventIndexed, dedupeThreadEvents, editOperationId, eventIdentity, latestEditableTurnId, projectPendingThreadEdit, projectThreadEditBranches, reconcilePendingTurnWithEvents, titleFromPrompt } from "./thread-storage.js";
+import { appendThreadEvent, appendThreadEventIndexed, dedupeThreadEvents, editOperationId, eventIdentity, latestEditableTurnId, mergeThreadEventSnapshots, projectPendingThreadEdit, projectThreadEditBranches, reconcilePendingTurnWithEvents, titleFromPrompt } from "./thread-storage.js";
 import {
   activeTurnIdAfterPendingSubmission,
   hasTerminalSessionBoundary,
@@ -581,14 +581,10 @@ export function AgentThreadView({
   const renderEvents = liveRenderSnapshot.events;
   const renderMessages = liveRenderSnapshot.messages;
   // Recovery is owned by the workspace so it can reconnect from Eve's durable
-  // cursor. Feed that same snapshot into the visible thread while recovery is
-  // active; otherwise useEveAgent's initialEvents store would stay frozen until
-  // the recovery remount completed and the UI would appear stuck.
+  // cursor. Keep the live snapshot visible while the worker catches up. The
+  // worker may still be writing a shorter checkpoint during that handoff; using
+  // it as the render source would make already-visible messages disappear.
   const recoveryRenderEvents = useThrottledSnapshot(thread.events, 75);
-  const recoveryRenderMessages = useMemo(
-    () => messagesFromEvents(recoveryRenderEvents),
-    [recoveryRenderEvents],
-  );
   // A durable edit recovery may update the parent thread without remounting
   // this view. Prefer that authoritative snapshot until the live Eve reducer
   // has consumed the same clear boundary, preventing a stale branch from
@@ -598,8 +594,31 @@ export function AgentThreadView({
   const durableSnapshotAhead = durableEditBoundary && (
     !liveEditBoundary || thread.session.streamIndex > (agent.session?.streamIndex ?? -1)
   );
-  const effectiveRenderEvents = isRecovering || durableSnapshotAhead ? recoveryRenderEvents : renderEvents;
-  const effectiveRenderMessages = isRecovering || durableSnapshotAhead ? recoveryRenderMessages : renderMessages;
+  const useRecoverySnapshot = isRecovering || durableSnapshotAhead;
+  const recoveryMergedRenderEvents = useMemo(
+    () => useRecoverySnapshot
+      ? mergeThreadEventSnapshots(renderEvents, recoveryRenderEvents)
+      : renderEvents,
+    [recoveryRenderEvents, renderEvents, useRecoverySnapshot],
+  );
+  const recoveryRenderMessages = useMemo(
+    () => messagesFromEvents(recoveryRenderEvents),
+    [recoveryRenderEvents],
+  );
+  const recoveryMergedRenderMessages = useMemo(
+    () => recoveryMergedRenderEvents === renderEvents
+      ? renderMessages
+      : recoveryMergedRenderEvents === recoveryRenderEvents
+        ? recoveryRenderMessages
+        : messagesFromEvents(recoveryMergedRenderEvents),
+    [recoveryMergedRenderEvents, recoveryRenderEvents, recoveryRenderMessages, renderEvents, renderMessages],
+  );
+  const effectiveRenderEvents = useRecoverySnapshot
+    ? recoveryMergedRenderEvents
+    : renderEvents;
+  const effectiveRenderMessages = useRecoverySnapshot
+    ? recoveryMergedRenderMessages
+    : renderMessages;
   // Keep an accepted edit's superseded branch hidden until the replacement
   // assistant settles. `optimisticPendingTurn` is cleared at Eve's
   // message.received acknowledgement to release admission state, while the
@@ -1999,7 +2018,11 @@ export function AgentThreadView({
   // server commits the rewind. That is normal turn execution, not a transport
   // outage; exposing the internal recovery wording makes every edit look
   // broken even while the replacement turn is progressing normally.
-  const showRecoveryStatus = isRecovering && displayPendingTurn?.operation !== "edit";
+  // A recovery worker is also the live stream for an active turn. Showing a
+  // reconnect banner while durable events are still arriving makes a healthy
+  // diff/tool stream look stalled. Reserve the banner for a genuine handoff
+  // with no open turn to render.
+  const showRecoveryStatus = isRecovering && !durableTurnOpen && !runtimeIsBusy && displayPendingTurn?.operation !== "edit";
 
   return (
     <AssistantRuntimeProvider runtime={assistantRuntime}>
@@ -2501,11 +2524,25 @@ export function projectStagedUserMessages(
       messageBelongsToTurn(message, receipt.data.turnId) &&
       message.parts.some((part) => part.type === "text" && part.text.trim() === turn.text.trim()),
     )) continue;
-    projected.push({
+    const stagedMessage: EveMessage = {
       id,
       parts: [{ text: turn.text, type: "text" }],
       role: "user",
-    });
+    };
+    // Steering belongs after the currently visible segment of its active Eve
+    // turn. Appending it to the transcript tail makes the temporary row look
+    // like a new conversation turn and lets later assistant snapshots appear
+    // before it. Only use an explicit turn anchor (or the receipt's anchor);
+    // an unanchored queued message is a normal next turn and stays at the end.
+    const receiptTurnId = receipt?.type === "message.received" ? receipt.data.turnId : undefined;
+    const targetTurnId = turn.expectedTurnId ?? receiptTurnId;
+    const targetIndex = targetTurnId
+      ? projected.reduce((last, message, index) =>
+          messageBelongsToTurn(message, targetTurnId) ? index : last,
+        -1)
+      : -1;
+    if (targetIndex >= 0) projected.splice(targetIndex + 1, 0, stagedMessage);
+    else projected.push(stagedMessage);
   }
   return projected;
 }

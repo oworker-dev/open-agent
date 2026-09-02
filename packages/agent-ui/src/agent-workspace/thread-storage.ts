@@ -507,6 +507,31 @@ export function appendThreadEventIndexed(
   return true;
 }
 
+/**
+ * Merge two render snapshots without allowing a reconnect snapshot to erase
+ * events that the live reducer has already observed. The longer snapshot is
+ * normally the authoritative one; events unique to the shorter snapshot are
+ * retained as a defensive measure for concurrent catch-up.
+ */
+export function mergeThreadEventSnapshots(
+  left: readonly MessageStreamEvent[],
+  right: readonly MessageStreamEvent[],
+): readonly MessageStreamEvent[] {
+  if (left.length === 0) return right;
+  if (right.length === 0) return left;
+  const leftIds = new Set(left.map(eventIdentity));
+  const rightIds = new Set(right.map(eventIdentity));
+  if (left.length >= right.length && [...rightIds].every((id) => leftIds.has(id))) return left;
+  if (right.length >= left.length && [...leftIds].every((id) => rightIds.has(id))) return right;
+
+  const base = left.length >= right.length ? left : right;
+  const additions = base === left ? right : left;
+  const merged = [...base];
+  const ids = new Set(merged.map(eventIdentity));
+  for (const event of additions) appendThreadEventIndexed(merged, ids, event);
+  return compactThreadEvents(merged);
+}
+
 // A live Eve stream can contain thousands of cumulative text/tool snapshots.
 // Keep the latest snapshot index beside the mutable event array so each
 // append is amortized O(1) instead of scanning the entire transcript. WeakMap
