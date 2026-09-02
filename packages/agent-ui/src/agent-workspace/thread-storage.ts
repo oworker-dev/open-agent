@@ -518,9 +518,15 @@ export function mergeThreadEventSnapshots(
   const leftIds = new Set(left.map(eventIdentity));
   const rightIds = new Set(right.map(eventIdentity));
   // The common reconnect case is a strict prefix/duplicate snapshot. Keep the
-  // already ordered side without sorting the entire transcript.
-  if ([...rightIds].every((id) => leftIds.has(id))) return left;
-  if ([...leftIds].every((id) => rightIds.has(id))) return right;
+  // already ordered side without sorting the entire transcript. If both
+  // snapshots contain the same identities in a different order, however,
+  // neither side is safe to return as-is: that is exactly the live/recovery
+  // interleave which can move a tool or reasoning block ahead of its user
+  // message. Let the canonical ordering pass below resolve that case.
+  const rightSubsetOfLeft = [...rightIds].every((id) => leftIds.has(id));
+  const leftSubsetOfRight = [...leftIds].every((id) => rightIds.has(id));
+  if (rightSubsetOfLeft && (right.length < left.length || sameEventIdentityOrder(left, right))) return left;
+  if (leftSubsetOfRight && (left.length < right.length || sameEventIdentityOrder(left, right))) return right;
   const seen = new Set<string>();
   const candidates: Array<{ event: MessageStreamEvent; position: number }> = [];
   let position = 0;
@@ -537,6 +543,15 @@ export function mergeThreadEventSnapshots(
   }
   candidates.sort((a, b) => compareEventOrder(a.event, b.event) || a.position - b.position);
   return compactThreadEvents(candidates.map((candidate) => candidate.event));
+}
+
+function sameEventIdentityOrder(
+  left: readonly MessageStreamEvent[],
+  right: readonly MessageStreamEvent[],
+): boolean {
+  return left.length === right.length && left.every((event, index) =>
+    eventIdentity(event) === eventIdentity(right[index]!),
+  );
 }
 
 /**

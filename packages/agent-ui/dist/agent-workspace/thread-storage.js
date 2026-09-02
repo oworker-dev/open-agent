@@ -394,9 +394,11 @@ export function mergeThreadEventSnapshots(left, right) {
         return left;
     const leftIds = new Set(left.map(eventIdentity));
     const rightIds = new Set(right.map(eventIdentity));
-    if ([...rightIds].every((id) => leftIds.has(id)))
+    const rightSubsetOfLeft = [...rightIds].every((id) => leftIds.has(id));
+    const leftSubsetOfRight = [...leftIds].every((id) => rightIds.has(id));
+    if (rightSubsetOfLeft && (right.length < left.length || sameEventIdentityOrder(left, right)))
         return left;
-    if ([...leftIds].every((id) => rightIds.has(id)))
+    if (leftSubsetOfRight && (left.length < right.length || sameEventIdentityOrder(left, right)))
         return right;
     const seen = new Set();
     const candidates = [];
@@ -411,6 +413,9 @@ export function mergeThreadEventSnapshots(left, right) {
     }
     candidates.sort((a, b) => compareEventOrder(a.event, b.event) || a.position - b.position);
     return compactThreadEvents(candidates.map((candidate) => candidate.event));
+}
+function sameEventIdentityOrder(left, right) {
+    return left.length === right.length && left.every((event, index) => eventIdentity(event) === eventIdentity(right[index]));
 }
 function compareEventOrder(left, right) {
     const leftCursor = eventCursors.get(left);
