@@ -159,6 +159,39 @@ test("retries transient GET failures without replaying writes", async () => {
   assert.equal(calls, 2);
 });
 
+test("retries a transcript window GET when a successful body is truncated", async () => {
+  let calls = 0;
+  const thread = createAgentThread(100, "Truncated window");
+  const storage = createHttpAgentThreadStorage({
+    fetch: (async () => {
+      calls += 1;
+      if (calls === 1) {
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('{"collection":'));
+            controller.error(new TypeError("terminated"));
+          },
+        });
+        return new Response(body, {
+          headers: { "content-type": "application/json" },
+          status: 200,
+        });
+      }
+      return Response.json({
+        eventWindow: { endIndex: 1, hasMoreBefore: false, startIndex: 0, total: 1 },
+        revision: 3,
+        thread,
+      }, { headers: { etag: '"3"' } });
+    }) as typeof fetch,
+    readRetryLimit: 1,
+  });
+
+  const loaded = await storage.loadThreadWindow?.("truncated-read", thread.id);
+  assert.equal(loaded?.thread.id, thread.id);
+  assert.equal(loaded?.window.endIndex, 1);
+  assert.equal(calls, 2);
+});
+
 test("uses a cached collection after a matching 304 response", async () => {
   let calls = 0;
   let conditional: string | null = null;

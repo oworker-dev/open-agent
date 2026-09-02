@@ -32,14 +32,14 @@ export function createHttpAgentThreadStorage(options) {
     return {
         async load(storageKey) {
             const knownRevision = revisions.get(storageKey);
-            const response = await request(fetchImplementation, options, collectionUrl(endpoint, storageKey, {
+            const { response, body } = await request(fetchImplementation, options, collectionUrl(endpoint, storageKey, {
                 ...(preferredThreadId ? { threadId: preferredThreadId } : {}),
                 view: "index",
             }), {
                 ...(knownRevision === undefined ? {} : { headers: { "if-none-match": `"${knownRevision}"` } }),
                 requestTimeoutMs,
                 readRetryLimit,
-            });
+            }, readCollectionResponse);
             if (response.status === 304) {
                 const cached = baselines.get(storageKey);
                 if (cached && knownRevision !== undefined)
@@ -47,16 +47,18 @@ export function createHttpAgentThreadStorage(options) {
                 throw new AgentThreadStorageHttpError(304, "The Agent thread index cache is unavailable.");
             }
             await requireOk(response);
-            const body = await readCollectionResponse(response);
+            if (!body)
+                throw new Error("Agent thread storage returned an empty collection response.");
             revisions.set(storageKey, body.revision);
             baselines.set(storageKey, body.collection);
             return body.collection;
         },
         async loadThread(storageKey, threadId) {
             preferredThreadId = threadId;
-            const response = await request(fetchImplementation, options, collectionUrl(endpoint, storageKey, { threadId }), { requestTimeoutMs, readRetryLimit });
+            const { response, body } = await request(fetchImplementation, options, collectionUrl(endpoint, storageKey, { threadId }), { requestTimeoutMs, readRetryLimit }, readThreadResponse);
             await requireOk(response);
-            const body = await response.json();
+            if (!body)
+                throw new Error("Agent thread storage returned an empty thread response.");
             if (!Number.isSafeInteger(body.revision) || body.revision < 0) {
                 throw new Error("Agent thread storage returned an invalid revision.");
             }
@@ -88,9 +90,10 @@ export function createHttpAgentThreadStorage(options) {
                 query.eventBefore = String(windowOptions.before);
             if (windowOptions.limit !== undefined)
                 query.eventLimit = String(windowOptions.limit);
-            const response = await request(fetchImplementation, options, collectionUrl(endpoint, storageKey, query), { requestTimeoutMs, readRetryLimit });
+            const { response, body } = await request(fetchImplementation, options, collectionUrl(endpoint, storageKey, query), { requestTimeoutMs, readRetryLimit }, readThreadWindowResponse);
             await requireOk(response);
-            const body = await response.json();
+            if (!body)
+                throw new Error("Agent thread storage returned an empty transcript response.");
             if (!Number.isSafeInteger(body.revision) || body.revision < 0) {
                 throw new Error("Agent thread storage returned an invalid revision.");
             }
@@ -123,16 +126,17 @@ export function createHttpAgentThreadStorage(options) {
         },
         async repairThread(storageKey, threadId) {
             preferredThreadId = threadId;
-            const response = await request(fetchImplementation, options, repairCollectionUrl(endpoint, storageKey, { threadId }), {
+            const { response, body } = await request(fetchImplementation, options, repairCollectionUrl(endpoint, storageKey, { threadId }), {
                 headers: { "content-type": "application/json" },
                 method: "POST",
                 requestTimeoutMs,
                 readRetryLimit: 0,
-            });
+            }, readThreadResponse);
             if (response.status === 404)
                 return undefined;
             await requireOk(response);
-            const body = await response.json();
+            if (!body)
+                throw new Error("Agent thread storage returned an empty repair response.");
             if (!Number.isSafeInteger(body.revision) || body.revision < 0) {
                 throw new Error("Agent thread storage returned an invalid revision.");
             }
@@ -166,7 +170,7 @@ export function createHttpAgentThreadStorage(options) {
             }
             const savedCollection = snapshotCollection(collection);
             const patch = createCollectionPatch(baseline, savedCollection);
-            const response = await request(fetchImplementation, options, collectionUrl(endpoint, storageKey), {
+            const { response } = await request(fetchImplementation, options, collectionUrl(endpoint, storageKey), {
                 body: JSON.stringify(patch),
                 headers: {
                     "content-type": "application/json",
@@ -311,7 +315,7 @@ function appendOnlyEventDelta(previous, next) {
 function sameEventIds(left, right) {
     return left.length === right.length && left.every((event, index) => right[index] !== undefined && eventIdentity(event) === eventIdentity(right[index]));
 }
-async function request(fetchImplementation, options, url, init) {
+async function request(fetchImplementation, options, url, init, read) {
     const method = (init?.method ?? "GET").toUpperCase();
     const retryLimit = method === "GET"
         ? init?.readRetryLimit ?? options.readRetryLimit ?? DEFAULT_READ_RETRY_LIMIT
@@ -336,8 +340,21 @@ async function request(fetchImplementation, options, url, init) {
                 },
                 signal: controller.signal,
             });
-            if (attempt >= retryLimit || !isRetryableReadStatus(response.status))
-                return response;
+            if (attempt >= retryLimit || !isRetryableReadStatus(response.status)) {
+                if (read && response.ok) {
+                    try {
+                        return { body: await read(response), response };
+                    }
+                    catch (error) {
+                        if (attempt >= retryLimit || !isRetryableReadError(error))
+                            throw error;
+                        attempt += 1;
+                        await sleepWithRetryAfter(undefined, attempt);
+                        continue;
+                    }
+                }
+                return { response };
+            }
             await response.body?.cancel().catch(() => undefined);
             attempt += 1;
             await sleepWithRetryAfter(response.headers.get("retry-after"), attempt);
@@ -382,7 +399,8 @@ function isRetryableReadStatus(status) {
 function isRetryableReadError(error) {
     if (!(error instanceof Error))
         return false;
-    return error instanceof TypeError || error.name === "AbortError" || error.name === "TimeoutError";
+    return error instanceof TypeError || error instanceof SyntaxError ||
+        error.name === "AbortError" || error.name === "TimeoutError";
 }
 async function sleepWithRetryAfter(header, attempt) {
     const retryAfterSeconds = header ? Number(header) : NaN;
@@ -412,6 +430,12 @@ async function readRevisionResponse(response) {
         throw new Error("Agent thread storage returned an invalid revision.");
     }
     return body.revision;
+}
+async function readThreadResponse(response) {
+    return await response.json();
+}
+async function readThreadWindowResponse(response) {
+    return await response.json();
 }
 async function readCollectionResponse(response) {
     const body = await response.json();

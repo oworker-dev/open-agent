@@ -72,7 +72,7 @@ export function createHttpAgentThreadStorage(
   return {
     async load(storageKey) {
       const knownRevision = revisions.get(storageKey);
-      const response = await request(
+      const { response, body } = await request(
         fetchImplementation,
         options,
         collectionUrl(endpoint, storageKey, {
@@ -84,6 +84,7 @@ export function createHttpAgentThreadStorage(
           requestTimeoutMs,
           readRetryLimit,
         },
+        readCollectionResponse,
       );
       if (response.status === 304) {
         const cached = baselines.get(storageKey);
@@ -91,21 +92,22 @@ export function createHttpAgentThreadStorage(
         throw new AgentThreadStorageHttpError(304, "The Agent thread index cache is unavailable.");
       }
       await requireOk(response);
-      const body = await readCollectionResponse(response);
+      if (!body) throw new Error("Agent thread storage returned an empty collection response.");
       revisions.set(storageKey, body.revision);
       baselines.set(storageKey, body.collection);
       return body.collection;
     },
     async loadThread(storageKey, threadId) {
       preferredThreadId = threadId;
-      const response = await request(
+      const { response, body } = await request(
         fetchImplementation,
         options,
         collectionUrl(endpoint, storageKey, { threadId }),
         { requestTimeoutMs, readRetryLimit },
+        readThreadResponse,
       );
       await requireOk(response);
-      const body = await response.json() as { revision?: unknown; thread?: unknown };
+      if (!body) throw new Error("Agent thread storage returned an empty thread response.");
       if (!Number.isSafeInteger(body.revision) || (body.revision as number) < 0) {
         throw new Error("Agent thread storage returned an invalid revision.");
       }
@@ -137,18 +139,15 @@ export function createHttpAgentThreadStorage(
       const query: Record<string, string> = { eventWindow: "1", threadId };
       if (windowOptions.before !== undefined) query.eventBefore = String(windowOptions.before);
       if (windowOptions.limit !== undefined) query.eventLimit = String(windowOptions.limit);
-      const response = await request(
+      const { response, body } = await request(
         fetchImplementation,
         options,
         collectionUrl(endpoint, storageKey, query),
         { requestTimeoutMs, readRetryLimit },
+        readThreadWindowResponse,
       );
       await requireOk(response);
-      const body = await response.json() as {
-        eventWindow?: unknown;
-        revision?: unknown;
-        thread?: unknown;
-      };
+      if (!body) throw new Error("Agent thread storage returned an empty transcript response.");
       if (!Number.isSafeInteger(body.revision) || (body.revision as number) < 0) {
         throw new Error("Agent thread storage returned an invalid revision.");
       }
@@ -183,7 +182,7 @@ export function createHttpAgentThreadStorage(
     },
     async repairThread(storageKey, threadId) {
       preferredThreadId = threadId;
-      const response = await request(
+      const { response, body } = await request(
         fetchImplementation,
         options,
         repairCollectionUrl(endpoint, storageKey, { threadId }),
@@ -193,10 +192,11 @@ export function createHttpAgentThreadStorage(
           requestTimeoutMs,
           readRetryLimit: 0,
         },
+        readThreadResponse,
       );
       if (response.status === 404) return undefined;
       await requireOk(response);
-      const body = await response.json() as { revision?: unknown; thread?: unknown };
+      if (!body) throw new Error("Agent thread storage returned an empty repair response.");
       if (!Number.isSafeInteger(body.revision) || (body.revision as number) < 0) {
         throw new Error("Agent thread storage returned an invalid revision.");
       }
@@ -233,7 +233,7 @@ export function createHttpAgentThreadStorage(
       // request body that was already sent.
       const savedCollection = snapshotCollection(collection);
       const patch = createCollectionPatch(baseline, savedCollection);
-      const response = await request(
+      const { response } = await request(
         fetchImplementation,
         options,
         collectionUrl(endpoint, storageKey),
@@ -450,7 +450,7 @@ function sameEventIds(
   );
 }
 
-async function request(
+async function request<T = never>(
   fetchImplementation: typeof globalThis.fetch,
   options: HttpAgentThreadStorageOptions,
   url: string,
@@ -458,7 +458,8 @@ async function request(
     readonly readRetryLimit?: number;
     readonly requestTimeoutMs?: number;
   },
-): Promise<Response> {
+  read?: (response: Response) => Promise<T>,
+): Promise<{ readonly body?: T; readonly response: Response }> {
   const method = (init?.method ?? "GET").toUpperCase();
   const retryLimit = method === "GET"
     ? init?.readRetryLimit ?? options.readRetryLimit ?? DEFAULT_READ_RETRY_LIMIT
@@ -483,7 +484,19 @@ async function request(
         },
         signal: controller.signal,
       });
-      if (attempt >= retryLimit || !isRetryableReadStatus(response.status)) return response;
+      if (attempt >= retryLimit || !isRetryableReadStatus(response.status)) {
+        if (read && response.ok) {
+          try {
+            return { body: await read(response), response };
+          } catch (error) {
+            if (attempt >= retryLimit || !isRetryableReadError(error)) throw error;
+            attempt += 1;
+            await sleepWithRetryAfter(undefined, attempt);
+            continue;
+          }
+        }
+        return { response };
+      }
       await response.body?.cancel().catch(() => undefined);
       attempt += 1;
       await sleepWithRetryAfter(response.headers.get("retry-after"), attempt);
@@ -528,7 +541,10 @@ function isRetryableReadStatus(status: number): boolean {
 
 function isRetryableReadError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
-  return error instanceof TypeError || error.name === "AbortError" || error.name === "TimeoutError";
+  // A truncated chunked body can surface as TypeError in fetch implementations
+  // or SyntaxError when response.json() sees an incomplete JSON document.
+  return error instanceof TypeError || error instanceof SyntaxError ||
+    error.name === "AbortError" || error.name === "TimeoutError";
 }
 
 async function sleepWithRetryAfter(header: string | null | undefined, attempt: number): Promise<void> {
@@ -559,6 +575,17 @@ async function readRevisionResponse(response: Response): Promise<number> {
     throw new Error("Agent thread storage returned an invalid revision.");
   }
   return body.revision as number;
+}
+
+type ThreadResponse = { revision?: unknown; thread?: unknown };
+type ThreadWindowResponse = { eventWindow?: unknown; revision?: unknown; thread?: unknown };
+
+async function readThreadResponse(response: Response): Promise<ThreadResponse> {
+  return await response.json() as ThreadResponse;
+}
+
+async function readThreadWindowResponse(response: Response): Promise<ThreadWindowResponse> {
+  return await response.json() as ThreadWindowResponse;
 }
 
 async function readCollectionResponse(response: Response): Promise<{
