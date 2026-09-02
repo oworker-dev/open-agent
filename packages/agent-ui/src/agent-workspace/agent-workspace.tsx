@@ -31,6 +31,8 @@ import {
   createAgentThread,
   eventIdentity,
   mergeThreadCollectionsForConflict,
+  mergeThreadEventSnapshots,
+  rememberThreadEventCursor,
   reconcileHydratedPendingTurn,
   reconcilePendingTurnWithEvents,
   type AgentThreadCollection,
@@ -341,13 +343,49 @@ export function AgentWorkspace({
       setEphemeralThreadIds((current) => withoutSetValue(current, threadId));
     }
     setThreads((current) => {
-      const next = current.map((thread) => thread.id === threadId
-        ? {
-            ...thread,
-            ...patch,
-            updatedAt: patch.updatedAt ?? Math.max(Date.now(), thread.updatedAt + 1),
+      const next = current.map((thread) => {
+        if (thread.id !== threadId) return thread;
+        const incomingCursor = patch.session?.streamIndex;
+        const currentCursor = thread.session.streamIndex;
+        const explicitTranscriptReplacement = patch.pendingTurn?.state === "clearing" ||
+          patch.pendingTurn?.state === "resubmitting";
+        // Recovery workers are intentionally replaceable. An older worker can
+        // finish after a newer live stream and publish a lower cursor; that
+        // snapshot is stale and must never roll the transcript or queue back.
+        if (incomingCursor !== undefined && incomingCursor < currentCursor && !explicitTranscriptReplacement) return thread;
+
+        let effectivePatch = patch;
+        if (patch.events && thread.events.length > 0) {
+          // At an equal cursor the two snapshots describe the same durable
+          // prefix, while at a higher cursor the incoming snapshot may be a
+          // bounded catch-up window. Merge both so a shorter recovery view can
+          // never erase events already rendered by the live reducer.
+          const incomingIds = new Set(patch.events.map(eventIdentity));
+          const needsMerge = !explicitTranscriptReplacement && (incomingCursor === undefined ||
+            incomingCursor >= currentCursor && (
+              patch.events.length < thread.events.length ||
+              thread.events.some((event) => !incomingIds.has(eventIdentity(event)))
+            ));
+          if (needsMerge) {
+            effectivePatch = {
+              ...patch,
+              events: mergeThreadEventSnapshots(thread.events, patch.events),
+            };
           }
-        : thread);
+        }
+        return {
+          ...thread,
+          ...effectivePatch,
+          session: effectivePatch.session
+            ? {
+                ...thread.session,
+                ...effectivePatch.session,
+                streamIndex: Math.max(thread.session.streamIndex, effectivePatch.session.streamIndex),
+              }
+            : thread.session,
+          updatedAt: patch.updatedAt ?? Math.max(Date.now(), thread.updatedAt + 1),
+        };
+      });
       threadsRef.current = next;
       return next;
     });
@@ -1482,6 +1520,7 @@ export function AgentWorkspace({
               startIndex: cursor,
               ...(follow ? { streamReconnectPolicy: RECOVERY_STREAM_RECONNECT_POLICY } : {}),
             })) {
+              rememberThreadEventCursor(event, cursor);
               // User submissions can land between any two events in one streamed
               // recovery response. Merge them before every event so an older
               // recovery snapshot can never erase a newly staged turn.
@@ -2258,6 +2297,7 @@ async function readTailBoundary(
       startIndex: Math.max(0, startIndex),
       streamReconnectPolicy: { reconnect: false },
     })) {
+      rememberThreadEventCursor(event, startIndex);
       return isRecoveryBoundary(event) ? event : undefined;
     }
   } catch (error) {
@@ -2289,6 +2329,7 @@ async function readSettledTail(
     startIndex,
     streamReconnectPolicy: { reconnect: false },
   })) {
+    rememberThreadEventCursor(event, startIndex + events.length);
     events.push(event);
     // The SDK normally stops at Eve's declared tail. Keep this caller-side
     // guard as a second boundary so a proxy/runtime that leaves a bounded
@@ -2314,6 +2355,7 @@ async function readSettledRange(
     startIndex,
     streamReconnectPolicy: { reconnect: false },
   })) {
+    rememberThreadEventCursor(event, startIndex + events.length);
     events.push(event);
     if (events.length >= expectedEvents) break;
   }

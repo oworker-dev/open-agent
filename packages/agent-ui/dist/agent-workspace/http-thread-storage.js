@@ -1,4 +1,4 @@
-import { AGENT_THREAD_STORAGE_VERSION, eventIdentity, parseThreadCollection, } from "./thread-storage.js";
+import { AGENT_THREAD_STORAGE_VERSION, eventIdentity, mergeThreadEventSnapshots, parseThreadCollection, } from "./thread-storage.js";
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const MAX_REQUEST_TIMEOUT_MS = 120_000;
 const DEFAULT_READ_RETRY_LIMIT = 2;
@@ -261,10 +261,9 @@ function createCollectionPatch(baseline, collection) {
             return [withoutTranscriptWindow({ ...thread, events: [], hydration: "summary" })];
         }
         if (!isExplicitTranscriptReplacement(thread)) {
-            const unseen = thread.events.filter((event) => {
-                const identity = eventIdentity(event);
-                return !previous.events.some((candidate) => eventIdentity(candidate) === identity);
-            });
+            const merged = mergeThreadEventSnapshots(previous.events, thread.events);
+            const previousIds = new Set(previous.events.map(eventIdentity));
+            const unseen = merged.filter((event) => !previousIds.has(eventIdentity(event)));
             if (unseen.length > 0) {
                 eventAppends.push({ events: unseen, threadId: thread.id });
             }

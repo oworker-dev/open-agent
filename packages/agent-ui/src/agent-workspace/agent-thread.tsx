@@ -21,7 +21,7 @@ import {
   interruptedTurnContextFromEvents,
   interruptedTurnContextsFromEvents,
 } from "./retained-context.js";
-import { appendThreadEvent, appendThreadEventIndexed, dedupeThreadEvents, editOperationId, eventIdentity, latestEditableTurnId, mergeThreadEventSnapshots, projectPendingThreadEdit, projectThreadEditBranches, reconcilePendingTurnWithEvents, titleFromPrompt } from "./thread-storage.js";
+import { appendThreadEvent, appendThreadEventIndexed, dedupeThreadEvents, editOperationId, eventIdentity, latestEditableTurnId, mergeThreadEventSnapshots, projectPendingThreadEdit, projectThreadEditBranches, reconcilePendingTurnWithEvents, rememberThreadEventCursor, titleFromPrompt } from "./thread-storage.js";
 import {
   activeTurnIdAfterPendingSubmission,
   hasTerminalSessionBoundary,
@@ -350,6 +350,7 @@ export function AgentThreadView({
       // the event, which previously advanced the absolute cursor while
       // dropping its compact transcript projection.
       const sourceIndex = consumedStreamIndexRef.current;
+      rememberThreadEventCursor(event, sourceIndex);
       const suppressed = shouldSuppressInterruptedTurnStreamEvent(event, sourceIndex, interruptedTurnsRef.current);
       if (!suppressed) {
         appendThreadEventIndexed(compactedEventsRef.current, compactedEventIdsRef.current, event);
@@ -1305,7 +1306,7 @@ export function AgentThreadView({
 
   const withdrawLatestQueuedFollowUp = async (): Promise<string | undefined> => {
     const turn = queuedTurnsRef.current.findLast((candidate) =>
-      candidate.intent === "active-turn" && mailboxTurnIsCancellable(candidate)
+      candidate.intent !== "post-cancellation" && mailboxTurnIsCancellable(candidate)
     );
     if (!turn) return undefined;
     if (turn.delivery !== "server" || !turn.mailboxItemId || !mailbox) {
@@ -1485,15 +1486,12 @@ export function AgentThreadView({
         return;
       }
       if (text.length > 0) {
-        const expectedTurnId = latestActiveTurnId(latestEventsRef.current);
         setQueueError(undefined);
         updateQueuedTurns([
           ...queuedTurnsRef.current,
           {
             ...(mailbox ? { delivery: "server" as const } : {}),
-            ...(mailbox && expectedTurnId ? { expectedTurnId } : {}),
             id: createPendingTurnId(),
-            intent: "active-turn",
             state: "queued",
             submittedAt: Date.now(),
             text,
@@ -1630,7 +1628,11 @@ export function AgentThreadView({
         displayMessageIdentityRef.current,
         thread.session.sessionId,
       ),
-      thread.queuedTurns.filter((turn) => turn.intent === "post-cancellation"),
+      // Keep accepted/committed admissions staged until their durable user
+      // row is visible. A mailbox item can be accepted/committed one render
+      // before Eve's reducer publishes `message.received`; filtering active
+      // follow-ups here made the message disappear in that handoff.
+      thread.queuedTurns,
       interruptedDisplayEvents,
     );
     return projected;
@@ -1965,32 +1967,16 @@ export function AgentThreadView({
     );
     if (!next) return;
 
-    if (next.intent === "active-turn" && !next.expectedTurnId) {
-      const expectedTurnId = latestActiveTurnId(agent.events);
-      if (expectedTurnId) {
-        // Persist the authoritative Eve turn before admission. A browser may
-        // accept a follow-up while session creation is still streaming its
-        // first turn.started event; classifying it as a normal send in that
-        // window would miss the current turn's next model boundary.
-        updateQueuedTurns(queuedTurnsRef.current.map((turn) =>
-          turn.id === next.id ? { ...turn, expectedTurnId } : turn,
-        ));
-        return;
-      }
-      // Keep the durable browser queue until Eve either identifies the active
-      // turn or the original admission settles. Once settled, the same item is
-      // intentionally delivered as the next normal turn.
-      if (admissionBusy) return;
-    }
-
     mailboxEnqueueIdsRef.current.add(next.id);
     void mailbox.enqueue({
       clientMessageId: next.id,
       ...(thread.retainedContext ? { clientContext: thread.retainedContext } : {}),
-      ...(next.expectedTurnId ? { expectedTurnId: next.expectedTurnId } : {}),
       message: next.text,
       operationId: next.id,
-      operationKind: next.expectedTurnId ? "steer" : "send",
+      // Follow-ups are ordinary FIFO sends. The mailbox worker waits for Eve
+      // to reach `session.waiting` before delivering them, preserving the
+      // existing session context without active-turn steering.
+      operationKind: "send",
       preferences: preferencesRef.current,
       sessionId: agent.session.sessionId,
     }).then((receipt) => {
@@ -2698,6 +2684,17 @@ export function projectStagedUserMessages(
   if (turns.length === 0) return messages;
   const projected = [...messages];
   for (const turn of turns) {
+    // A queued/delivering mailbox item is already represented by the compact
+    // composer queue. Project it into the transcript only once admission has
+    // been accepted/committed (or for a post-cancellation browser draft,
+    // whose queue row is intentionally the optimistic transcript). This
+    // avoids showing the same pending follow-up twice while still bridging
+    // the accepted-receipt → Eve reducer handoff where messages used to vanish.
+    if (
+      turn.intent !== "post-cancellation" &&
+      turn.state !== "accepted" &&
+      turn.state !== "committed"
+    ) continue;
     const id = `${turn.id}:user`;
     if (projected.some((message) => message.id === id)) continue;
     // Eve acknowledges a mailbox item before its message reducer snapshot is
@@ -2715,13 +2712,14 @@ export function projectStagedUserMessages(
       parts: [{ text: turn.text, type: "text" }],
       role: "user",
     };
-    // Steering belongs after the currently visible segment of its active Eve
-    // turn. Appending it to the transcript tail makes the temporary row look
-    // like a new conversation turn and lets later assistant snapshots appear
-    // before it. Only use an explicit turn anchor (or the receipt's anchor);
-    // an unanchored queued message is a normal next turn and stays at the end.
+    // A normal FIFO follow-up is a new Eve turn and therefore stays at the
+    // transcript tail. Its durable receipt is the only safe anchor while Eve's
+    // reducer is still publishing the corresponding user row.
     const receiptTurnId = receipt?.type === "message.received" ? receipt.data.turnId : undefined;
-    const targetTurnId = turn.expectedTurnId ?? receiptTurnId;
+    // `expectedTurnId` belongs to the legacy active-turn steering lane. New
+    // follow-ups are ordinary FIFO sends and must stay at the transcript tail;
+    // only a durable receipt can identify their actual Eve turn.
+    const targetTurnId = receiptTurnId;
     const targetIndex = targetTurnId
       ? projected.reduce((last, message, index) =>
           messageBelongsToTurn(message, targetTurnId) ? index : last,

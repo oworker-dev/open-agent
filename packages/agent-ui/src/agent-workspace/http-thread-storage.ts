@@ -1,6 +1,7 @@
 import {
   AGENT_THREAD_STORAGE_VERSION,
   eventIdentity,
+  mergeThreadEventSnapshots,
   parseThreadCollection,
   type AgentThreadCollection,
   type AgentThreadStorage,
@@ -380,10 +381,14 @@ function createCollectionPatch(
       // the baseline and append it in stream order. Existing durable events
       // remain untouched, so this path is lossless even when the snapshot is
       // only a partial tail.
-      const unseen = thread.events.filter((event) => {
-        const identity = eventIdentity(event);
-        return !previous.events.some((candidate) => eventIdentity(candidate) === identity);
-      });
+      // A reconnect snapshot can contain the same events in a different order
+      // (for example a live page interleaved with a bounded recovery page).
+      // Derive the append set from the canonical merge instead of the raw
+      // array so the server's append-only event log never receives a reordered
+      // suffix.
+      const merged = mergeThreadEventSnapshots(previous.events, thread.events);
+      const previousIds = new Set(previous.events.map(eventIdentity));
+      const unseen = merged.filter((event) => !previousIds.has(eventIdentity(event)));
       if (unseen.length > 0) {
         eventAppends.push({ events: unseen, threadId: thread.id });
       }

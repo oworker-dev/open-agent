@@ -1,6 +1,7 @@
 import { sanitizeRetainedContext } from "./retained-context.js";
 export const AGENT_THREAD_STORAGE_VERSION = 2;
 const EMPTY_SESSION = { streamIndex: 0 };
+const eventCursors = new WeakMap();
 const FALLBACK_PREFERENCES = {
     executionMode: "standard",
     modelId: "default",
@@ -61,24 +62,7 @@ function mergeConflictEvents(local, remote) {
         return localEvents;
     if (localEvents.length === 0)
         return remoteEvents;
-    const localIds = new Set(localEvents.map(eventIdentity));
-    const remoteIds = new Set(remoteEvents.map(eventIdentity));
-    const localSubsetOfRemote = [...localIds].every((id) => remoteIds.has(id));
-    const remoteSubsetOfLocal = [...remoteIds].every((id) => localIds.has(id));
-    if (localSubsetOfRemote)
-        return remoteEvents;
-    if (remoteSubsetOfLocal)
-        return localEvents;
-    const merged = [...remoteEvents];
-    const mergedIds = new Set(remoteIds);
-    for (const event of localEvents) {
-        const id = eventIdentity(event);
-        if (mergedIds.has(id))
-            continue;
-        merged.push(event);
-        mergedIds.add(id);
-    }
-    return compactThreadEvents(merged);
+    return mergeThreadEventSnapshots(localEvents, remoteEvents);
 }
 export const browserThreadStorage = {
     load: loadThreadCollection,
@@ -410,17 +394,91 @@ export function mergeThreadEventSnapshots(left, right) {
         return left;
     const leftIds = new Set(left.map(eventIdentity));
     const rightIds = new Set(right.map(eventIdentity));
-    if (left.length >= right.length && [...rightIds].every((id) => leftIds.has(id)))
+    if ([...rightIds].every((id) => leftIds.has(id)))
         return left;
-    if (right.length >= left.length && [...leftIds].every((id) => rightIds.has(id)))
+    if ([...leftIds].every((id) => rightIds.has(id)))
         return right;
-    const base = left.length >= right.length ? left : right;
-    const additions = base === left ? right : left;
-    const merged = [...base];
-    const ids = new Set(merged.map(eventIdentity));
-    for (const event of additions)
-        appendThreadEventIndexed(merged, ids, event);
-    return compactThreadEvents(merged);
+    const seen = new Set();
+    const candidates = [];
+    let position = 0;
+    for (const event of [...left, ...right]) {
+        const identity = eventIdentity(event);
+        if (seen.has(identity))
+            continue;
+        seen.add(identity);
+        candidates.push({ event, position });
+        position += 1;
+    }
+    candidates.sort((a, b) => compareEventOrder(a.event, b.event) || a.position - b.position);
+    return compactThreadEvents(candidates.map((candidate) => candidate.event));
+}
+function compareEventOrder(left, right) {
+    const leftCursor = eventCursors.get(left);
+    const rightCursor = eventCursors.get(right);
+    if (leftCursor !== undefined && rightCursor !== undefined && leftCursor !== rightCursor) {
+        return leftCursor - rightCursor;
+    }
+    const leftSequence = eventSequence(left);
+    const rightSequence = eventSequence(right);
+    if (leftSequence !== undefined && rightSequence !== undefined && leftSequence !== rightSequence) {
+        return leftSequence - rightSequence;
+    }
+    const leftStep = eventStepIndex(left);
+    const rightStep = eventStepIndex(right);
+    if (leftStep !== undefined && rightStep !== undefined && leftStep !== rightStep) {
+        return leftStep - rightStep;
+    }
+    const leftAt = eventTimestamp(left);
+    const rightAt = eventTimestamp(right);
+    if (leftAt !== undefined && rightAt !== undefined && leftAt !== rightAt) {
+        return leftAt - rightAt;
+    }
+    return eventLifecycleRank(left) - eventLifecycleRank(right);
+}
+function eventSequence(event) {
+    const value = event.data?.sequence;
+    return typeof value === "number" && Number.isSafeInteger(value) ? value : undefined;
+}
+function eventStepIndex(event) {
+    const value = event.data?.stepIndex;
+    return typeof value === "number" && Number.isSafeInteger(value) ? value : undefined;
+}
+function eventTimestamp(event) {
+    const value = event.meta?.at;
+    if (typeof value !== "string")
+        return undefined;
+    const timestamp = Date.parse(value);
+    return Number.isFinite(timestamp) ? timestamp : undefined;
+}
+function eventLifecycleRank(event) {
+    switch (event.type) {
+        case "session.started": return -2;
+        case "session.waiting":
+        case "session.completed":
+        case "session.failed": return 100;
+        case "turn.started": return 0;
+        case "message.received": return 1;
+        case "context.cleared": return 1;
+        case "step.started": return 2;
+        case "reasoning.appended":
+        case "reasoning.completed":
+        case "message.appended":
+        case "message.completed":
+        case "action.input.partial":
+        case "actions.requested":
+        case "input.requested":
+        case "authorization.required":
+        case "model.retrying": return 3;
+        case "action.partial":
+        case "action.result":
+        case "authorization.completed": return 4;
+        case "step.completed":
+        case "step.failed": return 5;
+        case "turn.completed":
+        case "turn.failed":
+        case "turn.cancelled": return 6;
+        default: return 50;
+    }
 }
 const cumulativeIndexesByEvents = new WeakMap();
 function cumulativeIndexFor(events) {
@@ -448,6 +506,11 @@ export function eventIdentity(event) {
         return `id:${event.meta.id}`;
     }
     return `event:${JSON.stringify(event)}`;
+}
+export function rememberThreadEventCursor(event, cursor) {
+    if (Number.isSafeInteger(cursor) && cursor >= 0 && event && typeof event === "object") {
+        eventCursors.set(event, cursor);
+    }
 }
 function hasEventIdentity(events, event) {
     const identity = eventIdentity(event);

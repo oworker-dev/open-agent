@@ -15,7 +15,7 @@ import { sanitizeAgentError } from "./error-presentation.js";
 import { AgentMailboxHttpError } from "./http-agent-mailbox.js";
 import { messagesFor } from "./i18n.js";
 import { interruptedTurnContextFromEvents, interruptedTurnContextsFromEvents, } from "./retained-context.js";
-import { appendThreadEventIndexed, dedupeThreadEvents, editOperationId, eventIdentity, latestEditableTurnId, mergeThreadEventSnapshots, projectPendingThreadEdit, projectThreadEditBranches, reconcilePendingTurnWithEvents, titleFromPrompt } from "./thread-storage.js";
+import { appendThreadEventIndexed, dedupeThreadEvents, editOperationId, eventIdentity, latestEditableTurnId, mergeThreadEventSnapshots, projectPendingThreadEdit, projectThreadEditBranches, reconcilePendingTurnWithEvents, rememberThreadEventCursor, titleFromPrompt } from "./thread-storage.js";
 import { activeTurnIdAfterPendingSubmission, hasTerminalSessionBoundary, hasSettledLatestTurn, isRetryableAgentFailure, isProxiedInputOnlyMessage, normalizeSettledAgentMessages, projectAgentDisplayTimeline, shouldSuppressInterruptedTurnDisplayEvent, shouldSuppressInterruptedTurnStreamEvent, stableUserMessageId, unresolvedInputRequests, } from "./turn-presentation.js";
 import { summarizeUsage } from "./usage.js";
 const CANCELLATION_STREAM_REATTACH_AFTER_MS = 5_000;
@@ -189,6 +189,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     const handleEvent = useCallback((event) => {
         lastObservedEventAtRef.current = Date.now();
         const sourceIndex = consumedStreamIndexRef.current;
+        rememberThreadEventCursor(event, sourceIndex);
         const suppressed = shouldSuppressInterruptedTurnStreamEvent(event, sourceIndex, interruptedTurnsRef.current);
         if (!suppressed) {
             appendThreadEventIndexed(compactedEventsRef.current, compactedEventIdsRef.current, event);
@@ -859,7 +860,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
                 : candidate));
     }
     const withdrawLatestQueuedFollowUp = async () => {
-        const turn = queuedTurnsRef.current.findLast((candidate) => candidate.intent === "active-turn" && mailboxTurnIsCancellable(candidate));
+        const turn = queuedTurnsRef.current.findLast((candidate) => candidate.intent !== "post-cancellation" && mailboxTurnIsCancellable(candidate));
         if (!turn)
             return undefined;
         if (turn.delivery !== "server" || !turn.mailboxItemId || !mailbox) {
@@ -996,15 +997,12 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
                 return;
             }
             if (text.length > 0) {
-                const expectedTurnId = latestActiveTurnId(latestEventsRef.current);
                 setQueueError(undefined);
                 updateQueuedTurns([
                     ...queuedTurnsRef.current,
                     {
                         ...(mailbox ? { delivery: "server" } : {}),
-                        ...(mailbox && expectedTurnId ? { expectedTurnId } : {}),
                         id: createPendingTurnId(),
-                        intent: "active-turn",
                         state: "queued",
                         submittedAt: Date.now(),
                         text,
@@ -1098,7 +1096,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         pendingRoot: undefined,
     });
     const projectedMessages = useMemo(() => {
-        const projected = projectStagedUserMessages(stabilizeDisplayMessageIdentities(ensureActiveAssistantMessage(projectedRuntimeMessages, projectionEvents, isBusy || isPendingTurnInFlight(admissionPendingTurn) || Boolean(latestTurnFailure(interruptedDisplayEvents)), displayPendingTurn, displayMessageIdentityRef.current), projectionEvents, displayPendingTurn, displayMessageIdentityRef.current, thread.session.sessionId), thread.queuedTurns.filter((turn) => turn.intent === "post-cancellation"), interruptedDisplayEvents);
+        const projected = projectStagedUserMessages(stabilizeDisplayMessageIdentities(ensureActiveAssistantMessage(projectedRuntimeMessages, projectionEvents, isBusy || isPendingTurnInFlight(admissionPendingTurn) || Boolean(latestTurnFailure(interruptedDisplayEvents)), displayPendingTurn, displayMessageIdentityRef.current), projectionEvents, displayPendingTurn, displayMessageIdentityRef.current, thread.session.sessionId), thread.queuedTurns, interruptedDisplayEvents);
         return projected;
     }, [admissionPendingTurn, displayPendingTurn, interruptedDisplayEvents, isBusy, optimisticPendingTurn, projectionEvents, projectedRuntimeMessages, thread.queuedTurns, thread.session.sessionId]);
     const ungroupedVisibleMessages = useMemo(() => projectedMessages.filter((message) => !isProxiedInputOnlyMessage(message, projectionEvents)), [projectionEvents, projectedMessages]);
@@ -1359,23 +1357,13 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             !mailboxEnqueueIdsRef.current.has(turn.id));
         if (!next)
             return;
-        if (next.intent === "active-turn" && !next.expectedTurnId) {
-            const expectedTurnId = latestActiveTurnId(agent.events);
-            if (expectedTurnId) {
-                updateQueuedTurns(queuedTurnsRef.current.map((turn) => turn.id === next.id ? { ...turn, expectedTurnId } : turn));
-                return;
-            }
-            if (admissionBusy)
-                return;
-        }
         mailboxEnqueueIdsRef.current.add(next.id);
         void mailbox.enqueue({
             clientMessageId: next.id,
             ...(thread.retainedContext ? { clientContext: thread.retainedContext } : {}),
-            ...(next.expectedTurnId ? { expectedTurnId: next.expectedTurnId } : {}),
             message: next.text,
             operationId: next.id,
-            operationKind: next.expectedTurnId ? "steer" : "send",
+            operationKind: "send",
             preferences: preferencesRef.current,
             sessionId: agent.session.sessionId,
         }).then((receipt) => {
@@ -1792,6 +1780,10 @@ export function projectStagedUserMessages(messages, turns, events = []) {
         return messages;
     const projected = [...messages];
     for (const turn of turns) {
+        if (turn.intent !== "post-cancellation" &&
+            turn.state !== "accepted" &&
+            turn.state !== "committed")
+            continue;
         const id = `${turn.id}:user`;
         if (projected.some((message) => message.id === id))
             continue;
@@ -1806,7 +1798,7 @@ export function projectStagedUserMessages(messages, turns, events = []) {
             role: "user",
         };
         const receiptTurnId = receipt?.type === "message.received" ? receipt.data.turnId : undefined;
-        const targetTurnId = turn.expectedTurnId ?? receiptTurnId;
+        const targetTurnId = receiptTurnId;
         const targetIndex = targetTurnId
             ? projected.reduce((last, message, index) => messageBelongsToTurn(message, targetTurnId) ? index : last, -1)
             : -1;

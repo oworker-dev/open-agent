@@ -17,7 +17,7 @@ import { AgentThreadView } from "./agent-thread.js";
 import { cn } from "../utils.js";
 import { AgentThreadStorageConflictError, AgentThreadStorageHttpError } from "./http-thread-storage.js";
 import { messagesFor, resolveBrowserLocale } from "./i18n.js";
-import { AGENT_THREAD_STORAGE_VERSION, browserThreadStorage, appendThreadEventIndexed, compactThreadEvents, createAgentThread, eventIdentity, mergeThreadCollectionsForConflict, reconcileHydratedPendingTurn, reconcilePendingTurnWithEvents, } from "./thread-storage.js";
+import { AGENT_THREAD_STORAGE_VERSION, browserThreadStorage, appendThreadEventIndexed, compactThreadEvents, createAgentThread, eventIdentity, mergeThreadCollectionsForConflict, mergeThreadEventSnapshots, rememberThreadEventCursor, reconcileHydratedPendingTurn, reconcilePendingTurnWithEvents, } from "./thread-storage.js";
 import { hasUnresolvedInputRequests, mergeSubagentSessions, shouldSuppressInterruptedTurnStreamEvent, } from "./turn-presentation.js";
 import { loadSessionDeliverables } from "./session-deliverables.js";
 const DEFAULT_STORAGE_KEY = "open-agent:threads:v1";
@@ -241,13 +241,41 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
             setEphemeralThreadIds((current) => withoutSetValue(current, threadId));
         }
         setThreads((current) => {
-            const next = current.map((thread) => thread.id === threadId
-                ? {
-                    ...thread,
-                    ...patch,
-                    updatedAt: patch.updatedAt ?? Math.max(Date.now(), thread.updatedAt + 1),
+            const next = current.map((thread) => {
+                if (thread.id !== threadId)
+                    return thread;
+                const incomingCursor = patch.session?.streamIndex;
+                const currentCursor = thread.session.streamIndex;
+                const explicitTranscriptReplacement = patch.pendingTurn?.state === "clearing" ||
+                    patch.pendingTurn?.state === "resubmitting";
+                if (incomingCursor !== undefined && incomingCursor < currentCursor && !explicitTranscriptReplacement)
+                    return thread;
+                let effectivePatch = patch;
+                if (patch.events && thread.events.length > 0) {
+                    const incomingIds = new Set(patch.events.map(eventIdentity));
+                    const needsMerge = !explicitTranscriptReplacement && (incomingCursor === undefined ||
+                        incomingCursor >= currentCursor && (patch.events.length < thread.events.length ||
+                            thread.events.some((event) => !incomingIds.has(eventIdentity(event)))));
+                    if (needsMerge) {
+                        effectivePatch = {
+                            ...patch,
+                            events: mergeThreadEventSnapshots(thread.events, patch.events),
+                        };
+                    }
                 }
-                : thread);
+                return {
+                    ...thread,
+                    ...effectivePatch,
+                    session: effectivePatch.session
+                        ? {
+                            ...thread.session,
+                            ...effectivePatch.session,
+                            streamIndex: Math.max(thread.session.streamIndex, effectivePatch.session.streamIndex),
+                        }
+                        : thread.session,
+                    updatedAt: patch.updatedAt ?? Math.max(Date.now(), thread.updatedAt + 1),
+                };
+            });
             threadsRef.current = next;
             return next;
         });
@@ -1192,6 +1220,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                             startIndex: cursor,
                             ...(follow ? { streamReconnectPolicy: RECOVERY_STREAM_RECONNECT_POLICY } : {}),
                         })) {
+                            rememberThreadEventCursor(event, cursor);
                             mergeLiveAdmissions();
                             if (cancellationPending && event.type === "turn.started") {
                                 interruptedTurns = retargetLatestInterruptedTurn(interruptedTurns, event.data.turnId);
@@ -1576,6 +1605,7 @@ async function readTailBoundary(session, startIndex, parentSignal) {
             startIndex: Math.max(0, startIndex),
             streamReconnectPolicy: { reconnect: false },
         })) {
+            rememberThreadEventCursor(event, startIndex);
             return isRecoveryBoundary(event) ? event : undefined;
         }
     }
@@ -1599,6 +1629,7 @@ async function readSettledTail(session, tailIndex, signal) {
         startIndex,
         streamReconnectPolicy: { reconnect: false },
     })) {
+        rememberThreadEventCursor(event, startIndex + events.length);
         events.push(event);
         if (events.length >= expectedEvents)
             break;
@@ -1616,6 +1647,7 @@ async function readSettledRange(session, startIndex, tailIndex, signal) {
         startIndex,
         streamReconnectPolicy: { reconnect: false },
     })) {
+        rememberThreadEventCursor(event, startIndex + events.length);
         events.push(event);
         if (events.length >= expectedEvents)
             break;

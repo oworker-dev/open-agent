@@ -31,6 +31,7 @@ export declare function appendThreadEvent(events: readonly MessageStreamEvent[],
 export declare function appendThreadEventIndexed(events: MessageStreamEvent[], eventIds: Set<string>, event: MessageStreamEvent): boolean;
 export declare function mergeThreadEventSnapshots(left: readonly MessageStreamEvent[], right: readonly MessageStreamEvent[]): readonly MessageStreamEvent[];
 export declare function eventIdentity(event: MessageStreamEvent): string;
+export declare function rememberThreadEventCursor(event: MessageStreamEvent, cursor: number): void;
 export declare function compactThreadEvents(events: readonly MessageStreamEvent[]): readonly MessageStreamEvent[];
 export declare function reconcilePendingTurnWithEvents(pendingTurn: AgentPendingTurn | undefined, events: readonly MessageStreamEvent[]): AgentPendingTurn | undefined;
 export declare function reconcileHydratedPendingTurn(pendingTurn: AgentPendingTurn | undefined, events: readonly MessageStreamEvent[]): AgentPendingTurn | undefined;

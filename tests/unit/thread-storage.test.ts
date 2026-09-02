@@ -53,8 +53,8 @@ test("recovery snapshot merge retains events unique to either snapshot", () => {
   const merged = mergeThreadEventSnapshots(live, recovery);
   assert.deepEqual(merged.map(eventIdentity), [
     eventIdentity(live[0]!),
-    eventIdentity(live[1]!),
     eventIdentity(recovery[1]!),
+    eventIdentity(live[1]!),
   ]);
 });
 
