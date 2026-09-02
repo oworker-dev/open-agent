@@ -1864,7 +1864,28 @@ export function AgentThreadView({
       preferences: preferencesRef.current,
       sessionId,
     }).then((receipt) => {
-      if (pendingTurnRef.current?.id !== pendingTurn.id) return;
+      const currentPending = pendingTurnRef.current;
+      if (
+        currentPending?.id !== pendingTurn.id ||
+        cancellationRef.current.requested ||
+        currentPending.state === "interrupted"
+      ) {
+        // The edit admission can resolve after the user pressed Stop (or
+        // after another local operation replaced it). Do not resurrect that
+        // stale operation; compensate for a mailbox item created during the
+        // race so it cannot be dispatched after cancellation settles.
+        if (receipt.status !== "cancelled") {
+          void mailbox.cancel(receipt.itemId).catch((error: unknown) => {
+            if (
+              !(error instanceof AgentMailboxHttpError) ||
+              error.code !== "mailbox_item_not_cancellable"
+            ) {
+              console.warn("Unable to cancel a stale edit mailbox item", error);
+            }
+          });
+        }
+        return;
+      }
       if (receipt.status === "failed" || receipt.status === "cancelled") {
         const failed = { ...pendingTurn, mailboxItemId: receipt.itemId, state: "delivery-failed" as const };
         pendingTurnRef.current = failed;
@@ -1973,6 +1994,28 @@ export function AgentThreadView({
       preferences: preferencesRef.current,
       sessionId: agent.session.sessionId,
     }).then((receipt) => {
+      // Cancellation/removal can win while the durable enqueue request is in
+      // flight. In that case the local queue row is already gone, but the
+      // server may still have created a mailbox item. Cancel the item as soon
+      // as its id is known; otherwise a worker tick can deliver a stale
+      // follow-up after Eve has parked the cancelled turn.
+      const stillQueued = queuedTurnsRef.current.some((turn) => turn.id === next.id);
+      if (!stillQueued) {
+        if (receipt.status !== "cancelled") {
+          void mailbox.cancel(receipt.itemId).catch((error: unknown) => {
+            // A worker may have admitted the item between enqueue and this
+            // compensating cancellation. The active Eve cancellation path
+            // handles that race; there is no queue row left to recover here.
+            if (
+              !(error instanceof AgentMailboxHttpError) ||
+              error.code !== "mailbox_item_not_cancellable"
+            ) {
+              console.warn("Unable to cancel a mailbox item removed before admission", error);
+            }
+          });
+        }
+        return;
+      }
       const state = mailboxTurnState(receipt.status);
       if (state === "cancelled") {
         updateQueuedTurns(queuedTurnsRef.current.filter((turn) => turn.id !== next.id));

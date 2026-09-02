@@ -1266,8 +1266,20 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             preferences: preferencesRef.current,
             sessionId,
         }).then((receipt) => {
-            if (pendingTurnRef.current?.id !== pendingTurn.id)
+            const currentPending = pendingTurnRef.current;
+            if (currentPending?.id !== pendingTurn.id ||
+                cancellationRef.current.requested ||
+                currentPending.state === "interrupted") {
+                if (receipt.status !== "cancelled") {
+                    void mailbox.cancel(receipt.itemId).catch((error) => {
+                        if (!(error instanceof AgentMailboxHttpError) ||
+                            error.code !== "mailbox_item_not_cancellable") {
+                            console.warn("Unable to cancel a stale edit mailbox item", error);
+                        }
+                    });
+                }
                 return;
+            }
             if (receipt.status === "failed" || receipt.status === "cancelled") {
                 const failed = { ...pendingTurn, mailboxItemId: receipt.itemId, state: "delivery-failed" };
                 pendingTurnRef.current = failed;
@@ -1367,6 +1379,18 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             preferences: preferencesRef.current,
             sessionId: agent.session.sessionId,
         }).then((receipt) => {
+            const stillQueued = queuedTurnsRef.current.some((turn) => turn.id === next.id);
+            if (!stillQueued) {
+                if (receipt.status !== "cancelled") {
+                    void mailbox.cancel(receipt.itemId).catch((error) => {
+                        if (!(error instanceof AgentMailboxHttpError) ||
+                            error.code !== "mailbox_item_not_cancellable") {
+                            console.warn("Unable to cancel a mailbox item removed before admission", error);
+                        }
+                    });
+                }
+                return;
+            }
             const state = mailboxTurnState(receipt.status);
             if (state === "cancelled") {
                 updateQueuedTurns(queuedTurnsRef.current.filter((turn) => turn.id !== next.id));
