@@ -1,5 +1,5 @@
 import type { MessageStreamEvent } from "eve/client";
-import type { AgentPendingTurn, AgentThread, AgentThreadPreferences, AgentTranscriptWindow } from "./contracts.js";
+import type { AgentInputResponseSubmission, AgentPendingTurn, AgentThread, AgentThreadPreferences, AgentTranscriptWindow } from "./contracts.js";
 export declare const AGENT_THREAD_STORAGE_VERSION = 2;
 export declare function editOperationId(sessionId: string, beforeTurnId: string, text: string): string;
 export type AgentThreadCollection = {
@@ -27,6 +27,10 @@ export declare function loadThreadCollection(storageKey: string): AgentThreadCol
 export declare function parseThreadCollection(value: unknown): AgentThreadCollection;
 export declare function saveThreadCollection(storageKey: string, threads: readonly AgentThread[], activeThreadId?: string): boolean;
 export declare function titleFromPrompt(prompt: string): string;
+export declare function mergeInputResponseSubmissions(left: readonly AgentInputResponseSubmission[], right: readonly AgentInputResponseSubmission[]): readonly AgentInputResponseSubmission[];
+export declare function inputResponseSubmissionProjectsAnswer(submission: AgentInputResponseSubmission): boolean;
+export declare function hasUnsettledInputResponseSubmission(submissions: readonly AgentInputResponseSubmission[]): boolean;
+export declare function settleInputResponseSubmissions(submissions: readonly AgentInputResponseSubmission[], streamIndex: number): readonly AgentInputResponseSubmission[];
 export declare function appendThreadEvent(events: readonly MessageStreamEvent[], event: MessageStreamEvent): readonly MessageStreamEvent[];
 export declare function appendThreadEventIndexed(events: MessageStreamEvent[], eventIds: Set<string>, event: MessageStreamEvent): boolean;
 export declare function mergeThreadEventSnapshots(left: readonly MessageStreamEvent[], right: readonly MessageStreamEvent[]): readonly MessageStreamEvent[];

@@ -165,7 +165,9 @@ export function createEveAgentMailboxRuntime(
             : {}),
           ...(input.payload.preferences ?? {}),
           ...(input.owner.issuer ? { issuer: input.owner.issuer } : {}),
-          message: input.payload.message,
+          ...(input.payload.inputResponses
+            ? { inputResponses: input.payload.inputResponses }
+            : { message: input.payload.message }),
           principalId: input.owner.principalId,
           principalType: input.owner.principalType,
           sessionId: input.sessionId,

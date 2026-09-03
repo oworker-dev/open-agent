@@ -126,11 +126,7 @@ function useThrottledValue<T>(value: T, delayMs: number): T {
   return snapshot;
 }
 
-export type AgentInputResponse = {
-  readonly optionId?: string;
-  readonly requestId: string;
-  readonly text?: string;
-};
+export type AgentInputResponse = InputResponse;
 
 type EveFilePart = Extract<EveMessagePart, { type: "file" }>;
 const EMPTY_CLOSED_INPUT_REQUEST_IDS: ReadonlySet<string> = new Set();

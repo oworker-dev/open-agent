@@ -64,9 +64,10 @@ export async function enqueueAgentMailboxMessage(options: {
   readonly clientMessageId: string;
   readonly clientContext?: AgentMailboxPayload["clientContext"];
   readonly expectedTurnId?: string;
+  readonly inputResponses?: Extract<AgentMailboxPayload, { readonly inputResponses: unknown }>["inputResponses"];
   readonly operationId?: string;
-  readonly operationKind?: "send" | "steer" | "edit";
-  readonly message: string;
+  readonly operationKind?: "send" | "steer" | "edit" | "respond";
+  readonly message?: string;
   readonly owner: AgentSessionOwner;
   readonly preferences?: AgentMailboxPayload["preferences"];
   readonly sessionId: string;
@@ -74,7 +75,7 @@ export async function enqueueAgentMailboxMessage(options: {
 }): Promise<EnqueueAgentMailboxResult> {
   const clientMessageId = parseClientMessageId(options.clientMessageId);
   const sessionId = parseSessionId(options.sessionId);
-  const message = parseMessage(options.message);
+  const content = parseMailboxContent(options);
   const operation = parseOperation({
     beforeTurnId: options.beforeTurnId,
     expectedTurnId: options.expectedTurnId,
@@ -83,7 +84,7 @@ export async function enqueueAgentMailboxMessage(options: {
   });
   const payload = {
     ...(options.clientContext ? { clientContext: options.clientContext } : {}),
-    message,
+    ...content,
     ...(operation ? { operation } : {}),
     ...(options.preferences ? { preferences: options.preferences } : {}),
   } as const;
@@ -152,7 +153,13 @@ export async function dispatchNextAgentMailboxMessage(options: {
       sessionId: item.sessionId,
     });
     const accepted = await options.store.accept(item.itemId, claimToken, delivered.sessionId);
-    return { item: accepted, status: "accepted" };
+    // Normal messages are committed by the message.received hook. Structured
+    // HITL responses resume the parked turn without that event, so the durable
+    // 202 admission itself is their commit boundary.
+    const committed = item.payload.operation?.kind === "respond"
+      ? await options.store.commit(item.itemId, delivered.sessionId)
+      : accepted;
+    return { item: committed, status: "accepted" };
   } catch (error) {
     const current = await options.store.findOwned(owner, item.itemId);
     if (current?.status === "committed") {
@@ -268,11 +275,31 @@ function parseMessage(value: string): string {
   return normalized;
 }
 
+function parseMailboxContent(options: {
+  readonly inputResponses?: readonly import("eve/client").InputResponse[];
+  readonly message?: string;
+  readonly operationKind?: "send" | "steer" | "edit" | "respond";
+}): Pick<Extract<AgentMailboxPayload, { readonly message: string }>, "message"> |
+  Pick<Extract<AgentMailboxPayload, { readonly inputResponses: unknown }>, "inputResponses"> {
+  if (options.operationKind === "respond") {
+    if (options.message !== undefined) throw new Error("A respond operation cannot contain a message.");
+    const inputResponses = options.inputResponses;
+    if (!inputResponses || inputResponses.length < 1 || inputResponses.length > 16) {
+      throw new Error("A respond operation requires between 1 and 16 input responses.");
+    }
+    return { inputResponses };
+  }
+  if (options.inputResponses !== undefined) {
+    throw new Error("inputResponses requires operationKind respond.");
+  }
+  return { message: parseMessage(options.message ?? "") };
+}
+
 function parseOperation(input: {
   readonly beforeTurnId?: string;
   readonly expectedTurnId?: string;
   readonly operationId?: string;
-  readonly operationKind?: "send" | "steer" | "edit";
+  readonly operationKind?: "send" | "steer" | "edit" | "respond";
 }): NonNullable<AgentMailboxPayload["operation"]> | undefined {
   if (input.operationId === undefined && input.operationKind === undefined && input.expectedTurnId === undefined && input.beforeTurnId === undefined) {
     return undefined;
@@ -288,6 +315,10 @@ function parseOperation(input: {
   }
   if (input.operationKind === "edit" && input.beforeTurnId === undefined) {
     throw new Error("beforeTurnId is required for an edit operation.");
+  }
+  if (input.operationKind === "respond" &&
+      (input.expectedTurnId !== undefined || input.beforeTurnId !== undefined)) {
+    throw new Error("A respond operation cannot target an edit or steering boundary.");
   }
   if (input.expectedTurnId !== undefined &&
       !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,511}$/.test(input.expectedTurnId)) {

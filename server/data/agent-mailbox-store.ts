@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { isBoundedAgentClientContext } from "@oworker/open-agent-contracts/client-context";
 import type { Pool, PoolClient } from "pg";
+import type { InputResponse } from "eve/client";
 import {
   getAgentDatabasePool,
   quoteIdentifier,
@@ -18,14 +19,13 @@ export type AgentMailboxStatus =
   | "queued"
   | "submission-ambiguous";
 
-export type AgentMailboxPayload = {
+type AgentMailboxPayloadBase = {
   readonly clientContext?: readonly string[];
-  readonly message: string;
-  /** Stable product operation metadata. Eve treats the message as opaque text. */
+  /** Stable product operation metadata. Eve treats the content as opaque input. */
   readonly operation?: {
     readonly beforeTurnId?: string;
     readonly expectedTurnId?: string;
-    readonly kind: "send" | "steer" | "edit";
+    readonly kind: "send" | "steer" | "edit" | "respond";
     readonly operationId: string;
   };
   readonly preferences?: {
@@ -34,6 +34,11 @@ export type AgentMailboxPayload = {
     readonly reasoning: string;
   };
 };
+
+export type AgentMailboxPayload = AgentMailboxPayloadBase & (
+  | { readonly inputResponses: readonly InputResponse[]; readonly message?: never }
+  | { readonly inputResponses?: never; readonly message: string }
+);
 
 export type AgentMailboxItem = {
   readonly admissionStartedAt?: string;
@@ -502,14 +507,26 @@ function assertOwner(owner: AgentSessionOwner): void {
 }
 
 function assertPayload(payload: AgentMailboxPayload): void {
-  assertText(payload.message, "payload.message", 65_536);
+  const hasMessage = "message" in payload && typeof payload.message === "string";
+  const hasInputResponses = "inputResponses" in payload && Array.isArray(payload.inputResponses);
+  if (hasMessage === hasInputResponses) {
+    throw new Error("payload must contain exactly one message or inputResponses value.");
+  }
+  if (hasMessage) {
+    assertText(payload.message, "payload.message", 65_536);
+  } else if (hasInputResponses) {
+    assertInputResponses(payload.inputResponses);
+  }
   if (payload.operation) {
     assertText(payload.operation.operationId, "payload.operation.operationId", 200);
-    if (!["send", "steer", "edit"].includes(payload.operation.kind)) {
+    if (!["send", "steer", "edit", "respond"].includes(payload.operation.kind)) {
       throw new Error("payload.operation.kind is invalid.");
     }
     if (payload.operation.expectedTurnId) {
       assertText(payload.operation.expectedTurnId, "payload.operation.expectedTurnId", 512);
+    }
+    if ((payload.operation.kind === "respond") !== hasInputResponses) {
+      throw new Error("payload.operation.kind must match the payload content.");
     }
   }
   if (payload.clientContext && !isBoundedAgentClientContext(payload.clientContext)) {
@@ -525,6 +542,21 @@ function assertPayload(payload: AgentMailboxPayload): void {
     ].includes(payload.preferences.executionMode)) {
       throw new Error("payload.preferences.executionMode is invalid.");
     }
+  }
+}
+
+function assertInputResponses(value: readonly InputResponse[]): void {
+  if (value.length < 1 || value.length > 16) {
+    throw new Error("payload.inputResponses must contain between 1 and 16 responses.");
+  }
+  for (const response of value) {
+    if (!response || typeof response !== "object") throw new Error("payload.inputResponses is invalid.");
+    assertText(response.requestId, "payload.inputResponses.requestId", 512);
+    const hasOption = typeof response.optionId === "string" && response.optionId.trim().length > 0;
+    const hasText = typeof response.text === "string" && response.text.trim().length > 0;
+    if (!hasOption && !hasText) throw new Error("An input response requires optionId or text.");
+    if (response.optionId !== undefined) assertText(response.optionId, "payload.inputResponses.optionId", 512);
+    if (response.text !== undefined) assertText(response.text, "payload.inputResponses.text", 65_536);
   }
 }
 

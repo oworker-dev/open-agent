@@ -786,3 +786,46 @@ test("preserves validated attachments for a durable edited-turn retry", () => {
     text: "",
   });
 });
+
+test("hydrates durable input responses and rejects malformed response snapshots", () => {
+  const collection = parseThreadCollection({
+    threads: [{
+      createdAt: 1,
+      events: [],
+      id: "thread-input-response",
+      inputResponseSubmissions: [{
+        id: "response-1",
+        mailboxItemId: "mail-response-1",
+        responses: [
+          { optionId: "approve", requestId: "request-1" },
+          { requestId: "request-2" },
+        ],
+        state: "committed",
+        streamIndexAtSubmission: 12,
+        submittedAt: 2,
+      }, {
+        id: "response-2",
+        responses: [{ requestId: "request-3", text: "Confirmed" }],
+        settledAtStreamIndex: 24,
+        state: "committed",
+        streamIndexAtSubmission: 12,
+        submittedAt: 3,
+      }],
+      preferences: { modelId: "model", reasoning: "medium" },
+      session: { sessionId: "session-response", streamIndex: 24 },
+      status: "ready",
+      title: "Responses",
+      updatedAt: 3,
+    }],
+    version: 2,
+  });
+
+  assert.deepEqual(collection.threads[0]?.inputResponseSubmissions, [{
+    id: "response-2",
+    responses: [{ requestId: "request-3", text: "Confirmed" }],
+    settledAtStreamIndex: 24,
+    state: "committed",
+    streamIndexAtSubmission: 12,
+    submittedAt: 3,
+  }]);
+});

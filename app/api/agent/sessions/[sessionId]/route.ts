@@ -112,6 +112,9 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
     return problem(400, "agent_session_operation_invalid", "The session operation is invalid.");
   }
   if (body.action === "cancel") {
+    if (body.turnId !== undefined && (typeof body.turnId !== "string" || !body.turnId.trim())) {
+      return problem(400, "agent_session_operation_invalid", "turnId must be a non-empty string.");
+    }
     if (!ownershipStore) return databaseUnavailable();
     try {
       const result = await cancelAgentSession({
@@ -119,6 +122,7 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
         identity: authenticated.identity,
         ownershipStore,
         sessionId,
+        ...(typeof body.turnId === "string" ? { turnId: body.turnId } : {}),
       });
       return result
         ? Response.json(

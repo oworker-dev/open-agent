@@ -48,6 +48,7 @@ export type AgentSessionRuntime = {
   readonly cancel: (input: {
     readonly accessToken: string;
     readonly sessionId: string;
+    readonly turnId?: string;
   }) => Promise<"accepted" | "no_active_turn">;
   /** Read the current Eve lifecycle boundary when a bounded event page has no terminal marker. */
   readonly inspect?: (input: {
@@ -80,6 +81,7 @@ export const eveAgentSessionRuntime: AgentSessionRuntime = {
     return await runtime.cancel({
       owner: INTERNAL_CONTROL_OWNER,
       sessionId: input.sessionId,
+      ...(input.turnId ? { turnId: input.turnId } : {}),
     });
   },
   async inspect(input) {
@@ -188,6 +190,7 @@ export async function cancelAgentSession(options: {
   readonly ownershipStore: AgentSessionOwnershipStore;
   readonly runtime?: AgentSessionRuntime;
   readonly sessionId: string;
+  readonly turnId?: string;
 }): Promise<{ readonly sessionId: string; readonly status: "accepted" | "no_active_turn" } | undefined> {
   assertSessionId(options.sessionId);
   const ownership = await options.ownershipStore.verify(options.sessionId, options.identity);
@@ -195,6 +198,7 @@ export async function cancelAgentSession(options: {
   const status = await (options.runtime ?? eveAgentSessionRuntime).cancel({
     accessToken: options.accessToken,
     sessionId: options.sessionId,
+    ...(options.turnId ? { turnId: options.turnId } : {}),
   });
   return { sessionId: options.sessionId, status };
 }

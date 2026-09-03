@@ -38,6 +38,7 @@ export function mergeThreadCollectionsForConflict(local, remote) {
         byId.set(thread.id, {
             ...selected,
             events,
+            inputResponseSubmissions: mergeInputResponseSubmissions(thread.inputResponseSubmissions ?? [], existing.inputResponseSubmissions ?? []),
             ...(events.length > 0 ? { hydration: undefined } : {}),
             session: {
                 ...selected.session,
@@ -148,6 +149,7 @@ function parseThread(value) {
     const pendingTurn = parsePendingTurn(value.pendingTurn);
     const draftRestore = parseDraftRestore(value.draftRestore);
     const interruptedTurns = parseInterruptedTurns(value.interruptedTurns);
+    const inputResponseSubmissions = parseInputResponseSubmissions(value.inputResponseSubmissions);
     const closedInputRequestIds = Array.isArray(value.closedInputRequestIds)
         ? [...new Set(value.closedInputRequestIds.filter((id) => typeof id === "string" && id.trim().length > 0))].slice(-128)
         : [];
@@ -174,6 +176,7 @@ function parseThread(value) {
         ...(value.hydration === "summary" ? { hydration: "summary" } : {}),
         id: value.id,
         ...(interruptedTurns.length > 0 ? { interruptedTurns } : {}),
+        ...(inputResponseSubmissions.length > 0 ? { inputResponseSubmissions } : {}),
         ...(pendingTurn ? { pendingTurn } : {}),
         preferences: {
             executionMode: isExecutionMode(preferences.executionMode)
@@ -197,6 +200,94 @@ function parseThread(value) {
         title: value.title,
         updatedAt,
     };
+}
+function parseInputResponseSubmissions(value) {
+    if (!Array.isArray(value))
+        return [];
+    const submissions = new Map();
+    for (const candidate of value) {
+        if (!isRecord(candidate) ||
+            typeof candidate.id !== "string" || !candidate.id ||
+            !Array.isArray(candidate.responses) || candidate.responses.length === 0 ||
+            typeof candidate.streamIndexAtSubmission !== "number" ||
+            !Number.isSafeInteger(candidate.streamIndexAtSubmission) || candidate.streamIndexAtSubmission < 0 ||
+            typeof candidate.submittedAt !== "number" || !Number.isFinite(candidate.submittedAt) ||
+            !isInputResponseSubmissionState(candidate.state))
+            continue;
+        const responses = candidate.responses.flatMap((response) => {
+            if (!isRecord(response) || typeof response.requestId !== "string" || !response.requestId)
+                return [];
+            const optionId = typeof response.optionId === "string" && response.optionId ? response.optionId : undefined;
+            const text = typeof response.text === "string" && response.text ? response.text : undefined;
+            if (!optionId && !text)
+                return [];
+            return [{ ...(optionId ? { optionId } : {}), requestId: response.requestId, ...(text ? { text } : {}) }];
+        });
+        if (responses.length !== candidate.responses.length)
+            continue;
+        submissions.set(candidate.id, {
+            id: candidate.id,
+            ...(typeof candidate.mailboxItemId === "string" && candidate.mailboxItemId
+                ? { mailboxItemId: candidate.mailboxItemId }
+                : {}),
+            responses,
+            ...(typeof candidate.settledAtStreamIndex === "number" &&
+                Number.isSafeInteger(candidate.settledAtStreamIndex) && candidate.settledAtStreamIndex >= 0
+                ? { settledAtStreamIndex: candidate.settledAtStreamIndex }
+                : {}),
+            state: candidate.state,
+            streamIndexAtSubmission: candidate.streamIndexAtSubmission,
+            submittedAt: candidate.submittedAt,
+        });
+    }
+    return [...submissions.values()].sort((left, right) => left.submittedAt - right.submittedAt);
+}
+function isInputResponseSubmissionState(value) {
+    return value === "submitting" || value === "accepted" || value === "cancelled" ||
+        value === "committed" || value === "delivering" || value === "failed" ||
+        value === "queued" || value === "submission-ambiguous";
+}
+export function mergeInputResponseSubmissions(left, right) {
+    const submissions = new Map(right.map((entry) => [entry.id, entry]));
+    for (const entry of left) {
+        const current = submissions.get(entry.id);
+        if (!current || entry.settledAtStreamIndex !== undefined ||
+            (current.settledAtStreamIndex === undefined && inputResponseStateRank(entry.state) >= inputResponseStateRank(current.state))) {
+            submissions.set(entry.id, entry);
+        }
+    }
+    return [...submissions.values()].sort((a, b) => a.submittedAt - b.submittedAt);
+}
+export function inputResponseSubmissionProjectsAnswer(submission) {
+    return submission.state !== "failed" && submission.state !== "cancelled";
+}
+export function hasUnsettledInputResponseSubmission(submissions) {
+    return submissions.some((submission) => submission.settledAtStreamIndex === undefined &&
+        inputResponseSubmissionProjectsAnswer(submission));
+}
+export function settleInputResponseSubmissions(submissions, streamIndex) {
+    let changed = false;
+    const settled = submissions.map((submission) => {
+        if (submission.settledAtStreamIndex !== undefined ||
+            !inputResponseSubmissionProjectsAnswer(submission) ||
+            streamIndex <= submission.streamIndexAtSubmission)
+            return submission;
+        changed = true;
+        return { ...submission, settledAtStreamIndex: streamIndex };
+    });
+    return changed ? settled : submissions;
+}
+function inputResponseStateRank(state) {
+    switch (state) {
+        case "submitting": return 0;
+        case "queued": return 1;
+        case "delivering": return 2;
+        case "accepted": return 3;
+        case "committed": return 4;
+        case "submission-ambiguous": return 5;
+        case "failed": return 6;
+        case "cancelled": return 7;
+    }
 }
 function parseTranscriptWindow(value) {
     if (!isRecord(value) ||

@@ -17,7 +17,7 @@ import { AgentThreadView } from "./agent-thread.js";
 import { cn } from "../utils.js";
 import { AgentThreadStorageConflictError, AgentThreadStorageHttpError } from "./http-thread-storage.js";
 import { messagesFor, resolveBrowserLocale } from "./i18n.js";
-import { AGENT_THREAD_STORAGE_VERSION, browserThreadStorage, appendThreadEventIndexed, compactThreadEvents, createAgentThread, eventIdentity, mergeThreadCollectionsForConflict, mergeThreadEventSnapshots, rememberThreadEventCursor, reconcileHydratedPendingTurn, reconcilePendingTurnWithEvents, } from "./thread-storage.js";
+import { AGENT_THREAD_STORAGE_VERSION, browserThreadStorage, appendThreadEventIndexed, compactThreadEvents, createAgentThread, eventIdentity, hasUnsettledInputResponseSubmission, mergeInputResponseSubmissions, mergeThreadCollectionsForConflict, mergeThreadEventSnapshots, rememberThreadEventCursor, reconcileHydratedPendingTurn, reconcilePendingTurnWithEvents, settleInputResponseSubmissions, } from "./thread-storage.js";
 import { hasUnresolvedInputRequests, mergeSubagentSessions, shouldSuppressInterruptedTurnStreamEvent, } from "./turn-presentation.js";
 import { loadSessionDeliverables } from "./session-deliverables.js";
 const DEFAULT_STORAGE_KEY = "open-agent:threads:v1";
@@ -44,6 +44,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
     const [activeSubagentSessionId, setActiveSubagentSessionId] = useState();
     const [isHydrated, setIsHydrated] = useState(false);
     const [recoveringIds, setRecoveringIds] = useState(new Set());
+    const [reconnectingIds, setReconnectingIds] = useState(new Set());
     const [recoveryErrors, setRecoveryErrors] = useState(new Map());
     const [hydratingThreadIds, setHydratingThreadIds] = useState(new Set());
     const [threadHydrationErrors, setThreadHydrationErrors] = useState(new Map());
@@ -967,6 +968,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
         setRecoveryErrors((current) => withoutMapKey(current, thread.id));
         const controller = new AbortController();
         recoveryControllers.current.set(thread.id, controller);
+        setReconnectingIds((current) => new Set(current).add(thread.id));
         const editRecovery = thread.pendingTurn?.operation === "edit";
         const releaseRecovery = () => {
             if (recoveryControllers.current.get(thread.id) !== controller)
@@ -974,7 +976,11 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
             recoveryStarted.current.delete(thread.id);
             recoveryControllers.current.delete(thread.id);
             setRecoveringIds((current) => withoutSetValue(current, thread.id));
+            setReconnectingIds((current) => withoutSetValue(current, thread.id));
             return true;
+        };
+        const markRecoveryConnected = () => {
+            setReconnectingIds((current) => withoutSetValue(current, thread.id));
         };
         const events = [...thread.events];
         const recoveredCursor = thread.session.streamIndex;
@@ -987,6 +993,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
         let knownRuntimeBoundary;
         let runtimeBoundaryState = "unknown";
         let runtimeTailIndex;
+        const hasUnsettledInputResponseAtStart = hasUnsettledInputResponseSubmission(thread.inputResponseSubmissions ?? []);
         let followIdleTimeouts = 0;
         if (inspectSession) {
             try {
@@ -997,7 +1004,9 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                 }
                 runtimeBoundaryState = boundary.state;
                 runtimeTailIndex = boundary.tailIndex;
-                if (boundary.state === "waiting" || boundary.state === "terminal") {
+                markRecoveryConnected();
+                if ((boundary.state === "waiting" || boundary.state === "terminal") &&
+                    !hasUnsettledInputResponseAtStart && !hasUnsettledMailboxAdmission(thread)) {
                     await settleThreadHistory(thread, boundary, editRecovery);
                     releaseRecovery();
                     return;
@@ -1044,6 +1053,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
         const originalPendingTurnId = thread.pendingTurn?.id;
         let pendingTurn = reconcilePendingTurnWithEvents(thread.pendingTurn, events);
         let queuedTurns = thread.queuedTurns;
+        let inputResponseSubmissions = thread.inputResponseSubmissions ?? [];
         let interruptedTurns = thread.interruptedTurns ?? [];
         let cancellationPending = thread.status === "cancelling";
         const committedCatchUpTurns = new Map(queuedTurns
@@ -1063,6 +1073,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
             if (!sameInterruptedTurns(interruptedTurns, liveThread.interruptedTurns ?? [])) {
                 interruptedTurns = liveThread.interruptedTurns ?? [];
             }
+            inputResponseSubmissions = mergeInputResponseSubmissions(inputResponseSubmissions, liveThread.inputResponseSubmissions ?? []);
             const liveQueuedTurnIds = new Set(liveThread.queuedTurns.map((turn) => turn.id));
             queuedTurns = queuedTurns.filter((turn) => !consumedQueuedTurnIds.has(turn.id) &&
                 (recoveryOwnedQueuedTurnIds.has(turn.id) || liveQueuedTurnIds.has(turn.id)));
@@ -1096,6 +1107,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
             if (!mailbox)
                 return;
             const updates = new Map();
+            const responseUpdates = new Map();
             await Promise.all(queuedTurns.map(async (turn) => {
                 if (turn.delivery !== "server" || !turn.mailboxItemId)
                     return;
@@ -1118,7 +1130,19 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                 catch {
                 }
             }));
-            if (updates.size === 0)
+            await Promise.all(inputResponseSubmissions.map(async (submission) => {
+                if (!submission.mailboxItemId || submission.settledAtStreamIndex !== undefined ||
+                    submission.state === "failed" || submission.state === "cancelled")
+                    return;
+                try {
+                    const receipt = await mailbox.inspect(submission.mailboxItemId);
+                    if (receipt.status !== submission.state)
+                        responseUpdates.set(submission.id, receipt.status);
+                }
+                catch {
+                }
+            }));
+            if (updates.size === 0 && responseUpdates.size === 0)
                 return;
             const next = queuedTurns.flatMap((turn) => {
                 const state = updates.get(turn.id);
@@ -1126,14 +1150,21 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                     return [];
                 return state ? [{ ...turn, state }] : [turn];
             });
-            if (sameQueuedTurns(queuedTurns, next))
-                return;
-            queuedTurns = next;
-            updateThread(thread.id, { queuedTurns });
+            if (!sameQueuedTurns(queuedTurns, next))
+                queuedTurns = next;
+            if (responseUpdates.size > 0) {
+                inputResponseSubmissions = inputResponseSubmissions.map((submission) => {
+                    const state = responseUpdates.get(submission.id);
+                    return state ? { ...submission, state } : submission;
+                });
+            }
+            updateThread(thread.id, { inputResponseSubmissions, queuedTurns });
         };
         const hasPendingServerQueue = () => queuedTurns.some((turn) => turn.delivery === "server" && mailboxTurnAwaitsAdmission(turn) && Boolean(turn.mailboxItemId));
         const currentBoundarySettles = () => {
             if (pendingTurn?.operation === "edit" && isPendingMailboxEdit(pendingTurn))
+                return false;
+            if (hasUnsettledInputResponseSubmission(inputResponseSubmissions))
                 return false;
             const last = events.at(-1);
             if (knownRuntimeBoundary && runtimeBoundaryReady) {
@@ -1171,6 +1202,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
             updateThread(thread.id, {
                 events: [...events],
                 interruptedTurns,
+                inputResponseSubmissions,
                 pendingTurn,
                 queuedTurns,
                 session: { ...session.state, streamIndex: persistedCursor },
@@ -1181,6 +1213,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
         };
         try {
             cursor = await reconcileRecoveryCursor(connection.client, session.state.sessionId, recoveryStartCursor, events, controller.signal);
+            markRecoveryConnected();
             recoveryCursorReconciled = cursor !== recoveryStartCursor;
             while (!settled && !controller.signal.aborted) {
                 try {
@@ -1227,6 +1260,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                             startIndex: cursor,
                             ...(follow ? { streamReconnectPolicy: RECOVERY_STREAM_RECONNECT_POLICY } : {}),
                         })) {
+                            markRecoveryConnected();
                             rememberThreadEventCursor(event, cursor);
                             mergeLiveAdmissions();
                             if (cancellationPending && event.type === "turn.started") {
@@ -1238,6 +1272,9 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                                 recoveryEventsSinceFlush += 1;
                             }
                             cursor += 1;
+                            if (event.type === "session.waiting" || event.type === "session.completed" || event.type === "session.failed") {
+                                inputResponseSubmissions = settleInputResponseSubmissions(inputResponseSubmissions, cursor);
+                            }
                             recoverySnapshotDirty = true;
                             consumed += 1;
                             onEvent?.(event);
@@ -1309,6 +1346,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                         await followWatchdog;
                         flushRecoverySnapshot();
                     }
+                    markRecoveryConnected();
                     if (controller.signal.aborted)
                         return;
                     if (restartFollowFromDurableProgress && !settled) {
@@ -1363,6 +1401,9 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                         if (missingBoundary) {
                             appendThreadEventIndexed(events, eventIds, missingBoundary);
                             recoverySnapshotDirty = true;
+                            if (missingBoundary.type === "session.waiting" || missingBoundary.type === "session.completed" || missingBoundary.type === "session.failed") {
+                                inputResponseSubmissions = settleInputResponseSubmissions(inputResponseSubmissions, cursor);
+                            }
                             if (cancellationPending &&
                                 (missingBoundary.type === "session.waiting" || missingBoundary.type === "session.completed" || missingBoundary.type === "session.failed"))
                                 cancellationPending = false;
@@ -1373,7 +1414,9 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                     }
                     if (!settled && currentBoundarySettles())
                         settled = true;
-                    reconnectAttempt = consumed > 0 ? 0 : reconnectAttempt + 1;
+                    reconnectAttempt = consumed > 0 || hasUnsettledInputResponseSubmission(inputResponseSubmissions) || hasPendingServerQueue()
+                        ? 0
+                        : reconnectAttempt + 1;
                     setRecoveryErrors((current) => withoutMapKey(current, thread.id));
                 }
                 catch (error) {
@@ -1381,6 +1424,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                         return;
                     if (!isRetryableRecoveryError(error))
                         throw error;
+                    setReconnectingIds((current) => new Set(current).add(thread.id));
                     reconnectAttempt += 1;
                 }
                 if (reconnectAttempt > MAX_RECOVERY_RECONNECT_ATTEMPTS) {
@@ -1400,6 +1444,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
             const recoveryPatch = {
                 events: compactThreadEvents(events),
                 interruptedTurns,
+                inputResponseSubmissions,
                 pendingTurn,
                 queuedTurns,
                 session: { ...session.state, streamIndex: cursor },
@@ -1457,6 +1502,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
         }
     }, [isHydrated, recoverThread, recoveringIds, threads]);
     const activeIsRecovering = activeThread ? recoveringIds.has(activeThread.id) : false;
+    const activeIsReconnecting = activeThread ? reconnectingIds.has(activeThread.id) : false;
     const activeThreadRuntimeKey = activeThread
         ? `${activeThread.id}:${activeThread.transcriptWindow?.startIndex ?? 0}:${threadRuntimeSeeds.get(activeThread.id) ?? "initial"}`
         : "none";
@@ -1470,7 +1516,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                                 setPanelResizing(true);
                         } }) : null, _jsx(ResizablePanel, { className: "min-w-0 p-0", "data-workbench-panel": true, defaultSize: "100%", id: "agent-workbench", minSize: "0px", children: _jsxs(ResizablePanelGroup, { className: "h-full", orientation: "horizontal", children: [_jsx(ResizablePanel, { className: cn("min-w-0", secondaryOpen && !desktopLayout && "hidden"), defaultSize: secondaryOpen && !desktopLayout ? "0%" : secondaryOpen ? "70%" : "100%", id: "agent-primary", minSize: "0px", children: _jsxs("section", { className: "flex h-full min-w-0 flex-col overflow-hidden bg-card", "data-slot": "agent-workbench", children: [_jsxs("header", { className: "flex h-12 shrink-0 items-center justify-between border-b border-border/70 px-3 lg:h-13 lg:px-4", children: [_jsxs("div", { className: "flex min-w-0 items-center gap-2", children: [_jsx(Button, { "aria-label": messages.openNavigation, className: "lg:hidden", onClick: () => setSidebarOpen(true), size: "icon-sm", variant: "ghost", children: _jsx(MenuIcon, { className: "size-4" }) }), _jsx(Button, { "aria-label": messages.toggleNavigation, className: "hidden lg:inline-flex", disabled: workbenchTransitioning, onClick: toggleDesktopSidebar, size: "icon-sm", variant: "ghost", children: workbenchMode === "split" ? _jsx(PanelLeftCloseIcon, { className: "size-4" }) : _jsx(PanelLeftIcon, { className: "size-4" }) }), activeSubagentSessionId ? (_jsx(Button, { "aria-label": messages.backToTask, onClick: closeSubagent, size: "icon-sm", variant: "ghost", children: _jsx(ArrowLeftIcon, { className: "size-4" }) })) : null, _jsx("h2", { className: "truncate font-medium text-[15px]", children: activeSubagentSessionId ? activeSubagent?.label ?? messages.subagentSession : activeThread.title })] }), _jsxs("div", { className: "flex items-center gap-1", children: [_jsx(Button, { "aria-label": secondaryOpen ? messages.closeSecondaryView : messages.openSecondaryView, onClick: () => setSecondaryOpen((open) => !open), size: "icon-sm", variant: "ghost", children: _jsx(PanelRightIcon, { className: "size-4" }) }), _jsx(AgentSubagentMenu, { activeSessionId: activeSubagentSessionId, durableSessions: durableSubagents, events: activeThread.events, locale: locale, onControl: controlSubagent, onOpen: openSubagent }), hostSlots?.threadHeaderEnd] })] }), deletionIssue ? (_jsxs("div", { className: "flex shrink-0 items-center gap-3 border-b border-destructive/30 bg-destructive/5 px-4 py-2.5 text-sm", role: "alert", children: [_jsx(AlertCircleIcon, { className: "size-4 shrink-0 text-destructive" }), _jsx("p", { className: "min-w-0 flex-1 text-foreground", children: messages.deleteUnavailable }), _jsx(Button, { onClick: () => setDeletionIssue(false), size: "sm", variant: "outline", children: messages.dismiss })] })) : null, runtimeStatus.provider !== "ready" ? (_jsxs("div", { className: "flex shrink-0 items-start gap-3 border-b border-amber-500/30 bg-amber-500/8 px-4 py-2.5 text-sm", role: "status", children: [_jsx(ServerOffIcon, { className: "mt-0.5 size-4 shrink-0 text-amber-700 dark:text-amber-300" }), _jsx("p", { className: "min-w-0 flex-1 text-foreground", children: runtimeStatus.provider === "mock" ? messages.mockProvider : messages.providerUnconfigured })] })) : null, activeIsHydrating ? (_jsx("main", { className: "flex min-h-0 flex-1 items-center justify-center bg-background px-6", children: threadHydrationErrors.has(activeThread.id) ? (_jsxs("div", { className: "max-w-md text-center", role: "alert", children: [_jsx(AlertCircleIcon, { className: "mx-auto size-5 text-destructive" }), _jsx("p", { className: "mt-3 text-sm text-muted-foreground", children: threadHydrationErrors.get(activeThread.id) ?? messages.recoveryFailed }), _jsx(Button, { className: "mt-4", onClick: () => hydrateThread(activeThread), size: "sm", variant: "outline", children: messages.retry })] })) : (_jsx("p", { className: "text-sm text-muted-foreground", role: "status", children: messages.loading })) })) : activeSubagentSessionId ? (activeSubagent ? (_jsx(AgentChildSessionView, { client: client, commands: commands, locale: locale, mailbox: mailbox, mentions: mentions, models: models, onEvent: onEvent, onOpenDeliverable: openDeliverable, onOpenSubagent: openSubagent, onStorageError: onStorageError, preferences: activeThread.preferences, providerReady: runtimeStatus.provider !== "unconfigured", reasoningLevels: reasoningLevels, sessionId: activeSubagentSessionId, storageKey: storageKey, threadStorage: threadStorage })) : (_jsx(UnavailableSubagentView, { locale: locale, onBack: closeSubagent }))) : (_jsx("div", { className: "flex min-h-0 flex-1 flex-col", children: _jsx(AgentThreadView, { client: client, commands: commands, draftStorageKey: ephemeralThreadIds.has(activeThread.id)
                                                         ? `${storageKey}:draft:new`
-                                                        : `${storageKey}:draft:${activeThread.id}`, isRecovering: activeIsRecovering, historyHasMore: activeThread.transcriptWindow?.hasMoreBefore === true, historyLoading: threadHistoryLoading.has(activeThread.id), locale: locale, mailbox: mailbox, mentions: mentions, models: models, onCancelRecovery: () => cancelThreadRecovery(activeThread.id), onChange: changeActiveThread, onEvent: onEvent, onOpenDeliverable: openDeliverable, onOpenSubagent: openSubagent, onLoadEarlier: () => loadEarlierThreadEvents(activeThread.id), onRetryRecovery: () => requestThreadRecovery(activeThread.id), onRecoveryNeeded: recoverActiveThread, providerReady: runtimeStatus.provider !== "unconfigured", recoveryError: recoveryErrors.get(activeThread.id), reasoningLevels: reasoningLevels, thread: activeThread }, activeThreadRuntimeKey) }))] }) }), secondaryOpen ? (_jsxs(_Fragment, { children: [desktopLayout ? _jsx(ResizableHandle, { className: "flex bg-transparent after:w-2", "data-secondary-resize-handle": true }) : null, _jsx(ResizablePanel, { className: "min-w-0 border-l border-border/70", defaultSize: desktopLayout ? "30%" : "100%", id: "agent-secondary", maxSize: desktopLayout ? "50%" : "100%", minSize: desktopLayout ? "260px" : "0px", children: _jsx(AgentSecondaryView, { assetUrl: client?.assetUrl, assets: sessionAssets, assetsError: assetsError, assetsLoading: assetsLoading, deliverables: deliverablesError ? undefined : sessionDeliverables, deliverablesError: deliverablesError, deliverablesLoading: deliverablesLoading, children: activeThread ? subagentsForThread(activeThread.events, durableSubagents) : [], childContent: secondaryChildSessionId && activeThread ? (_jsx(AgentChildSessionView, { client: client, commands: commands, locale: locale, mailbox: mailbox, mentions: mentions, models: models, onEvent: onEvent, onOpenDeliverable: openDeliverable, onOpenSubagent: openSubagent, onStorageError: onStorageError, preferences: activeThread.preferences, providerReady: runtimeStatus.provider !== "unconfigured", reasoningLevels: reasoningLevels, sessionId: secondaryChildSessionId, storageKey: storageKey, threadStorage: threadStorage })) : undefined, locale: locale, onClose: () => setSecondaryOpen(false), onOpenAsset: onOpenAsset ? (asset) => onOpenAsset(asset) : undefined, onOpenDeliverable: onOpenDeliverable, onOpenChild: (sessionId) => {
+                                                        : `${storageKey}:draft:${activeThread.id}`, isRecovering: activeIsRecovering, isReconnecting: activeIsReconnecting, historyHasMore: activeThread.transcriptWindow?.hasMoreBefore === true, historyLoading: threadHistoryLoading.has(activeThread.id), locale: locale, mailbox: mailbox, mentions: mentions, models: models, onCancelRecovery: () => cancelThreadRecovery(activeThread.id), onChange: changeActiveThread, onEvent: onEvent, onOpenDeliverable: openDeliverable, onOpenSubagent: openSubagent, onLoadEarlier: () => loadEarlierThreadEvents(activeThread.id), onRetryRecovery: () => requestThreadRecovery(activeThread.id), onRecoveryNeeded: recoverActiveThread, providerReady: runtimeStatus.provider !== "unconfigured", recoveryError: recoveryErrors.get(activeThread.id), reasoningLevels: reasoningLevels, thread: activeThread }, activeThreadRuntimeKey) }))] }) }), secondaryOpen ? (_jsxs(_Fragment, { children: [desktopLayout ? _jsx(ResizableHandle, { className: "flex bg-transparent after:w-2", "data-secondary-resize-handle": true }) : null, _jsx(ResizablePanel, { className: "min-w-0 border-l border-border/70", defaultSize: desktopLayout ? "30%" : "100%", id: "agent-secondary", maxSize: desktopLayout ? "50%" : "100%", minSize: desktopLayout ? "260px" : "0px", children: _jsx(AgentSecondaryView, { assetUrl: client?.assetUrl, assets: sessionAssets, assetsError: assetsError, assetsLoading: assetsLoading, deliverables: deliverablesError ? undefined : sessionDeliverables, deliverablesError: deliverablesError, deliverablesLoading: deliverablesLoading, children: activeThread ? subagentsForThread(activeThread.events, durableSubagents) : [], childContent: secondaryChildSessionId && activeThread ? (_jsx(AgentChildSessionView, { client: client, commands: commands, locale: locale, mailbox: mailbox, mentions: mentions, models: models, onEvent: onEvent, onOpenDeliverable: openDeliverable, onOpenSubagent: openSubagent, onStorageError: onStorageError, preferences: activeThread.preferences, providerReady: runtimeStatus.provider !== "unconfigured", reasoningLevels: reasoningLevels, sessionId: secondaryChildSessionId, storageKey: storageKey, threadStorage: threadStorage })) : undefined, locale: locale, onClose: () => setSecondaryOpen(false), onOpenAsset: onOpenAsset ? (asset) => onOpenAsset(asset) : undefined, onOpenDeliverable: onOpenDeliverable, onOpenChild: (sessionId) => {
                                                     setSecondaryChildSessionId(sessionId);
                                                 }, onRefreshAssets: refreshAssets, onRefreshDeliverables: refreshDeliverables, onSelectTab: setSecondaryTab, requestedDeliverable: requestedDeliverable?.deliverable, requestedDeliverableRequestId: requestedDeliverable?.requestId, tab: secondaryTab }, `secondary:${activeThread?.id ?? "empty"}:${activeThread?.session.sessionId ?? "draft"}`) })] })) : null] }) })] }), workbenchFullscreen ? (_jsx(FloatingAgentSidebar, { activeThreadId: activeThread.id, brand: productName, deletingThreadIds: deletingThreadIds, hostFooter: hostSlots?.sidebarFooter, locale: locale, messages: messages, onDelete: deleteThread, onNew: createThread, onRename: renameThread, onSelect: selectThread, onSettings: () => setSettingsOpen(true), threads: visibleThreads })) : null, _jsx(AgentSettingsDialog, { extensions: extensions, locale: locale, messages: messages, onLocaleChange: setLocale, onOpenChange: setSettingsOpen, open: settingsOpen })] }));
 }
@@ -1883,6 +1929,12 @@ function isPendingMailboxEdit(turn) {
     return turn.operation === "edit" &&
         (turn.state === "submitting" || turn.state === "clearing" || turn.state === "resubmitting");
 }
+function hasUnsettledMailboxAdmission(thread) {
+    return thread.queuedTurns.some((turn) => turn.delivery === "server" && mailboxTurnAwaitsAdmission(turn)) || Boolean(thread.pendingTurn?.delivery === "server" &&
+        (thread.pendingTurn.state === "submitting" ||
+            thread.pendingTurn.state === "clearing" ||
+            thread.pendingTurn.state === "resubmitting"));
+}
 function transcriptCoversSession(thread) {
     return hasCompleteTranscriptCoverage(thread) || thread.session.streamIndex <= thread.events.length;
 }
@@ -2032,6 +2084,7 @@ function isUrgentPersistenceChange(previous, next) {
             !samePendingTurn(prior.pendingTurn, thread.pendingTurn) ||
             !sameQueuedTurns(prior.queuedTurns, thread.queuedTurns) ||
             !sameInterruptedTurns(prior.interruptedTurns ?? [], thread.interruptedTurns ?? []) ||
+            JSON.stringify(prior.inputResponseSubmissions ?? []) !== JSON.stringify(thread.inputResponseSubmissions ?? []) ||
             !sameStringList(prior.closedInputRequestIds, thread.closedInputRequestIds) ||
             !sameStringList(prior.retainedContext ?? [], thread.retainedContext ?? []))
             return true;

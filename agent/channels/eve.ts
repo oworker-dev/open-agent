@@ -276,15 +276,15 @@ const mailboxRoute = POST(MAILBOX_ROUTE, async (request, {
     if (boundary.state === "running" && input.operationKind === "steer" && !steer) {
       return mailboxProblem(400, "mailbox_expected_turn_missing", "A steering message requires the active turn id.");
     }
-    const accepted = await session.send(
-      input.message,
-      {
-        auth: mailboxSessionAuth(input),
-        ...(input.clientContext ? { clientContext: input.clientContext } : {}),
-        ...(revert ? { revert } : {}),
-        ...(steer ? { steer } : {}),
-      },
-    );
+    const turnOptions = {
+      auth: mailboxSessionAuth(input),
+      ...(input.clientContext ? { clientContext: input.clientContext } : {}),
+      ...(revert ? { revert } : {}),
+      ...(steer ? { steer } : {}),
+    };
+    const accepted = input.operationKind === "respond"
+      ? await session.respond(input.inputResponses!, turnOptions)
+      : await session.send(input.message!, turnOptions);
     if (accepted.status === "session_not_active") {
       return mailboxProblem(
         410,
@@ -351,10 +351,11 @@ type MailboxDeliverRequest = {
   readonly expectedTurnId?: string;
   readonly issuer?: string;
   readonly itemId: string;
-  readonly message: string;
+  readonly inputResponses?: readonly import("eve/client").InputResponse[];
+  readonly message?: string;
   readonly modelId?: string;
   readonly operationId?: string;
-  readonly operationKind?: "send" | "steer" | "edit";
+  readonly operationKind?: "send" | "steer" | "edit" | "respond";
   readonly principalId: string;
   readonly principalType: string;
   readonly reasoning?: string;
@@ -399,7 +400,6 @@ function parseMailboxRequest(body: string): MailboxInspectRequest | MailboxTrans
     value.action !== "deliver" ||
     !validText(value.clientMessageId, 200) ||
     !validText(value.itemId, 512) ||
-    !validText(value.message, 65_536) ||
     !validText(value.principalId, 512) ||
     !validText(value.principalType, 512) ||
     !validText(value.tenantId, 512) ||
@@ -414,13 +414,18 @@ function parseMailboxRequest(body: string): MailboxInspectRequest | MailboxTrans
     value.operationKind !== undefined &&
       value.operationKind !== "send" &&
       value.operationKind !== "steer" &&
-      value.operationKind !== "edit" ||
+      value.operationKind !== "edit" &&
+      value.operationKind !== "respond" ||
     value.expectedTurnId !== undefined && !validText(value.expectedTurnId, 512) ||
     value.beforeTurnId !== undefined && !validText(value.beforeTurnId, 512) ||
     value.operationKind === "steer" &&
       (typeof value.operationId !== "string" || typeof value.expectedTurnId !== "string") ||
     value.operationKind === "edit" &&
       (typeof value.operationId !== "string" || typeof value.beforeTurnId !== "string") ||
+    value.operationKind === "respond" &&
+      (typeof value.operationId !== "string" || !validInputResponses(value.inputResponses) || value.message !== undefined) ||
+    value.operationKind !== "respond" &&
+      (!validText(value.message, 65_536) || value.inputResponses !== undefined) ||
     value.operationId !== undefined && typeof value.operationKind !== "string" ||
     value.clientContext !== undefined && !validClientContext(value.clientContext)
   ) return undefined;
@@ -433,7 +438,8 @@ function parseMailboxRequest(body: string): MailboxInspectRequest | MailboxTrans
     ...(value.expectedTurnId ? { expectedTurnId: value.expectedTurnId } : {}),
     ...(value.issuer ? { issuer: value.issuer } : {}),
     itemId: value.itemId,
-    message: value.message,
+    ...(validInputResponses(value.inputResponses) ? { inputResponses: value.inputResponses } : {}),
+    ...(typeof value.message === "string" ? { message: value.message } : {}),
     ...(value.modelId ? { modelId: value.modelId } : {}),
     ...(value.operationId ? { operationId: value.operationId } : {}),
     ...(value.operationKind ? { operationKind: value.operationKind } : {}),
@@ -443,6 +449,15 @@ function parseMailboxRequest(body: string): MailboxInspectRequest | MailboxTrans
     sessionId: value.sessionId,
     tenantId: value.tenantId,
   };
+}
+
+function validInputResponses(value: unknown): value is readonly import("eve/client").InputResponse[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 16) return false;
+  return value.every((response) => isRecord(response) &&
+    validText(response.requestId, 512) &&
+    (validText(response.optionId, 512) || validText(response.text, 65_536)) &&
+    (response.optionId === undefined || validText(response.optionId, 512)) &&
+    (response.text === undefined || validText(response.text, 65_536)));
 }
 
 function canSteerMailboxRequest(

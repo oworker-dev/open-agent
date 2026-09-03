@@ -128,6 +128,7 @@ function mergeSummaryThread(
   const next: Record<string, unknown> = {
     ...current,
     closedInputRequestIds: replacement.closedInputRequestIds,
+    inputResponseSubmissions: replacement.inputResponseSubmissions,
     preferences: replacement.preferences,
     queuedTurns: replacement.queuedTurns,
     revision: replacement.revision,
@@ -136,7 +137,7 @@ function mergeSummaryThread(
     title: replacement.title,
     updatedAt: replacement.updatedAt,
   };
-  for (const key of ["draftRestore", "interruptedTurns", "pendingTurn", "retainedContext"] as const) {
+  for (const key of ["draftRestore", "interruptedTurns", "inputResponseSubmissions", "pendingTurn", "retainedContext"] as const) {
     if (Object.prototype.hasOwnProperty.call(replacement, key)) next[key] = replacement[key];
     else delete next[key];
   }
@@ -196,6 +197,7 @@ export function summarizeThreadCollection(
           events: [],
           hydration: "summary",
           id: thread.id,
+          ...(thread.inputResponseSubmissions ? { inputResponseSubmissions: thread.inputResponseSubmissions } : {}),
           ...(thread.pendingTurn ? { pendingTurn: thread.pendingTurn } : {}),
           preferences: thread.preferences,
           queuedTurns: thread.queuedTurns,

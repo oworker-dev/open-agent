@@ -30,10 +30,10 @@ declare const diffViewerVariants: (props?: ({
     size?: "default" | "sm" | "lg" | null | undefined;
 } & import("class-variance-authority/types").ClassProp) | undefined) => string;
 declare const diffLineVariants: (props?: ({
-    type?: "del" | "add" | "normal" | "empty" | null | undefined;
+    type?: "del" | "normal" | "add" | "empty" | null | undefined;
 } & import("class-variance-authority/types").ClassProp) | undefined) => string;
 declare const diffLineTextVariants: (props?: ({
-    type?: "del" | "add" | "normal" | "empty" | null | undefined;
+    type?: "del" | "normal" | "add" | "empty" | null | undefined;
 } & import("class-variance-authority/types").ClassProp) | undefined) => string;
 declare function DiffViewerFileBadge({ filename }: {
     filename?: string | undefined;

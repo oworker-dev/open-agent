@@ -118,6 +118,69 @@ test("dispatcher admits a steer for the exact active Eve turn", async () => {
   assert.equal(runtime.deliveries.length, 1);
 });
 
+test("a structured input response commits at durable admission without a message receipt", async () => {
+  const store = new MemoryMailboxStore();
+  await enqueueAgentMailboxMessage({
+    clientMessageId: "response-request-1",
+    inputResponses: [{ optionId: "approve", requestId: "request-approval-1" }],
+    operationId: "response-request-1",
+    operationKind: "respond",
+    owner,
+    sessionId: "session-1",
+    store,
+  });
+  const runtime = new FakeMailboxRuntime({ state: "waiting" });
+
+  const result = await dispatchNextAgentMailboxMessage({ runtime, store });
+
+  assert.equal(result.status, "accepted");
+  assert.equal(store.items[0]?.status, "committed");
+  assert.deepEqual(runtime.deliveries[0]?.inputResponses, [
+    { optionId: "approve", requestId: "request-approval-1" },
+  ]);
+  assert.equal(runtime.deliveries[0]?.message, undefined);
+});
+
+test("structured input responses reject mixed message payloads", async () => {
+  const store = new MemoryMailboxStore();
+  await assert.rejects(
+    enqueueAgentMailboxMessage({
+      clientMessageId: "response-request-2",
+      inputResponses: [{ optionId: "approve", requestId: "request-approval-2" }],
+      message: "approve",
+      operationId: "response-request-2",
+      operationKind: "respond",
+      owner,
+      sessionId: "session-1",
+      store,
+    }),
+    /cannot contain a message/i,
+  );
+});
+
+test("a stale steer remains queued and is admitted only at the waiting boundary", async () => {
+  const store = new MemoryMailboxStore();
+  await enqueueAgentMailboxMessage({
+    clientMessageId: "message-stale-steer-1",
+    expectedTurnId: "turn-old",
+    message: "Continue after the turn changed.",
+    operationId: "operation-stale-steer-1",
+    operationKind: "steer",
+    owner,
+    sessionId: "session-1",
+    store,
+  });
+  const runtime = new FakeMailboxRuntime({ state: "running", turnId: "turn-new" });
+
+  assert.equal((await dispatchNextAgentMailboxMessage({ runtime, store })).status, "deferred");
+  assert.equal(runtime.deliveries.length, 0);
+
+  runtime.boundary = { state: "waiting" };
+  assert.equal((await dispatchNextAgentMailboxMessage({ runtime, store })).status, "accepted");
+  assert.equal(runtime.deliveries.length, 1);
+  assert.equal(store.items[0]?.payload.operation?.kind, "steer");
+});
+
 test("edit admission is deferred while running and delivered once at the waiting boundary", async () => {
   const store = new MemoryMailboxStore();
   await enqueueAgentMailboxMessage({
@@ -289,7 +352,8 @@ class FakeMailboxRuntime implements AgentMailboxRuntime {
     beforeTurnId?: string;
     clientMessageId: string;
     itemId: string;
-    message: string;
+    inputResponses?: AgentMailboxItem["payload"]["inputResponses"];
+    message?: string;
     sessionId: string;
   }> = [];
   deliveryError?: Error;
@@ -309,7 +373,9 @@ class FakeMailboxRuntime implements AgentMailboxRuntime {
         : {}),
       clientMessageId: input.clientMessageId,
       itemId: input.itemId,
-      message: input.payload.message,
+      ...(input.payload.inputResponses
+        ? { inputResponses: input.payload.inputResponses }
+        : { message: input.payload.message }),
       sessionId: input.sessionId,
     });
     if (this.deliveryError) throw this.deliveryError;

@@ -15,7 +15,7 @@ import { sanitizeAgentError } from "./error-presentation.js";
 import { AgentMailboxHttpError } from "./http-agent-mailbox.js";
 import { messagesFor } from "./i18n.js";
 import { interruptedTurnContextFromEvents, interruptedTurnContextsFromEvents, } from "./retained-context.js";
-import { appendThreadEventIndexed, dedupeThreadEvents, editOperationId, eventIdentity, latestEditableTurnId, mergeThreadEventSnapshots, projectPendingThreadEdit, projectThreadEditBranches, reconcilePendingTurnWithEvents, rememberThreadEventCursor, titleFromPrompt } from "./thread-storage.js";
+import { appendThreadEventIndexed, dedupeThreadEvents, editOperationId, eventIdentity, inputResponseSubmissionProjectsAnswer, latestEditableTurnId, mergeThreadEventSnapshots, projectPendingThreadEdit, projectThreadEditBranches, reconcilePendingTurnWithEvents, rememberThreadEventCursor, settleInputResponseSubmissions, titleFromPrompt } from "./thread-storage.js";
 import { activeTurnIdAfterPendingSubmission, hasTerminalSessionBoundary, hasSettledLatestTurn, isRetryableAgentFailure, isProxiedInputOnlyMessage, normalizeSettledAgentMessages, projectAgentDisplayTimeline, shouldSuppressInterruptedTurnDisplayEvent, shouldSuppressInterruptedTurnStreamEvent, stableUserMessageId, unresolvedInputRequests, } from "./turn-presentation.js";
 import { summarizeUsage } from "./usage.js";
 const CANCELLATION_STREAM_REATTACH_AFTER_MS = 5_000;
@@ -34,7 +34,7 @@ const LONG_RUNNING_STREAM_RECONNECT_POLICY = {
         maxDelayMs: 10_000,
     },
 };
-export function AgentThreadView({ client, commands, draftStorageKey, historyHasMore = false, historyLoading = false, isRecovering = false, locale, mailbox, mentions, models, onChange, onCancelRecovery, onEvent, onOpenDeliverable, onOpenSubagent, onLoadEarlier, onRetryRecovery, onRecoveryNeeded, providerReady, recoveryError, reasoningLevels, thread, }) {
+export function AgentThreadView({ client, commands, draftStorageKey, historyHasMore = false, historyLoading = false, isRecovering = false, isReconnecting = false, locale, mailbox, mentions, models, onChange, onCancelRecovery, onEvent, onOpenDeliverable, onOpenSubagent, onLoadEarlier, onRetryRecovery, onRecoveryNeeded, providerReady, recoveryError, reasoningLevels, thread, }) {
     const preferencesRef = useRef(thread.preferences);
     const latestEventsRef = useRef(thread.events);
     const persistedCancellationTurnId = thread.status === "cancelling"
@@ -68,6 +68,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     const retainedContextRef = useRef(thread.retainedContext);
     const interruptedTurnsRef = useRef(thread.interruptedTurns ?? []);
     const closedInputRequestIdsRef = useRef(new Set(thread.closedInputRequestIds));
+    const inputResponseSubmissionsRef = useRef(thread.inputResponseSubmissions ?? []);
     const dispatchingQueuedTurnIdRef = useRef(undefined);
     const mailboxEnqueueIdsRef = useRef(new Set());
     const turnAdmissionBusyRef = useRef(false);
@@ -146,6 +147,13 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     useEffect(() => {
         closedInputRequestIdsRef.current = new Set(thread.closedInputRequestIds);
     }, [thread.closedInputRequestIds]);
+    useEffect(() => {
+        inputResponseSubmissionsRef.current = thread.inputResponseSubmissions ?? [];
+    }, [thread.inputResponseSubmissions]);
+    const updateInputResponseSubmissions = useCallback((submissions) => {
+        inputResponseSubmissionsRef.current = submissions;
+        onChange({ inputResponseSubmissions: submissions, updatedAt: Date.now() });
+    }, [onChange]);
     const [connection] = useState(() => createAgentSession(client, () => preferencesRef.current, thread.session));
     const sessionRef = useRef(attachAgentSession(connection, connection.initialSession));
     const requestDurableCancellation = useCallback((durableSession, turnId) => {
@@ -162,7 +170,11 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
                 return;
             requestState.sentSessionId = durableSession.state.sessionId;
         }
-        void durableSession.cancel(turnId ? { turnId } : undefined)
+        const cancelRequest = mailbox?.cancelSession
+            ? mailbox.cancelSession({ sessionId: durableSession.state.sessionId, ...(turnId ? { turnId } : {}) })
+                .then((status) => ({ status }))
+            : durableSession.cancel(turnId ? { turnId } : undefined);
+        void cancelRequest
             .then((result) => {
             if (cancellationRef.current !== requestState || !requestState.requested)
                 return;
@@ -185,7 +197,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             setCancellationError(error instanceof Error ? error.message : "Unable to stop this turn.");
             setCancellationState("cancelling");
         });
-    }, [onChange, settleCancellationUi]);
+    }, [mailbox, onChange, settleCancellationUi]);
     const handleEvent = useCallback((event) => {
         lastObservedEventAtRef.current = Date.now();
         const sourceIndex = consumedStreamIndexRef.current;
@@ -266,6 +278,11 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         }
         if (event.type === "session.waiting" || event.type === "session.completed" || event.type === "session.failed") {
             turnAdmissionBusyRef.current = false;
+            const submissions = settleInputResponseSubmissions(inputResponseSubmissionsRef.current, sourceIndex + 1);
+            if (submissions !== inputResponseSubmissionsRef.current) {
+                inputResponseSubmissionsRef.current = submissions;
+                onChange({ inputResponseSubmissions: submissions, updatedAt: Date.now() });
+            }
         }
         if (event.type === "turn.cancelled") {
             const settledInterruptedTurns = settleInterruptedTurn(interruptedTurnsRef.current, event.data.turnId, sourceIndex + 1);
@@ -476,7 +493,15 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     }, [authoritativeEvents, effectiveRenderMessages, optimisticPendingTurn]);
     const admissionBusy = pendingTurnInFlight || serverFollowUpInFlight || (!durableTurnSettled &&
         (runtimeIsBusy || durableTurnOpen || liveTurnOpen || isRecovering || cancellationSettling));
-    const pendingInputRequests = unresolvedInputRequests(authoritativeEvents, closedInputRequestIdsRef.current);
+    const durableInputResponses = useMemo(() => (thread.inputResponseSubmissions ?? [])
+        .filter(inputResponseSubmissionProjectsAnswer)
+        .flatMap((submission) => submission.responses), [thread.inputResponseSubmissions]);
+    const resolvedInputRequestIds = new Set(durableInputResponses.map((response) => response.requestId));
+    const unavailableInputRequestIds = new Set([
+        ...closedInputRequestIdsRef.current,
+        ...resolvedInputRequestIds,
+    ]);
+    const pendingInputRequests = unresolvedInputRequests(authoritativeEvents, unavailableInputRequestIds);
     const approvalRequest = pendingInputRequests.find((request) => request.kind === "tool-approval");
     const approvalTakeover = approvalRequest
         ? {
@@ -1014,12 +1039,15 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
                 return;
             }
             if (text.length > 0) {
+                const expectedTurnId = latestActiveTurnId(latestEventsRef.current);
                 setQueueError(undefined);
                 updateQueuedTurns([
                     ...queuedTurnsRef.current,
                     {
                         ...(mailbox ? { delivery: "server" } : {}),
+                        ...(mailbox && expectedTurnId ? { expectedTurnId } : {}),
                         id: createPendingTurnId(),
+                        ...(mailbox ? { intent: "active-turn" } : {}),
                         state: "queued",
                         submittedAt: Date.now(),
                         text,
@@ -1106,8 +1134,8 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         const source = displayInterruptedTurns.length > 0
             ? messagesFromEvents(interruptedDisplayEvents)
             : projectionMessages;
-        return normalizeSettledAgentMessages(source, interruptedDisplayEvents);
-    }, [displayInterruptedTurns.length, interruptedDisplayEvents, projectionMessages]);
+        return normalizeSettledAgentMessages(projectInputResponses(source, durableInputResponses), interruptedDisplayEvents);
+    }, [displayInterruptedTurns.length, durableInputResponses, interruptedDisplayEvents, projectionMessages]);
     const displayMessageIdentityRef = useRef({
         assistantByTurn: new Map(),
         pendingRoot: undefined,
@@ -1374,13 +1402,25 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             !mailboxEnqueueIdsRef.current.has(turn.id));
         if (!next)
             return;
+        if (next.intent === "active-turn" && !next.expectedTurnId) {
+            const expectedTurnId = latestActiveTurnId(agent.events);
+            if (expectedTurnId) {
+                updateQueuedTurns(queuedTurnsRef.current.map((turn) => turn.id === next.id ? { ...turn, expectedTurnId } : turn));
+                return;
+            }
+            const originalTurnStillSettling = pendingTurnInFlight || runtimeIsBusy ||
+                durableTurnOpen || liveTurnOpen || isRecovering || cancellationSettling;
+            if (originalTurnStillSettling)
+                return;
+        }
         mailboxEnqueueIdsRef.current.add(next.id);
         void mailbox.enqueue({
             clientMessageId: next.id,
             ...(thread.retainedContext ? { clientContext: thread.retainedContext } : {}),
+            ...(next.expectedTurnId ? { expectedTurnId: next.expectedTurnId } : {}),
             message: next.text,
             operationId: next.id,
-            operationKind: "send",
+            operationKind: next.intent === "active-turn" && next.expectedTurnId ? "steer" : "send",
             preferences: preferencesRef.current,
             sessionId: agent.session.sessionId,
         }).then((receipt) => {
@@ -1410,7 +1450,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         }).finally(() => {
             mailboxEnqueueIdsRef.current.delete(next.id);
         });
-    }, [admissionBusy, agent.events, agent.session?.sessionId, mailbox, messages.queueDeliveryFailed, thread.queuedTurns]);
+    }, [agent.events, agent.session?.sessionId, cancellationSettling, durableTurnOpen, isRecovering, liveTurnOpen, mailbox, messages.queueDeliveryFailed, pendingTurnInFlight, runtimeIsBusy, thread.queuedTurns]);
     useEffect(() => {
         if (!mailbox || isRecovering)
             return;
@@ -1455,13 +1495,13 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             return;
         const serverTurns = queuedTurnsRef.current.filter((turn) => turn.delivery === "server" && Boolean(turn.mailboxItemId));
         const committedAdmission = serverTurns.some((turn) => turn.state === "committed");
-        const parkedDelivery = !admissionBusy && serverTurns.some((turn) => turn.state === "queued" || turn.state === "delivering" || turn.state === "accepted");
+        const parkedDelivery = serverTurns.some((turn) => turn.state === "queued" || turn.state === "delivering" || turn.state === "accepted");
         if (!committedAdmission && !parkedDelivery)
             return;
-        if (runtimeIsBusy || durableTurnOpen || liveTurnOpen)
+        if (pendingTurnInFlight || cancellationSettling || runtimeIsBusy || durableTurnOpen || liveTurnOpen)
             return;
         requestRecovery();
-    }, [admissionBusy, durableTurnOpen, inputLocked, isRecovering, liveTurnOpen, mailbox, requestRecovery, runtimeIsBusy, thread.queuedTurns]);
+    }, [cancellationSettling, durableTurnOpen, inputLocked, isRecovering, liveTurnOpen, mailbox, pendingTurnInFlight, requestRecovery, runtimeIsBusy, thread.queuedTurns]);
     useEffect(() => {
         if (admissionBusy || runtimeIsBusy || inputLocked || !providerReady ||
             dispatchingQueuedTurnIdRef.current ||
@@ -1508,15 +1548,94 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             setTurnError(error instanceof Error ? error.message : messages.queueDeliveryFailed);
         });
     }, [admissionBusy, agent, agent.session?.sessionId, inputLocked, messages.queueDeliveryFailed, onChange, providerReady, runtimeIsBusy, thread.queuedTurns]);
+    const inputResponseEnqueueIdsRef = useRef(new Set());
+    useEffect(() => {
+        if (!mailbox || !providerReady)
+            return;
+        const sessionId = sessionRef.current?.state.sessionId ?? agent.session?.sessionId;
+        const next = inputResponseSubmissionsRef.current.find((submission) => submission.state === "submitting" && !submission.mailboxItemId &&
+            !inputResponseEnqueueIdsRef.current.has(submission.id));
+        if (!sessionId || !next)
+            return;
+        inputResponseEnqueueIdsRef.current.add(next.id);
+        void mailbox.enqueue({
+            clientMessageId: next.id,
+            ...(thread.retainedContext ? { clientContext: thread.retainedContext } : {}),
+            inputResponses: next.responses,
+            operationId: next.id,
+            operationKind: "respond",
+            preferences: preferencesRef.current,
+            sessionId,
+        }).then((receipt) => {
+            const submissions = inputResponseSubmissionsRef.current.map((submission) => submission.id === next.id
+                ? { ...submission, mailboxItemId: receipt.itemId, state: receipt.status }
+                : submission);
+            updateInputResponseSubmissions(submissions);
+            requestRecovery();
+        }).catch((error) => {
+            const submissions = inputResponseSubmissionsRef.current.map((submission) => submission.id === next.id ? { ...submission, state: "failed" } : submission);
+            updateInputResponseSubmissions(submissions);
+            setTurnError(error instanceof Error ? error.message : messages.queueDeliveryFailed);
+        }).finally(() => {
+            inputResponseEnqueueIdsRef.current.delete(next.id);
+        });
+    }, [agent.session?.sessionId, mailbox, messages.queueDeliveryFailed, providerReady, requestRecovery, thread.inputResponseSubmissions, thread.retainedContext, updateInputResponseSubmissions]);
+    useEffect(() => {
+        if (!mailbox)
+            return;
+        const pending = inputResponseSubmissionsRef.current.filter((submission) => Boolean(submission.mailboxItemId) &&
+            submission.state !== "committed" && submission.state !== "cancelled" && submission.state !== "failed");
+        if (pending.length === 0)
+            return;
+        let disposed = false;
+        const poll = async () => {
+            const updates = new Map();
+            await Promise.all(pending.map(async (submission) => {
+                try {
+                    const receipt = await mailbox.inspect(submission.mailboxItemId);
+                    updates.set(submission.id, receipt.status);
+                }
+                catch {
+                }
+            }));
+            if (disposed || updates.size === 0)
+                return;
+            const submissions = inputResponseSubmissionsRef.current.map((submission) => {
+                const state = updates.get(submission.id);
+                return state ? { ...submission, state } : submission;
+            });
+            updateInputResponseSubmissions(submissions);
+            if ([...updates.values()].some((state) => state === "accepted" || state === "committed")) {
+                requestRecovery();
+            }
+        };
+        const timer = window.setInterval(() => void poll(), MAILBOX_STATUS_POLL_MS);
+        void poll();
+        return () => {
+            disposed = true;
+            window.clearInterval(timer);
+        };
+    }, [mailbox, requestRecovery, thread.inputResponseSubmissions, updateInputResponseSubmissions]);
     const respond = (inputResponses) => {
         prepareTurn();
-        return agent.respond(inputResponses, retainedContextOptions(thread.retainedContext));
+        if (!mailbox) {
+            return agent.respond(inputResponses, retainedContextOptions(thread.retainedContext));
+        }
+        const submission = {
+            id: createPendingTurnId(),
+            responses: inputResponses,
+            state: "submitting",
+            streamIndexAtSubmission: consumedStreamIndexRef.current,
+            submittedAt: Date.now(),
+        };
+        updateInputResponseSubmissions([...inputResponseSubmissionsRef.current, submission]);
+        return Promise.resolve();
     };
     const closeInputRequest = (requestId) => closeInputRequests([requestId]);
     const visibleQueuedTurns = thread.queuedTurns.filter((turn) => turn.intent !== "post-cancellation" &&
         turn.state !== "accepted" &&
         turn.state !== "committed");
-    const showRecoveryStatus = isRecovering && !durableTurnOpen && !runtimeIsBusy && displayPendingTurn?.operation !== "edit";
+    const showRecoveryStatus = isReconnecting && displayPendingTurn?.operation !== "edit";
     return (_jsx(AssistantRuntimeProvider, { runtime: assistantRuntime, children: _jsx("main", { className: "flex min-h-0 flex-1 flex-col overflow-hidden", children: _jsx(AssistantThreadSurface, { assetUrl: client?.assetUrl, approvalTakeover: approvalTakeover, cancellationState: cancellationState, commands: commands, composerTop: showRecoveryStatus || visibleQueuedTurns.length > 0 || queueError ? (_jsxs(_Fragment, { children: [showRecoveryStatus ? (_jsxs("div", { className: "flex items-center gap-2 border-b border-border/60 px-1 pb-2 text-xs text-muted-foreground", "data-agent-recovery-status": true, role: "status", children: [_jsx(LoaderCircleIcon, { className: "size-3.5 animate-spin" }), _jsx("span", { children: messages.reconnecting })] })) : null, visibleQueuedTurns.length > 0 || queueError ? (_jsx(FollowUpQueue, { error: queueError, messages: messages, onRemove: removeQueuedTurn, onRetry: markQueuedTurnForRetry, turns: visibleQueuedTurns })) : null] })) : undefined, draftStorageKey: draftStorageKey, historyHasMore: historyHasMore, historyLoading: historyLoading, events: displayEvents, eveMessages: visibleMessages, fallbackStartedAt: displayPendingTurn?.submittedAt, inputDisabled: inputLocked, isBusy: isBusy, sessionTerminal: sessionTerminal, sessionSettled: durableTurnSettled, onCancel: requestCancellation, locale: locale, mentions: mentions, messages: messages, models: models, onInputResponses: respond, onCloseInputRequest: closeInputRequest, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, onLoadEarlier: onLoadEarlier, onPreferencesChange: (preferences) => onChange({ preferences }), onDraftRestoreConsumed: (id) => {
                     if (thread.draftRestore?.id === id)
                         onChange({ draftRestore: undefined });
@@ -1815,7 +1934,10 @@ export function projectStagedUserMessages(messages, turns, events = []) {
             role: "user",
         };
         const receiptTurnId = receipt?.type === "message.received" ? receipt.data.turnId : undefined;
-        const targetTurnId = receiptTurnId;
+        const activeExpectedTurnId = turn.expectedTurnId && latestActiveTurnId(events) === turn.expectedTurnId
+            ? turn.expectedTurnId
+            : undefined;
+        const targetTurnId = activeExpectedTurnId ?? receiptTurnId;
         const targetIndex = targetTurnId
             ? projected.reduce((last, message, index) => messageBelongsToTurn(message, targetTurnId) ? index : last, -1)
             : -1;
@@ -1852,6 +1974,51 @@ function messagesFromEvents(events) {
     for (const event of events)
         data = reducer.reduce(data, event);
     return data.messages;
+}
+function projectInputResponses(messages, responses) {
+    if (responses.length === 0)
+        return messages;
+    const byRequestId = new Map(responses.map((response) => [response.requestId, response]));
+    let changed = false;
+    const projected = messages.map((message) => {
+        let messageChanged = false;
+        const parts = message.parts.map((part) => {
+            if (part.type !== "dynamic-tool")
+                return part;
+            const request = part.toolMetadata?.eve?.inputRequest;
+            const response = request ? byRequestId.get(request.requestId) : undefined;
+            if (!response || part.toolMetadata?.eve?.inputResponse)
+                return part;
+            messageChanged = true;
+            const toolMetadata = {
+                ...part.toolMetadata,
+                eve: {
+                    inputResponse: response,
+                    kind: part.toolMetadata?.eve?.kind ?? "unknown",
+                    name: part.toolMetadata?.eve?.name ?? part.toolName,
+                    ...(request ? { inputRequest: request } : {}),
+                },
+            };
+            if (part.state === "output-available" || part.state === "output-error" || part.state === "output-denied") {
+                return { ...part, toolMetadata };
+            }
+            return {
+                ...part,
+                approval: {
+                    id: response.requestId,
+                    ...(response.text ? { reason: response.text } : {}),
+                },
+                input: part.input,
+                state: "approval-responded",
+                toolMetadata,
+            };
+        });
+        if (!messageChanged)
+            return message;
+        changed = true;
+        return { ...message, parts };
+    });
+    return changed ? projected : messages;
 }
 function retargetInterruptedTurn(turns, fromTurnId, toTurnId) {
     const turn = turns.find((candidate) => candidate.turnId === fromTurnId);

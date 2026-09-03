@@ -169,6 +169,27 @@ test("thread indexes retain an unacknowledged pending admission for refresh reco
   assert.deepEqual(summary.threads[0]?.queuedTurns, pending.queuedTurns);
 });
 
+test("thread indexes retain durable input responses for refresh projection", () => {
+  const thread = {
+    ...createAgentThread(1, "Approval"),
+    inputResponseSubmissions: [{
+      id: "response-approval-1",
+      mailboxItemId: "mail-approval-1",
+      responses: [{ optionId: "approve", requestId: "request-approval-1" }],
+      state: "committed" as const,
+      streamIndexAtSubmission: 8,
+      submittedAt: 2,
+    }],
+  };
+
+  const summary = summarizeThreadCollection(
+    { activeThreadId: thread.id, threads: [thread], version: 2 },
+    "other-thread",
+  );
+
+  assert.deepEqual(summary.threads[0]?.inputResponseSubmissions, thread.inputResponseSubmissions);
+});
+
 test("summary checkpoints cannot downgrade authoritative transcript coverage", () => {
   const first = {
     ...createAgentThread(1, "First"),

@@ -140,6 +140,10 @@ test.beforeEach(async ({ page }, testInfo) => {
   // runtime boundary authoritative in the same way as a live Eve session;
   // individual settled-session tests register a newer waiting response.
   await page.route(/\/api\/standalone\/sessions\/[^/]+$/, async (route) => {
+    if (route.request().method() !== "GET") {
+      await route.fallback();
+      return;
+    }
     await route.fulfill({
       body: JSON.stringify({ ok: true, state: "running" }),
       contentType: "application/json",
@@ -952,13 +956,33 @@ test("ask_question renders a localized question card instead of raw tool JSON", 
       status: 200,
     });
   });
-  await page.route(`**/eve/v1/session/${sessionId}`, async (route) => {
-    const body = route.request().postDataJSON();
-    if (body.inputResponses) inputResponseBody = body;
+  await page.route("**/api/standalone/mailbox", async (route) => {
+    const body = route.request().postDataJSON() as Record<string, unknown>;
+    inputResponseBody = body;
     await route.fulfill({
-      body: JSON.stringify({ sessionId }),
+      body: JSON.stringify({
+        item: {
+          clientMessageId: body.clientMessageId,
+          itemId: "mail-question-response",
+          status: "committed",
+        },
+        ok: true,
+      }),
       contentType: "application/json",
-      headers: { "x-eve-session-id": sessionId },
+      status: 202,
+    });
+  });
+  await page.route("**/api/standalone/mailbox/mail-question-response", async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({
+        item: {
+          clientMessageId: "question-response",
+          itemId: "mail-question-response",
+          status: "committed",
+        },
+        ok: true,
+      }),
+      contentType: "application/json",
       status: 200,
     });
   });
@@ -998,6 +1022,7 @@ test("ask_question renders a localized question card instead of raw tool JSON", 
   expect(inputResponseBody).toBeUndefined();
   await question.getByRole("button", { name: "确认", exact: true }).click();
   await expect.poll(() => inputResponseBody).toMatchObject({
+    operationKind: "respond",
     inputResponses: [{
       optionId: "minimal",
       requestId: "call-question",
@@ -1009,6 +1034,18 @@ test("ask_question renders a localized question card instead of raw tool JSON", 
   await expect(page.getByText("正在运行 1 个工具", { exact: true })).toHaveCount(0);
   await expect(composer).toBeEditable();
   await page.screenshot({ path: "/tmp/open-agent-ask-question.png" });
+
+  // The answer is a durable mailbox submission, not only a local form state.
+  // A hard refresh must therefore keep the request attached to its original
+  // tool card and render the settled, disabled review instead of asking again.
+  await page.reload();
+  const restoredQuestion = page.locator('[data-input-request-kind="question"]');
+  await expect(restoredQuestion).toBeVisible();
+  await expect(restoredQuestion.getByText(/Responded|已回复/u)).toBeVisible();
+  await expect(restoredQuestion.locator('[data-slot="questionnaire-choices"]')).toHaveCount(0);
+  const restoredTrigger = restoredQuestion.getByRole("button").first();
+  if (await restoredTrigger.getAttribute("aria-expanded") !== "true") await restoredTrigger.click();
+  await expect(restoredQuestion.getByText("同时保持温暖的品牌语气", { exact: true })).toBeVisible();
 });
 
 test("a normal composer message bypasses a pending Agent question", async ({ page }) => {
@@ -2300,7 +2337,7 @@ test("a queued follow-up does not replace a healthy stream during prolonged Prov
   await expect(page.getByText("Reconnecting to the active run...")).toHaveCount(0);
 });
 
-test("a follow-up is delivered as a FIFO turn after the active session parks", async ({ page }) => {
+test("a follow-up steers the active Eve turn without opening a second session", async ({ page }) => {
   const sessionId = "mock-follow-up-session";
   let continuationRequests = 0;
   let continuationAvailable = false;
@@ -2373,11 +2410,12 @@ test("a follow-up is delivered as a FIFO turn after the active session parks", a
     const availableEvents = continuationAvailable
       ? [
           ...initialEvents,
-          ...eventsFromNdjson(mockContinuationTurn(
+          ...mockSteeredTurnRemainder(
+            "turn_tool",
+            mailboxBody?.clientMessageId,
             "Add the requested footer",
             "Footer added.",
-            1,
-          )),
+          ),
         ]
       : initialEvents;
     await route.fulfill({
@@ -2405,10 +2443,10 @@ test("a follow-up is delivered as a FIFO turn after the active session parks", a
   expect(mailboxRequests).toBe(1);
   expect(mailboxBody).toMatchObject({
     message: "Add the requested footer",
-    operationKind: "send",
+    expectedTurnId: "turn_tool",
+    operationKind: "steer",
     sessionId,
   });
-  expect(mailboxBody).not.toHaveProperty("expectedTurnId");
   expect(mailboxBody?.operationId).toBe(mailboxBody?.clientMessageId);
 });
 
@@ -3095,12 +3133,32 @@ test("a proxied child approval stays attached to the parent task and resumes it"
     }],
     version: 1,
   });
-  await page.route(`**/eve/v1/session/${sessionId}`, async (route) => {
+  await page.route("**/api/standalone/mailbox", async (route) => {
     responseBody = route.request().postDataJSON();
     await route.fulfill({
-      body: JSON.stringify({ sessionId }),
+      body: JSON.stringify({
+        item: {
+          clientMessageId: (responseBody as Record<string, unknown>).clientMessageId,
+          itemId: "mail-child-approval",
+          status: "committed",
+        },
+        ok: true,
+      }),
       contentType: "application/json",
-      headers: { "x-eve-session-id": sessionId },
+      status: 202,
+    });
+  });
+  await page.route("**/api/standalone/mailbox/mail-child-approval", async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({
+        item: {
+          clientMessageId: "child-approval-response",
+          itemId: "mail-child-approval",
+          status: "committed",
+        },
+        ok: true,
+      }),
+      contentType: "application/json",
       status: 200,
     });
   });
@@ -3140,6 +3198,7 @@ test("a proxied child approval stays attached to the parent task and resumes it"
 
   await approvalTakeover.getByRole("button", { name: "Approve", exact: true }).click();
   await expect.poll(() => responseBody).toMatchObject({
+    operationKind: "respond",
     inputResponses: [{ optionId: "approve", requestId: "request-child-bash" }],
   });
   await expect(page.getByText("The delegated task resumed and completed.", { exact: true })).toBeVisible();
@@ -4250,12 +4309,13 @@ test("stop keeps the composer locked until the durable cancellation boundary set
       status: 200,
     });
   });
-  await page.route(`**/eve/v1/session/${sessionId}/cancel`, async (route) => {
+  await page.route(`**/api/standalone/sessions/${sessionId}`, async (route) => {
+    expect(route.request().method()).toBe("POST");
     cancelledTurnId = (route.request().postDataJSON() as { turnId?: string }).turnId;
     await route.fulfill({
       body: JSON.stringify({ ok: true, sessionId, status: "accepted" }),
       contentType: "application/json",
-      status: 200,
+      status: 202,
     });
   });
   await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
@@ -4355,7 +4415,17 @@ test("a recovering cancellation never revives late output from the interrupted t
     }],
     version: 2,
   });
-  await page.route(`**/eve/v1/session/${sessionId}/cancel`, async (route) => {
+  await page.route(`**/api/standalone/sessions/${sessionId}`, async (route) => {
+    if (route.request().method() !== "POST") {
+      await route.fulfill({
+        body: JSON.stringify({ ok: true, state: "running", tailIndex: initialEvents.length - 1 }),
+        contentType: "application/json",
+        status: 200,
+      });
+      return;
+    }
+    expect((route.request().postDataJSON() as { action?: string; turnId?: string }).action).toBe("cancel");
+    expect((route.request().postDataJSON() as { turnId?: string }).turnId).toBe(turnId);
     cancelRequests += 1;
     await route.fulfill({
       body: JSON.stringify({ ok: true, sessionId, status: "accepted" }),
@@ -4646,7 +4716,8 @@ test("a follow-up after cancellation receives the interrupted task and completed
     headers: { "x-eve-session-id": sessionId },
     status: 200,
   }));
-  await page.route(`**/eve/v1/session/${sessionId}/cancel`, async (route) => {
+  await page.route(`**/api/standalone/sessions/${sessionId}`, async (route) => {
+    expect(route.request().method()).toBe("POST");
     cancelRequested = true;
     await route.fulfill({
       body: JSON.stringify({ ok: true, sessionId, status: "accepted" }),
@@ -4774,7 +4845,15 @@ test("stop before turn admission stays immediate and retries against the authori
       status: 200,
     });
   });
-  await page.route(`**/eve/v1/session/${sessionId}/cancel`, async (route) => {
+  await page.route(`**/api/standalone/sessions/${sessionId}`, async (route) => {
+    if (route.request().method() !== "POST") {
+      await route.fulfill({
+        body: JSON.stringify({ ok: true, state: "running" }),
+        contentType: "application/json",
+        status: 200,
+      });
+      return;
+    }
     cancellations.push((route.request().postDataJSON() ?? {}) as { turnId?: string });
     if (cancellations.length === 1) releaseStreams?.();
     await route.fulfill({
@@ -4883,7 +4962,15 @@ test("stop cancels a recovered long-running turn after one bounded catch-up", as
     }],
     version: 2,
   });
-  await page.route(`**/eve/v1/session/${sessionId}/cancel`, async (route) => {
+  await page.route(`**/api/standalone/sessions/${sessionId}`, async (route) => {
+    if (route.request().method() !== "POST") {
+      await route.fulfill({
+        body: JSON.stringify({ ok: true, state: "running", tailIndex: runningEvents.length - 1 }),
+        contentType: "application/json",
+        status: 200,
+      });
+      return;
+    }
     cancelRequested = true;
     releaseStreams?.();
     expect((route.request().postDataJSON() as { turnId?: string }).turnId).toBe(turnId);

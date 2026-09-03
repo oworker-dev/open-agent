@@ -3,6 +3,7 @@ export type HttpAgentMailboxOptions = {
     readonly endpoint?: string;
     readonly fetch?: typeof globalThis.fetch;
     readonly getAccessToken?: () => string | Promise<string>;
+    readonly sessionEndpoint?: string;
 };
 export declare class AgentMailboxHttpError extends Error {
     readonly code?: string;

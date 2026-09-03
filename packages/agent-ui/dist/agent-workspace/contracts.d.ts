@@ -1,4 +1,4 @@
-import type { ClientAuth, ClientRedirectPolicy, MessageStreamEvent, HeadersValue, PrepareSend } from "eve/client";
+import type { ClientAuth, ClientRedirectPolicy, InputResponse, MessageStreamEvent, HeadersValue, PrepareSend } from "eve/client";
 import type { ReactNode } from "react";
 import type { AgentThreadStorage } from "./thread-storage.js";
 export type AgentThreadStatus = "cancelling" | "error" | "ready" | "streaming" | "submitted" | "waiting";
@@ -47,19 +47,37 @@ export type AgentMailboxReceipt = {
     readonly lastError?: string;
     readonly status: AgentMailboxItemStatus;
 };
+export type AgentInputResponse = InputResponse;
+export type AgentInputResponseSubmission = {
+    readonly id: string;
+    readonly mailboxItemId?: string;
+    readonly responses: readonly AgentInputResponse[];
+    readonly settledAtStreamIndex?: number;
+    readonly state: "submitting" | AgentMailboxItemStatus;
+    readonly streamIndexAtSubmission: number;
+    readonly submittedAt: number;
+};
 export interface AgentWorkspaceMailbox {
     cancel(itemId: string): Promise<AgentMailboxReceipt>;
+    cancelSession?(input: {
+        readonly sessionId: string;
+        readonly turnId?: string;
+    }): Promise<"accepted" | "no_active_turn">;
     enqueue(input: {
         readonly clientMessageId: string;
         readonly clientContext?: readonly string[];
         readonly beforeTurnId?: string;
         readonly expectedTurnId?: string;
-        readonly message: string;
         readonly operationId: string;
-        readonly operationKind: "edit" | "send" | "steer";
         readonly preferences: AgentThreadPreferences;
         readonly sessionId: string;
-    }): Promise<AgentMailboxReceipt>;
+    } & ({
+        readonly inputResponses: readonly AgentInputResponse[];
+        readonly operationKind: "respond";
+    } | {
+        readonly message: string;
+        readonly operationKind: "edit" | "send" | "steer";
+    })): Promise<AgentMailboxReceipt>;
     inspect(itemId: string): Promise<AgentMailboxReceipt>;
     retry(itemId: string): Promise<AgentMailboxReceipt>;
 }
@@ -148,6 +166,7 @@ export type AgentThread = {
     readonly hydration?: "summary";
     readonly id: string;
     readonly interruptedTurns?: readonly AgentInterruptedTurn[];
+    readonly inputResponseSubmissions?: readonly AgentInputResponseSubmission[];
     readonly pendingTurn?: AgentPendingTurn;
     readonly preferences: AgentThreadPreferences;
     readonly retainedContext?: readonly string[];

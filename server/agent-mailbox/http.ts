@@ -94,8 +94,8 @@ function parseEnqueueRequest(
     : never;
 } {
   if (!isRecord(value)) return { error: "The mailbox request must be an object.", ok: false };
-  if (!validText(value.clientMessageId) || !validText(value.message) || !validText(value.sessionId)) {
-    return { error: "clientMessageId, message, and sessionId are required.", ok: false };
+  if (!validText(value.clientMessageId) || !validText(value.sessionId)) {
+    return { error: "clientMessageId and sessionId are required.", ok: false };
   }
   if (!isRecord(value.preferences)) {
     return { error: "A validated Agent preference snapshot is required.", ok: false };
@@ -114,8 +114,8 @@ function parseEnqueueRequest(
   if (value.beforeTurnId !== undefined && !validText(value.beforeTurnId)) {
     return { error: "beforeTurnId must be a non-empty string.", ok: false };
   }
-  if (operationKind !== undefined && operationKind !== "send" && operationKind !== "steer" && operationKind !== "edit") {
-    return { error: "operationKind must be send, steer, or edit.", ok: false };
+  if (operationKind !== undefined && operationKind !== "send" && operationKind !== "steer" && operationKind !== "edit" && operationKind !== "respond") {
+    return { error: "operationKind must be send, steer, edit, or respond.", ok: false };
   }
   if (value.operationId !== undefined && operationKind === undefined) {
     return { error: "operationKind is required when operationId is provided.", ok: false };
@@ -125,6 +125,14 @@ function parseEnqueueRequest(
   }
   if (operationKind === "edit" && !validText(value.beforeTurnId)) {
     return { error: "beforeTurnId is required for an edit operation.", ok: false };
+  }
+  const inputResponses = parseInputResponses(value.inputResponses);
+  if (operationKind === "respond") {
+    if (!inputResponses || value.message !== undefined) {
+      return { error: "A respond operation requires inputResponses and cannot contain message.", ok: false };
+    }
+  } else if (!validText(value.message) || value.inputResponses !== undefined) {
+    return { error: "A message operation requires message and cannot contain inputResponses.", ok: false };
   }
   const modelId = value.preferences.modelId;
   const reasoning = value.preferences.reasoning;
@@ -149,11 +157,28 @@ function parseEnqueueRequest(
       ...(operationKind
         ? { operationKind }
         : {}),
-      message: value.message,
+      ...(inputResponses ? { inputResponses } : { message: value.message as string }),
       preferences: { executionMode, modelId, reasoning },
       sessionId: value.sessionId,
     },
   };
+}
+
+function parseInputResponses(value: unknown): readonly import("eve/client").InputResponse[] | undefined {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 16) return undefined;
+  const responses: import("eve/client").InputResponse[] = [];
+  for (const entry of value) {
+    if (!isRecord(entry) || !validText(entry.requestId)) return undefined;
+    const optionId = validText(entry.optionId) ? entry.optionId : undefined;
+    const text = validText(entry.text) ? entry.text : undefined;
+    if (!optionId && !text) return undefined;
+    responses.push({
+      ...(optionId ? { optionId } : {}),
+      requestId: entry.requestId,
+      ...(text ? { text } : {}),
+    });
+  }
+  return responses;
 }
 
 function parseClientContext(value: unknown): readonly string[] | undefined {

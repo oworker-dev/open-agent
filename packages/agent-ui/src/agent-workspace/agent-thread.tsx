@@ -2,7 +2,7 @@
 
 import type { UserContent } from "ai";
 import { ClientError, defaultMessageReducer, type ClientSession, type MessageStreamEvent } from "eve/client";
-import { useEveAgent, type EveMessage } from "eve/react";
+import { useEveAgent, type EveDynamicToolPart, type EveMessage } from "eve/react";
 import { AssistantRuntimeProvider, unstable_defaultDirectiveFormatter, useExternalStoreRuntime, type AppendMessage, type ExternalStoreAdapter, type ExternalThreadQueueAdapter, type RespondToToolApprovalOptions } from "@assistant-ui/react";
 import { AlertCircleIcon, Clock3Icon, HammerIcon, LoaderCircleIcon, RotateCcwIcon, SearchIcon, ShieldCheckIcon, SparklesIcon, XIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -11,9 +11,8 @@ import { cn } from "../utils.js";
 import { attachAgentSession, createAgentSession } from "./agent-client.js";
 import { createBrowserAttachmentAdapter, createHttpAgentAssetUploadAdapter } from "./browser-asset-upload.js";
 import { convertEveMessages, getEveMessageContent } from "./eve-message-adapter.js";
-import type { AgentInputResponse } from "./agent-message.js";
 import { AssistantThreadSurface, type AgentApprovalTakeover } from "./assistant-thread-surface.js";
-import type { AgentInterruptedTurn, AgentModelOption, AgentPendingTurn, AgentPromptMenuItem, AgentQueuedTurn, AgentSessionDeliverable, AgentThread, AgentThreadPatch, AgentTranscriptCoverage, AgentWorkspaceClientConfig, AgentWorkspaceMailbox, PromptInputMessage } from "./contracts.js";
+import type { AgentInputResponse, AgentInputResponseSubmission, AgentInterruptedTurn, AgentModelOption, AgentPendingTurn, AgentPromptMenuItem, AgentQueuedTurn, AgentSessionDeliverable, AgentThread, AgentThreadPatch, AgentTranscriptCoverage, AgentWorkspaceClientConfig, AgentWorkspaceMailbox, PromptInputMessage } from "./contracts.js";
 import { sanitizeAgentError } from "./error-presentation.js";
 import { AgentMailboxHttpError } from "./http-agent-mailbox.js";
 import { messagesFor, type AgentLocale, type AgentMessages } from "./i18n.js";
@@ -21,7 +20,7 @@ import {
   interruptedTurnContextFromEvents,
   interruptedTurnContextsFromEvents,
 } from "./retained-context.js";
-import { appendThreadEvent, appendThreadEventIndexed, dedupeThreadEvents, editOperationId, eventIdentity, latestEditableTurnId, mergeThreadEventSnapshots, projectPendingThreadEdit, projectThreadEditBranches, reconcilePendingTurnWithEvents, rememberThreadEventCursor, titleFromPrompt } from "./thread-storage.js";
+import { appendThreadEvent, appendThreadEventIndexed, dedupeThreadEvents, editOperationId, eventIdentity, inputResponseSubmissionProjectsAnswer, latestEditableTurnId, mergeThreadEventSnapshots, projectPendingThreadEdit, projectThreadEditBranches, reconcilePendingTurnWithEvents, rememberThreadEventCursor, settleInputResponseSubmissions, titleFromPrompt } from "./thread-storage.js";
 import {
   activeTurnIdAfterPendingSubmission,
   hasTerminalSessionBoundary,
@@ -92,6 +91,7 @@ export function AgentThreadView({
   historyHasMore = false,
   historyLoading = false,
   isRecovering = false,
+  isReconnecting = false,
   locale,
   mailbox,
   mentions,
@@ -115,6 +115,7 @@ export function AgentThreadView({
   readonly historyHasMore?: boolean;
   readonly historyLoading?: boolean;
   readonly isRecovering?: boolean;
+  readonly isReconnecting?: boolean;
   readonly locale: AgentLocale;
   readonly mailbox?: AgentWorkspaceMailbox;
   readonly mentions: readonly AgentPromptMenuItem[];
@@ -167,6 +168,7 @@ export function AgentThreadView({
   const retainedContextRef = useRef(thread.retainedContext);
   const interruptedTurnsRef = useRef<readonly AgentInterruptedTurn[]>(thread.interruptedTurns ?? []);
   const closedInputRequestIdsRef = useRef<ReadonlySet<string>>(new Set(thread.closedInputRequestIds));
+  const inputResponseSubmissionsRef = useRef<readonly AgentInputResponseSubmission[]>(thread.inputResponseSubmissions ?? []);
   const dispatchingQueuedTurnIdRef = useRef<string | undefined>(undefined);
   const mailboxEnqueueIdsRef = useRef(new Set<string>());
   const turnAdmissionBusyRef = useRef(false);
@@ -288,6 +290,15 @@ export function AgentThreadView({
     closedInputRequestIdsRef.current = new Set(thread.closedInputRequestIds);
   }, [thread.closedInputRequestIds]);
 
+  useEffect(() => {
+    inputResponseSubmissionsRef.current = thread.inputResponseSubmissions ?? [];
+  }, [thread.inputResponseSubmissions]);
+
+  const updateInputResponseSubmissions = useCallback((submissions: readonly AgentInputResponseSubmission[]) => {
+    inputResponseSubmissionsRef.current = submissions;
+    onChange({ inputResponseSubmissions: submissions, updatedAt: Date.now() });
+  }, [onChange]);
+
   const [connection] = useState(() =>
     createAgentSession(client, () => preferencesRef.current, thread.session),
   );
@@ -306,7 +317,11 @@ export function AgentThreadView({
       requestState.sentSessionId = durableSession.state.sessionId;
     }
 
-    void durableSession.cancel(turnId ? { turnId } : undefined)
+    const cancelRequest = mailbox?.cancelSession
+      ? mailbox.cancelSession({ sessionId: durableSession.state.sessionId, ...(turnId ? { turnId } : {}) })
+          .then((status) => ({ status }))
+      : durableSession.cancel(turnId ? { turnId } : undefined);
+    void cancelRequest
       .then((result) => {
         // A late response from an older cancel request must not resurrect the
         // stopping state after Eve has already emitted session.waiting and
@@ -339,7 +354,7 @@ export function AgentThreadView({
         setCancellationError(error instanceof Error ? error.message : "Unable to stop this turn.");
         setCancellationState("cancelling");
       });
-  }, [onChange, settleCancellationUi]);
+  }, [mailbox, onChange, settleCancellationUi]);
 
   const handleEvent = useCallback(
     (event: MessageStreamEvent) => {
@@ -451,6 +466,14 @@ export function AgentThreadView({
         // imperative admission gate in sync as well; a stale `true` here
         // would queue every later user message forever.
         turnAdmissionBusyRef.current = false;
+        const submissions = settleInputResponseSubmissions(
+          inputResponseSubmissionsRef.current,
+          sourceIndex + 1,
+        );
+        if (submissions !== inputResponseSubmissionsRef.current) {
+          inputResponseSubmissionsRef.current = submissions;
+          onChange({ inputResponseSubmissions: submissions, updatedAt: Date.now() });
+        }
       }
       if (event.type === "turn.cancelled") {
         const settledInterruptedTurns = settleInterruptedTurn(
@@ -816,7 +839,18 @@ export function AgentThreadView({
 
   const admissionBusy = pendingTurnInFlight || serverFollowUpInFlight || (!durableTurnSettled &&
     (runtimeIsBusy || durableTurnOpen || liveTurnOpen || isRecovering || cancellationSettling));
-  const pendingInputRequests = unresolvedInputRequests(authoritativeEvents, closedInputRequestIdsRef.current);
+  const durableInputResponses = useMemo(
+    () => (thread.inputResponseSubmissions ?? [])
+      .filter(inputResponseSubmissionProjectsAnswer)
+      .flatMap((submission) => submission.responses),
+    [thread.inputResponseSubmissions],
+  );
+  const resolvedInputRequestIds = new Set(durableInputResponses.map((response) => response.requestId));
+  const unavailableInputRequestIds = new Set([
+    ...closedInputRequestIdsRef.current,
+    ...resolvedInputRequestIds,
+  ]);
+  const pendingInputRequests = unresolvedInputRequests(authoritativeEvents, unavailableInputRequestIds);
   const approvalRequest = pendingInputRequests.find((request) => request.kind === "tool-approval");
   const approvalTakeover: AgentApprovalTakeover | undefined = approvalRequest
     ? {
@@ -1511,12 +1545,15 @@ export function AgentThreadView({
         return;
       }
       if (text.length > 0) {
+        const expectedTurnId = latestActiveTurnId(latestEventsRef.current);
         setQueueError(undefined);
         updateQueuedTurns([
           ...queuedTurnsRef.current,
           {
             ...(mailbox ? { delivery: "server" as const } : {}),
+            ...(mailbox && expectedTurnId ? { expectedTurnId } : {}),
             id: createPendingTurnId(),
+            ...(mailbox ? { intent: "active-turn" as const } : {}),
             state: "queued",
             submittedAt: Date.now(),
             text,
@@ -1631,9 +1668,12 @@ export function AgentThreadView({
     const source = displayInterruptedTurns.length > 0
       ? messagesFromEvents(interruptedDisplayEvents)
       : projectionMessages;
-    return normalizeSettledAgentMessages(source, interruptedDisplayEvents);
+    return normalizeSettledAgentMessages(
+      projectInputResponses(source, durableInputResponses),
+      interruptedDisplayEvents,
+    );
   },
-    [displayInterruptedTurns.length, interruptedDisplayEvents, projectionMessages]);
+    [displayInterruptedTurns.length, durableInputResponses, interruptedDisplayEvents, projectionMessages]);
   const displayMessageIdentityRef = useRef<DisplayMessageIdentityState>({
     assistantByTurn: new Map(),
     pendingRoot: undefined,
@@ -1717,8 +1757,9 @@ export function AgentThreadView({
       throw new Error("Reordering durable mailbox items is not supported.");
     },
     remove: (turnId) => queueCallbacksRef.current.removeQueuedTurn(turnId),
-    // Eve injects follow-ups at the next safe turn boundary. The default
-    // assistant-ui steer lane is deliberately mapped to that durable FIFO.
+    // Eve injects active-turn follow-ups at the next safe model boundary. The
+    // UI can render them as separate interaction blocks while the runtime
+    // keeps the same durable session and turn context.
     steer: (message) => {
       void queueCallbacksRef.current.submit(promptFromAssistantMessage(getEveMessageContent(message)));
     },
@@ -1992,16 +2033,35 @@ export function AgentThreadView({
     );
     if (!next) return;
 
+    if (next.intent === "active-turn" && !next.expectedTurnId) {
+      const expectedTurnId = latestActiveTurnId(agent.events);
+      if (expectedTurnId) {
+        // Persist the authoritative turn before admission. A follow-up can be
+        // submitted while the first turn is still emitting its preamble; a
+        // normal send in that window would miss the active-turn lane.
+        updateQueuedTurns(queuedTurnsRef.current.map((turn) =>
+          turn.id === next.id ? { ...turn, expectedTurnId } : turn,
+        ));
+        return;
+      }
+      // Do not guess an active turn from message text. Keep the durable row
+      // until the original admission settles and Eve exposes its boundary.
+      // Do not include this queued item in the guard: `serverFollowUpInFlight`
+      // is part of `admissionBusy`, and using it here would deadlock a
+      // follow-up after the original turn has already reached `session.waiting`.
+      const originalTurnStillSettling = pendingTurnInFlight || runtimeIsBusy ||
+        durableTurnOpen || liveTurnOpen || isRecovering || cancellationSettling;
+      if (originalTurnStillSettling) return;
+    }
+
     mailboxEnqueueIdsRef.current.add(next.id);
     void mailbox.enqueue({
       clientMessageId: next.id,
       ...(thread.retainedContext ? { clientContext: thread.retainedContext } : {}),
+      ...(next.expectedTurnId ? { expectedTurnId: next.expectedTurnId } : {}),
       message: next.text,
       operationId: next.id,
-      // Follow-ups are ordinary FIFO sends. The mailbox worker waits for Eve
-      // to reach `session.waiting` before delivering them, preserving the
-      // existing session context without active-turn steering.
-      operationKind: "send",
+      operationKind: next.intent === "active-turn" && next.expectedTurnId ? "steer" : "send",
       preferences: preferencesRef.current,
       sessionId: agent.session.sessionId,
     }).then((receipt) => {
@@ -2045,7 +2105,7 @@ export function AgentThreadView({
     }).finally(() => {
       mailboxEnqueueIdsRef.current.delete(next.id);
     });
-  }, [admissionBusy, agent.events, agent.session?.sessionId, mailbox, messages.queueDeliveryFailed, thread.queuedTurns]);
+  }, [agent.events, agent.session?.sessionId, cancellationSettling, durableTurnOpen, isRecovering, liveTurnOpen, mailbox, messages.queueDeliveryFailed, pendingTurnInFlight, runtimeIsBusy, thread.queuedTurns]);
 
   useEffect(() => {
     if (!mailbox || isRecovering) return;
@@ -2095,7 +2155,10 @@ export function AgentThreadView({
       turn.delivery === "server" && Boolean(turn.mailboxItemId)
     );
     const committedAdmission = serverTurns.some((turn) => turn.state === "committed");
-    const parkedDelivery = !admissionBusy && serverTurns.some((turn) =>
+    // The queued mailbox item is itself part of `admissionBusy`; do not use
+    // that aggregate to decide whether recovery should start, or an accepted
+    // retry can never hand the stream back to Eve.
+    const parkedDelivery = serverTurns.some((turn) =>
       turn.state === "queued" || turn.state === "delivering" || turn.state === "accepted"
     );
     if (!committedAdmission && !parkedDelivery) return;
@@ -2110,9 +2173,9 @@ export function AgentThreadView({
     // swaps the live reducer for an older thread checkpoint and makes the
     // already-rendered transcript disappear. Keep the live turn authoritative
     // until its durable lifecycle boundary has settled.
-    if (runtimeIsBusy || durableTurnOpen || liveTurnOpen) return;
+    if (pendingTurnInFlight || cancellationSettling || runtimeIsBusy || durableTurnOpen || liveTurnOpen) return;
     requestRecovery();
-  }, [admissionBusy, durableTurnOpen, inputLocked, isRecovering, liveTurnOpen, mailbox, requestRecovery, runtimeIsBusy, thread.queuedTurns]);
+  }, [cancellationSettling, durableTurnOpen, inputLocked, isRecovering, liveTurnOpen, mailbox, pendingTurnInFlight, requestRecovery, runtimeIsBusy, thread.queuedTurns]);
 
   useEffect(() => {
     if (
@@ -2169,9 +2232,93 @@ export function AgentThreadView({
     });
   }, [admissionBusy, agent, agent.session?.sessionId, inputLocked, messages.queueDeliveryFailed, onChange, providerReady, runtimeIsBusy, thread.queuedTurns]);
 
+  const inputResponseEnqueueIdsRef = useRef(new Set<string>());
+  useEffect(() => {
+    if (!mailbox || !providerReady) return;
+    const sessionId = sessionRef.current?.state.sessionId ?? agent.session?.sessionId;
+    const next = inputResponseSubmissionsRef.current.find((submission) =>
+      submission.state === "submitting" && !submission.mailboxItemId &&
+      !inputResponseEnqueueIdsRef.current.has(submission.id)
+    );
+    if (!sessionId || !next) return;
+    inputResponseEnqueueIdsRef.current.add(next.id);
+    void mailbox.enqueue({
+      clientMessageId: next.id,
+      ...(thread.retainedContext ? { clientContext: thread.retainedContext } : {}),
+      inputResponses: next.responses,
+      operationId: next.id,
+      operationKind: "respond",
+      preferences: preferencesRef.current,
+      sessionId,
+    }).then((receipt) => {
+      const submissions = inputResponseSubmissionsRef.current.map((submission) =>
+        submission.id === next.id
+          ? { ...submission, mailboxItemId: receipt.itemId, state: receipt.status }
+          : submission,
+      );
+      updateInputResponseSubmissions(submissions);
+      requestRecovery();
+    }).catch((error: unknown) => {
+      const submissions = inputResponseSubmissionsRef.current.map((submission) =>
+        submission.id === next.id ? { ...submission, state: "failed" as const } : submission,
+      );
+      updateInputResponseSubmissions(submissions);
+      setTurnError(error instanceof Error ? error.message : messages.queueDeliveryFailed);
+    }).finally(() => {
+      inputResponseEnqueueIdsRef.current.delete(next.id);
+    });
+  }, [agent.session?.sessionId, mailbox, messages.queueDeliveryFailed, providerReady, requestRecovery, thread.inputResponseSubmissions, thread.retainedContext, updateInputResponseSubmissions]);
+
+  useEffect(() => {
+    if (!mailbox) return;
+    const pending = inputResponseSubmissionsRef.current.filter((submission) =>
+      Boolean(submission.mailboxItemId) &&
+      submission.state !== "committed" && submission.state !== "cancelled" && submission.state !== "failed"
+    );
+    if (pending.length === 0) return;
+    let disposed = false;
+    const poll = async () => {
+      const updates = new Map<string, AgentInputResponseSubmission["state"]>();
+      await Promise.all(pending.map(async (submission) => {
+        try {
+          const receipt = await mailbox.inspect(submission.mailboxItemId!);
+          updates.set(submission.id, receipt.status);
+        } catch {
+          // Preserve the last durable state during a transient status outage.
+        }
+      }));
+      if (disposed || updates.size === 0) return;
+      const submissions = inputResponseSubmissionsRef.current.map((submission) => {
+        const state = updates.get(submission.id);
+        return state ? { ...submission, state } : submission;
+      });
+      updateInputResponseSubmissions(submissions);
+      if ([...updates.values()].some((state) => state === "accepted" || state === "committed")) {
+        requestRecovery();
+      }
+    };
+    const timer = window.setInterval(() => void poll(), MAILBOX_STATUS_POLL_MS);
+    void poll();
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [mailbox, requestRecovery, thread.inputResponseSubmissions, updateInputResponseSubmissions]);
+
   const respond = (inputResponses: readonly AgentInputResponse[]) => {
     prepareTurn();
-    return agent.respond(inputResponses, retainedContextOptions(thread.retainedContext));
+    if (!mailbox) {
+      return agent.respond(inputResponses, retainedContextOptions(thread.retainedContext));
+    }
+    const submission: AgentInputResponseSubmission = {
+      id: createPendingTurnId(),
+      responses: inputResponses,
+      state: "submitting",
+      streamIndexAtSubmission: consumedStreamIndexRef.current,
+      submittedAt: Date.now(),
+    };
+    updateInputResponseSubmissions([...inputResponseSubmissionsRef.current, submission]);
+    return Promise.resolve();
   };
 
   const closeInputRequest = (requestId: string) => closeInputRequests([requestId]);
@@ -2189,7 +2336,7 @@ export function AgentThreadView({
   // reconnect banner while durable events are still arriving makes a healthy
   // diff/tool stream look stalled. Reserve the banner for a genuine handoff
   // with no open turn to render.
-  const showRecoveryStatus = isRecovering && !durableTurnOpen && !runtimeIsBusy && displayPendingTurn?.operation !== "edit";
+  const showRecoveryStatus = isReconnecting && displayPendingTurn?.operation !== "edit";
 
   return (
     <AssistantRuntimeProvider runtime={assistantRuntime}>
@@ -2737,14 +2884,18 @@ export function projectStagedUserMessages(
       parts: [{ text: turn.text, type: "text" }],
       role: "user",
     };
-    // A normal FIFO follow-up is a new Eve turn and therefore stays at the
-    // transcript tail. Its durable receipt is the only safe anchor while Eve's
-    // reducer is still publishing the corresponding user row.
+    // A steering follow-up belongs after the currently visible segment of its
+    // active Eve turn. Its durable receipt remains the final anchor while Eve
+    // publishes the corresponding user row.
     const receiptTurnId = receipt?.type === "message.received" ? receipt.data.turnId : undefined;
-    // `expectedTurnId` belongs to the legacy active-turn steering lane. New
-    // follow-ups are ordinary FIFO sends and must stay at the transcript tail;
-    // only a durable receipt can identify their actual Eve turn.
-    const targetTurnId = receiptTurnId;
+    // `expectedTurnId` is captured at submit time. If that turn settles before
+    // mailbox admission, it is no longer a valid visual anchor; keep the
+    // staged row at the transcript tail until Eve emits its authoritative
+    // receipt instead of briefly inserting it into historical content.
+    const activeExpectedTurnId = turn.expectedTurnId && latestActiveTurnId(events) === turn.expectedTurnId
+      ? turn.expectedTurnId
+      : undefined;
+    const targetTurnId = activeExpectedTurnId ?? receiptTurnId;
     const targetIndex = targetTurnId
       ? projected.reduce((last, message, index) =>
           messageBelongsToTurn(message, targetTurnId) ? index : last,
@@ -2786,6 +2937,51 @@ function messagesFromEvents(events: readonly MessageStreamEvent[]): readonly Eve
   let data = reducer.initial();
   for (const event of events) data = reducer.reduce(data, event);
   return data.messages;
+}
+
+function projectInputResponses(
+  messages: readonly EveMessage[],
+  responses: readonly AgentInputResponse[],
+): readonly EveMessage[] {
+  if (responses.length === 0) return messages;
+  const byRequestId = new Map(responses.map((response) => [response.requestId, response]));
+  let changed = false;
+  const projected = messages.map((message) => {
+    let messageChanged = false;
+    const parts = message.parts.map((part) => {
+      if (part.type !== "dynamic-tool") return part;
+      const request = part.toolMetadata?.eve?.inputRequest;
+      const response = request ? byRequestId.get(request.requestId) : undefined;
+      if (!response || part.toolMetadata?.eve?.inputResponse) return part;
+      messageChanged = true;
+      const toolMetadata = {
+        ...part.toolMetadata,
+        eve: {
+          inputResponse: response,
+          kind: part.toolMetadata?.eve?.kind ?? "unknown" as const,
+          name: part.toolMetadata?.eve?.name ?? part.toolName,
+          ...(request ? { inputRequest: request } : {}),
+        },
+      };
+      if (part.state === "output-available" || part.state === "output-error" || part.state === "output-denied") {
+        return { ...part, toolMetadata } as EveDynamicToolPart;
+      }
+      return {
+        ...part,
+        approval: {
+          id: response.requestId,
+          ...(response.text ? { reason: response.text } : {}),
+        },
+        input: part.input,
+        state: "approval-responded" as const,
+        toolMetadata,
+      } as EveDynamicToolPart;
+    });
+    if (!messageChanged) return message;
+    changed = true;
+    return { ...message, parts };
+  });
+  return changed ? projected : messages;
 }
 
 function retargetInterruptedTurn(

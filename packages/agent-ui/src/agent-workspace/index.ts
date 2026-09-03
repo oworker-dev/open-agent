@@ -12,10 +12,11 @@ export {
   type HttpAgentThreadStorageOptions,
 } from "./http-thread-storage.js";
 export { AgentMessage } from "./agent-message.js";
-export type { AgentInputResponse } from "./agent-message.js";
 export { createHttpAgentAssetUploadAdapter } from "./browser-asset-upload.js";
 export type {
   AgentAssetUpload,
+  AgentInputResponse,
+  AgentInputResponseSubmission,
   AgentAssetUploadAdapter,
   AgentExtensionInfo,
   AgentAssetEndpoint,
@@ -63,14 +64,18 @@ export {
   dedupeThreadEvents,
   editOperationId,
   eventIdentity,
+  hasUnsettledInputResponseSubmission,
+  inputResponseSubmissionProjectsAnswer,
   latestEditableTurnId,
   mergeThreadEventSnapshots,
   mergeThreadCollectionsForConflict,
+  mergeInputResponseSubmissions,
   parseThreadCollection,
   projectPendingThreadEdit,
   projectThreadEditBranches,
   reconcileHydratedPendingTurn,
   reconcilePendingTurnWithEvents,
+  settleInputResponseSubmissions,
 } from "./thread-storage.js";
 export type {
   AgentThreadCollection,

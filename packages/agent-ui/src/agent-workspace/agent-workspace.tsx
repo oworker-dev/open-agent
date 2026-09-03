@@ -20,7 +20,7 @@ import { AgentSubagentMenu } from "./agent-subagent-menu.js";
 import { AgentSecondaryView, type AgentSecondaryChild, type AgentSecondaryTab } from "./agent-secondary-view.js";
 import { AgentThreadView } from "./agent-thread.js";
 import { cn } from "../utils.js";
-import type { AgentAssetEndpoint, AgentDeliverableEndpoint, AgentInterruptedTurn, AgentModelOption, AgentPendingTurn, AgentQueuedTurn, AgentSessionAsset, AgentSessionBoundary, AgentSessionInspector, AgentSessionDeliverable, AgentSubagentController, AgentSubagentLoader, AgentSubagentSummary, AgentThread, AgentThreadPatch, AgentThreadPreferences, AgentTranscriptWindow, AgentWorkspaceClientConfig, AgentWorkspaceMailbox } from "./contracts.js";
+import type { AgentAssetEndpoint, AgentDeliverableEndpoint, AgentInputResponseSubmission, AgentInterruptedTurn, AgentModelOption, AgentPendingTurn, AgentQueuedTurn, AgentSessionAsset, AgentSessionBoundary, AgentSessionInspector, AgentSessionDeliverable, AgentSubagentController, AgentSubagentLoader, AgentSubagentSummary, AgentThread, AgentThreadPatch, AgentThreadPreferences, AgentTranscriptWindow, AgentWorkspaceClientConfig, AgentWorkspaceMailbox } from "./contracts.js";
 import { AgentThreadStorageConflictError, AgentThreadStorageHttpError } from "./http-thread-storage.js";
 import { messagesFor, resolveBrowserLocale, type AgentLocale, type AgentMessages } from "./i18n.js";
 import {
@@ -30,11 +30,14 @@ import {
   compactThreadEvents,
   createAgentThread,
   eventIdentity,
+  hasUnsettledInputResponseSubmission,
+  mergeInputResponseSubmissions,
   mergeThreadCollectionsForConflict,
   mergeThreadEventSnapshots,
   rememberThreadEventCursor,
   reconcileHydratedPendingTurn,
   reconcilePendingTurnWithEvents,
+  settleInputResponseSubmissions,
   type AgentThreadCollection,
   type AgentThreadStorage,
 } from "./thread-storage.js";
@@ -132,6 +135,7 @@ export function AgentWorkspace({
   const [activeSubagentSessionId, setActiveSubagentSessionId] = useState<string>();
   const [isHydrated, setIsHydrated] = useState(false);
   const [recoveringIds, setRecoveringIds] = useState<Set<string>>(new Set());
+  const [reconnectingIds, setReconnectingIds] = useState<Set<string>>(new Set());
   const [recoveryErrors, setRecoveryErrors] = useState<Map<string, string>>(new Map());
   const [hydratingThreadIds, setHydratingThreadIds] = useState<Set<string>>(new Set());
   const [threadHydrationErrors, setThreadHydrationErrors] = useState<Map<string, string>>(new Map());
@@ -1200,6 +1204,7 @@ export function AgentWorkspace({
     setRecoveryErrors((current) => withoutMapKey(current, thread.id));
     const controller = new AbortController();
     recoveryControllers.current.set(thread.id, controller);
+    setReconnectingIds((current) => new Set(current).add(thread.id));
     // An edit recovery is a replacement of the current transcript branch. Do
     // not remount assistant-ui when its bounded catch-up completes; keeping
     // the existing runtime identity avoids replacing the thinking row twice.
@@ -1212,7 +1217,11 @@ export function AgentWorkspace({
       recoveryStarted.current.delete(thread.id);
       recoveryControllers.current.delete(thread.id);
       setRecoveringIds((current) => withoutSetValue(current, thread.id));
+      setReconnectingIds((current) => withoutSetValue(current, thread.id));
       return true;
+    };
+    const markRecoveryConnected = () => {
+      setReconnectingIds((current) => withoutSetValue(current, thread.id));
     };
     const events = [...thread.events];
 
@@ -1236,6 +1245,9 @@ export function AgentWorkspace({
     // forever and is the same failure mode as the historical infinite replay.
     let runtimeBoundaryState: "unknown" | "running" | "waiting" | "terminal" = "unknown";
     let runtimeTailIndex: number | undefined;
+    const hasUnsettledInputResponseAtStart = hasUnsettledInputResponseSubmission(
+      thread.inputResponseSubmissions ?? [],
+    );
     let followIdleTimeouts = 0;
     // A browser checkpoint can remain "submitted" after Eve has already
     // parked or retired the run. Probe the authoritative lifecycle before
@@ -1249,7 +1261,9 @@ export function AgentWorkspace({
         }
         runtimeBoundaryState = boundary.state;
         runtimeTailIndex = boundary.tailIndex;
-        if (boundary.state === "waiting" || boundary.state === "terminal") {
+        markRecoveryConnected();
+        if ((boundary.state === "waiting" || boundary.state === "terminal") &&
+            !hasUnsettledInputResponseAtStart && !hasUnsettledMailboxAdmission(thread)) {
           // A settled runtime is history, never a recovery stream. Publish
           // the settled lifecycle first, then read only a small tail window to
           // recover a missing turn boundary or final tool result.
@@ -1304,6 +1318,7 @@ export function AgentWorkspace({
     const originalPendingTurnId = thread.pendingTurn?.id;
     let pendingTurn = reconcilePendingTurnWithEvents(thread.pendingTurn, events);
     let queuedTurns = thread.queuedTurns;
+    let inputResponseSubmissions = thread.inputResponseSubmissions ?? [];
     let interruptedTurns = thread.interruptedTurns ?? [];
     let cancellationPending = thread.status === "cancelling";
     const committedCatchUpTurns = new Map(
@@ -1335,6 +1350,10 @@ export function AgentWorkspace({
       if (!sameInterruptedTurns(interruptedTurns, liveThread.interruptedTurns ?? [])) {
         interruptedTurns = liveThread.interruptedTurns ?? [];
       }
+      inputResponseSubmissions = mergeInputResponseSubmissions(
+        inputResponseSubmissions,
+        liveThread.inputResponseSubmissions ?? [],
+      );
 
       const liveQueuedTurnIds = new Set(liveThread.queuedTurns.map((turn) => turn.id));
       queuedTurns = queuedTurns.filter((turn) =>
@@ -1378,6 +1397,7 @@ export function AgentWorkspace({
       mergeLiveAdmissions();
       if (!mailbox) return;
       const updates = new Map<string, AgentQueuedTurn["state"] | "remove">();
+      const responseUpdates = new Map<string, AgentInputResponseSubmission["state"]>();
       await Promise.all(queuedTurns.map(async (turn) => {
         if (turn.delivery !== "server" || !turn.mailboxItemId) return;
         try {
@@ -1401,15 +1421,30 @@ export function AgentWorkspace({
           // Keep the last durable UI snapshot during a transient mailbox outage.
         }
       }));
-      if (updates.size === 0) return;
+      await Promise.all(inputResponseSubmissions.map(async (submission) => {
+        if (!submission.mailboxItemId || submission.settledAtStreamIndex !== undefined ||
+            submission.state === "failed" || submission.state === "cancelled") return;
+        try {
+          const receipt = await mailbox.inspect(submission.mailboxItemId);
+          if (receipt.status !== submission.state) responseUpdates.set(submission.id, receipt.status);
+        } catch {
+          // Keep the last durable response state during a transient outage.
+        }
+      }));
+      if (updates.size === 0 && responseUpdates.size === 0) return;
       const next = queuedTurns.flatMap((turn) => {
         const state = updates.get(turn.id);
         if (state === "remove") return [];
         return state ? [{ ...turn, state }] : [turn];
       });
-      if (sameQueuedTurns(queuedTurns, next)) return;
-      queuedTurns = next;
-      updateThread(thread.id, { queuedTurns });
+      if (!sameQueuedTurns(queuedTurns, next)) queuedTurns = next;
+      if (responseUpdates.size > 0) {
+        inputResponseSubmissions = inputResponseSubmissions.map((submission) => {
+          const state = responseUpdates.get(submission.id);
+          return state ? { ...submission, state } : submission;
+        });
+      }
+      updateThread(thread.id, { inputResponseSubmissions, queuedTurns });
     };
     const hasPendingServerQueue = () => queuedTurns.some((turn) =>
       turn.delivery === "server" && mailboxTurnAwaitsAdmission(turn) && Boolean(turn.mailboxItemId),
@@ -1420,6 +1455,7 @@ export function AgentWorkspace({
       // must not short-circuit recovery before the replacement turn's
       // message.received and completion events arrive.
       if (pendingTurn?.operation === "edit" && isPendingMailboxEdit(pendingTurn)) return false;
+      if (hasUnsettledInputResponseSubmission(inputResponseSubmissions)) return false;
       const last = events.at(-1);
       if (knownRuntimeBoundary && runtimeBoundaryReady) {
         if (committedCatchUpTurns.size > 0 || hasPendingServerQueue()) return false;
@@ -1467,6 +1503,7 @@ export function AgentWorkspace({
       updateThread(thread.id, {
         events: [...events],
         interruptedTurns,
+        inputResponseSubmissions,
         pendingTurn,
         queuedTurns,
         session: { ...session.state, streamIndex: persistedCursor },
@@ -1484,6 +1521,7 @@ export function AgentWorkspace({
         events,
         controller.signal,
       );
+      markRecoveryConnected();
       // A stale browser checkpoint may contain an absolute cursor ahead of
       // the visible event prefix. Once the probe locates the last persisted
       // event, recovery is allowed to publish the corrected lower cursor;
@@ -1538,6 +1576,7 @@ export function AgentWorkspace({
               startIndex: cursor,
               ...(follow ? { streamReconnectPolicy: RECOVERY_STREAM_RECONNECT_POLICY } : {}),
             })) {
+              markRecoveryConnected();
               rememberThreadEventCursor(event, cursor);
               // User submissions can land between any two events in one streamed
               // recovery response. Merge them before every event so an older
@@ -1559,6 +1598,12 @@ export function AgentWorkspace({
                 recoveryEventsSinceFlush += 1;
               }
               cursor += 1;
+              if (event.type === "session.waiting" || event.type === "session.completed" || event.type === "session.failed") {
+                inputResponseSubmissions = settleInputResponseSubmissions(
+                  inputResponseSubmissions,
+                  cursor,
+                );
+              }
               recoverySnapshotDirty = true;
               consumed += 1;
               onEvent?.(event);
@@ -1634,6 +1679,7 @@ export function AgentWorkspace({
             await followWatchdog;
             flushRecoverySnapshot();
           }
+          markRecoveryConnected();
           // Cancellation or teardown can abort the finite stream after the
           // SDK has returned from the iterator. Do not run tail repair,
           // runtime inspection, or another reconnect pass after that point.
@@ -1712,6 +1758,12 @@ export function AgentWorkspace({
             if (missingBoundary) {
               appendThreadEventIndexed(events, eventIds, missingBoundary);
               recoverySnapshotDirty = true;
+              if (missingBoundary.type === "session.waiting" || missingBoundary.type === "session.completed" || missingBoundary.type === "session.failed") {
+                inputResponseSubmissions = settleInputResponseSubmissions(
+                  inputResponseSubmissions,
+                  cursor,
+                );
+              }
               if (
                 cancellationPending &&
                 (missingBoundary.type === "session.waiting" || missingBoundary.type === "session.completed" || missingBoundary.type === "session.failed")
@@ -1722,11 +1774,17 @@ export function AgentWorkspace({
             }
           }
           if (!settled && currentBoundarySettles()) settled = true;
-          reconnectAttempt = consumed > 0 ? 0 : reconnectAttempt + 1;
+          // A durable admission can be committed immediately before Eve
+          // starts its resumed turn. An empty bounded read in that interval is
+          // normal queue latency, not a failed transport reconnect.
+          reconnectAttempt = consumed > 0 || hasUnsettledInputResponseSubmission(inputResponseSubmissions) || hasPendingServerQueue()
+            ? 0
+            : reconnectAttempt + 1;
           setRecoveryErrors((current) => withoutMapKey(current, thread.id));
         } catch (error) {
           if (controller.signal.aborted || isAbortError(error)) return;
           if (!isRetryableRecoveryError(error)) throw error;
+          setReconnectingIds((current) => new Set(current).add(thread.id));
           reconnectAttempt += 1;
         }
         if (reconnectAttempt > MAX_RECOVERY_RECONNECT_ATTEMPTS) {
@@ -1743,6 +1801,7 @@ export function AgentWorkspace({
       const recoveryPatch: AgentThreadPatch = {
         events: compactThreadEvents(events),
         interruptedTurns,
+        inputResponseSubmissions,
         pendingTurn,
         queuedTurns,
         session: { ...session.state, streamIndex: cursor },
@@ -1811,6 +1870,7 @@ export function AgentWorkspace({
   }, [isHydrated, recoverThread, recoveringIds, threads]);
 
   const activeIsRecovering = activeThread ? recoveringIds.has(activeThread.id) : false;
+  const activeIsReconnecting = activeThread ? reconnectingIds.has(activeThread.id) : false;
   const activeThreadRuntimeKey = activeThread
     // Recovery state is a render mode, not a reducer identity. Including the
     // transient `recovering` flag here remounted the thread once when recovery
@@ -1938,6 +1998,7 @@ export function AgentWorkspace({
                 ? `${storageKey}:draft:new`
                 : `${storageKey}:draft:${activeThread.id}`}
               isRecovering={activeIsRecovering}
+              isReconnecting={activeIsReconnecting}
               historyHasMore={activeThread.transcriptWindow?.hasMoreBefore === true}
               historyLoading={threadHistoryLoading.has(activeThread.id)}
               // Storage revisions are persistence concurrency tokens, not UI
@@ -2682,6 +2743,15 @@ function isPendingMailboxEdit(turn: AgentPendingTurn): boolean {
     (turn.state === "submitting" || turn.state === "clearing" || turn.state === "resubmitting");
 }
 
+function hasUnsettledMailboxAdmission(thread: AgentThread): boolean {
+  return thread.queuedTurns.some((turn) =>
+    turn.delivery === "server" && mailboxTurnAwaitsAdmission(turn)
+  ) || Boolean(thread.pendingTurn?.delivery === "server" &&
+    (thread.pendingTurn.state === "submitting" ||
+      thread.pendingTurn.state === "clearing" ||
+      thread.pendingTurn.state === "resubmitting"));
+}
+
 function transcriptCoversSession(thread: AgentThread): boolean {
   return hasCompleteTranscriptCoverage(thread) || thread.session.streamIndex <= thread.events.length;
 }
@@ -2902,6 +2972,7 @@ function isUrgentPersistenceChange(
       !samePendingTurn(prior.pendingTurn, thread.pendingTurn) ||
       !sameQueuedTurns(prior.queuedTurns, thread.queuedTurns) ||
       !sameInterruptedTurns(prior.interruptedTurns ?? [], thread.interruptedTurns ?? []) ||
+      JSON.stringify(prior.inputResponseSubmissions ?? []) !== JSON.stringify(thread.inputResponseSubmissions ?? []) ||
       !sameStringList(prior.closedInputRequestIds, thread.closedInputRequestIds) ||
       !sameStringList(prior.retainedContext ?? [], thread.retainedContext ?? [])
     ) return true;

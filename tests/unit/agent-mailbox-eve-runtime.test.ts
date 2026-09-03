@@ -110,6 +110,38 @@ test("Eve mailbox runtime forwards the exact edit target and operation identity"
   });
 });
 
+test("Eve mailbox runtime forwards structured input responses without synthesizing text", async () => {
+  let requestBody: unknown;
+  const runtime = createEveAgentMailboxRuntime(environment, async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body));
+    return Response.json({ ok: true, sessionId: "session-1" }, { status: 202 });
+  });
+
+  await runtime.deliver({
+    clientMessageId: "response-request-1",
+    itemId: "mail-response-1",
+    owner: owner(),
+    payload: {
+      inputResponses: [{ optionId: "approve", requestId: "request-approval-1" }],
+      operation: { kind: "respond", operationId: "response-request-1" },
+    },
+    sessionId: "session-1",
+  });
+
+  assert.deepEqual(requestBody, {
+    action: "deliver",
+    clientMessageId: "response-request-1",
+    inputResponses: [{ optionId: "approve", requestId: "request-approval-1" }],
+    itemId: "mail-response-1",
+    operationId: "response-request-1",
+    operationKind: "respond",
+    principalId: "user-1",
+    principalType: "user",
+    sessionId: "session-1",
+    tenantId: "tenant-1",
+  });
+});
+
 
 test("Eve mailbox runtime retains the active turn identity", async () => {
   const runtime = createEveAgentMailboxRuntime(environment, async () =>
