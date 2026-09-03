@@ -196,6 +196,11 @@ export function AssistantThreadSurface({
     >
       <ThreadPrimitive.Viewport
         aria-live="polite"
+        // Keep assistant-ui's native bottom-follow behavior when the user is
+        // already at the bottom. The top turn anchor still controls the
+        // initial placement of a new turn; autoScroll only follows subsequent
+        // content growth and respects manual scroll-up.
+        autoScroll
         scrollToBottomOnInitialize={viewportScrollOnInitialize}
         scrollToBottomOnThreadSwitch={viewportScrollOnThreadSwitch}
         turnAnchor="top"

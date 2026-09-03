@@ -699,6 +699,25 @@ export function AgentThreadView({
     (displayPendingCandidate.state === "delivery-failed" || displayPendingCandidate.id === failedEditOperationId)
     ? undefined
     : displayPendingCandidate;
+  // A server mailbox item becomes `committed` before Eve's reducer necessarily
+  // exposes the matching user row/turn. Keep one stable display admission for
+  // that short handoff so the composer remains busy and the assistant row can
+  // show Thinking instead of falling back to the previous settled turn.
+  const committedFollowUp = thread.queuedTurns.find((turn) =>
+    turn.delivery === "server" &&
+    (turn.state === "committed" || turn.state === "accepted") &&
+    !hasDurableQueuedTurnMessage(turn, effectiveRenderMessages, effectiveRenderEvents),
+  );
+  const displayAdmissionTurn = displayPendingTurn ?? (committedFollowUp
+    ? {
+        eventCountAtSubmission: compactedEventsRef.current.length,
+        id: committedFollowUp.id,
+        operation: "send" as const,
+        state: "submitting" as const,
+        submittedAt: committedFollowUp.submittedAt,
+        text: committedFollowUp.text,
+      }
+    : undefined);
   latestEventsRef.current = agent.events;
   const durableSessionSettled = hasSettledSessionBoundary(thread.events);
   const localSessionSettled = hasSettledSessionBoundary(agent.events);
@@ -743,6 +762,12 @@ export function AgentThreadView({
   const durableTurnSettled = !pendingTurnInFlight &&
     hasSettledLatestTurn(authoritativeEvents) &&
     hasSettledSessionBoundary(authoritativeEvents);
+  const serverFollowUpInFlight = thread.queuedTurns.some((turn) =>
+    turn.delivery === "server" &&
+    (turn.state === "queued" || turn.state === "accepted" ||
+      turn.state === "delivering" || turn.state === "committed" ||
+      turn.state === "admission-ambiguous"),
+  );
   // The Eve hook can briefly report `ready`/`idle` between provider frames,
   // while its in-memory event list already contains a started turn that has
   // not reached a terminal boundary. Treat that live turn as authoritative
@@ -761,7 +786,7 @@ export function AgentThreadView({
     authoritativeEvents.some((event) => event.type === "turn.started");
   const cancellationSettling = cancellationRef.current.requested || thread.status === "cancelling";
   const agentIsBusy = (runtimeIsBusy || durableTurnOpen || liveTurnOpen) && !localInterruption && !cancellationSettling && !durableTurnSettled;
-  const isBusy = pendingTurnInFlight || agentIsBusy ||
+  const isBusy = pendingTurnInFlight || serverFollowUpInFlight || agentIsBusy ||
     (isRecovering && !localInterruption && !cancellationSettling && !durableTurnSettled);
 
   // Eve publishes the receipt before its reducer publishes the corresponding
@@ -789,7 +814,7 @@ export function AgentThreadView({
     setOptimisticPendingTurn(undefined);
   }, [authoritativeEvents, effectiveRenderMessages, optimisticPendingTurn]);
 
-  const admissionBusy = pendingTurnInFlight || (!durableTurnSettled &&
+  const admissionBusy = pendingTurnInFlight || serverFollowUpInFlight || (!durableTurnSettled &&
     (runtimeIsBusy || durableTurnOpen || liveTurnOpen || isRecovering || cancellationSettling));
   const pendingInputRequests = unresolvedInputRequests(authoritativeEvents, closedInputRequestIdsRef.current);
   const approvalRequest = pendingInputRequests.find((request) => request.kind === "tool-approval");
@@ -1620,11 +1645,11 @@ export function AgentThreadView({
           projectedRuntimeMessages,
           projectionEvents,
           isBusy || isPendingTurnInFlight(admissionPendingTurn) || Boolean(latestTurnFailure(interruptedDisplayEvents)),
-          displayPendingTurn,
+          displayAdmissionTurn,
           displayMessageIdentityRef.current,
         ),
         projectionEvents,
-        displayPendingTurn,
+        displayAdmissionTurn,
         displayMessageIdentityRef.current,
         thread.session.sessionId,
       ),
@@ -1636,7 +1661,7 @@ export function AgentThreadView({
       interruptedDisplayEvents,
     );
     return projected;
-  }, [admissionPendingTurn, displayPendingTurn, interruptedDisplayEvents, isBusy, optimisticPendingTurn, projectionEvents, projectedRuntimeMessages, thread.queuedTurns, thread.session.sessionId]);
+  }, [admissionPendingTurn, displayAdmissionTurn, interruptedDisplayEvents, isBusy, optimisticPendingTurn, projectionEvents, projectedRuntimeMessages, thread.queuedTurns, thread.session.sessionId]);
   const ungroupedVisibleMessages = useMemo(
     () => projectedMessages.filter((message) =>
       !isProxiedInputOnlyMessage(message, projectionEvents),
@@ -1651,7 +1676,7 @@ export function AgentThreadView({
   const displayEvents = displayTimeline.events;
   const orderedDisplayMessages = orderPendingUserMessage(
     displayTimeline.messages,
-    displayPendingTurn,
+    displayAdmissionTurn,
     displayEvents,
     displayMessageIdentityRef.current,
   );
@@ -1662,7 +1687,7 @@ export function AgentThreadView({
   const visibleMessages = stabilizeDisplayMessageIdentities(
     orderedDisplayMessages,
     projectionEvents,
-    displayPendingTurn,
+    displayAdmissionTurn,
     displayMessageIdentityRef.current,
     thread.session.sessionId,
   );

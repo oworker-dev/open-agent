@@ -411,6 +411,19 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         (displayPendingCandidate.state === "delivery-failed" || displayPendingCandidate.id === failedEditOperationId)
         ? undefined
         : displayPendingCandidate;
+    const committedFollowUp = thread.queuedTurns.find((turn) => turn.delivery === "server" &&
+        (turn.state === "committed" || turn.state === "accepted") &&
+        !hasDurableQueuedTurnMessage(turn, effectiveRenderMessages, effectiveRenderEvents));
+    const displayAdmissionTurn = displayPendingTurn ?? (committedFollowUp
+        ? {
+            eventCountAtSubmission: compactedEventsRef.current.length,
+            id: committedFollowUp.id,
+            operation: "send",
+            state: "submitting",
+            submittedAt: committedFollowUp.submittedAt,
+            text: committedFollowUp.text,
+        }
+        : undefined);
     latestEventsRef.current = agent.events;
     const durableSessionSettled = hasSettledSessionBoundary(thread.events);
     const localSessionSettled = hasSettledSessionBoundary(agent.events);
@@ -433,13 +446,17 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     const durableTurnSettled = !pendingTurnInFlight &&
         hasSettledLatestTurn(authoritativeEvents) &&
         hasSettledSessionBoundary(authoritativeEvents);
+    const serverFollowUpInFlight = thread.queuedTurns.some((turn) => turn.delivery === "server" &&
+        (turn.state === "queued" || turn.state === "accepted" ||
+            turn.state === "delivering" || turn.state === "committed" ||
+            turn.state === "admission-ambiguous"));
     const liveTurnOpen = hasOpenLatestTurn(agent.events);
     const durableTurnOpen = !pendingTurnInFlight && !durableTurnSettled &&
         thread.status !== "ready" && thread.status !== "error" &&
         authoritativeEvents.some((event) => event.type === "turn.started");
     const cancellationSettling = cancellationRef.current.requested || thread.status === "cancelling";
     const agentIsBusy = (runtimeIsBusy || durableTurnOpen || liveTurnOpen) && !localInterruption && !cancellationSettling && !durableTurnSettled;
-    const isBusy = pendingTurnInFlight || agentIsBusy ||
+    const isBusy = pendingTurnInFlight || serverFollowUpInFlight || agentIsBusy ||
         (isRecovering && !localInterruption && !cancellationSettling && !durableTurnSettled);
     useEffect(() => {
         const pending = optimisticDisplayTurn;
@@ -457,7 +474,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             return;
         setOptimisticPendingTurn(undefined);
     }, [authoritativeEvents, effectiveRenderMessages, optimisticPendingTurn]);
-    const admissionBusy = pendingTurnInFlight || (!durableTurnSettled &&
+    const admissionBusy = pendingTurnInFlight || serverFollowUpInFlight || (!durableTurnSettled &&
         (runtimeIsBusy || durableTurnOpen || liveTurnOpen || isRecovering || cancellationSettling));
     const pendingInputRequests = unresolvedInputRequests(authoritativeEvents, closedInputRequestIdsRef.current);
     const approvalRequest = pendingInputRequests.find((request) => request.kind === "tool-approval");
@@ -1096,15 +1113,15 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         pendingRoot: undefined,
     });
     const projectedMessages = useMemo(() => {
-        const projected = projectStagedUserMessages(stabilizeDisplayMessageIdentities(ensureActiveAssistantMessage(projectedRuntimeMessages, projectionEvents, isBusy || isPendingTurnInFlight(admissionPendingTurn) || Boolean(latestTurnFailure(interruptedDisplayEvents)), displayPendingTurn, displayMessageIdentityRef.current), projectionEvents, displayPendingTurn, displayMessageIdentityRef.current, thread.session.sessionId), thread.queuedTurns, interruptedDisplayEvents);
+        const projected = projectStagedUserMessages(stabilizeDisplayMessageIdentities(ensureActiveAssistantMessage(projectedRuntimeMessages, projectionEvents, isBusy || isPendingTurnInFlight(admissionPendingTurn) || Boolean(latestTurnFailure(interruptedDisplayEvents)), displayAdmissionTurn, displayMessageIdentityRef.current), projectionEvents, displayAdmissionTurn, displayMessageIdentityRef.current, thread.session.sessionId), thread.queuedTurns, interruptedDisplayEvents);
         return projected;
-    }, [admissionPendingTurn, displayPendingTurn, interruptedDisplayEvents, isBusy, optimisticPendingTurn, projectionEvents, projectedRuntimeMessages, thread.queuedTurns, thread.session.sessionId]);
+    }, [admissionPendingTurn, displayAdmissionTurn, interruptedDisplayEvents, isBusy, optimisticPendingTurn, projectionEvents, projectedRuntimeMessages, thread.queuedTurns, thread.session.sessionId]);
     const ungroupedVisibleMessages = useMemo(() => projectedMessages.filter((message) => !isProxiedInputOnlyMessage(message, projectionEvents)), [projectionEvents, projectedMessages]);
     const ungroupedDisplayEvents = interruptedDisplayEvents;
     const displayTimeline = useMemo(() => projectAgentDisplayTimeline(ungroupedVisibleMessages, ungroupedDisplayEvents), [ungroupedDisplayEvents, ungroupedVisibleMessages]);
     const displayEvents = displayTimeline.events;
-    const orderedDisplayMessages = orderPendingUserMessage(displayTimeline.messages, displayPendingTurn, displayEvents, displayMessageIdentityRef.current);
-    const visibleMessages = stabilizeDisplayMessageIdentities(orderedDisplayMessages, projectionEvents, displayPendingTurn, displayMessageIdentityRef.current, thread.session.sessionId);
+    const orderedDisplayMessages = orderPendingUserMessage(displayTimeline.messages, displayAdmissionTurn, displayEvents, displayMessageIdentityRef.current);
+    const visibleMessages = stabilizeDisplayMessageIdentities(orderedDisplayMessages, projectionEvents, displayAdmissionTurn, displayMessageIdentityRef.current, thread.session.sessionId);
     const assistantMessages = useMemo(() => convertEveMessages({ messages: visibleMessages }, {
         assetUrl: client?.assetUrl,
         error: agent.error,
