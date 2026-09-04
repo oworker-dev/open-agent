@@ -610,7 +610,10 @@ export function AgentThreadView({
     () => ({ events: agent.events, messages: agent.data.messages }),
     [agent.data.messages, agent.events],
   );
-  const liveRenderSnapshot = useThrottledSnapshot(liveRenderSource, 50);
+  // Eve itself publishes at frame cadence (~16ms). Keep a single short
+  // coalescing window for expensive projections without adding a visible
+  // half-frame of latency to first-token/tool updates.
+  const liveRenderSnapshot = useThrottledSnapshot(liveRenderSource, 32);
   const renderEvents = liveRenderSnapshot.events;
   const renderMessages = liveRenderSnapshot.messages;
   // Recovery is owned by the workspace so it can reconnect from Eve's durable
@@ -2932,10 +2935,20 @@ function isAgentTurnBusyError(error: unknown): boolean {
   return error instanceof Error && /already processing a turn/i.test(error.message);
 }
 
+// Rebuilding Eve's reducer is linear in the event count. A single render can
+// ask for the same immutable snapshot more than once (recovery projection,
+// edit projection, and interruption normalization). Cache by snapshot
+// identity so those consumers share one reduction pass; WeakMap keeps old
+// long-session snapshots collectible.
+const messagesByEventSnapshot = new WeakMap<object, readonly EveMessage[]>();
+
 function messagesFromEvents(events: readonly MessageStreamEvent[]): readonly EveMessage[] {
+  const cached = messagesByEventSnapshot.get(events as object);
+  if (cached) return cached;
   const reducer = defaultMessageReducer();
   let data = reducer.initial();
   for (const event of events) data = reducer.reduce(data, event);
+  messagesByEventSnapshot.set(events as object, data.messages);
   return data.messages;
 }
 

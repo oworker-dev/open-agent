@@ -467,6 +467,45 @@ hot rows, or infers ownership. A successful restore is still a data-integrity
 drill; the selected Eve deployment must subsequently open the restored World
 and pass its session replay gate before any purge is authorized.
 
+The archive worker is disabled by default, including in the production-preview
+launcher. Set `WORKFLOW_ARCHIVE_ENABLED=1` only after configuring durable
+object storage with enough independent capacity; a local MinIO instance on the
+same disk as PostgreSQL merely duplicates bytes and does not create storage
+headroom. When enabled, the
+worker discovers only complete roots whose members are all terminal, whose
+newest completion is older than `WORKFLOW_ARCHIVE_OLDER_THAN_MS`, and which
+have no retained Hook. It exports from a repeatable read-only PostgreSQL
+snapshot, validates the line archive locally, uploads it under
+`WORKFLOW_ARCHIVE_S3_PREFIX`, reads the object back to verify its full-file
+SHA-256, then commits an idempotent archive record. Database leases make this
+safe when multiple replicas start the worker. S3 connection settings use the
+`WORKFLOW_ARCHIVE_S3_*` variables and fall back to matching
+`AGENT_ASSET_S3_*` values; use a dedicated prefix or bucket in production.
+
+`WORKFLOW_ARCHIVE_MAX_ROOTS` bounds work per pass, while
+`WORKFLOW_ARCHIVE_DISCOVERY_LIMIT` pages the durable discovery cursor. Neither
+value limits a conversation, event stream, archive size, or total archive
+count. Export uses a separate two-connection Workflow pool and temporary spool
+directory (`WORKFLOW_ARCHIVE_SPOOL_DIRECTORY`, or the OS temporary directory),
+so it does not occupy the application's streaming pool. Failures retain their
+record and retry with bounded exponential backoff. The worker never archives a
+`running`/waiting Eve session, never truncates a stream, and never deletes hot
+Workflow rows. Hot deletion remains deliberately disabled until cold-history
+reads and deployment-specific restore/replay policy are available.
+
+Use `npm run download:workflow-archive -- --root-run-id <id> --output <file>`
+to retrieve a completed archive. The command resolves the object through its
+database record, verifies the downloaded byte count and full-object SHA-256,
+then validates the root membership and archive manifest before returning the
+file to the operator. Pass that verified file to the guarded restore command;
+do not restore directly into the live Workflow database.
+
+An archive record reaching `completed` is not permission to delete its hot
+root. Open Agent does not currently expose cold history through the normal
+conversation read path or restore archived roots on demand, so the worker is
+copy-only and no purge worker is provided. Keep monitoring both PostgreSQL and
+object-store capacity until a product-level cold-read lifecycle exists.
+
 AgentRun startup has a post-acceptance cleanup guard. A transient database
 failure while binding Eve's accepted session is retried, and an unbound session
 is reset before its admission slot is released. A cleanup failure is reported

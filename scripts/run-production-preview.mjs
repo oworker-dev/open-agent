@@ -125,6 +125,18 @@ const runtimeEnvironment = {
   WORKFLOW_POSTGRES_URL: postgresUrl("open-agent-gate-world", 56433),
   WORKFLOW_POSTGRES_WORKER_CONCURRENCY: "20",
   WORKFLOW_TARGET_WORLD: "@workflow/world-postgres",
+  // A local preview commonly shares one disk between PostgreSQL and MinIO.
+  // Archiving there copies data without releasing hot Workflow rows, so only
+  // start the worker when the operator explicitly selects durable cold storage.
+  WORKFLOW_ARCHIVE_ENABLED: process.env.WORKFLOW_ARCHIVE_ENABLED || "0",
+  WORKFLOW_ARCHIVE_DISCOVERY_LIMIT: process.env.WORKFLOW_ARCHIVE_DISCOVERY_LIMIT || "100",
+  WORKFLOW_ARCHIVE_INTERVAL_MS: process.env.WORKFLOW_ARCHIVE_INTERVAL_MS || "900000",
+  WORKFLOW_ARCHIVE_LEASE_MS: process.env.WORKFLOW_ARCHIVE_LEASE_MS || "3600000",
+  WORKFLOW_ARCHIVE_MAX_ROOTS: process.env.WORKFLOW_ARCHIVE_MAX_ROOTS || "1",
+  WORKFLOW_ARCHIVE_OLDER_THAN_MS: process.env.WORKFLOW_ARCHIVE_OLDER_THAN_MS || "604800000",
+  WORKFLOW_ARCHIVE_QUERY_TIMEOUT_MS: process.env.WORKFLOW_ARCHIVE_QUERY_TIMEOUT_MS || "15000",
+  WORKFLOW_ARCHIVE_RETRY_BASE_MS: process.env.WORKFLOW_ARCHIVE_RETRY_BASE_MS || "300000",
+  WORKFLOW_ARCHIVE_S3_PREFIX: process.env.WORKFLOW_ARCHIVE_S3_PREFIX || "workflow-archives/v2",
 };
 
 let shutdownRequested = false;
@@ -219,6 +231,12 @@ try {
     env: runtimeEnvironment,
     stdio: "inherit",
   });
+  if (runtimeEnvironment.WORKFLOW_ARCHIVE_ENABLED === "1") {
+    spawnManaged("workflow-archive-worker", process.execPath, ["scripts/run-workflow-archive-worker.mjs"], {
+      env: runtimeEnvironment,
+      stdio: "inherit",
+    });
+  }
 
   console.log(`OPEN_AGENT_PUBLIC_URL=${publicOrigin}`);
   outcome = await Promise.race([...managedChildren.values()].map((entry) => entry.exit));

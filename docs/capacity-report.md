@@ -386,3 +386,27 @@ below the configured 2 GiB safety margin, so the large capacity matrix started
 zero load batches and exited safely. This is a deliberate fail-closed result;
 the threshold was not lowered and the shared Workflow database was not used for
 load generation.
+
+## 2026-09-04 terminal-root archive drill
+
+The terminal-root archive worker was exercised against the real PostgreSQL
+Workflow World and an S3-compatible MinIO object store. One archived root
+contained three Workflow runs and 470 records; the line archive was 1,624,585
+bytes with manifest SHA-256
+`f1d77d2835190cce707eee2b27bad55e8a3e53f766a6301436cd94d416be745e`
+and full-object SHA-256
+`55d0dfab587a5f6f47b59099ca4d11e52364afc6cb5a42f80fdd95abf20d2e6d`.
+The object was downloaded with byte-count and checksum verification, restored
+into a newly migrated isolated Workflow database, and replayed by a temporary
+Eve runtime. Replay returned 215 ordered events (tail index 214), beginning at
+`session.started` and ending at `session.failed`. The temporary runtime and
+database were removed after the drill.
+
+This establishes a verified copy and restore path for complete terminal root
+trees. It does not authorize hot deletion: active and waiting roots remain
+ineligible, and archived terminal history is still served from PostgreSQL by
+the product. The worker therefore performs no purge. It is disabled by default
+in the local production-preview launcher because this host has only about 1.5
+GiB free and its PostgreSQL and MinIO services share the same disk; enabling it
+there would duplicate bytes without reclaiming capacity. Production operators
+must opt in with independent durable object storage.

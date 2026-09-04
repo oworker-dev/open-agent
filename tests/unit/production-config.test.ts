@@ -65,6 +65,30 @@ test("accepts the verified production topology", () => {
   assert.deepEqual(inspectProductionConfiguration(validEnvironment, "24.18.1"), []);
 });
 
+test("validates terminal Workflow archive configuration only when enabled", () => {
+  const missing = inspectProductionConfiguration({
+    ...validEnvironment,
+    WORKFLOW_ARCHIVE_ENABLED: "1",
+  }, "24.18.1");
+  assert.equal(missing.filter((item) => item.code === "missing-required").length, 3);
+
+  const configured = inspectProductionConfiguration({
+    ...validEnvironment,
+    WORKFLOW_ARCHIVE_ENABLED: "1",
+    WORKFLOW_ARCHIVE_DISCOVERY_LIMIT: "100",
+    WORKFLOW_ARCHIVE_INTERVAL_MS: "900000",
+    WORKFLOW_ARCHIVE_LEASE_MS: "3600000",
+    WORKFLOW_ARCHIVE_MAX_ROOTS: "2",
+    WORKFLOW_ARCHIVE_OLDER_THAN_MS: "604800000",
+    WORKFLOW_ARCHIVE_QUERY_TIMEOUT_MS: "15000",
+    WORKFLOW_ARCHIVE_RETRY_BASE_MS: "300000",
+    WORKFLOW_ARCHIVE_S3_ACCESS_KEY_ID: "archive-key",
+    WORKFLOW_ARCHIVE_S3_BUCKET: "archives",
+    WORKFLOW_ARCHIVE_S3_SECRET_ACCESS_KEY: "archive-secret",
+  }, "24.18.1");
+  assert.deepEqual(configured, []);
+});
+
 test("requires finite AgentRun admission limits in production", () => {
   assert.deepEqual(inspectProductionConfiguration({
     ...validEnvironment,

@@ -74,8 +74,45 @@ function failureFromData(data) {
         ...(statusCode === undefined ? {} : { statusCode }),
     };
 }
+const eventSnapshotIndexes = new WeakMap();
+function eventSnapshotIndex(events) {
+    const cached = eventSnapshotIndexes.get(events);
+    if (cached)
+        return cached;
+    const byTurn = new Map();
+    const byTurnStep = new Map();
+    const maximumStepByTurn = new Map();
+    let latestSessionFailure;
+    for (const event of events) {
+        if (event.type === "session.failed")
+            latestSessionFailure = event;
+        const turnId = eventTurnId(event);
+        if (!turnId)
+            continue;
+        const turnEvents = byTurn.get(turnId) ?? [];
+        turnEvents.push(event);
+        byTurn.set(turnId, turnEvents);
+        const stepIndex = eventStepIndex(event);
+        if (stepIndex === undefined)
+            continue;
+        const key = `${turnId}:${stepIndex}`;
+        const stepEvents = byTurnStep.get(key) ?? [];
+        stepEvents.push(event);
+        byTurnStep.set(key, stepEvents);
+        maximumStepByTurn.set(turnId, Math.max(maximumStepByTurn.get(turnId) ?? -1, stepIndex));
+    }
+    const index = {
+        byTurn,
+        byTurnStep,
+        maximumStepByTurn,
+        ...(latestSessionFailure ? { latestSessionFailure } : {}),
+    };
+    eventSnapshotIndexes.set(events, index);
+    return index;
+}
 function modelRetryingEvents(events, turnId, stepIndex) {
-    return events.filter((event) => {
+    const candidates = eventSnapshotIndex(events).byTurnStep.get(`${turnId}:${stepIndex}`) ?? [];
+    return candidates.filter((event) => {
         const candidate = event;
         if (candidate.type !== "model.retrying" || !candidate.data || typeof candidate.data !== "object")
             return false;
@@ -239,6 +276,35 @@ export function normalizeSettledAgentMessages(messages, events) {
                     : isLocalInterruptedBoundary(event) ? "cancelling" : "cancelled");
         }
     }
+    const rootEventsCache = new Map();
+    const segmentEventsCache = new Map();
+    const segmentEventsFor = (message, turnId) => {
+        const clientMessageId = assistantSegmentClientMessageId(message, turnId);
+        const cacheKey = `${turnId}\u0000${clientMessageId ?? ""}`;
+        const cached = segmentEventsCache.get(cacheKey);
+        if (cached)
+            return cached;
+        let rootEvents = rootEventsCache.get(turnId);
+        if (!rootEvents) {
+            rootEvents = eventsForRootTurn(events, turnId);
+            rootEventsCache.set(turnId, rootEvents);
+        }
+        const receiptIndex = rootEvents.findIndex((event) => event.type === "message.received" &&
+            event.data.turnId === turnId &&
+            (clientMessageId === undefined
+                ? event.data.clientMessageId === undefined
+                : event.data.clientMessageId === clientMessageId));
+        const segment = receiptIndex < 0
+            ? rootEvents
+            : (() => {
+                const nextReceiptIndex = rootEvents.findIndex((event, index) => index > receiptIndex &&
+                    event.type === "message.received" &&
+                    event.data.turnId === turnId);
+                return rootEvents.slice(receiptIndex, nextReceiptIndex < 0 ? undefined : nextReceiptIndex);
+            })();
+        segmentEventsCache.set(cacheKey, segment);
+        return segment;
+    };
     return messages.map((message) => {
         if (message.role !== "assistant" || !message.metadata?.turnId)
             return message;
@@ -246,7 +312,7 @@ export function normalizeSettledAgentMessages(messages, events) {
         const terminal = terminalTurns.get(messageTurnId);
         if (!terminal)
             return message;
-        const segmentEvents = eventsForAssistantSegment(message, events).events;
+        const segmentEvents = segmentEventsFor(message, messageTurnId);
         const segmentCompletedResults = new Map();
         const segmentPartialToolInputs = new Map();
         for (const event of segmentEvents) {
@@ -571,16 +637,15 @@ export function projectAgentDisplayTimeline(messages, events) {
 export function presentAgentStep(events, turnId, stepIndex) {
     if (!turnId)
         return { status: "running" };
-    const stepEvents = events.filter((event) => eventTurnId(event) === turnId &&
-        eventStepIndex(event) === stepIndex);
+    const index = eventSnapshotIndex(events);
+    const stepEvents = index.byTurnStep.get(`${turnId}:${stepIndex}`) ?? [];
+    const turnEvents = index.byTurn.get(turnId) ?? [];
     const starts = stepEvents.filter((event) => event.type === "step.started");
     const failures = stepEvents.filter((event) => event.type === "step.failed");
     const completed = [...stepEvents].reverse().find((event) => event.type === "step.completed");
-    const maximumTurnStepIndex = events.reduce((maximum, event) => eventTurnId(event) === turnId
-        ? Math.max(maximum, eventStepIndex(event) ?? -1)
-        : maximum, -1);
+    const maximumTurnStepIndex = index.maximumStepByTurn.get(turnId) ?? -1;
     const terminalFailureEvent = stepIndex === maximumTurnStepIndex
-        ? [...events].reverse().find((event) => event.type === "turn.failed" && event.data.turnId === turnId) ?? [...events].reverse().find((event) => event.type === "session.failed")
+        ? [...turnEvents].reverse().find((event) => event.type === "turn.failed" && event.data.turnId === turnId) ?? index.latestSessionFailure
         : undefined;
     const terminalFailure = terminalFailureEvent
         ? failureFromData(terminalFailureEvent.data)
@@ -651,9 +716,13 @@ export function presentAgentStep(events, turnId, stepIndex) {
 export function reasoningContentForStep(events, turnId, stepIndex) {
     if (!turnId)
         return "";
+    const index = eventSnapshotIndex(events);
+    const scopedEvents = stepIndex === undefined
+        ? index.byTurn.get(turnId) ?? []
+        : index.byTurnStep.get(`${turnId}:${stepIndex}`) ?? [];
     let content = "";
     let completedBlock = false;
-    for (const event of events) {
+    for (const event of scopedEvents) {
         if (event.type === "step.started" &&
             (turnId === undefined || event.data.turnId === turnId) &&
             (stepIndex === undefined || event.data.stepIndex === stepIndex)) {
@@ -1163,8 +1232,20 @@ function eventTimestamp(event) {
     return Number.isFinite(parsed) ? parsed : undefined;
 }
 function turnDisplayCoordinates(events) {
-    const turnIds = events.flatMap((event) => event.type === "turn.started" ? [event.data.turnId] : []);
-    const userTurns = new Set(events.flatMap((event) => event.type === "message.received" ? [event.data.turnId] : []));
+    const turnIds = [];
+    const userTurns = new Set();
+    const maximumStepByTurn = new Map();
+    for (const event of events) {
+        if (event.type === "turn.started")
+            turnIds.push(event.data.turnId);
+        if (event.type === "message.received")
+            userTurns.add(event.data.turnId);
+        const turnId = eventTurnId(event);
+        const stepIndex = eventStepIndex(event);
+        if (turnId !== undefined && stepIndex !== undefined) {
+            maximumStepByTurn.set(turnId, Math.max(maximumStepByTurn.get(turnId) ?? -1, stepIndex));
+        }
+    }
     const continuations = continuationTurnIds(events, userTurns);
     const preliminary = new Map();
     let rootTurnId;
@@ -1175,12 +1256,7 @@ function turnDisplayCoordinates(events) {
             nextStepOffset = 0;
         }
         preliminary.set(turnId, { rootTurnId, stepOffset: nextStepOffset });
-        const maximumStepIndex = events.reduce((maximum, event) => {
-            const stepIndex = eventStepIndex(event);
-            return eventTurnId(event) === turnId && stepIndex !== undefined
-                ? Math.max(maximum, stepIndex)
-                : maximum;
-        }, -1);
+        const maximumStepIndex = maximumStepByTurn.get(turnId) ?? -1;
         nextStepOffset += maximumStepIndex + 1;
     }
     const finalTurns = new Map();

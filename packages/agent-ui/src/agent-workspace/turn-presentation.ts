@@ -172,12 +172,58 @@ type ModelRetryingEvent = {
   readonly type: "model.retrying";
 };
 
+type EventSnapshotIndex = {
+  readonly byTurn: ReadonlyMap<string, readonly MessageStreamEvent[]>;
+  readonly byTurnStep: ReadonlyMap<string, readonly MessageStreamEvent[]>;
+  readonly maximumStepByTurn: ReadonlyMap<string, number>;
+  readonly latestSessionFailure?: Extract<MessageStreamEvent, { type: "session.failed" }>;
+};
+
+// AgentMessage renders several derived rows (reasoning, retries, tools) from
+// one immutable event snapshot. Without an index each row filtered or reduced
+// the complete transcript again, which made a long turn progressively more
+// expensive and could block the browser while new events were arriving.
+const eventSnapshotIndexes = new WeakMap<object, EventSnapshotIndex>();
+
+function eventSnapshotIndex(events: readonly MessageStreamEvent[]): EventSnapshotIndex {
+  const cached = eventSnapshotIndexes.get(events as object);
+  if (cached) return cached;
+  const byTurn = new Map<string, MessageStreamEvent[]>();
+  const byTurnStep = new Map<string, MessageStreamEvent[]>();
+  const maximumStepByTurn = new Map<string, number>();
+  let latestSessionFailure: Extract<MessageStreamEvent, { type: "session.failed" }> | undefined;
+  for (const event of events) {
+    if (event.type === "session.failed") latestSessionFailure = event;
+    const turnId = eventTurnId(event);
+    if (!turnId) continue;
+    const turnEvents = byTurn.get(turnId) ?? [];
+    turnEvents.push(event);
+    byTurn.set(turnId, turnEvents);
+    const stepIndex = eventStepIndex(event);
+    if (stepIndex === undefined) continue;
+    const key = `${turnId}:${stepIndex}`;
+    const stepEvents = byTurnStep.get(key) ?? [];
+    stepEvents.push(event);
+    byTurnStep.set(key, stepEvents);
+    maximumStepByTurn.set(turnId, Math.max(maximumStepByTurn.get(turnId) ?? -1, stepIndex));
+  }
+  const index: EventSnapshotIndex = {
+    byTurn,
+    byTurnStep,
+    maximumStepByTurn,
+    ...(latestSessionFailure ? { latestSessionFailure } : {}),
+  };
+  eventSnapshotIndexes.set(events as object, index);
+  return index;
+}
+
 function modelRetryingEvents(
   events: readonly MessageStreamEvent[],
   turnId: string,
   stepIndex: number,
 ): readonly ModelRetryingEvent[] {
-  return events.filter((event): event is MessageStreamEvent & ModelRetryingEvent => {
+  const candidates = eventSnapshotIndex(events).byTurnStep.get(`${turnId}:${stepIndex}`) ?? [];
+  return candidates.filter((event): event is MessageStreamEvent & ModelRetryingEvent => {
     const candidate = event as MessageStreamEvent & { readonly type?: unknown; readonly data?: unknown };
     if (candidate.type !== "model.retrying" || !candidate.data || typeof candidate.data !== "object") return false;
     const data = candidate.data as Partial<ModelRetryingEvent["data"]>;
@@ -438,6 +484,45 @@ export function normalizeSettledAgentMessages(
     }
   }
 
+  // `eventsForAssistantSegment` is intentionally event-order aware, but
+  // scanning the complete transcript once per assistant message becomes
+  // quadratic for long sessions (and this function runs on every live
+  // projection update). Cache the root-turn slice and then the segment slice
+  // for this normalization pass. The cache is local to the immutable event
+  // snapshot, so it cannot leak stale ranges across reconnects or edits.
+  const rootEventsCache = new Map<string, readonly MessageStreamEvent[]>();
+  const segmentEventsCache = new Map<string, readonly MessageStreamEvent[]>();
+  const segmentEventsFor = (message: EveMessage, turnId: string): readonly MessageStreamEvent[] => {
+    const clientMessageId = assistantSegmentClientMessageId(message, turnId);
+    const cacheKey = `${turnId}\u0000${clientMessageId ?? ""}`;
+    const cached = segmentEventsCache.get(cacheKey);
+    if (cached) return cached;
+    let rootEvents = rootEventsCache.get(turnId);
+    if (!rootEvents) {
+      rootEvents = eventsForRootTurn(events, turnId);
+      rootEventsCache.set(turnId, rootEvents);
+    }
+    const receiptIndex = rootEvents.findIndex((event) =>
+      event.type === "message.received" &&
+      event.data.turnId === turnId &&
+      (clientMessageId === undefined
+        ? event.data.clientMessageId === undefined
+        : event.data.clientMessageId === clientMessageId)
+    );
+    const segment = receiptIndex < 0
+      ? rootEvents
+      : (() => {
+          const nextReceiptIndex = rootEvents!.findIndex((event, index) =>
+            index > receiptIndex &&
+            event.type === "message.received" &&
+            event.data.turnId === turnId
+          );
+          return rootEvents!.slice(receiptIndex, nextReceiptIndex < 0 ? undefined : nextReceiptIndex);
+        })();
+    segmentEventsCache.set(cacheKey, segment);
+    return segment;
+  };
+
   return messages.map((message) => {
     if (message.role !== "assistant" || !message.metadata?.turnId) return message;
     const messageTurnId = message.metadata.turnId;
@@ -450,7 +535,7 @@ export function normalizeSettledAgentMessages(
     // segment that produced the message; using the entire turn here causes a
     // successful tool in one segment to be attached to every other segment
     // and falsely synthesized as `tool call did not complete`.
-    const segmentEvents = eventsForAssistantSegment(message, events).events;
+    const segmentEvents = segmentEventsFor(message, messageTurnId);
     const segmentCompletedResults = new Map<string, { readonly output: unknown; readonly toolName: string }>();
     const segmentPartialToolInputs = new Map<string, Extract<MessageStreamEvent, { type: "action.input.partial" }>>();
     for (const event of segmentEvents) {
@@ -877,24 +962,17 @@ export function presentAgentStep(
   stepIndex: number,
 ): AgentStepPresentation {
   if (!turnId) return { status: "running" };
-  const stepEvents = events.filter((event) =>
-    eventTurnId(event) === turnId &&
-    eventStepIndex(event) === stepIndex
-  );
+  const index = eventSnapshotIndex(events);
+  const stepEvents = index.byTurnStep.get(`${turnId}:${stepIndex}`) ?? [];
+  const turnEvents = index.byTurn.get(turnId) ?? [];
   const starts = stepEvents.filter((event) => event.type === "step.started");
   const failures = stepEvents.filter((event) => event.type === "step.failed");
   const completed = [...stepEvents].reverse().find((event) => event.type === "step.completed");
-  const maximumTurnStepIndex = events.reduce((maximum, event) =>
-    eventTurnId(event) === turnId
-      ? Math.max(maximum, eventStepIndex(event) ?? -1)
-      : maximum,
-  -1);
+  const maximumTurnStepIndex = index.maximumStepByTurn.get(turnId) ?? -1;
   const terminalFailureEvent = stepIndex === maximumTurnStepIndex
-    ? [...events].reverse().find((event): event is Extract<MessageStreamEvent, { type: "turn.failed" }> =>
+    ? [...turnEvents].reverse().find((event): event is Extract<MessageStreamEvent, { type: "turn.failed" }> =>
         event.type === "turn.failed" && event.data.turnId === turnId
-      ) ?? [...events].reverse().find((event): event is Extract<MessageStreamEvent, { type: "session.failed" }> =>
-        event.type === "session.failed"
-      )
+      ) ?? index.latestSessionFailure
     : undefined;
   const terminalFailure = terminalFailureEvent
     ? failureFromData(terminalFailureEvent.data)
@@ -975,9 +1053,13 @@ export function reasoningContentForStep(
   // search every historical turn. Returning an empty value prevents a new
   // assistant row from inheriting the previous turn's reasoning block.
   if (!turnId) return "";
+  const index = eventSnapshotIndex(events);
+  const scopedEvents = stepIndex === undefined
+    ? index.byTurn.get(turnId) ?? []
+    : index.byTurnStep.get(`${turnId}:${stepIndex}`) ?? [];
   let content = "";
   let completedBlock = false;
-  for (const event of events) {
+  for (const event of scopedEvents) {
     if (
       event.type === "step.started" &&
       (turnId === undefined || event.data.turnId === turnId) &&
@@ -1706,8 +1788,22 @@ type TurnDisplayCoordinates = {
 function turnDisplayCoordinates(
   events: readonly MessageStreamEvent[],
 ): ReadonlyMap<string, TurnDisplayCoordinates> {
-  const turnIds = events.flatMap((event) => event.type === "turn.started" ? [event.data.turnId] : []);
-  const userTurns = new Set(events.flatMap((event) => event.type === "message.received" ? [event.data.turnId] : []));
+  const turnIds: string[] = [];
+  const userTurns = new Set<string>();
+  const maximumStepByTurn = new Map<string, number>();
+  // Build the small coordinate index in one pass. The old implementation
+  // reduced the entire transcript once for every turn, which made rendering
+  // a long session O(turns × events) and could monopolize the browser main
+  // thread while a hot stream was arriving.
+  for (const event of events) {
+    if (event.type === "turn.started") turnIds.push(event.data.turnId);
+    if (event.type === "message.received") userTurns.add(event.data.turnId);
+    const turnId = eventTurnId(event);
+    const stepIndex = eventStepIndex(event);
+    if (turnId !== undefined && stepIndex !== undefined) {
+      maximumStepByTurn.set(turnId, Math.max(maximumStepByTurn.get(turnId) ?? -1, stepIndex));
+    }
+  }
   // A turn without `message.received` is only a visual continuation when Eve
   // explicitly parked for HITL input immediately before it. Treating every
   // unanchored turn as a continuation merges independent turns after a partial
@@ -1722,12 +1818,7 @@ function turnDisplayCoordinates(
       nextStepOffset = 0;
     }
     preliminary.set(turnId, { rootTurnId, stepOffset: nextStepOffset });
-    const maximumStepIndex = events.reduce((maximum, event) => {
-      const stepIndex = eventStepIndex(event);
-      return eventTurnId(event) === turnId && stepIndex !== undefined
-        ? Math.max(maximum, stepIndex)
-        : maximum;
-    }, -1);
+    const maximumStepIndex = maximumStepByTurn.get(turnId) ?? -1;
     nextStepOffset += maximumStepIndex + 1;
   }
 

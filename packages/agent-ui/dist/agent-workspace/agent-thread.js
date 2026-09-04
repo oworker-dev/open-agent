@@ -376,7 +376,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     }, [agent.session, onChange]);
     flushCheckpointRef.current = flushLiveCheckpoint;
     const liveRenderSource = useMemo(() => ({ events: agent.events, messages: agent.data.messages }), [agent.data.messages, agent.events]);
-    const liveRenderSnapshot = useThrottledSnapshot(liveRenderSource, 50);
+    const liveRenderSnapshot = useThrottledSnapshot(liveRenderSource, 32);
     const renderEvents = liveRenderSnapshot.events;
     const renderMessages = liveRenderSnapshot.messages;
     const recoveryRenderEvents = useThrottledSnapshot(thread.events, 75);
@@ -1968,11 +1968,16 @@ function latestStartedTurnId(events) {
 function isAgentTurnBusyError(error) {
     return error instanceof Error && /already processing a turn/i.test(error.message);
 }
+const messagesByEventSnapshot = new WeakMap();
 function messagesFromEvents(events) {
+    const cached = messagesByEventSnapshot.get(events);
+    if (cached)
+        return cached;
     const reducer = defaultMessageReducer();
     let data = reducer.initial();
     for (const event of events)
         data = reducer.reduce(data, event);
+    messagesByEventSnapshot.set(events, data.messages);
     return data.messages;
 }
 function projectInputResponses(messages, responses) {

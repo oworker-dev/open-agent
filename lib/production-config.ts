@@ -328,6 +328,34 @@ export function inspectProductionConfiguration(
   }
   requireValue(environment, "WORKFLOW_POSTGRES_URL", error);
   requireValue(environment, "WORKFLOW_POSTGRES_JOB_PREFIX", error);
+  const workflowArchiveEnabled = environment.WORKFLOW_ARCHIVE_ENABLED?.trim();
+  if (workflowArchiveEnabled && workflowArchiveEnabled !== "0" && workflowArchiveEnabled !== "1") {
+    error("workflow-archive-enabled", "WORKFLOW_ARCHIVE_ENABLED must be 0 or 1.");
+  }
+  if (workflowArchiveEnabled === "1") {
+    requireConfiguredValue(
+      environment.WORKFLOW_ARCHIVE_S3_BUCKET || environment.AGENT_ASSET_S3_BUCKET,
+      "WORKFLOW_ARCHIVE_S3_BUCKET",
+      error,
+    );
+    requireConfiguredValue(
+      environment.WORKFLOW_ARCHIVE_S3_ACCESS_KEY_ID || environment.AGENT_ASSET_S3_ACCESS_KEY_ID,
+      "WORKFLOW_ARCHIVE_S3_ACCESS_KEY_ID",
+      error,
+    );
+    requireConfiguredValue(
+      environment.WORKFLOW_ARCHIVE_S3_SECRET_ACCESS_KEY || environment.AGENT_ASSET_S3_SECRET_ACCESS_KEY,
+      "WORKFLOW_ARCHIVE_S3_SECRET_ACCESS_KEY",
+      error,
+    );
+    inspectOptionalInteger(environment.WORKFLOW_ARCHIVE_MAX_ROOTS, "WORKFLOW_ARCHIVE_MAX_ROOTS", 1, 100, error);
+    inspectOptionalInteger(environment.WORKFLOW_ARCHIVE_DISCOVERY_LIMIT, "WORKFLOW_ARCHIVE_DISCOVERY_LIMIT", 1, 10_000, error);
+    inspectOptionalInteger(environment.WORKFLOW_ARCHIVE_INTERVAL_MS, "WORKFLOW_ARCHIVE_INTERVAL_MS", 10_000, 86_400_000, error);
+    inspectOptionalInteger(environment.WORKFLOW_ARCHIVE_LEASE_MS, "WORKFLOW_ARCHIVE_LEASE_MS", 60_000, 86_400_000, error);
+    inspectOptionalInteger(environment.WORKFLOW_ARCHIVE_OLDER_THAN_MS, "WORKFLOW_ARCHIVE_OLDER_THAN_MS", 60_000, 315_360_000_000, error);
+    inspectOptionalInteger(environment.WORKFLOW_ARCHIVE_QUERY_TIMEOUT_MS, "WORKFLOW_ARCHIVE_QUERY_TIMEOUT_MS", 1_000, 300_000, error);
+    inspectOptionalInteger(environment.WORKFLOW_ARCHIVE_RETRY_BASE_MS, "WORKFLOW_ARCHIVE_RETRY_BASE_MS", 1_000, 86_400_000, error);
+  }
 
   let deploymentTenancy: AgentDeploymentTenancy | undefined;
   try {
