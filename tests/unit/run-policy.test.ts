@@ -31,6 +31,15 @@ test("normalizes and deduplicates host capability policy", () => {
   );
 });
 
+test("normalizes an explicit tool allowlist and preserves an explicit empty list", () => {
+  assert.deepEqual(
+    parseAgentRunPolicy({ tools: ["web_fetch", "bash", "web_fetch"] }),
+    { tools: ["bash", "web_fetch"] },
+  );
+  assert.deepEqual(parseAgentRunPolicy({ tools: [] }), { tools: [] });
+  assert.throws(() => parseAgentRunPolicy({ tools: [" bad"] }), /invalid tool name/);
+});
+
 test("rejects unknown fields and invalid direct-channel budgets", () => {
   assert.throws(() => parseAgentRunPolicy({ approvalMode: "always" }), /unknown field/);
   assert.throws(() => parseAgentRunPolicy({ executionMode: "full-access" }), /executionMode/);

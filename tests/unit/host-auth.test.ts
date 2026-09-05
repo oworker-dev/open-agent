@@ -28,6 +28,7 @@ test("accepts a host JWT and projects tenant identity", async () => {
         exp: Math.floor(Date.now() / 1000) + 300,
         iss: "https://muses.example.test",
         agentHostScope: JSON.stringify({ projectId: "project-123", canvasId: "canvas-123" }),
+        hostId: "muses",
         sub: "user-123",
         tenantId: "workspace-123",
       })}`,
@@ -38,9 +39,34 @@ test("accepts a host JWT and projects tenant identity", async () => {
   assert.equal(result.authenticator, "host-jwt");
   assert.equal(result.principalType, "user");
   assert.equal(result.attributes.tenantId, "workspace-123");
+  assert.equal(result.attributes.hostId, "muses");
   assert.deepEqual(JSON.parse(String(result.attributes.agentHostScope)), { projectId: "project-123", canvasId: "canvas-123" });
   assert.equal(result.subject, "user-123");
   assert.equal(result.principalId, "https://muses.example.test:user-123");
+});
+
+test("rejects a malformed host registry id even when the JWT signature is valid", async () => {
+  const auth = hostJwtAuth({
+    audiences: ["open-agent"],
+    issuer: "https://muses.example.test",
+    secret: SECRET,
+  });
+  await assert.rejects(
+    () => auth(new Request("https://agent.example.test/eve/v1/session", {
+      headers: {
+        authorization: `Bearer ${signJwt({
+          actorType: "user",
+          aud: "open-agent",
+          exp: Math.floor(Date.now() / 1000) + 300,
+          hostId: "bad host id",
+          iss: "https://muses.example.test",
+          sub: "user-123",
+          tenantId: "workspace-123",
+        })}`,
+      },
+    })),
+    (error: unknown) => error instanceof ForbiddenError,
+  );
 });
 
 test("rejects a verified host token without a tenant scope", async () => {

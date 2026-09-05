@@ -687,3 +687,22 @@ versioned Workflow draft create/command/validate/publish. It never exposes a
 database handle or internal Agent state. Configure the same 32+ character HMAC
 secret as `MUSES_AGENT_HOST_TOOLS_SECRET` in Muses and
 `AGENT_HOST_TOOLS_SECRET` in this service.
+
+### Multi-host routing and tool profiles
+
+One Open Agent deployment can serve several independent hosts. A host signs a
+stable `hostId` claim into its JWT, and the Agent resolves that id against the
+server-only `AGENT_HOST_GATEWAYS_JSON` registry. Each entry contains a gateway
+`url`, a 32+ character `secret`, and an optional bounded `timeoutMs`; the
+browser cannot select or override these values. Deployments that serve one host
+may continue using `AGENT_HOST_TOOLS_URL` and `AGENT_HOST_TOOLS_SECRET`.
+
+Runtime Config profiles may include `allowedTools` and `defaultTools`. A
+resolved AgentRun can only narrow that profile with `policy.tools`; omitted
+fields preserve the deployment's existing tool set, while an explicit empty
+list exposes no optional tools. The grant is stored in the durable session
+authentication snapshot and Eve filters the model-visible tool set before each
+call, so a no-sandbox profile does not merely fail sandbox calls after the
+model has already seen them. Tool names select capabilities compiled into the
+deployment; Runtime Config cannot inject executable code or an unreviewed MCP
+adapter.

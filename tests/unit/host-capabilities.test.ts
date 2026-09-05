@@ -9,6 +9,7 @@ import {
   invokeHostCapability,
   listHostCapabilities,
   readHostCapabilityTimeoutMs,
+  resolveHostGateway,
   shouldExposeHostCapabilities,
 } from "../../agent/lib/host-capabilities.ts";
 
@@ -71,6 +72,32 @@ test("does not expose inherited Host tools without an authenticated explicit gra
       },
     },
   }, environment), true);
+});
+
+test("routes a signed host identity through the server-side gateway registry", () => {
+  const session = sessionContext(JSON.stringify({ hostCapabilities: ["documents.read"] }));
+  (session.session.auth.current!.attributes as Record<string, unknown>).hostId = "muses";
+  const gateway = resolveHostGateway(session, {
+    AGENT_HOST_GATEWAYS_JSON: JSON.stringify({
+      muses: {
+        url: "https://muses.example/agent-tools",
+        secret: SECRET,
+        timeoutMs: 15_000,
+      },
+    }),
+    AGENT_HOST_TOOLS_URL: "https://attacker.example/should-not-win",
+    AGENT_HOST_TOOLS_SECRET: SECRET,
+  });
+  assert.deepEqual(gateway, {
+    baseUrl: "https://muses.example/agent-tools",
+    secret: SECRET,
+    timeoutMs: 15_000,
+  });
+  assert.equal(resolveHostGateway(sessionContext(), {
+    AGENT_HOST_GATEWAYS_JSON: JSON.stringify({
+      muses: { url: "https://muses.example", secret: SECRET },
+    }),
+  }), undefined);
 });
 
 test("signs Host capability requests with raw host identity and opaque scope", async () => {

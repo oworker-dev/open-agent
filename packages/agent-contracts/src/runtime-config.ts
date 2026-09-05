@@ -36,6 +36,10 @@ export type AgentRuntimeProfile = {
   readonly defaultSkills: readonly AgentExtensionRef[];
   readonly allowedMcpConnections: readonly AgentExtensionRef[];
   readonly defaultMcpConnections: readonly AgentExtensionRef[];
+  /** Optional compiled-tool allowlist. Omitted preserves the deployment default. */
+  readonly allowedTools?: readonly string[];
+  /** Tools selected by default for sessions using this profile. */
+  readonly defaultTools?: readonly string[];
 };
 
 /**
@@ -261,6 +265,8 @@ function parseProfile(value: unknown): AgentRuntimeProfile {
     "allowedSkills",
     "defaultMcpConnections",
     "defaultSkills",
+    "allowedTools",
+    "defaultTools",
     "id",
     "instructions",
     "label",
@@ -279,10 +285,38 @@ function parseProfile(value: unknown): AgentRuntimeProfile {
     defaultSkills: extensionRefs(value.defaultSkills, "profile.defaultSkills"),
     allowedMcpConnections: extensionRefs(value.allowedMcpConnections, "profile.allowedMcpConnections"),
     defaultMcpConnections: extensionRefs(value.defaultMcpConnections, "profile.defaultMcpConnections"),
+    ...(value.allowedTools === undefined ? {} : { allowedTools: toolNames(value.allowedTools, "profile.allowedTools") }),
+    ...(value.defaultTools === undefined ? {} : { defaultTools: toolNames(value.defaultTools, "profile.defaultTools") }),
   };
   assertDefaultsAllowed(profile.defaultSkills, profile.allowedSkills, "Skill");
   assertDefaultsAllowed(profile.defaultMcpConnections, profile.allowedMcpConnections, "MCP connection");
+  if (profile.defaultTools !== undefined && profile.allowedTools !== undefined) {
+    assertDefaultsAllowedNames(profile.defaultTools, profile.allowedTools, "Tool");
+  }
   return profile;
+}
+
+function toolNames(value: unknown, name: string): readonly string[] {
+  if (!Array.isArray(value) || value.length > 256) throw invalid(`${name} is invalid`);
+  const names = value.map((item) => {
+    if (typeof item !== "string" || item.length < 1 || item.length > 160 ||
+        item.trim() !== item || !/^[A-Za-z0-9][A-Za-z0-9._:-]*$/u.test(item)) {
+      throw invalid(`${name} contains an invalid tool name`);
+    }
+    return item;
+  });
+  return [...new Set(names)].sort();
+}
+
+function assertDefaultsAllowedNames(
+  defaults: readonly string[],
+  allowed: readonly string[],
+  kind: string,
+) {
+  const allowedNames = new Set(allowed);
+  for (const name of defaults) {
+    if (!allowedNames.has(name)) throw invalid(`${kind} ${name} is defaulted but not allowed`);
+  }
 }
 
 function extensionRefs(value: unknown, name: string): readonly AgentExtensionRef[] {

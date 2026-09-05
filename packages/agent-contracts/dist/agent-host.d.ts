@@ -4,6 +4,8 @@ export type AgentHostTokenClaims = {
     readonly sub: string;
     readonly tenantId: string;
     readonly actorType: "user" | "service";
+    /** Stable server-side Host Registry key used to route Host capabilities. */
+    readonly hostId?: string;
     /** Opaque host-defined scope values. The Agent never interprets their keys. */
     readonly hostScope?: Readonly<Record<string, string>>;
     readonly permissions?: readonly string[];

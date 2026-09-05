@@ -100,6 +100,26 @@ test("runtime limits cannot be expanded by an AgentRun request", () => {
   );
 });
 
+test("tool policy defaults to the profile and cannot expand its allowlist", () => {
+  const config = {
+    ...DEFAULT_AGENT_RUNTIME_CONFIG,
+    profile: {
+      ...DEFAULT_AGENT_RUNTIME_CONFIG.profile,
+      allowedTools: ["web_fetch", "host_invoke"],
+      defaultTools: ["web_fetch"],
+    },
+  };
+  assert.deepEqual(resolveAgentRunPolicy(profile, {}, undefined, config).tools, ["web_fetch"]);
+  assert.deepEqual(
+    resolveAgentRunPolicy(profile, { tools: [] }, undefined, config).tools,
+    [],
+  );
+  assert.throws(
+    () => resolveAgentRunPolicy(profile, { tools: ["bash"] }, undefined, config),
+    /not allowed by the Agent profile/,
+  );
+});
+
 test("derives tenant lifecycle manifests from a Host runtime config", () => {
   const runtimeSkill = { id: "tenant-playbook", version: "1.0.0" } as const;
   const runtimeMcp = { id: "tenant-mcp", version: "1.0.0" } as const;

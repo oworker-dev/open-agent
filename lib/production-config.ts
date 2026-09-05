@@ -1,3 +1,5 @@
+import { validateHostGatewayRegistry } from "../agent/lib/host-capabilities.ts";
+
 export type ProductionDiagnostic = {
   readonly code: string;
   readonly level: "error" | "warning";
@@ -639,6 +641,17 @@ export function inspectProductionConfiguration(
 
   const hostToolsUrl = environment.AGENT_HOST_TOOLS_URL?.trim();
   const hostToolsSecret = environment.AGENT_HOST_TOOLS_SECRET?.trim();
+  if (environment.AGENT_HOST_GATEWAYS_JSON?.trim()) {
+    try {
+      validateHostGatewayRegistry(environment);
+    } catch (error) {
+      diagnostics.push({
+        code: "host-gateways-registry",
+        level: "error",
+        message: error instanceof Error ? error.message : "AGENT_HOST_GATEWAYS_JSON is invalid.",
+      });
+    }
+  }
   if (Boolean(hostToolsUrl) !== Boolean(hostToolsSecret)) {
     error(
       "host-tools-pair",

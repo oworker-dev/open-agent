@@ -16,6 +16,29 @@ export type AgentExtensionStatus = "published" | "revoked";
 export type AgentExtensionCredentialMode = "none" | "reference-required";
 export type AgentExtensionTenantDefault = "disabled" | "enabled";
 
+/** Names of tools compiled into this deployment and safe to select by policy. */
+export const COMPILED_AGENT_TOOL_NAMES: ReadonlySet<string> = new Set([
+  "agent",
+  "apply_patch",
+  "ask_question",
+  "bash",
+  "glob",
+  "grep",
+  "host_capabilities",
+  "host_invoke",
+  "import_asset",
+  "load_skill",
+  "publish_artifact",
+  "publish_preview",
+  "read_file",
+  "record_checkpoint",
+  "todo",
+  "view_image",
+  "web_fetch",
+  "web_search",
+  "write_file",
+]);
+
 export type AgentExtensionManifest = AgentExtensionRef & {
   readonly credentialMode: AgentExtensionCredentialMode;
   readonly defaultTenantStatus: AgentExtensionTenantDefault;
@@ -106,6 +129,7 @@ export function resolveAgentRunPolicy(
     revokedRefs,
     config,
   );
+  const tools = resolveAgentRunTools(requested.tools, profile.allowedTools, profile.defaultTools);
   const limits = mergeAgentRunLimits(config.limits, requested.limits);
 
   return {
@@ -114,7 +138,30 @@ export function resolveAgentRunPolicy(
     ...(limits ? { limits } : {}),
     mcpConnections,
     skills,
+    ...(tools !== undefined ? { tools } : {}),
   };
+}
+
+function resolveAgentRunTools(
+  requested: readonly string[] | undefined,
+  allowed: readonly string[] | undefined,
+  defaults: readonly string[] | undefined,
+): readonly string[] | undefined {
+  const selected = requested ?? defaults ?? allowed;
+  if (selected === undefined) return undefined;
+  const allowedNames = allowed === undefined ? undefined : new Set(allowed);
+  const resolved = [...new Set(selected)].sort();
+  const unknown = resolved.find((name) => !COMPILED_AGENT_TOOL_NAMES.has(name));
+  if (unknown !== undefined) {
+    throw new Error(`Tool ${unknown} is not compiled into this Agent deployment.`);
+  }
+  if (allowedNames !== undefined) {
+    const denied = resolved.find((name) => !allowedNames.has(name));
+    if (denied !== undefined) {
+      throw new Error(`Tool ${denied} is not allowed by the Agent profile.`);
+    }
+  }
+  return resolved;
 }
 
 export function mergeAgentRunLimits(

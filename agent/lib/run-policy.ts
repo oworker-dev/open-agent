@@ -26,6 +26,7 @@ const LIMIT_NAMES = [
 ] as const satisfies readonly (keyof AgentRunLimits)[];
 const CAPABILITY_NAME = /^[a-zA-Z0-9][a-zA-Z0-9._:-]*$/;
 const MAX_CAPABILITIES = 128;
+const MAX_TOOLS = 256;
 const MAX_EXTENSIONS = 64;
 const EXECUTION_MODES = ["automation", "cautious", "standard"] as const satisfies readonly AgentExecutionMode[];
 const EXTENSION_ID = /^[a-z0-9][a-z0-9._-]*$/;
@@ -75,7 +76,7 @@ export function readAgentRunPolicy(session: RunPolicyContext): AgentRunPolicy {
 /** Strict parser shared by the public AgentRun API and the direct Eve channel. */
 export function parseAgentRunPolicy(value: unknown): AgentRunPolicy {
   if (!isRecord(value)) throw new Error("The AgentRun policy must be a JSON object.");
-  assertOnlyKeys(value, ["executionMode", "hostCapabilities", "limits", "mcpConnections", "skills"], "AgentRun policy");
+  assertOnlyKeys(value, ["executionMode", "hostCapabilities", "limits", "mcpConnections", "skills", "tools"], "AgentRun policy");
 
   const executionMode = value.executionMode === undefined ? undefined : parseExecutionMode(value.executionMode);
 
@@ -123,6 +124,7 @@ export function parseAgentRunPolicy(value: unknown): AgentRunPolicy {
 
   const mcpConnections = parseExtensionRefs(value.mcpConnections, "mcpConnections");
   const skills = parseExtensionRefs(value.skills, "skills");
+  const tools = parseToolNames(value.tools);
 
   return {
     ...(executionMode ? { executionMode } : {}),
@@ -130,7 +132,28 @@ export function parseAgentRunPolicy(value: unknown): AgentRunPolicy {
     ...(limits ? { limits } : {}),
     ...(mcpConnections ? { mcpConnections } : {}),
     ...(skills ? { skills } : {}),
+    ...(tools ? { tools } : {}),
   };
+}
+
+function parseToolNames(value: unknown): readonly string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length > MAX_TOOLS) {
+    throw new Error(`AgentRun tools must contain at most ${MAX_TOOLS} names.`);
+  }
+  const names = value.map((item) => {
+    if (
+      typeof item !== "string" ||
+      item.length < 1 ||
+      item.length > 160 ||
+      item.trim() !== item ||
+      !CAPABILITY_NAME.test(item)
+    ) {
+      throw new Error("AgentRun tools contains an invalid tool name.");
+    }
+    return item;
+  });
+  return [...new Set(names)].sort();
 }
 
 export function readAgentExecutionMode(session: RunPolicyContext): AgentExecutionMode {

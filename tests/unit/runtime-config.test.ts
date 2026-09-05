@@ -73,6 +73,30 @@ test("accepts a credential-free host runtime snapshot and projects its UI catalo
   assert.deepEqual(ui.reasoningLevels, ["low", "medium"]);
 });
 
+test("parses an optional compiled tool policy and enforces profile defaults", () => {
+  const config = parseAgentRuntimeConfigSnapshot({
+    ...DEFAULT_AGENT_RUNTIME_CONFIG,
+    profile: {
+      ...DEFAULT_AGENT_RUNTIME_CONFIG.profile,
+      allowedTools: ["web_fetch", "host_invoke"],
+      defaultTools: ["web_fetch"],
+    },
+  });
+  assert.deepEqual(config.profile.allowedTools, ["host_invoke", "web_fetch"]);
+  assert.deepEqual(config.profile.defaultTools, ["web_fetch"]);
+  assert.throws(
+    () => parseAgentRuntimeConfigSnapshot({
+      ...DEFAULT_AGENT_RUNTIME_CONFIG,
+      profile: {
+        ...DEFAULT_AGENT_RUNTIME_CONFIG.profile,
+        allowedTools: ["web_fetch"],
+        defaultTools: ["bash"],
+      },
+    }),
+    /defaulted but not allowed/,
+  );
+});
+
 test("rejects credentials, duplicate models, and unsupported defaults", () => {
   assert.throws(
     () => parseAgentRuntimeConfigSnapshot({

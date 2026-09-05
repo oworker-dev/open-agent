@@ -42,11 +42,21 @@ export function hostJwtAuth(config: HostJwtAuthConfig): AuthFn<Request> {
       });
     }
 
+    const hostId = verified.sessionAuth.attributes.hostId;
+    if (hostId !== undefined &&
+        (typeof hostId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(hostId))) {
+      throw new ForbiddenError({
+        code: "host_id_invalid",
+        message: "The host token contains an invalid hostId.",
+      });
+    }
+
     return {
       ...verified.sessionAuth,
       attributes: {
         ...verified.sessionAuth.attributes,
         tenantId: tenantId.trim(),
+        ...(typeof hostId === "string" ? { hostId: hostId.trim() } : {}),
       },
       authenticator: "host-jwt",
       principalType: actorType ?? "user",

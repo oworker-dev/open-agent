@@ -49,6 +49,7 @@ const startSchema = z.object({
     }).strict().optional(),
     mcpConnections: z.array(extensionRefSchema).max(64).optional(),
     skills: z.array(extensionRefSchema).max(64).optional(),
+    tools: z.array(capabilityNameSchema).max(256).optional(),
   }).strict().optional(),
   profile: z.object({
     profileId: z.string().trim().min(1).max(120),

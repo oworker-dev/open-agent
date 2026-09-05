@@ -30,6 +30,10 @@ export type AgentRuntimeProfile = {
     readonly defaultSkills: readonly AgentExtensionRef[];
     readonly allowedMcpConnections: readonly AgentExtensionRef[];
     readonly defaultMcpConnections: readonly AgentExtensionRef[];
+    /** Optional compiled-tool allowlist. Omitted preserves the deployment default. */
+    readonly allowedTools?: readonly string[];
+    /** Tools selected by default for sessions using this profile. */
+    readonly defaultTools?: readonly string[];
 };
 /**
  * Host-published extension metadata. Skill content is procedure text only;

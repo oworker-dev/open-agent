@@ -9,6 +9,15 @@ import { allowedHostCapabilities, readAgentRunPolicy } from "./run-policy.ts";
 // turn. Keep the default inside the public upper bound so a host can still
 // choose a shorter timeout for read-only capabilities.
 const DEFAULT_TIMEOUT_MS = 120_000;
+const HOST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+const MAX_GATEWAY_REGISTRY_BYTES = 256 * 1024;
+const MAX_GATEWAYS = 256;
+
+export type HostCapabilityGateway = {
+  readonly baseUrl: string;
+  readonly secret: string;
+  readonly timeoutMs: number;
+};
 
 export const hostCapabilityCatalogState = defineState<
   readonly AgentHostCapabilityDescriptor[]
@@ -17,10 +26,14 @@ export const hostCapabilityCatalogState = defineState<
 export function isHostCapabilityConfigured(
   environment: Readonly<Record<string, string | undefined>> = process.env,
 ): boolean {
-  return Boolean(
-    environment.AGENT_HOST_TOOLS_URL?.trim() &&
-      environment.AGENT_HOST_TOOLS_SECRET?.trim(),
-  );
+  try {
+    return parseHostGatewayRegistry(environment) !== undefined || Boolean(
+      environment.AGENT_HOST_TOOLS_URL?.trim() &&
+        environment.AGENT_HOST_TOOLS_SECRET?.trim(),
+    );
+  } catch {
+    return false;
+  }
 }
 
 type HostCapabilityResolverContext = {
@@ -41,7 +54,7 @@ export function shouldExposeHostCapabilities(
   return Boolean(
     principal &&
       allowed?.length &&
-      isHostCapabilityConfigured(environment),
+      resolveHostGateway(session, environment),
   );
 }
 
@@ -116,20 +129,113 @@ export async function invokeHostCapability(
 }
 
 function hostClient(session: SessionContext) {
-  const baseUrl = required(process.env.AGENT_HOST_TOOLS_URL, "AGENT_HOST_TOOLS_URL");
-  const secret = required(
-    process.env.AGENT_HOST_TOOLS_SECRET,
-    "AGENT_HOST_TOOLS_SECRET",
-  );
+  const gateway = resolveHostGateway(session);
+  if (!gateway) {
+    throw new Error("No Host capability gateway is configured for this Agent host.");
+  }
+  return createAgentHostCapabilityClient({
+    baseUrl: gateway.baseUrl,
+    identity: hostIdentity(session),
+    secret: gateway.secret,
+    timeoutMs: gateway.timeoutMs,
+  });
+}
+
+/**
+ * Resolve a gateway from the signed Host identity. Registry entries are
+ * deployment configuration, never browser input; the legacy global URL/secret
+ * remains the fallback for single-host deployments.
+ */
+export function resolveHostGateway(
+  session: HostCapabilityResolverContext,
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+): HostCapabilityGateway | undefined {
+  const registry = parseHostGatewayRegistry(environment);
+  if (registry !== undefined) {
+    const hostId = readHostId(session);
+    return hostId ? registry.get(hostId) : undefined;
+  }
+  const baseUrl = environment.AGENT_HOST_TOOLS_URL?.trim();
+  const secret = environment.AGENT_HOST_TOOLS_SECRET?.trim();
+  if (!baseUrl || !secret) return undefined;
   if (secret.length < 32) {
     throw new Error("AGENT_HOST_TOOLS_SECRET must contain at least 32 characters.");
   }
-  return createAgentHostCapabilityClient({
+  return {
     baseUrl,
-    identity: hostIdentity(session),
     secret,
-    timeoutMs: readHostCapabilityTimeoutMs(),
-  });
+    timeoutMs: readHostCapabilityTimeoutMs(environment),
+  };
+}
+
+function readHostId(session: HostCapabilityResolverContext): string | undefined {
+  const principal = session.session.auth.current ?? session.session.auth.initiator;
+  const value = principal?.attributes.hostId ?? principal?.attributes.agentHostId;
+  return typeof value === "string" && HOST_ID_PATTERN.test(value) ? value : undefined;
+}
+
+function parseHostGatewayRegistry(
+  environment: Readonly<Record<string, string | undefined>>,
+): ReadonlyMap<string, HostCapabilityGateway> | undefined {
+  const raw = environment.AGENT_HOST_GATEWAYS_JSON?.trim();
+  if (!raw) return undefined;
+  if (Buffer.byteLength(raw) > MAX_GATEWAY_REGISTRY_BYTES) {
+    throw new Error("AGENT_HOST_GATEWAYS_JSON exceeds 256 KiB.");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("AGENT_HOST_GATEWAYS_JSON must be valid JSON.");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("AGENT_HOST_GATEWAYS_JSON must be an object keyed by hostId.");
+  }
+  const gateways = new Map<string, HostCapabilityGateway>();
+  for (const [hostId, value] of Object.entries(parsed as Record<string, unknown>)) {
+    if (gateways.size >= MAX_GATEWAYS) {
+      throw new Error(`AGENT_HOST_GATEWAYS_JSON may contain at most ${MAX_GATEWAYS} hosts.`);
+    }
+    if (!HOST_ID_PATTERN.test(hostId)) throw new Error("AGENT_HOST_GATEWAYS_JSON contains an invalid hostId.");
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error(`Host gateway ${hostId} must be an object.`);
+    }
+    const entry = value as Record<string, unknown>;
+    const unknown = Object.keys(entry).find((key) => !["url", "secret", "timeoutMs"].includes(key));
+    if (unknown) throw new Error(`Host gateway ${hostId} contains unknown field ${unknown}.`);
+    const baseUrl = typeof entry.url === "string" ? entry.url.trim() : "";
+    const secret = typeof entry.secret === "string" ? entry.secret.trim() : "";
+    if (!baseUrl || !secret || secret.length < 32) {
+      throw new Error(`Host gateway ${hostId} requires a URL and a 32+ character secret.`);
+    }
+    let url: URL;
+    try {
+      url = new URL(baseUrl);
+    } catch {
+      throw new Error(`Host gateway ${hostId} URL is invalid.`);
+    }
+    const loopback = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]";
+    if ((url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) || url.username || url.password) {
+      throw new Error(`Host gateway ${hostId} URL must be an HTTP(S) URL without credentials.`);
+    }
+    const timeoutMs = entry.timeoutMs === undefined
+      ? DEFAULT_TIMEOUT_MS
+      : typeof entry.timeoutMs === "number"
+        ? entry.timeoutMs
+        : Number.NaN;
+    if (!Number.isInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > DEFAULT_TIMEOUT_MS) {
+      throw new Error(`Host gateway ${hostId} timeoutMs must be from 1000 to 120000.`);
+    }
+    gateways.set(hostId, { baseUrl, secret, timeoutMs });
+  }
+  return gateways;
+}
+
+/** Validate the optional registry during production boot/doctor checks. */
+export function validateHostGatewayRegistry(
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+): void {
+  parseHostGatewayRegistry(environment);
 }
 
 function hostIdentity(session: SessionContext): AgentHostInvocationIdentity {

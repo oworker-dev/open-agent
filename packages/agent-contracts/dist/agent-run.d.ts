@@ -32,6 +32,11 @@ export type AgentRunPolicy = {
     readonly limits?: AgentRunLimits;
     readonly mcpConnections?: readonly AgentExtensionRef[];
     readonly skills?: readonly AgentExtensionRef[];
+    /**
+     * Optional session-scoped allowlist of compiled tools. Omitted means the
+     * deployment's normal tool set; an empty list intentionally exposes none.
+     */
+    readonly tools?: readonly string[];
 };
 export type AgentRunParentRef = {
     readonly depth: number;
