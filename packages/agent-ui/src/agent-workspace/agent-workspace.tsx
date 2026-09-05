@@ -345,7 +345,11 @@ export function AgentWorkspace({
   const updateThread = useCallback((
     threadId: string,
     patch: AgentThreadPatch,
-    options?: { readonly allowCursorRewind?: boolean },
+    options?: {
+      readonly allowCursorRewind?: boolean;
+      /** Apply a read/recovery snapshot without marking the thread as active. */
+      readonly preserveUpdatedAt?: boolean;
+    },
   ) => {
     if (patch.pendingTurn || patch.events?.length || patch.session?.sessionId) {
       setEphemeralThreadIds((current) => withoutSetValue(current, threadId));
@@ -398,7 +402,9 @@ export function AgentWorkspace({
                   : Math.max(thread.session.streamIndex, effectivePatch.session.streamIndex),
               }
             : thread.session,
-          updatedAt: patch.updatedAt ?? Math.max(Date.now(), thread.updatedAt + 1),
+          updatedAt: options?.preserveUpdatedAt
+            ? thread.updatedAt
+            : patch.updatedAt ?? Math.max(Date.now(), thread.updatedAt + 1),
         };
       });
       threadsRef.current = next;
@@ -476,7 +482,6 @@ export function AgentWorkspace({
       ...(settledPendingTurn ? { pendingTurn: settledPendingTurn } : { pendingTurn: undefined }),
       session: settledSession,
       status: settledStatus,
-      updatedAt: Date.now(),
     };
     if (caughtUpSettledRange && activeThreadIdRef.current === thread.id && !preserveRuntimeIdentity) {
       // Eve's reducer seeds `initialEvents` once. A finite settled catch-up is
@@ -491,10 +496,10 @@ export function AgentWorkspace({
           next.set(thread.id, seed);
           return next;
         });
-        updateThread(thread.id, settledPatch);
+        updateThread(thread.id, settledPatch, { preserveUpdatedAt: true });
       });
     } else {
-      updateThread(thread.id, settledPatch);
+      updateThread(thread.id, settledPatch, { preserveUpdatedAt: true });
     }
 
     // A settled runtime does not prove that the browser transcript is
@@ -530,8 +535,7 @@ export function AgentWorkspace({
             ...repaired,
             events: compactThreadEvents(repaired.events),
             ...(repairedPendingTurn ? { pendingTurn: repairedPendingTurn } : { pendingTurn: undefined }),
-            updatedAt: Date.now(),
-          });
+          }, { preserveUpdatedAt: true });
           return;
         }
       } catch (error) {
@@ -600,8 +604,7 @@ export function AgentWorkspace({
         revision: (thread.revision ?? 0) + 1,
         session: settledSession,
         status: settledStatus,
-        updatedAt: Date.now(),
-      });
+      }, { preserveUpdatedAt: true });
     } catch {
       // The runtime lifecycle is already settled. A transient tail read must
       // not reopen a live stream or put the completed thread back in recovery.
@@ -625,8 +628,7 @@ export function AgentWorkspace({
       if (thread.status === "streaming" || thread.status === "submitted") {
         updateThread(thread.id, {
           status: statusFromEvents(thread.events, new Set(thread.closedInputRequestIds)),
-          updatedAt: Date.now(),
-        });
+        }, { preserveUpdatedAt: true });
       }
       return;
     }
@@ -1083,7 +1085,9 @@ export function AgentWorkspace({
               ...(!reconciledPendingTurn ? { pendingTurn: undefined } : {}),
               ...(healedCoverage ? { transcriptCoverage: healedCoverage } : {}),
               ...(loaded.window ? { transcriptWindow: loaded.window } : {}),
-              updatedAt: Date.now(),
+              // Hydration is a read/repair operation. Preserve activity time
+              // so merely opening a session cannot reorder it after refresh.
+              updatedAt: Math.max(thread.updatedAt, hydrated.updatedAt),
             };
         const withWindow = loaded.window && nextThread.transcriptWindow !== loaded.window
           ? { ...nextThread, transcriptWindow: loaded.window }
@@ -1137,13 +1141,7 @@ export function AgentWorkspace({
           startIndex: loaded.window.startIndex,
           total: Math.max(latestWindow.total, loaded.window.total),
         },
-        // AgentThreadView seeds Eve's reducer from initialEvents once per
-        // mount. Bump the hydration revision so the newly prepended page is
-        // projected immediately instead of remaining invisible in the stale
-        // external-store snapshot.
-        revision: (latest.revision ?? 0) + 1,
-        updatedAt: Date.now(),
-      });
+      }, { preserveUpdatedAt: true });
     } catch (error) {
       onStorageError?.(error);
     } finally {
@@ -1811,6 +1809,10 @@ export function AgentWorkspace({
             ? "error"
             : recoveryStatus(),
       };
+      const recoveryUpdateOptions = {
+        ...(recoveryCursorReconciled ? { allowCursorRewind: true } : {}),
+        preserveUpdatedAt: true,
+      } as const;
       // The mounted Eve reducer is seeded only once. A recovery worker may
       // consume a finite catch-up stream while the child remains mounted; if
       // we simply flip `isRecovering` back to false, the stale live reducer
@@ -1829,20 +1831,20 @@ export function AgentWorkspace({
           updateThread(
             thread.id,
             recoveryPatch,
-            recoveryCursorReconciled ? { allowCursorRewind: true } : undefined,
+            recoveryUpdateOptions,
           );
         });
       } else {
         updateThread(
           thread.id,
           recoveryPatch,
-          recoveryCursorReconciled ? { allowCursorRewind: true } : undefined,
+          recoveryUpdateOptions,
         );
       }
     } catch (error) {
       if (controller.signal.aborted || isAbortError(error)) return;
       if (recoveryControllers.current.get(thread.id) !== controller) return;
-      updateThread(thread.id, { status: "error", updatedAt: Date.now() });
+      updateThread(thread.id, { status: "error" }, { preserveUpdatedAt: true });
       setRecoveryErrors((current) => new Map(current).set(thread.id, error instanceof Error ? error.message : messages.recoveryFailed));
       console.error("Agent session recovery failed", error);
     } finally {
@@ -1876,7 +1878,7 @@ export function AgentWorkspace({
     // transient `recovering` flag here remounted the thread once when recovery
     // started and again when it settled, producing visible edit flashes. The
     // durable seed is the only state that requires reseeding Eve's reducer.
-    ? `${activeThread.id}:${activeThread.transcriptWindow?.startIndex ?? 0}:${threadRuntimeSeeds.get(activeThread.id) ?? "initial"}`
+    ? `${activeThread.id}:${threadRuntimeSeeds.get(activeThread.id) ?? "initial"}`
     : "none";
   const activeIsHydrating = activeThread?.hydration === "summary";
   if (!isHydrated || !activeThread) return <div className="flex h-dvh items-center justify-center bg-background text-muted-foreground">{messages.loading}</div>;
@@ -2881,7 +2883,7 @@ async function saveThreadCollectionWithConflictRecovery(
       // window before resolving a revision conflict; the extra reads occur
       // only on a conflict and keep the append-only event log authoritative
       // without materializing every historical event.
-      const remote = await loadConflictCollection(storageKey, storage);
+      const remote = await loadConflictCollection(storageKey, storage, candidate);
       candidate = mergeThreadCollectionsForConflict(candidate, remote);
     }
   }
@@ -2891,16 +2893,24 @@ async function saveThreadCollectionWithConflictRecovery(
 async function loadConflictCollection(
   storageKey: string,
   storage: AgentThreadStorage,
+  local: AgentThreadCollection,
 ): Promise<AgentThreadCollection> {
   const index = await storage.load(storageKey);
   if (!storage.loadThread && !storage.loadThreadWindow) return index;
+  const localThreads = new Map(local.threads.map((thread) => [thread.id, thread]));
   const threads: AgentThread[] = [];
   // Keep hydration sequential. createHttpAgentThreadStorage updates its
   // baseline after each single-thread read; parallel reads can race and leave
   // the baseline containing only the last hydrated thread, which makes the
   // next conflict PATCH look like a deletion of the others.
   for (const thread of index.threads) {
-    if (thread.hydration !== "summary") {
+    const localThread = localThreads.get(thread.id);
+    if (
+      thread.hydration !== "summary" ||
+      !localThread ||
+      localThread.hydration === "summary" ||
+      !threadSnapshotsMayConflict(localThread, thread)
+    ) {
       threads.push(thread);
       continue;
     }
@@ -2918,6 +2928,19 @@ async function loadConflictCollection(
     }
   }
   return { ...index, threads };
+}
+
+/**
+ * The index contains enough metadata to identify which full local snapshots
+ * can actually conflict. Unchanged and summary-only threads are safe to merge
+ * without loading their transcripts; the server preserves their append-only
+ * event logs when applying summary metadata.
+ */
+function threadSnapshotsMayConflict(local: AgentThread, remote: AgentThread): boolean {
+  return local.updatedAt !== remote.updatedAt ||
+    local.revision !== remote.revision ||
+    local.session.sessionId !== remote.session.sessionId ||
+    local.session.streamIndex !== remote.session.streamIndex;
 }
 
 function mergeVisibleThreads(

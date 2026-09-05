@@ -5,6 +5,7 @@ import {
   loadSessionDeliverables,
   mergeSessionDeliverables,
   resolveSessionDeliverableEndpoint,
+  splitSessionDeliverables,
 } from "../../packages/agent-ui/src/agent-workspace/session-deliverables.ts";
 
 test("session deliverable parser accepts bounded host-neutral records", () => {
@@ -15,10 +16,13 @@ test("session deliverable parser accepts bounded host-neutral records", () => {
     id: "prv_1",
     kind: "website-preview",
     mediaType: "text/html",
-    sizeBytes: 2048,
+    sizeBytes: "2048",
     title: "index.html",
     url: "/api/previews/prv_1/index.html?token=signed",
+    alias: "Marketing site",
+    version: "2",
   }] }), [{
+    alias: "Marketing site",
     createdAt: "2029-01-01T00:00:00.000Z",
     expiresAt: "2029-01-02T00:00:00.000Z",
     fileCount: 4,
@@ -28,11 +32,18 @@ test("session deliverable parser accepts bounded host-neutral records", () => {
     sizeBytes: 2048,
     title: "index.html",
     url: "/api/previews/prv_1/index.html?token=signed",
+    version: "2",
   }]);
   assert.deepEqual(parseSessionDeliverables({ deliverables: [
     { createdAt: "now", id: "x", kind: "unknown", sizeBytes: 1, title: "bad", url: "javascript:alert(1)" },
     { createdAt: "now", id: "y", kind: "asset", sizeBytes: -1, title: "bad", url: "/asset" },
-  ] }), []);
+  ] }), [{
+    createdAt: "now",
+    id: "y",
+    kind: "asset",
+    title: "bad",
+    url: "/asset",
+  }]);
 });
 
 test("session deliverable endpoints support query and route templates", () => {
@@ -67,6 +78,16 @@ test("legacy assets supplement an empty unified deliverable registry", () => {
     url: "/api/deliverables/asset-1",
   };
   assert.deepEqual(mergeSessionDeliverables([unified], assets), [unified]);
+});
+
+test("session deliverables separate uploaded assets from published outputs", () => {
+  const groups = splitSessionDeliverables([
+    { createdAt: "now", id: "asset-1", kind: "asset", title: "upload.txt", url: "/assets/1" },
+    { createdAt: "now", id: "artifact-1", kind: "artifact", title: "result.txt", url: "/artifacts/1" },
+    { createdAt: "now", id: "preview-1", kind: "website-preview", title: "index.html", url: "/previews/1" },
+  ]);
+  assert.deepEqual(groups.assets.map((item) => item.id), ["asset-1"]);
+  assert.deepEqual(groups.publications.map((item) => item.id), ["artifact-1", "preview-1"]);
 });
 
 test("session deliverable loader applies host bearer auth and rejects unsafe endpoints", async () => {

@@ -4,13 +4,23 @@ import { randomUUID } from "node:crypto";
 import { publicationOwnerFromAuth } from "../lib/session-ownership-auth.ts";
 import { createArtifactToken, readPreviewTtlSeconds } from "../../lib/preview-token.ts";
 import { createArtifactStoreFromEnvironment, MAX_ARTIFACT_BYTES } from "../../server/data/artifact-store.ts";
+import { MAX_PUBLICATION_ALIAS_LENGTH, MAX_PUBLICATION_VERSION_LENGTH } from "../../server/data/publication-metadata.ts";
+
+const publicationLabel = (maxLength: number) => z.string()
+  .trim()
+  .min(1)
+  .max(maxLength)
+  .refine((value) => !/[\u0000-\u001f\u007f]/u.test(value), "Must not contain control characters")
+  .optional();
 
 export default defineTool({
   description:
     "Publish one completed file from /workspace as a temporary authenticated download or media preview URL. Use after generating and validating the artifact; never claim a file was delivered before this tool succeeds.",
   inputSchema: z.object({
+    alias: publicationLabel(MAX_PUBLICATION_ALIAS_LENGTH).describe("Optional human-readable name for this published artifact."),
     path: z.string().trim().min(1).max(512),
     filename: z.string().trim().min(1).max(255).optional(),
+    version: publicationLabel(MAX_PUBLICATION_VERSION_LENGTH).describe("Optional version label, such as v1 or 2026.09.05."),
   }),
   async execute(input, ctx) {
     const auth = ctx.session.auth.current;
@@ -26,6 +36,7 @@ export default defineTool({
     const store = createArtifactStoreFromEnvironment();
     const record = await store.create({
       artifactId: `art_${randomUUID()}`,
+      alias: input.alias,
       content,
       expiresAt,
       filename,
@@ -33,6 +44,7 @@ export default defineTool({
       principalId: owner.principalId,
       sessionId: ctx.session.id,
       tenantId: owner.tenantId,
+      version: input.version,
     });
     const token = createArtifactToken(record.artifactId, expiresAt);
     const baseUrl = process.env.AGENT_PUBLIC_BASE_URL?.trim();
@@ -40,6 +52,7 @@ export default defineTool({
     const url = baseUrl ? new URL(pathPart, `${baseUrl.replace(/\/$/u, "")}/`).toString() : pathPart;
     return {
       artifactId: record.artifactId,
+      ...(record.alias ? { alias: record.alias } : {}),
       bytes: record.totalBytes,
       createdAt: record.createdAt,
       expiresAt: record.expiresAt,
@@ -47,6 +60,7 @@ export default defineTool({
       kind: "artifact",
       mediaType: record.mediaType,
       url,
+      ...(record.version ? { version: record.version } : {}),
     };
   },
 });

@@ -51,29 +51,31 @@ export function parseSessionDeliverables(payload: unknown): readonly AgentSessio
   for (const value of values.slice(0, 400)) {
     if (!isRecord(value)) continue;
     const id = boundedText(value.id, 512);
+    const alias = boundedText(value.alias, 160);
     const kind = value.kind;
     const title = boundedText(value.title, 255);
     const createdAt = boundedText(value.createdAt, 64);
     const url = safeResourceUrl(value.url);
-    const sizeBytes = typeof value.sizeBytes === "number" && Number.isSafeInteger(value.sizeBytes) && value.sizeBytes >= 0
-      ? value.sizeBytes
-      : undefined;
-    if (!id || !title || !createdAt || !url || sizeBytes === undefined || !isDeliverableKind(kind)) continue;
+    const sizeBytes = nonNegativeInteger(value.sizeBytes);
+    if (!id || !title || !createdAt || !url || !isDeliverableKind(kind)) continue;
     const expiresAt = boundedText(value.expiresAt, 64);
     const fileCount = typeof value.fileCount === "number" && Number.isSafeInteger(value.fileCount) && value.fileCount >= 0
       ? value.fileCount
       : undefined;
     const mediaType = boundedText(value.mediaType, 200);
+    const version = boundedText(value.version, 80);
     deliverables.push({
+      ...(alias ? { alias } : {}),
       createdAt,
       ...(expiresAt ? { expiresAt } : {}),
       ...(fileCount !== undefined ? { fileCount } : {}),
       id,
       kind,
       ...(mediaType ? { mediaType } : {}),
-      sizeBytes,
+      ...(sizeBytes !== undefined ? { sizeBytes } : {}),
       title,
       url,
+      ...(version ? { version } : {}),
     });
   }
   return deliverables;
@@ -98,6 +100,19 @@ export function mergeSessionDeliverables(
     if (!merged.has(key)) merged.set(key, deliverable);
   }
   return [...merged.values()];
+}
+
+/** Keep uploaded session files separate from Agent-published outputs in the UI. */
+export function splitSessionDeliverables(
+  deliverables: readonly AgentSessionDeliverable[],
+): {
+  readonly assets: readonly AgentSessionDeliverable[];
+  readonly publications: readonly AgentSessionDeliverable[];
+} {
+  return {
+    assets: deliverables.filter((deliverable) => deliverable.kind === "asset"),
+    publications: deliverables.filter((deliverable) => deliverable.kind !== "asset"),
+  };
 }
 
 export type AgentSessionAssetLike = {
@@ -133,6 +148,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function boundedText(value: unknown, maxLength: number): string | undefined {
   return typeof value === "string" && value.trim().length > 0 && value.length <= maxLength ? value.trim() : undefined;
+}
+
+function nonNegativeInteger(value: unknown): number | undefined {
+  const parsed = typeof value === "number" || typeof value === "string" ? Number(value) : Number.NaN;
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined;
 }
 
 function safeResourceUrl(value: unknown): string | undefined {

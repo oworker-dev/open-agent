@@ -3,7 +3,7 @@ import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-run
 import { ActionBarPrimitive, AttachmentPrimitive, ComposerPrimitive, MessagePrimitive, ThreadPrimitive, unstable_useMentionAdapter, useAui, useAuiState, } from "@assistant-ui/react";
 import { LexicalComposerInput } from "@assistant-ui/react-lexical";
 import { ArrowDownIcon, ArrowUpIcon, AtSignIcon, CheckIcon, CircleGaugeIcon, CircleXIcon, CopyIcon, ChevronDownIcon, FileIcon, ImageIcon, LockKeyholeIcon, LoaderCircleIcon, PlusIcon, PencilIcon, RotateCcwIcon, ShieldCheckIcon, SlashIcon, SquareIcon, WrenchIcon, WifiIcon, XIcon, } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ComposerTriggerPopover } from "../assistant-ui/composer-trigger-popover.js";
 import { copyText } from "../assistant-ui/copy-text.js";
 import { ContextDisplay } from "../assistant-ui/context-display.js";
@@ -20,8 +20,12 @@ import { cn } from "../utils.js";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuLabel, DropdownMenuRadioGroup, DropdownMenuRadioItem, DropdownMenuTrigger, } from "../ui/dropdown-menu.js";
 import { AgentMessage } from "./agent-message.js";
 import { classifyAgentFailure, presentAgentTurn } from "./turn-presentation.js";
-export function AssistantThreadSurface({ assetUrl, approvalTakeover, cancellationState, closedInputRequestIds, commands, composerTop, draftStorageKey, draftRestore, events, eveMessages, fallbackStartedAt, historyHasMore = false, historyLoading = false, inputDisabled, isBusy, scrollToBottomOnInitialize = true, scrollToBottomOnThreadSwitch = true, sessionTerminal, sessionSettled, onCancel, locale, mentions, messages, models, onInputResponses, onCloseInputRequest, onDraftRestoreConsumed, onOpenDeliverable, onOpenSubagent, onLoadEarlier, onPreferencesChange, onRetryRuntimeError, preferences, reasoningLevels, runtimeError, runtimeFailure, runtimeRetry, usage, }) {
+export function AssistantThreadSurface({ assetUrl, approvalTakeover, cancellationState, closedInputRequestIds, commands, composerTop, draftStorageKey, draftRestore, events, eveMessages, fallbackStartedAt, historyHasMore = false, historyLoading = false, historyStartIndex, inputDisabled, isBusy, scrollToBottomOnInitialize = true, scrollToBottomOnThreadSwitch = true, sessionTerminal, sessionSettled, onCancel, locale, mentions, messages, models, onInputResponses, onCloseInputRequest, onDraftRestoreConsumed, onOpenDeliverable, onOpenSubagent, onLoadEarlier, onPreferencesChange, onRetryRuntimeError, preferences, reasoningLevels, runtimeError, runtimeFailure, runtimeRetry, usage, }) {
     const composerIsEditing = useAuiState((state) => state.composer.isEditing);
+    const viewportRef = useRef(null);
+    const historyRequestInFlightRef = useRef(false);
+    const [historyPrepending, setHistoryPrepending] = useState(false);
+    const pendingHistoryAnchorRef = useRef(undefined);
     const viewportScrollOnInitialize = scrollToBottomOnInitialize && !composerIsEditing;
     const viewportScrollOnThreadSwitch = scrollToBottomOnThreadSwitch && !composerIsEditing;
     const eveMessagesById = useMemo(() => new Map(eveMessages.map((message) => [message.id, message])), [eveMessages]);
@@ -33,7 +37,84 @@ export function AssistantThreadSurface({ assetUrl, approvalTakeover, cancellatio
     const canRespondToInputRequest = eveMessages.some((message) => message.parts.some((part) => part.type === "dynamic-tool" &&
         Boolean(part.toolMetadata?.eve?.inputRequest) &&
         part.toolMetadata?.eve?.inputResponse === undefined));
-    return (_jsx(ThreadPrimitive.Root, { className: "aui-root flex h-full min-h-0 flex-col bg-background", style: { "--thread-max-width": "48rem" }, children: _jsxs(ThreadPrimitive.Viewport, { "aria-live": "polite", autoScroll: true, scrollToBottomOnInitialize: viewportScrollOnInitialize, scrollToBottomOnThreadSwitch: viewportScrollOnThreadSwitch, turnAnchor: "top", className: "relative flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-auto px-3 pt-3 sm:px-4 sm:pt-4", "data-slot": "thread-viewport", role: "log", children: [historyHasMore ? (_jsx("div", { className: "mx-auto mb-3 flex w-full max-w-(--thread-max-width) justify-center", children: _jsx(Button, { className: "text-xs text-muted-foreground", disabled: historyLoading, onClick: onLoadEarlier, size: "sm", variant: "ghost", children: historyLoading ? (locale === "zh-CN" ? "正在加载更早消息…" : "Loading earlier messages…") : (locale === "zh-CN" ? "加载更早消息" : "Load earlier messages") }) })) : null, _jsxs("div", { className: "mx-auto mb-14 flex w-full max-w-(--thread-max-width) flex-col gap-y-6 empty:hidden", children: [_jsx(ThreadPrimitive.Messages, { children: ({ message }) => message.composer.isEditing ? (_jsx(EditMessage, { messages: messages })) : message.role === "user" ? (_jsx(UserMessage, { isBusy: isBusy, messages: messages, sessionTerminal: sessionTerminal, sessionSettled: sessionSettled })) : (_jsx(AssistantMessage, { assetUrl: assetUrl, canRespond: !isBusy || canRespondToInputRequest, events: events, fallbackStartedAt: fallbackStartedAt, isStreaming: isBusy && !runtimeError && message.id === lastAssistantMessageId, isTurnContinuation: isSteeringContinuationMessage(message, events), locale: locale, message: eveMessagesById.get(message.id) ?? (() => {
+    const loadEarlierNearTop = useCallback(() => {
+        const viewport = viewportRef.current;
+        if (!viewport || !historyHasMore || historyLoading ||
+            historyRequestInFlightRef.current || !onLoadEarlier ||
+            historyStartIndex === undefined)
+            return;
+        const viewportTop = viewport.getBoundingClientRect().top;
+        const visibleMessage = [...viewport.querySelectorAll("[data-message-id]")].find((element) => element.getBoundingClientRect().bottom > viewportTop);
+        historyRequestInFlightRef.current = true;
+        setHistoryPrepending(true);
+        pendingHistoryAnchorRef.current = {
+            ...(visibleMessage?.dataset.messageId
+                ? {
+                    messageId: visibleMessage.dataset.messageId,
+                    messageOffsetTop: visibleMessage.getBoundingClientRect().top - viewportTop,
+                }
+                : {}),
+            scrollHeight: viewport.scrollHeight,
+            scrollTop: viewport.scrollTop,
+            startIndex: historyStartIndex,
+        };
+        void Promise.resolve()
+            .then(onLoadEarlier)
+            .catch(() => undefined)
+            .finally(() => {
+            historyRequestInFlightRef.current = false;
+        });
+    }, [historyHasMore, historyLoading, historyStartIndex, onLoadEarlier]);
+    const handleViewportScroll = useCallback(() => {
+        const viewport = viewportRef.current;
+        if (!viewport || viewport.scrollTop > 240)
+            return;
+        loadEarlierNearTop();
+    }, [loadEarlierNearTop]);
+    useLayoutEffect(() => {
+        const anchor = pendingHistoryAnchorRef.current;
+        const viewport = viewportRef.current;
+        if (!anchor || !viewport || historyStartIndex === undefined || historyStartIndex >= anchor.startIndex)
+            return;
+        let frameCount = 0;
+        let frame;
+        const restore = () => {
+            const currentViewport = viewportRef.current;
+            if (!currentViewport)
+                return;
+            const currentMessage = anchor.messageId
+                ? [...currentViewport.querySelectorAll("[data-message-id]")].find((element) => element.dataset.messageId === anchor.messageId)
+                : undefined;
+            const pageRendered = currentViewport.scrollHeight > anchor.scrollHeight;
+            if (pageRendered && currentMessage && anchor.messageOffsetTop !== undefined) {
+                const nextOffsetTop = currentMessage.getBoundingClientRect().top - currentViewport.getBoundingClientRect().top;
+                currentViewport.scrollTop += nextOffsetTop - anchor.messageOffsetTop;
+                pendingHistoryAnchorRef.current = undefined;
+                setHistoryPrepending(false);
+                return;
+            }
+            if (pageRendered) {
+                currentViewport.scrollTop = anchor.scrollTop + (currentViewport.scrollHeight - anchor.scrollHeight);
+                pendingHistoryAnchorRef.current = undefined;
+                setHistoryPrepending(false);
+                return;
+            }
+            if (frameCount >= 8) {
+                pendingHistoryAnchorRef.current = undefined;
+                setHistoryPrepending(false);
+            }
+            else {
+                frameCount += 1;
+                frame = window.requestAnimationFrame(restore);
+            }
+        };
+        frame = window.requestAnimationFrame(restore);
+        return () => {
+            if (frame !== undefined)
+                window.cancelAnimationFrame(frame);
+        };
+    }, [eveMessages.length, historyLoading, historyStartIndex]);
+    return (_jsx(ThreadPrimitive.Root, { className: "aui-root flex h-full min-h-0 flex-col bg-background", style: { "--thread-max-width": "48rem" }, children: _jsxs(ThreadPrimitive.Viewport, { "aria-live": "polite", autoScroll: !historyPrepending, onScroll: handleViewportScroll, ref: viewportRef, scrollToBottomOnInitialize: viewportScrollOnInitialize, scrollToBottomOnThreadSwitch: viewportScrollOnThreadSwitch, turnAnchor: "top", className: "relative flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-auto px-3 pt-3 sm:px-4 sm:pt-4", "data-slot": "thread-viewport", role: "log", children: [historyLoading ? (_jsxs("div", { className: "pointer-events-none absolute left-1/2 top-2 z-10 -translate-x-1/2 text-muted-foreground", "data-agent-history-loading": true, role: "status", children: [_jsx(LoaderCircleIcon, { className: "size-4 animate-spin" }), _jsx("span", { className: "sr-only", children: locale === "zh-CN" ? "正在加载更早消息" : "Loading earlier messages" })] })) : null, _jsxs("div", { className: "mx-auto mb-14 flex w-full max-w-(--thread-max-width) flex-col gap-y-6 empty:hidden", children: [_jsx(ThreadPrimitive.Messages, { children: ({ message }) => message.composer.isEditing ? (_jsx(EditMessage, { messages: messages })) : message.role === "user" ? (_jsx(UserMessage, { isBusy: isBusy, messages: messages, sessionTerminal: sessionTerminal, sessionSettled: sessionSettled })) : (_jsx(AssistantMessage, { assetUrl: assetUrl, canRespond: !isBusy || canRespondToInputRequest, events: events, fallbackStartedAt: fallbackStartedAt, isStreaming: isBusy && !runtimeError && message.id === lastAssistantMessageId, isTurnContinuation: isSteeringContinuationMessage(message, events), locale: locale, message: eveMessagesById.get(message.id) ?? (() => {
                                     const turnId = typeof message.metadata?.custom?.turnId === "string"
                                         ? message.metadata.custom.turnId
                                         : undefined;

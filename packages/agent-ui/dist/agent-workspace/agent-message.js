@@ -346,11 +346,11 @@ function KnownToolContent({ assetUrl, events, locale, onOpenSubagent, part, }) {
         const result = readableOutput(output);
         const url = firstUrl(output) ?? firstString(input, ["url"]);
         const deliverable = publishedDeliverable(output, "website-preview", url);
-        return url ? (_jsx(ArtifactCard, { icon: _jsx(MonitorIcon, { className: "size-4" }), meta: localize(locale, "Website preview", "网站预览"), onClick: () => deliverable && openDeliverable ? openDeliverable(deliverable) : window.open(url, "_blank", "noopener,noreferrer"), title: firstString(asRecord(output), ["title", "entrypoint"]) ?? localize(locale, "Published website", "已发布网站") })) : result ? _jsx("p", { className: "whitespace-pre-wrap text-xs text-muted-foreground", children: result }) : null;
+        return url ? (_jsx(ArtifactCard, { icon: _jsx(MonitorIcon, { className: "size-4" }), meta: deliverable ? publishedDeliverableMeta(deliverable, locale) : localize(locale, "Website preview", "网站预览"), onClick: () => deliverable && openDeliverable ? openDeliverable(deliverable) : window.open(url, "_blank", "noopener,noreferrer"), title: deliverable?.alias ?? deliverable?.title ?? firstString(asRecord(output), ["title", "entrypoint"]) ?? localize(locale, "Published website", "已发布网站") })) : result ? _jsx("p", { className: "whitespace-pre-wrap text-xs text-muted-foreground", children: result }) : null;
     }
-    if (["import_remote_asset", "remote_asset_import"].includes(normalized)) {
+    if (["import_asset", "import_remote_asset", "remote_asset_import"].includes(normalized)) {
         const record = asRecord(output);
-        const filename = firstString(record, ["filename"]) ?? firstString(input, ["filename"]) ?? localize(locale, "Remote asset", "远程资产");
+        const filename = firstString(record, ["filename"]) ?? firstString(input, ["filename", "url", "assetId"]) ?? localize(locale, "Asset", "资产");
         const mediaType = firstString(record, ["mediaType", "contentType"]);
         const bytes = firstNumber(record, ["bytes", "sizeBytes"]);
         return (_jsxs("div", { className: "flex items-center gap-2 text-sm", "data-tool-view": "asset-import", children: [_jsx(AttachmentMedia, { variant: "icon", children: _jsx(FileIcon, { className: "size-4" }) }), _jsx("span", { className: "min-w-0 truncate", children: filename }), _jsx("span", { className: "shrink-0 text-xs text-muted-foreground", children: [mediaType, bytes !== undefined ? formatBytes(bytes) : undefined].filter(Boolean).join(" · ") })] }));
@@ -360,7 +360,7 @@ function KnownToolContent({ assetUrl, events, locale, onOpenSubagent, part, }) {
         const url = firstUrl(output);
         const filename = firstString(record, ["filename", "name"]) ?? firstString(input, ["filename", "path"]);
         const deliverable = publishedDeliverable(output, "artifact", url);
-        return url ? (_jsx(ArtifactCard, { meta: [firstString(record, ["mediaType"]), formatBytes(firstNumber(record, ["bytes", "sizeBytes"]))].filter(Boolean).join(" · ") || localize(locale, "Session artifact", "会话产物"), onClick: () => deliverable && openDeliverable ? openDeliverable(deliverable) : window.open(url, "_blank", "noopener,noreferrer"), title: filename ?? localize(locale, "Open artifact", "打开产物") })) : _jsx("p", { className: "text-xs text-muted-foreground", children: filename ?? localize(locale, "Publishing artifact...", "正在发布产物…") });
+        return url ? (_jsx(ArtifactCard, { meta: deliverable ? publishedDeliverableMeta(deliverable, locale) : [firstString(record, ["mediaType"]), formatBytes(firstNumber(record, ["bytes", "sizeBytes"]))].filter(Boolean).join(" · ") || localize(locale, "Session artifact", "会话产物"), onClick: () => deliverable && openDeliverable ? openDeliverable(deliverable) : window.open(url, "_blank", "noopener,noreferrer"), title: deliverable?.alias ?? filename ?? localize(locale, "Open artifact", "打开产物") })) : _jsx("p", { className: "text-xs text-muted-foreground", children: filename ?? localize(locale, "Publishing artifact...", "正在发布产物…") });
     }
     if (["record_checkpoint", "checkpoint"].includes(normalized)) {
         const checkpoint = asRecord(output) ?? input;
@@ -790,8 +790,9 @@ function firstNumber(record, keys) {
         return undefined;
     for (const key of keys) {
         const value = record[key];
-        if (typeof value === "number" && Number.isFinite(value))
-            return value;
+        const parsed = typeof value === "number" || typeof value === "string" ? Number(value) : Number.NaN;
+        if (Number.isFinite(parsed) && parsed >= 0)
+            return parsed;
     }
     return undefined;
 }
@@ -876,16 +877,21 @@ function publishedDeliverable(value, kind, url) {
     const expiresAt = firstString(record, ["expiresAt"]);
     const fileCount = firstNumber(record, ["fileCount"]);
     const mediaType = firstString(record, ["mediaType"]);
+    const alias = firstString(record, ["alias"]);
+    const version = firstString(record, ["version"]);
+    const sizeBytes = firstNumber(record, ["bytes", "sizeBytes"]);
     return {
+        ...(alias ? { alias } : {}),
         createdAt: createdAt ?? new Date().toISOString(),
         ...(expiresAt ? { expiresAt } : {}),
         ...(fileCount !== undefined ? { fileCount } : {}),
         id,
         kind,
         ...(mediaType ? { mediaType } : {}),
-        sizeBytes: firstNumber(record, ["bytes", "sizeBytes"]) ?? 0,
+        ...(sizeBytes !== undefined ? { sizeBytes } : {}),
         title,
         url,
+        ...(version ? { version } : {}),
     };
 }
 function deliverablesForTurn(events, turnId) {
@@ -911,9 +917,16 @@ function deliverablesForTurn(events, turnId) {
 }
 function PublishedDeliverableCard({ deliverable, locale }) {
     const openDeliverable = useContext(DeliverableOpenContext);
-    return _jsx(ArtifactCard, { icon: deliverable.kind === "website-preview" ? _jsx(MonitorIcon, { className: "size-4" }) : undefined, meta: deliverable.kind === "website-preview"
-            ? [localize(locale, "Website preview", "网站预览"), deliverable.fileCount ? `${deliverable.fileCount} ${localize(locale, "files", "个文件")}` : undefined, formatBytes(deliverable.sizeBytes)].filter(Boolean).join(" · ")
-            : [deliverable.mediaType, formatBytes(deliverable.sizeBytes)].filter(Boolean).join(" · ") || localize(locale, "Session artifact", "会话产物"), onClick: () => openDeliverable ? openDeliverable(deliverable) : window.open(deliverable.url, "_blank", "noopener,noreferrer"), title: deliverable.title });
+    return _jsx(ArtifactCard, { "aria-label": `${locale === "zh-CN" ? "打开" : "Open"} ${deliverable.title}`, icon: deliverable.kind === "website-preview" ? _jsx(MonitorIcon, { className: "size-4" }) : undefined, meta: publishedDeliverableMeta(deliverable, locale), onClick: () => openDeliverable ? openDeliverable(deliverable) : window.open(deliverable.url, "_blank", "noopener,noreferrer"), title: deliverable.alias ?? deliverable.title });
+}
+function publishedDeliverableMeta(deliverable, locale) {
+    const title = deliverable.alias && deliverable.title !== deliverable.alias ? deliverable.title : undefined;
+    const version = deliverable.version ? `v${deliverable.version}` : undefined;
+    const kind = deliverable.kind === "website-preview"
+        ? localize(locale, "Website preview", "网站预览")
+        : localize(locale, "Published artifact", "发布资产");
+    const fileCount = deliverable.fileCount ? `${deliverable.fileCount} ${localize(locale, "files", "个文件")}` : undefined;
+    return [kind, version, title, fileCount, deliverable.mediaType, formatBytes(deliverable.sizeBytes)].filter(Boolean).join(" · ");
 }
 function todoItems(inputValue, outputValue) {
     const source = todoArray(inputValue) ?? todoArray(outputValue) ?? [];
@@ -1442,9 +1455,9 @@ function toolTitle(locale, part, events = []) {
     }
     if (["publish_preview", "website_preview"].includes(normalized))
         return localize(locale, "Published preview", "发布网站预览");
-    if (["import_remote_asset", "remote_asset_import"].includes(normalized)) {
-        const filename = firstString(asRecord(part.input), ["filename", "url"]);
-        return [localize(locale, "Imported remote asset", "导入远程资产"), filename].filter(Boolean).join(" ");
+    if (["import_asset", "import_remote_asset", "remote_asset_import"].includes(normalized)) {
+        const filename = firstString(asRecord(part.input), ["filename", "url", "assetId"]);
+        return [localize(locale, "Imported asset", "导入资产"), filename].filter(Boolean).join(" ");
     }
     if (["publish_artifact", "artifact_publish"].includes(normalized))
         return localize(locale, "Published artifact", "发布产物");

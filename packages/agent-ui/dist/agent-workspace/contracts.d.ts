@@ -224,15 +224,17 @@ export type AgentSessionAsset = {
 };
 export type AgentAssetEndpoint = string | ((sessionId: string) => string);
 export type AgentSessionDeliverable = {
+    readonly alias?: string;
     readonly createdAt: string;
     readonly expiresAt?: string;
     readonly fileCount?: number;
     readonly id: string;
     readonly kind: "artifact" | "asset" | "website-preview";
     readonly mediaType?: string;
-    readonly sizeBytes: number;
+    readonly sizeBytes?: number;
     readonly title: string;
     readonly url: string;
+    readonly version?: string;
 };
 export type AgentDeliverableEndpoint = string | ((sessionId: string) => string);
 export type AgentWorkspaceConfig = {

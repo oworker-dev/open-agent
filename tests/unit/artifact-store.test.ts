@@ -14,6 +14,7 @@ test("filesystem artifact store persists owner metadata and bytes", async () => 
     const store = createArtifactStoreFromEnvironment({ AGENT_ARTIFACT_STORAGE_PATH: root });
     const record = await store.create({
       artifactId: "art_123e4567-e89b-12d3-a456-426614174000",
+      alias: "Release notes",
       content: new TextEncoder().encode("hello"),
       expiresAt: new Date("2030-01-01T00:00:00.000Z"),
       filename: "result.txt",
@@ -21,14 +22,20 @@ test("filesystem artifact store persists owner metadata and bytes", async () => 
       principalId: "user-1",
       sessionId: "session-1",
       tenantId: "tenant-1",
+      version: "2026.09.05",
     });
+    assert.equal(record.alias, "Release notes");
+    assert.equal(record.version, "2026.09.05");
     assert.equal(record.totalBytes, 5);
     assert.deepEqual(await store.read(record.artifactId), {
       content: Buffer.from("hello"),
       filename: "result.txt",
       mediaType: "text/plain; charset=utf-8",
     });
-    assert.equal((await store.find(record.artifactId))?.tenantId, "tenant-1");
+    const reloaded = await store.find(record.artifactId);
+    assert.equal(reloaded?.tenantId, "tenant-1");
+    assert.equal(reloaded?.alias, "Release notes");
+    assert.equal(reloaded?.version, "2026.09.05");
     await assert.rejects(
       store.create({
         content: new Uint8Array(MAX_ARTIFACT_BYTES + 1),

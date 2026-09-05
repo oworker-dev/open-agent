@@ -273,6 +273,69 @@ test("loads transcript windows with an absolute before cursor", async () => {
   assert.match(urls[0] ?? "", /eventLimit=4/u);
 });
 
+test("an unchanged index refresh retains loaded event baselines", async () => {
+  const event = (id: string): MessageStreamEvent => ({
+    data: { sequence: 0, stepIndex: 0, turnId: id },
+    meta: { at: new Date(0).toISOString(), id },
+    type: "step.started",
+  });
+  const first = {
+    ...createAgentThread(100, "First"),
+    events: [event("event-first")],
+    id: "thread-first",
+    session: { sessionId: "session-first", streamIndex: 1 },
+  };
+  const second = {
+    ...createAgentThread(90, "Second"),
+    events: [event("event-second")],
+    id: "thread-second",
+    session: { sessionId: "session-second", streamIndex: 1 },
+  };
+  let revision = 1;
+  let savedPatch: {
+    readonly eventAppends?: readonly { readonly events: readonly MessageStreamEvent[]; readonly threadId: string }[];
+  } | undefined;
+  const storage = createHttpAgentThreadStorage({
+    fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), "http://agent.test");
+      const threadId = url.searchParams.get("threadId");
+      if (init?.method === "PATCH") {
+        savedPatch = JSON.parse(String(init.body)) as typeof savedPatch;
+        return Response.json({ revision: revision + 1 }, { headers: { etag: `"${revision + 1}"` } });
+      }
+      if (url.searchParams.get("eventWindow") === "1" && threadId) {
+        const thread = threadId === first.id ? first : second;
+        return Response.json({
+          eventWindow: { endIndex: 1, hasMoreBefore: false, startIndex: 0, total: 1 },
+          revision,
+          thread,
+        }, { headers: { etag: `"${revision}"` } });
+      }
+      return Response.json({
+        collection: {
+          activeThreadId: first.id,
+          threads: [first, second].map((thread) => ({ ...thread, events: [], hydration: "summary" })),
+          version: AGENT_THREAD_STORAGE_VERSION,
+        },
+        revision,
+      }, { headers: { etag: `"${revision}"` } });
+    }) as typeof fetch,
+  });
+
+  await storage.load("workspace-index-baseline");
+  await storage.loadThreadWindow?.("workspace-index-baseline", first.id);
+  await storage.loadThreadWindow?.("workspace-index-baseline", second.id);
+  revision = 2;
+  await storage.load("workspace-index-baseline");
+  await storage.save("workspace-index-baseline", {
+    activeThreadId: second.id,
+    threads: [first, second],
+    version: AGENT_THREAD_STORAGE_VERSION,
+  });
+
+  assert.deepEqual(savedPatch?.eventAppends, []);
+});
+
 test("maps cumulative replacements from a bounded window to absolute event indexes", async () => {
   const thread = {
     ...createAgentThread(100, "Windowed replacement"),

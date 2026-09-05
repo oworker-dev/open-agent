@@ -37,7 +37,7 @@ import {
   WifiIcon,
   XIcon,
 } from "lucide-react";
-import { type FormEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { type FormEvent, type ReactNode, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ComposerTriggerPopover } from "../assistant-ui/composer-trigger-popover.js";
 import { copyText } from "../assistant-ui/copy-text.js";
 import { ContextDisplay } from "../assistant-ui/context-display.js";
@@ -88,6 +88,7 @@ export function AssistantThreadSurface({
   fallbackStartedAt,
   historyHasMore = false,
   historyLoading = false,
+  historyStartIndex,
   inputDisabled,
   isBusy,
   scrollToBottomOnInitialize = true,
@@ -127,6 +128,7 @@ export function AssistantThreadSurface({
   readonly fallbackStartedAt?: number;
   readonly historyHasMore?: boolean;
   readonly historyLoading?: boolean;
+  readonly historyStartIndex?: number;
   /** Locks the main composer without disabling assistant-ui's edit composer. */
   readonly inputDisabled?: boolean;
   readonly isBusy: boolean;
@@ -148,7 +150,7 @@ export function AssistantThreadSurface({
   readonly onDraftRestoreConsumed: (id: string) => void;
   readonly onOpenDeliverable?: (deliverable: AgentSessionDeliverable) => void;
   readonly onOpenSubagent?: (sessionId: string) => void;
-  readonly onLoadEarlier?: () => void;
+  readonly onLoadEarlier?: () => void | Promise<void>;
   readonly onPreferencesChange: (preferences: AgentThreadPreferences) => void;
   readonly onRetryRuntimeError?: () => void;
   readonly preferences: AgentThreadPreferences;
@@ -167,6 +169,16 @@ export function AssistantThreadSurface({
   // before our edit callback runs. Suppress mount/switch scrolling for that
   // handoff so the user's current viewport is not pulled to the bottom.
   const composerIsEditing = useAuiState((state) => state.composer.isEditing);
+  const viewportRef = useRef<HTMLDivElement>(null);
+  const historyRequestInFlightRef = useRef(false);
+  const [historyPrepending, setHistoryPrepending] = useState(false);
+  const pendingHistoryAnchorRef = useRef<{
+    readonly messageId?: string;
+    readonly messageOffsetTop?: number;
+    readonly scrollHeight: number;
+    readonly scrollTop: number;
+    readonly startIndex: number;
+  } | undefined>(undefined);
   const viewportScrollOnInitialize = scrollToBottomOnInitialize && !composerIsEditing;
   const viewportScrollOnThreadSwitch = scrollToBottomOnThreadSwitch && !composerIsEditing;
   const eveMessagesById = useMemo(
@@ -189,6 +201,86 @@ export function AssistantThreadSurface({
     ),
   );
 
+  const loadEarlierNearTop = useCallback(() => {
+    const viewport = viewportRef.current;
+    if (
+      !viewport || !historyHasMore || historyLoading ||
+      historyRequestInFlightRef.current || !onLoadEarlier ||
+      historyStartIndex === undefined
+    ) return;
+    const viewportTop = viewport.getBoundingClientRect().top;
+    const visibleMessage = [...viewport.querySelectorAll<HTMLElement>("[data-message-id]")].find((element) =>
+      element.getBoundingClientRect().bottom > viewportTop,
+    );
+    historyRequestInFlightRef.current = true;
+    setHistoryPrepending(true);
+    pendingHistoryAnchorRef.current = {
+      ...(visibleMessage?.dataset.messageId
+        ? {
+            messageId: visibleMessage.dataset.messageId,
+            messageOffsetTop: visibleMessage.getBoundingClientRect().top - viewportTop,
+          }
+        : {}),
+      scrollHeight: viewport.scrollHeight,
+      scrollTop: viewport.scrollTop,
+      startIndex: historyStartIndex,
+    };
+    void Promise.resolve()
+      .then(onLoadEarlier)
+      .catch(() => undefined)
+      .finally(() => {
+        historyRequestInFlightRef.current = false;
+      });
+  }, [historyHasMore, historyLoading, historyStartIndex, onLoadEarlier]);
+
+  const handleViewportScroll = useCallback(() => {
+    const viewport = viewportRef.current;
+    if (!viewport || viewport.scrollTop > 240) return;
+    loadEarlierNearTop();
+  }, [loadEarlierNearTop]);
+
+  useLayoutEffect(() => {
+    const anchor = pendingHistoryAnchorRef.current;
+    const viewport = viewportRef.current;
+    if (!anchor || !viewport || historyStartIndex === undefined || historyStartIndex >= anchor.startIndex) return;
+    let frameCount = 0;
+    let frame: number | undefined;
+    const restore = () => {
+      const currentViewport = viewportRef.current;
+      if (!currentViewport) return;
+      const currentMessage = anchor.messageId
+        ? [...currentViewport.querySelectorAll<HTMLElement>("[data-message-id]")].find((element) =>
+            element.dataset.messageId === anchor.messageId,
+          )
+        : undefined;
+      const pageRendered = currentViewport.scrollHeight > anchor.scrollHeight;
+      if (pageRendered && currentMessage && anchor.messageOffsetTop !== undefined) {
+        const nextOffsetTop = currentMessage.getBoundingClientRect().top - currentViewport.getBoundingClientRect().top;
+        currentViewport.scrollTop += nextOffsetTop - anchor.messageOffsetTop;
+        pendingHistoryAnchorRef.current = undefined;
+        setHistoryPrepending(false);
+        return;
+      }
+      if (pageRendered) {
+        currentViewport.scrollTop = anchor.scrollTop + (currentViewport.scrollHeight - anchor.scrollHeight);
+        pendingHistoryAnchorRef.current = undefined;
+        setHistoryPrepending(false);
+        return;
+      }
+      if (frameCount >= 8) {
+        pendingHistoryAnchorRef.current = undefined;
+        setHistoryPrepending(false);
+      } else {
+        frameCount += 1;
+        frame = window.requestAnimationFrame(restore);
+      }
+    };
+    frame = window.requestAnimationFrame(restore);
+    return () => {
+      if (frame !== undefined) window.cancelAnimationFrame(frame);
+    };
+  }, [eveMessages.length, historyLoading, historyStartIndex]);
+
   return (
     <ThreadPrimitive.Root
       className="aui-root flex h-full min-h-0 flex-col bg-background"
@@ -200,7 +292,9 @@ export function AssistantThreadSurface({
         // already at the bottom. The top turn anchor still controls the
         // initial placement of a new turn; autoScroll only follows subsequent
         // content growth and respects manual scroll-up.
-        autoScroll
+        autoScroll={!historyPrepending}
+        onScroll={handleViewportScroll}
+        ref={viewportRef}
         scrollToBottomOnInitialize={viewportScrollOnInitialize}
         scrollToBottomOnThreadSwitch={viewportScrollOnThreadSwitch}
         turnAnchor="top"
@@ -208,17 +302,10 @@ export function AssistantThreadSurface({
         data-slot="thread-viewport"
         role="log"
       >
-        {historyHasMore ? (
-          <div className="mx-auto mb-3 flex w-full max-w-(--thread-max-width) justify-center">
-            <Button
-              className="text-xs text-muted-foreground"
-              disabled={historyLoading}
-              onClick={onLoadEarlier}
-              size="sm"
-              variant="ghost"
-            >
-              {historyLoading ? (locale === "zh-CN" ? "正在加载更早消息…" : "Loading earlier messages…") : (locale === "zh-CN" ? "加载更早消息" : "Load earlier messages")}
-            </Button>
+        {historyLoading ? (
+          <div className="pointer-events-none absolute left-1/2 top-2 z-10 -translate-x-1/2 text-muted-foreground" data-agent-history-loading role="status">
+            <LoaderCircleIcon className="size-4 animate-spin" />
+            <span className="sr-only">{locale === "zh-CN" ? "正在加载更早消息" : "Loading earlier messages"}</span>
           </div>
         ) : null}
         <div className="mx-auto mb-14 flex w-full max-w-(--thread-max-width) flex-col gap-y-6 empty:hidden">

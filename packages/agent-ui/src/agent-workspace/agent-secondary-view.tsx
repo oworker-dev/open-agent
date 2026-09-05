@@ -15,6 +15,7 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent, type ReactNode } from "react";
 import { StaticMarkdownText } from "../assistant-ui/markdown-text.js";
 import { WebPreview } from "../assistant-ui/web-preview.js";
+import { ArtifactCard } from "../assistant-ui/artifact-card.js";
 import {
   Attachment,
   AttachmentAction,
@@ -27,7 +28,7 @@ import { Button } from "../ui/button.js";
 import { cn } from "../utils.js";
 import type { AgentSessionAsset, AgentSessionDeliverable } from "./contracts.js";
 import type { AgentLocale } from "./i18n.js";
-import { mergeSessionDeliverables } from "./session-deliverables.js";
+import { mergeSessionDeliverables, splitSessionDeliverables } from "./session-deliverables.js";
 
 export type AgentSecondaryTab = "home" | "children" | "assets" | "deliverables";
 export type AgentSecondaryChild = {
@@ -46,6 +47,7 @@ type AgentSecondaryContentTab = {
   readonly deliverable: AgentSessionDeliverable;
   readonly id: string;
   readonly kind: "deliverable";
+  readonly overviewRoute: "assets" | "deliverables";
   readonly title: string;
 };
 
@@ -95,8 +97,8 @@ export function AgentSecondaryView({
   readonly tab?: AgentSecondaryTab;
 }) {
   const isZh = locale === "zh-CN";
-  const mergedDeliverables = useMemo(
-    () => mergeSessionDeliverables(deliverables, assets),
+  const deliverableGroups = useMemo(
+    () => splitSessionDeliverables(mergeSessionDeliverables(deliverables, assets)),
     [assets, deliverables],
   );
   const [overviewRoute, setOverviewRoute] = useState<AgentSecondaryTab>(normalizeOverviewRoute(tab));
@@ -133,6 +135,7 @@ export function AgentSecondaryView({
       deliverable,
       id: `deliverable:${deliverable.kind}:${deliverable.id}`,
       kind: "deliverable",
+      overviewRoute: deliverable.kind === "asset" ? "assets" : "deliverables",
       title: deliverable.title,
     };
     setOpenTabs((current) => upsertContentTab(current, contentTab));
@@ -159,13 +162,12 @@ export function AgentSecondaryView({
     if (activeTabId === contentTab.id) setActiveTabId("home");
   };
 
-  const refresh = onRefreshDeliverables ?? onRefreshAssets ?? (() => undefined);
-  const loading = deliverablesLoading ?? assetsLoading;
-  const error = deliverablesError ?? assetsError;
   const headerTitle = activeTab?.title ?? (overviewRoute === "children"
     ? (isZh ? "子代理" : "Sub-agents")
     : overviewRoute === "deliverables"
-      ? (isZh ? "会话资产" : "Session assets")
+      ? (isZh ? "发布资产" : "Published assets")
+      : overviewRoute === "assets"
+        ? (isZh ? "会话资产" : "Session assets")
       : (isZh ? "工作区" : "Workspace"));
 
   return (
@@ -174,7 +176,7 @@ export function AgentSecondaryView({
         {activeTab || overviewRoute !== "home" ? (
           <Button
             aria-label={activeTab ? (isZh ? "返回列表" : "Back to list") : (isZh ? "返回概览" : "Back to overview")}
-            onClick={() => selectOverviewRoute(activeTab?.kind === "child" ? "children" : activeTab?.kind === "deliverable" ? "deliverables" : "home")}
+            onClick={() => selectOverviewRoute(activeTab?.kind === "child" ? "children" : activeTab?.kind === "deliverable" ? activeTab.overviewRoute : "home")}
             size="icon-sm"
             variant="ghost"
           >
@@ -207,21 +209,31 @@ export function AgentSecondaryView({
         <>
           <div className="min-h-0 flex-1 overflow-y-auto p-3">
             {overviewRoute === "home" ? <Overview
+              assetCount={deliverableGroups.assets.length}
               childCount={children.length}
-              deliverableCount={mergedDeliverables.length}
+              publicationCount={deliverableGroups.publications.length}
               isZh={isZh}
               onChildren={() => selectOverviewRoute("children")}
-              onDeliverables={() => selectOverviewRoute("deliverables")}
+              onAssets={() => selectOverviewRoute("assets")}
+              onPublications={() => selectOverviewRoute("deliverables")}
             /> : null}
             {overviewRoute === "children" ? <ChildList children={children} isZh={isZh} onOpen={openChild} /> : null}
-            {overviewRoute === "deliverables" ? <DeliverableList
+            {overviewRoute === "assets" ? <SessionAssetList
               assetUrl={assetUrl}
-              deliverables={mergedDeliverables}
-              error={error}
+              assets={deliverableGroups.assets}
+              error={assetsError}
               isZh={isZh}
-              loading={loading}
+              loading={assetsLoading}
               onOpen={openDeliverable}
-              onRefresh={refresh}
+              onRefresh={onRefreshAssets ?? (() => undefined)}
+            /> : null}
+            {overviewRoute === "deliverables" ? <DeliverableList
+              deliverables={deliverableGroups.publications}
+              error={deliverablesError}
+              isZh={isZh}
+              loading={deliverablesLoading ?? false}
+              onOpen={openDeliverable}
+              onRefresh={onRefreshDeliverables ?? (() => undefined)}
             /> : null}
           </div>
         </>
@@ -234,10 +246,11 @@ export function AgentSecondaryView({
   );
 }
 
-function Overview({ childCount, deliverableCount, isZh, onChildren, onDeliverables }: { readonly childCount: number; readonly deliverableCount: number; readonly isZh: boolean; readonly onChildren: () => void; readonly onDeliverables: () => void }) {
+function Overview({ assetCount, childCount, isZh, onAssets, onChildren, onPublications, publicationCount }: { readonly assetCount: number; readonly childCount: number; readonly isZh: boolean; readonly onAssets: () => void; readonly onChildren: () => void; readonly onPublications: () => void; readonly publicationCount: number }) {
   return <div className="grid gap-2">
     <OverviewCard count={childCount} icon={<UsersRoundIcon className="size-4" />} label={isZh ? "子代理" : "Sub-agents"} onClick={onChildren} />
-    <OverviewCard count={deliverableCount} icon={<FileIcon className="size-4" />} label={isZh ? "会话资产" : "Session assets"} onClick={onDeliverables} />
+    <OverviewCard count={assetCount} icon={<FileIcon className="size-4" />} label={isZh ? "会话资产" : "Session assets"} onClick={onAssets} />
+    <OverviewCard count={publicationCount} icon={<MonitorIcon className="size-4" />} label={isZh ? "发布资产" : "Published assets"} onClick={onPublications} />
     <p className="px-1 pt-2 text-xs leading-5 text-muted-foreground">{isZh ? "子代理对话和 Agent 发布的文件、图片、网站会保留为会话级可访问引用。" : "Sub-agent conversations and Agent-published files, images, and websites remain accessible from this session."}</p>
   </div>;
 }
@@ -253,25 +266,43 @@ function ChildList({ children, isZh, onOpen }: { readonly children: readonly Age
   ))}</div>;
 }
 
-function DeliverableList({ assetUrl, deliverables, error, isZh, loading, onOpen, onRefresh }: { readonly assetUrl?: (assetId: string) => string; readonly deliverables: readonly AgentSessionDeliverable[]; readonly error?: string; readonly isZh: boolean; readonly loading: boolean; readonly onOpen: (deliverable: AgentSessionDeliverable) => void; readonly onRefresh: () => void }) {
+function SessionAssetList({ assetUrl, assets, error, isZh, loading, onOpen, onRefresh }: { readonly assetUrl?: (assetId: string) => string; readonly assets: readonly AgentSessionDeliverable[]; readonly error?: string; readonly isZh: boolean; readonly loading: boolean; readonly onOpen: (deliverable: AgentSessionDeliverable) => void; readonly onRefresh: () => void }) {
   return <div>
-    <div className="mb-2 flex items-center justify-between"><span className="text-xs text-muted-foreground">{isZh ? "当前会话" : "Current session"}</span><Button aria-label={isZh ? "刷新资产" : "Refresh assets"} disabled={loading} onClick={onRefresh} size="icon-sm" variant="ghost"><RefreshCwIcon className={cn("size-3.5", loading && "animate-spin")} /></Button></div>
+    <div className="mb-2 flex items-center justify-between"><span className="text-xs text-muted-foreground">{isZh ? "当前会话" : "Current session"}</span><Button aria-label={isZh ? "刷新会话资产" : "Refresh session assets"} disabled={loading} onClick={onRefresh} size="icon-sm" variant="ghost"><RefreshCwIcon className={cn("size-3.5", loading && "animate-spin")} /></Button></div>
     {error ? <p className="rounded-md bg-destructive/5 px-2.5 py-2 text-xs text-destructive" role="alert">{error}</p> : null}
-    {deliverables.length > 0 ? <div className="flex min-w-0 flex-col gap-2">{deliverables.map((deliverable) => <DeliverableRow assetUrl={assetUrl} deliverable={deliverable} key={`${deliverable.kind}:${deliverable.id}`} onOpen={() => onOpen(deliverable)} />)}</div> : loading ? <EmptyState label={isZh ? "加载中…" : "Loading…"} /> : <EmptyState label={isZh ? "当前会话还没有资产" : "No assets in this session"} />}
+    {assets.length > 0 ? <div className="flex min-w-0 flex-col gap-2">{assets.map((asset) => <SessionAssetRow assetUrl={assetUrl} deliverable={asset} key={`${asset.kind}:${asset.id}`} onOpen={() => onOpen(asset)} />)}</div> : loading ? <EmptyState label={isZh ? "加载中…" : "Loading…"} /> : <EmptyState label={isZh ? "当前会话还没有资产" : "No session assets"} />}
   </div>;
 }
 
-function DeliverableRow({ assetUrl, deliverable, onOpen }: { readonly assetUrl?: (assetId: string) => string; readonly deliverable: AgentSessionDeliverable; readonly onOpen: () => void }) {
+function DeliverableList({ deliverables, error, isZh, loading, onOpen, onRefresh }: { readonly deliverables: readonly AgentSessionDeliverable[]; readonly error?: string; readonly isZh: boolean; readonly loading: boolean; readonly onOpen: (deliverable: AgentSessionDeliverable) => void; readonly onRefresh: () => void }) {
+  return <div>
+    <div className="mb-2 flex items-center justify-between"><span className="text-xs text-muted-foreground">{isZh ? "Agent 发布" : "Agent publications"}</span><Button aria-label={isZh ? "刷新发布资产" : "Refresh published assets"} disabled={loading} onClick={onRefresh} size="icon-sm" variant="ghost"><RefreshCwIcon className={cn("size-3.5", loading && "animate-spin")} /></Button></div>
+    {error ? <p className="rounded-md bg-destructive/5 px-2.5 py-2 text-xs text-destructive" role="alert">{error}</p> : null}
+    {deliverables.length > 0 ? <div className="flex min-w-0 flex-col gap-2">{deliverables.map((deliverable) => <PublishedDeliverableRow deliverable={deliverable} isZh={isZh} key={`${deliverable.kind}:${deliverable.id}`} onOpen={() => onOpen(deliverable)} />)}</div> : loading ? <EmptyState label={isZh ? "加载中…" : "Loading…"} /> : <EmptyState label={isZh ? "当前会话还没有发布资产" : "No published assets"} />}
+  </div>;
+}
+
+function SessionAssetRow({ assetUrl, deliverable, onOpen }: { readonly assetUrl?: (assetId: string) => string; readonly deliverable: AgentSessionDeliverable; readonly onOpen: () => void }) {
   const url = deliverableUrl(deliverable, assetUrl);
   const image = deliverable.mediaType?.startsWith("image/") ?? false;
-  const Icon = deliverable.kind === "website-preview" ? MonitorIcon : image ? ImageIcon : FileIcon;
   return <Attachment className="w-full max-w-none" size="sm" state="done">
     <button aria-label={`${image ? "Preview" : "Open"} ${deliverable.title}`} className="flex min-w-0 flex-1 items-center gap-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/50" onClick={onOpen} type="button">
-      <AttachmentMedia variant={image ? "image" : "icon"}>{image ? <img alt="" className="size-full object-cover" loading="lazy" src={url} /> : <Icon className="size-4" />}</AttachmentMedia>
-      <AttachmentContent><AttachmentTitle>{deliverable.title}</AttachmentTitle><AttachmentDescription>{deliverableMeta(deliverable)}</AttachmentDescription></AttachmentContent>
+      <AttachmentMedia variant={image ? "image" : "icon"}>{image ? <img alt="" className="size-full object-cover" loading="lazy" src={url} /> : <FileIcon className="size-4" />}</AttachmentMedia>
+      <AttachmentContent><AttachmentTitle>{deliverable.title}</AttachmentTitle><AttachmentDescription>{sessionAssetMeta(deliverable)}</AttachmentDescription></AttachmentContent>
     </button>
-    <AttachmentAction asChild aria-label="Download deliverable" title="Download deliverable"><a download={deliverable.title} href={url} rel="noreferrer" target="_blank"><DownloadIcon className="size-3.5" /></a></AttachmentAction>
+    <AttachmentAction asChild aria-label="Download asset" title="Download asset"><a download={deliverable.title} href={url} rel="noreferrer" target="_blank"><DownloadIcon className="size-3.5" /></a></AttachmentAction>
   </Attachment>;
+}
+
+function PublishedDeliverableRow({ deliverable, isZh, onOpen }: { readonly deliverable: AgentSessionDeliverable; readonly isZh: boolean; readonly onOpen: () => void }) {
+  const image = deliverable.mediaType?.startsWith("image/") ?? false;
+  return <ArtifactCard
+    aria-label={`${isZh ? "打开" : "Open"} ${deliverable.title}`}
+    icon={deliverable.kind === "website-preview" ? <MonitorIcon className="size-4" /> : image ? <ImageIcon className="size-4" /> : undefined}
+    meta={deliverableMeta(deliverable, isZh)}
+    onClick={onOpen}
+    title={deliverable.alias ?? deliverable.title}
+  />;
 }
 
 function DeliverablePreview({ assetUrl, deliverable, locale }: { readonly assetUrl?: (assetId: string) => string; readonly deliverable: AgentSessionDeliverable; readonly locale: AgentLocale }) {
@@ -360,15 +391,23 @@ function upsertContentTab(tabs: readonly AgentSecondaryContentTab[], next: Agent
 }
 
 function normalizeOverviewRoute(tab: AgentSecondaryTab | undefined): AgentSecondaryTab {
-  return tab === "children" ? "children" : tab === "assets" || tab === "deliverables" ? "deliverables" : "home";
+  return tab === "children" || tab === "assets" || tab === "deliverables" ? tab : "home";
 }
 
 function deliverableUrl(deliverable: AgentSessionDeliverable, assetUrl?: (assetId: string) => string): string {
   return deliverable.kind === "asset" ? assetUrl?.(deliverable.id) ?? deliverable.url : deliverable.url;
 }
 
-function deliverableMeta(deliverable: AgentSessionDeliverable): string {
-  return [deliverable.kind === "website-preview" ? "Website" : deliverable.mediaType, deliverable.fileCount ? `${deliverable.fileCount} files` : undefined, formatBytes(deliverable.sizeBytes)].filter(Boolean).join(" · ");
+function sessionAssetMeta(deliverable: AgentSessionDeliverable): string {
+  return [deliverable.mediaType, formatBytes(deliverable.sizeBytes)].filter(Boolean).join(" · ");
+}
+
+function deliverableMeta(deliverable: AgentSessionDeliverable, isZh: boolean): string {
+  const title = deliverable.alias && deliverable.title !== deliverable.alias ? deliverable.title : undefined;
+  const kind = deliverable.kind === "website-preview" ? (isZh ? "网站预览" : "Website preview") : (isZh ? "发布资产" : "Published artifact");
+  const version = deliverable.version ? `v${deliverable.version}` : undefined;
+  const fileCount = deliverable.fileCount ? `${deliverable.fileCount} ${isZh ? "个文件" : "files"}` : undefined;
+  return [kind, version, title, fileCount, deliverable.mediaType, formatBytes(deliverable.sizeBytes)].filter(Boolean).join(" · ");
 }
 
 function childStatusColor(status: string): string {
@@ -383,4 +422,4 @@ function safeDisplayOrigin(url: string): string {
 }
 
 function EmptyState({ label }: { readonly label: string }) { return <p className="px-1 py-8 text-center text-sm text-muted-foreground">{label}</p>; }
-function formatBytes(value: number): string { if (value < 1024) return `${value} B`; if (value < 1024 * 1024) return `${Math.round(value / 1024)} KB`; if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`; return `${(value / 1024 / 1024 / 1024).toFixed(1)} GB`; }
+function formatBytes(value: number | undefined): string | undefined { if (value === undefined) return undefined; if (value < 1024) return `${value} B`; if (value < 1024 * 1024) return `${Math.round(value / 1024)} KB`; if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`; return `${(value / 1024 / 1024 / 1024).toFixed(1)} GB`; }

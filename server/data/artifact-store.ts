@@ -16,10 +16,12 @@ import {
   writePublicationObject,
 } from "./publication-object.ts";
 import { iterateDirectoryEntries } from "./filesystem-directory.ts";
+import { normalizePublicationMetadata } from "./publication-metadata.ts";
 
 export const MAX_ARTIFACT_BYTES = 25 * 1024 * 1024;
 
 export type ArtifactRecord = {
+  readonly alias?: string;
   readonly artifactId: string;
   readonly createdAt: string;
   readonly expiresAt: string;
@@ -29,6 +31,7 @@ export type ArtifactRecord = {
   readonly sessionId: string;
   readonly tenantId: string;
   readonly totalBytes: number;
+  readonly version?: string;
 };
 
 export type ArtifactFile = {
@@ -44,6 +47,7 @@ export type PublicationOwner = {
 
 export interface ArtifactStore {
   create(input: {
+    readonly alias?: string;
     readonly artifactId?: string;
     readonly content: Uint8Array;
     readonly expiresAt: Date;
@@ -52,6 +56,7 @@ export interface ArtifactStore {
     readonly principalId: string;
     readonly sessionId: string;
     readonly tenantId: string;
+    readonly version?: string;
   }): Promise<ArtifactRecord>;
   find(artifactId: string): Promise<ArtifactRecord | undefined>;
   list(sessionId: string, owner: PublicationOwner): Promise<readonly ArtifactRecord[]>;
@@ -83,6 +88,7 @@ function postgresArtifactStore(pool: Pool, table: string, assetStore?: AssetStor
   return {
     async create(input) {
       assertArtifactInput(input);
+      const metadata = normalizePublicationMetadata(input);
       const artifactId = input.artifactId ?? `art_${randomUUID()}`;
       const owner = { principalId: input.principalId, tenantId: input.tenantId };
       const assetId = assetStore
@@ -100,10 +106,10 @@ function postgresArtifactStore(pool: Pool, table: string, assetStore?: AssetStor
         const result = await pool.query<ArtifactRow>(
           `insert into ${table}
             (artifact_id, session_id, tenant_id, principal_id, filename, media_type,
-             content, asset_id, expires_at, total_bytes)
-           values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             content, asset_id, expires_at, total_bytes, alias, version)
+           values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
            returning artifact_id, session_id, tenant_id, principal_id, filename,
-             media_type, expires_at, created_at, total_bytes`,
+             media_type, expires_at, created_at, total_bytes, alias, version`,
           [
             artifactId,
             input.sessionId,
@@ -115,6 +121,8 @@ function postgresArtifactStore(pool: Pool, table: string, assetStore?: AssetStor
             assetId ?? null,
             input.expiresAt,
             input.content.byteLength,
+            metadata.alias ?? null,
+            metadata.version ?? null,
           ],
         );
         return toRecord(result.rows[0]);
@@ -128,7 +136,7 @@ function postgresArtifactStore(pool: Pool, table: string, assetStore?: AssetStor
     async find(artifactId) {
       const result = await pool.query<ArtifactRow>(
         `select artifact_id, session_id, tenant_id, principal_id, filename,
-           media_type, expires_at, created_at, total_bytes
+           media_type, expires_at, created_at, total_bytes, alias, version
          from ${table} where artifact_id = $1`,
         [artifactId],
       );
@@ -138,7 +146,7 @@ function postgresArtifactStore(pool: Pool, table: string, assetStore?: AssetStor
       assertListInput(sessionId, owner);
       const result = await pool.query<ArtifactRow>(
         `select artifact_id, session_id, tenant_id, principal_id, filename,
-           media_type, expires_at, created_at, total_bytes
+           media_type, expires_at, created_at, total_bytes, alias, version
          from ${table}
          where session_id = $1 and tenant_id = $2 and principal_id = $3 and expires_at > now()
          order by created_at desc
@@ -193,8 +201,10 @@ function createFilesystemArtifactStore(root: string): ArtifactStore {
   return {
     async create(input) {
       assertArtifactInput(input);
+      const metadata = normalizePublicationMetadata(input);
       const artifactId = input.artifactId ?? `art_${randomUUID()}`;
       const record: ArtifactRecord = {
+        ...metadata,
         artifactId,
         createdAt: new Date().toISOString(),
         expiresAt: input.expiresAt.toISOString(),
@@ -269,6 +279,7 @@ function createFilesystemArtifactStore(root: string): ArtifactStore {
 
 type ArtifactRow = {
   asset_id?: string | null;
+  alias?: string | null;
   artifact_id: string;
   created_at: Date | string;
   expires_at: Date | string;
@@ -277,13 +288,15 @@ type ArtifactRow = {
   principal_id: string;
   session_id: string;
   tenant_id: string;
-  total_bytes: number;
+  total_bytes: number | string;
+  version?: string | null;
   content?: Buffer | null;
 };
 
 function toRecord(row: ArtifactRow): ArtifactRecord {
   if (!row) throw new Error("The artifact store returned no created artifact.");
   return {
+    ...(row.alias ? { alias: row.alias } : {}),
     artifactId: row.artifact_id,
     createdAt: asIso(row.created_at),
     expiresAt: asIso(row.expires_at),
@@ -292,11 +305,13 @@ function toRecord(row: ArtifactRow): ArtifactRecord {
     principalId: row.principal_id,
     sessionId: row.session_id,
     tenantId: row.tenant_id,
-    totalBytes: row.total_bytes,
+    totalBytes: asByteCount(row.total_bytes),
+    ...(row.version ? { version: row.version } : {}),
   };
 }
 
 function assertArtifactInput(input: {
+  readonly alias?: string;
   readonly content: Uint8Array;
   readonly expiresAt: Date;
   readonly filename: string;
@@ -304,7 +319,9 @@ function assertArtifactInput(input: {
   readonly principalId: string;
   readonly sessionId: string;
   readonly tenantId: string;
+  readonly version?: string;
 }): void {
+  normalizePublicationMetadata(input);
   if (!input.sessionId || !input.tenantId || !input.principalId) {
     throw new Error("An artifact requires a session and authenticated owner.");
   }
@@ -346,6 +363,7 @@ function isArtifactRecord(value: unknown): value is ArtifactRecord {
   if (!value || typeof value !== "object") return false;
   const record = value as Partial<ArtifactRecord>;
   return typeof record.artifactId === "string"
+    && (record.alias === undefined || typeof record.alias === "string")
     && /^art_[a-f0-9-]{36}$/u.test(record.artifactId)
     && typeof record.createdAt === "string"
     && typeof record.expiresAt === "string"
@@ -354,7 +372,14 @@ function isArtifactRecord(value: unknown): value is ArtifactRecord {
     && typeof record.principalId === "string"
     && typeof record.sessionId === "string"
     && typeof record.tenantId === "string"
-    && typeof record.totalBytes === "number";
+    && typeof record.totalBytes === "number"
+    && (record.version === undefined || typeof record.version === "string");
+}
+
+function asByteCount(value: number | string): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) throw new Error("The artifact size is invalid.");
+  return parsed;
 }
 
 function asIso(value: Date | string): string {

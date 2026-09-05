@@ -10,18 +10,22 @@ test("filesystem preview cleanup removes expired trees and retains live previews
   try {
     const store = createPreviewStoreFromEnvironment({ AGENT_PREVIEW_STORAGE_PATH: root });
     const common = {
+      alias: "Marketing site",
       entrypoint: "index.html",
       files: [{ content: new TextEncoder().encode("<h1>ok</h1>"), mediaType: "text/html", path: "index.html" }],
       principalId: "user-1",
       sessionId: "session-1",
       tenantId: "tenant-1",
+      version: "2",
     } as const;
     const expired = await store.create({ ...common, expiresAt: new Date("2030-01-01T00:00:00.000Z") });
     const retained = await store.create({ ...common, expiresAt: new Date("2031-01-01T00:00:00.000Z") });
 
     assert.equal(await store.cleanupExpired?.({ now: new Date("2030-06-01T00:00:00.000Z") }), 1);
     assert.equal(await store.find(expired.previewId), undefined);
-    assert.ok(await store.find(retained.previewId));
+    const reloaded = await store.find(retained.previewId);
+    assert.equal(reloaded?.alias, "Marketing site");
+    assert.equal(reloaded?.version, "2");
   } finally {
     await rm(root, { force: true, recursive: true });
   }

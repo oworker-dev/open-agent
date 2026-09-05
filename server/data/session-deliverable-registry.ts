@@ -5,6 +5,7 @@ import { createAssetStoreFromEnvironment } from "./asset-store.ts";
 import { createPreviewStoreFromEnvironment, type PreviewRecord, type PreviewStore } from "./preview-store.ts";
 
 export type SessionDeliverable = {
+  readonly alias?: string;
   readonly createdAt: string;
   readonly expiresAt?: string;
   readonly fileCount?: number;
@@ -14,6 +15,7 @@ export type SessionDeliverable = {
   readonly sizeBytes: number;
   readonly title: string;
   readonly url: string;
+  readonly version?: string;
 };
 
 export interface SessionDeliverableRegistry {
@@ -77,6 +79,7 @@ function assetDeliverable(asset: AssetMetadata): SessionDeliverable {
 function artifactDeliverable(artifact: ArtifactRecord, signingSecret: string): SessionDeliverable {
   const token = createArtifactToken(artifact.artifactId, new Date(artifact.expiresAt), signingSecret);
   return {
+    ...(artifact.alias ? { alias: artifact.alias } : {}),
     createdAt: artifact.createdAt,
     expiresAt: artifact.expiresAt,
     id: artifact.artifactId,
@@ -85,12 +88,14 @@ function artifactDeliverable(artifact: ArtifactRecord, signingSecret: string): S
     sizeBytes: artifact.totalBytes,
     title: artifact.filename,
     url: `/api/artifacts/${encodeURIComponent(artifact.artifactId)}?token=${encodeURIComponent(token)}`,
+    ...(artifact.version ? { version: artifact.version } : {}),
   };
 }
 
 function previewDeliverable(preview: PreviewRecord, signingSecret: string): SessionDeliverable {
   const token = createPreviewToken(preview.previewId, new Date(preview.expiresAt), signingSecret);
   return {
+    ...(preview.alias ? { alias: preview.alias } : {}),
     createdAt: preview.createdAt,
     expiresAt: preview.expiresAt,
     fileCount: preview.fileCount,
@@ -100,6 +105,7 @@ function previewDeliverable(preview: PreviewRecord, signingSecret: string): Sess
     sizeBytes: preview.totalBytes,
     title: preview.entrypoint,
     url: `/api/previews/${encodeURIComponent(preview.previewId)}/${encodePath(preview.entrypoint)}?token=${encodeURIComponent(token)}`,
+    ...(preview.version ? { version: preview.version } : {}),
   };
 }
 

@@ -497,6 +497,202 @@ test("the thread index hydrates only the transcript selected from the sidebar", 
   expect(transcriptRequests.filter((search) => !search.includes("view=index"))).toHaveLength(1);
 });
 
+test("a selection conflict does not hydrate unrelated thread transcripts", async ({ page }) => {
+  const now = Date.now();
+  const makeThread = (id: string, title: string, updatedAt: number) => ({
+    closedInputRequestIds: [],
+    createdAt: updatedAt,
+    events: [],
+    id,
+    preferences: { executionMode: "standard", modelId: "gpt-5.6-sol", reasoning: "medium" },
+    queuedTurns: [],
+    session: { streamIndex: 0 },
+    status: "ready",
+    title,
+    updatedAt,
+  });
+  setFakeThreadCollection(page, {
+    activeThreadId: "thread-newest",
+    threads: [
+      makeThread("thread-newest", "Newest session", now),
+      makeThread("thread-target", "Target session", now - 1_000),
+      makeThread("thread-oldest", "Oldest session", now - 2_000),
+    ],
+    version: 2,
+  });
+  const hydratedThreadIds: string[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (
+      request.method() === "GET" &&
+      url.searchParams.get("eventWindow") === "1" &&
+      url.searchParams.get("threadId")
+    ) {
+      hydratedThreadIds.push(url.searchParams.get("threadId")!);
+    }
+  });
+
+  await page.goto("/");
+  const store = threadStores.get(page)!;
+  store.conflictsRemaining = 1;
+  await page.locator("aside").getByRole("button", { name: /Target session/ }).click();
+
+  await expect.poll(() => store.collection.activeThreadId).toBe("thread-target");
+  expect(hydratedThreadIds).toEqual(["thread-target"]);
+});
+
+test("opening an old thread preserves its activity timestamp", async ({ page }) => {
+  const now = Date.now();
+  const duplicate = {
+    data: { wait: "next-user-message" },
+    meta: { at: new Date(now - 10_000).toISOString(), id: "old-waiting-event" },
+    type: "session.waiting",
+  };
+  const oldUpdatedAt = now - 20_000;
+  setFakeThreadCollection(page, {
+    activeThreadId: "newer-thread",
+    threads: [{
+      closedInputRequestIds: [],
+      createdAt: now - 1_000,
+      events: [],
+      id: "newer-thread",
+      preferences: { executionMode: "standard", modelId: "gpt-5.6-sol", reasoning: "medium" },
+      queuedTurns: [],
+      session: { streamIndex: 0 },
+      status: "ready",
+      title: "Newer session",
+      updatedAt: now - 1_000,
+    }, {
+      closedInputRequestIds: [],
+      createdAt: oldUpdatedAt,
+      // Duplicate legacy snapshots force hydration compaction. This is a
+      // read-time repair and must not turn the old thread into recent activity.
+      events: [duplicate, duplicate],
+      id: "old-thread",
+      preferences: { executionMode: "standard", modelId: "gpt-5.6-sol", reasoning: "medium" },
+      queuedTurns: [],
+      session: { streamIndex: 2 },
+      status: "ready",
+      title: "Old session",
+      updatedAt: oldUpdatedAt,
+    }],
+    version: 2,
+  });
+
+  await page.goto("/");
+  await page.locator("aside").getByRole("button", { name: /Old session/ }).click();
+  await expect.poll(() => threadStores.get(page)?.collection.activeThreadId).toBe("old-thread");
+  await page.waitForTimeout(200);
+
+  const storedOldThread = threadStores.get(page)?.collection.threads.find((thread) => thread.id === "old-thread");
+  expect(storedOldThread?.updatedAt).toBe(oldUpdatedAt);
+});
+
+test("earlier history loads near the top without remounting or moving the visible anchor", async ({ page }) => {
+  const threadId = "incremental-history-thread";
+  const sessionId = "incremental-history-session";
+  const events = mockHistoryTurns(10);
+  const tailStart = 1 + 4 * 7;
+  const now = Date.now();
+  const storedThread = {
+    closedInputRequestIds: [],
+    createdAt: now,
+    events,
+    id: threadId,
+    preferences: { executionMode: "standard" as const, modelId: "gpt-5.6-sol", reasoning: "medium" },
+    queuedTurns: [],
+    session: { sessionId, streamIndex: events.length },
+    status: "ready" as const,
+    title: "Incremental history",
+    updatedAt: now,
+  };
+  setFakeThreadCollection(page, {
+    activeThreadId: threadId,
+    threads: [storedThread],
+    version: 2,
+  });
+  let earlierRequests = 0;
+  let releaseEarlierPage: (() => void) | undefined;
+  const earlierPageMayResolve = new Promise<void>((resolve) => {
+    releaseEarlierPage = resolve;
+  });
+  await page.route("**/api/standalone/thread-collections/**", async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    if (request.method() !== "GET" || url.searchParams.get("threadId") !== threadId) {
+      await route.fallback();
+      return;
+    }
+    if (url.searchParams.get("view") === "index") {
+      await route.fulfill({
+        body: JSON.stringify({
+          collection: {
+            activeThreadId: threadId,
+            threads: [{ ...storedThread, events: [], hydration: "summary" }],
+            version: 2,
+          },
+          revision: 0,
+        }),
+        contentType: "application/json",
+        headers: { etag: '"0"' },
+        status: 200,
+      });
+      return;
+    }
+    const before = url.searchParams.get("eventBefore");
+    const startIndex = before ? 0 : tailStart;
+    const endIndex = before ? tailStart : events.length;
+    if (before) {
+      earlierRequests += 1;
+      await earlierPageMayResolve;
+    }
+    await route.fulfill({
+      body: JSON.stringify({
+        eventWindow: {
+          endIndex,
+          hasMoreBefore: startIndex > 0,
+          startIndex,
+          total: events.length,
+        },
+        revision: 0,
+        thread: { ...storedThread, events: events.slice(startIndex, endIndex) },
+      }),
+      contentType: "application/json",
+      headers: { etag: '"0"' },
+      status: 200,
+    });
+  });
+  await page.route(`**/api/standalone/sessions/${sessionId}`, async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({ ok: true, state: "waiting", tailIndex: events.length - 1 }),
+      contentType: "application/json",
+      status: 200,
+    });
+  });
+
+  await page.goto(`/threads/${threadId}`);
+  const viewport = page.getByRole("log");
+  const anchor = page.getByText("History request 4", { exact: true });
+  await expect(page.getByText("History reply 9", { exact: true })).toBeVisible();
+  await expect(page.getByText("History request 0", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Load earlier messages" })).toHaveCount(0);
+  await viewport.evaluate((element) => {
+    element.dataset.historyViewportIdentity = "stable";
+    element.scrollTop = 80;
+  });
+  await expect.poll(() => earlierRequests).toBe(1);
+  const beforeTop = (await anchor.boundingBox())?.y;
+  expect(beforeTop).toBeDefined();
+  releaseEarlierPage?.();
+
+  await expect(page.getByText("History request 0", { exact: true })).toBeAttached();
+  await expect(viewport).toHaveAttribute("data-history-viewport-identity", "stable");
+  const afterTop = (await anchor.boundingBox())?.y;
+  expect(afterTop).toBeDefined();
+  expect(Math.abs((afterTop ?? 0) - (beforeTop ?? 0))).toBeLessThanOrEqual(2);
+  expect(earlierRequests).toBe(1);
+});
+
 test("editing a bounded transcript waits instead of clearing a partial history", async ({ page }) => {
   const threadId = "bounded-edit-thread";
   const sessionId = "bounded-edit-session";
@@ -1446,12 +1642,14 @@ test("provider failure feedback does not remount the active reasoning row", asyn
 
 for (const editScenario of [
   {
+    delayedCommit: true,
     editedReply: "Edited delivery.",
     editedRequest: "Edited request",
     label: "changed content",
     sessionId: "mock-edit-changed-session",
   },
   {
+    delayedCommit: false,
     editedReply: "Repeated delivery.",
     editedRequest: "Original request",
     label: "unchanged content",
@@ -1460,7 +1658,7 @@ for (const editScenario of [
 ] as const) {
 test(`editing the latest user turn with ${editScenario.label} submits one durable revert transaction`, async ({ page }) => {
   test.skip(!process.env.AGENT_DATABASE_URL, "Requires the server-backed mailbox/edit boundary.");
-  const { editedReply, editedRequest, sessionId } = editScenario;
+  const { delayedCommit, editedReply, editedRequest, sessionId } = editScenario;
   await page.addInitScript(() => {
     const nativeScrollTo = HTMLElement.prototype.scrollTo;
     const invokeNativeScrollTo = nativeScrollTo as unknown as (this: HTMLElement, optionsOrX?: ScrollToOptions | number, y?: number) => void;
@@ -1504,6 +1702,7 @@ test(`editing the latest user turn with ${editScenario.label} submits one durabl
     type: "context.cleared" as const,
   } as MessageStreamEvent;
   let mailboxAccepted = false;
+  let mailboxCommitted = false;
   let mailboxBody: Record<string, unknown> | undefined;
   let mailboxCalls = 0;
   let clearCalls = 0;
@@ -1536,13 +1735,14 @@ test(`editing the latest user turn with ${editScenario.label} submits one durabl
     mailboxCalls += 1;
     mailboxBody = route.request().postDataJSON() as Record<string, unknown>;
     mailboxAccepted = true;
+    mailboxCommitted = !delayedCommit;
     await route.fulfill({
       body: JSON.stringify({
         disposition: "created",
         item: {
           clientMessageId: mailboxBody.clientMessageId,
           itemId: `mail-${sessionId}`,
-          status: "committed",
+          status: mailboxCommitted ? "committed" : "queued",
         },
         ok: true,
       }),
@@ -1555,12 +1755,13 @@ test(`editing the latest user turn with ${editScenario.label} submits one durabl
       await route.continue();
       return;
     }
+    if (mailboxAccepted && delayedCommit) mailboxCommitted = true;
     await route.fulfill({
       body: JSON.stringify({
         item: {
           clientMessageId: mailboxBody?.clientMessageId,
           itemId: `mail-${sessionId}`,
-          status: mailboxAccepted ? "committed" : "queued",
+          status: mailboxCommitted ? "committed" : "queued",
         },
         ok: true,
       }),
@@ -1569,7 +1770,7 @@ test(`editing the latest user turn with ${editScenario.label} submits one durabl
     });
   });
   await page.route(`**/api/standalone/sessions/${sessionId}`, async (route) => {
-    const events = mailboxAccepted ? [...originalEvents, clearEvent, ...editedEvents] : originalEvents;
+    const events = mailboxCommitted ? [...originalEvents, clearEvent, ...editedEvents] : originalEvents;
     await route.fulfill({
       body: JSON.stringify({ ok: true, state: "waiting", tailIndex: events.length - 1 }),
       contentType: "application/json",
@@ -1588,7 +1789,7 @@ test(`editing the latest user turn with ${editScenario.label} submits one durabl
       return;
     }
     const startIndex = Number(url.searchParams.get("startIndex") ?? "0");
-    const events = mailboxAccepted ? [...originalEvents, clearEvent, ...editedEvents] : originalEvents;
+    const events = mailboxCommitted ? [...originalEvents, clearEvent, ...editedEvents] : originalEvents;
     const body = ndjson(events.slice(startIndex));
     await route.fulfill({
       body,
@@ -4356,6 +4557,8 @@ test("stop keeps the composer locked until the durable cancellation boundary set
 
   await expect(page.getByRole("button", { name: "Stopping", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Send", exact: true })).toBeHidden();
+  await page.getByRole("log").getByText("Wait", { exact: true }).hover();
+  await expect(page.getByRole("button", { name: "Edit message", exact: true })).toHaveCount(0);
   await expect.poll(() => cancelledTurnId).toBe("turn_0");
   // The cancel HTTP response is only an accepted command. The old client
   // released the composer here, which allowed a new turn to race the active
@@ -4363,6 +4566,8 @@ test("stop keeps the composer locked until the durable cancellation boundary set
   await expect(page.getByRole("button", { name: "Send", exact: true })).toBeHidden();
   releaseBoundary?.();
   await expect(page.getByRole("button", { name: "Send", exact: true })).toBeVisible();
+  await page.getByRole("log").getByText("Wait", { exact: true }).hover();
+  await expect(page.getByRole("button", { name: "Edit message", exact: true })).toBeVisible();
   expect(cancelledTurnId).toBe("turn_0");
 });
 
@@ -4916,6 +5121,8 @@ test("stop before session admission preserves the optimistic user message", asyn
   // the composer can return immediately without racing a server turn.
   await expect(page.getByRole("button", { name: "Send", exact: true })).toBeVisible();
   await expect(page.getByRole("log").getByText("Keep this message after stopping", { exact: true })).toBeVisible();
+  await page.getByRole("log").getByText("Keep this message after stopping", { exact: true }).hover();
+  await expect(page.getByRole("button", { name: "Edit message", exact: true })).toBeVisible();
   await expect.poll(() => {
     const pending = firstStoredThread(page)?.pendingTurn;
     if (typeof pending !== "object" || pending === null) return "";
@@ -5019,6 +5226,29 @@ function mockSuccessfulTurn(message: string, reply: string, sequence = 0): strin
     { data: { wait: "next-user-message" }, meta: { at }, type: "session.waiting" },
   ];
   return `${events.map((event) => JSON.stringify(event)).join("\n")}\n`;
+}
+
+function mockHistoryTurns(count: number): readonly MessageStreamEvent[] {
+  const base = Date.now();
+  const events: MessageStreamEvent[] = [{
+    data: { runtime: { agentId: "open-agent", agentName: "open-agent", eveVersion: "test", modelId: "mock/model" } },
+    meta: { at: new Date(base).toISOString(), id: "history-session-started" },
+    type: "session.started",
+  }];
+  for (let sequence = 0; sequence < count; sequence += 1) {
+    const turnId = `history-turn-${sequence}`;
+    const at = (offset: number) => new Date(base + sequence * 1_000 + offset).toISOString();
+    events.push(
+      { data: { sequence, turnId }, meta: { at: at(100), id: `history-turn-started-${sequence}` }, type: "turn.started" },
+      { data: { message: `History request ${sequence}`, parts: [{ text: `History request ${sequence}`, type: "text" }], sequence, turnId }, meta: { at: at(200), id: `history-message-received-${sequence}` }, type: "message.received" },
+      { data: { sequence, stepIndex: 0, turnId }, meta: { at: at(300), id: `history-step-started-${sequence}` }, type: "step.started" },
+      { data: { finishReason: "stop", message: `History reply ${sequence}`, sequence, stepIndex: 0, turnId }, meta: { at: at(400), id: `history-message-completed-${sequence}` }, type: "message.completed" },
+      { data: { finishReason: "stop", sequence, stepIndex: 0, turnId, usage: { inputTokens: 1, outputTokens: 1 } }, meta: { at: at(500), id: `history-step-completed-${sequence}` }, type: "step.completed" },
+      { data: { sequence, turnId }, meta: { at: at(600), id: `history-turn-completed-${sequence}` }, type: "turn.completed" },
+      { data: { continuationToken: `history-continuation-${sequence}`, wait: "next-user-message" }, meta: { at: at(700), id: `history-session-waiting-${sequence}` }, type: "session.waiting" },
+    );
+  }
+  return events;
 }
 
 function mockProviderFailureTurn(

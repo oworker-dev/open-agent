@@ -95,7 +95,7 @@ export function createHttpAgentThreadStorage(
       await requireOk(response);
       if (!body) throw new Error("Agent thread storage returned an empty collection response.");
       revisions.set(storageKey, body.revision);
-      baselines.set(storageKey, body.collection);
+      baselines.set(storageKey, baselineAfterIndex(baselines.get(storageKey), body.collection));
       return body.collection;
     },
     async loadThread(storageKey, threadId) {
@@ -171,9 +171,7 @@ export function createHttpAgentThreadStorage(
             transcriptWindow: body.eventWindow,
             // Keep previously fetched pages in the optimistic baseline so a
             // metadata checkpoint never mistakes a prepend for a truncation.
-            events: [...hydrated.events, ...baselineEvents].filter((event, index, all) =>
-              all.findIndex((candidate) => eventIdentity(candidate) === eventIdentity(event)) === index,
-            ),
+            events: mergeThreadEventSnapshots(baselineEvents, hydrated.events),
           },
         ],
         version: AGENT_THREAD_STORAGE_VERSION,
@@ -267,6 +265,43 @@ export function createHttpAgentThreadStorage(
       baselines.set(storageKey, baselineAfterPatch(baseline, savedCollection, patch));
     },
   };
+}
+
+function baselineAfterIndex(
+  previous: AgentThreadCollection | undefined,
+  index: AgentThreadCollection,
+): AgentThreadCollection {
+  if (!previous) return index;
+  const previousThreads = new Map(previous.threads.map((thread) => [thread.id, thread]));
+  return {
+    ...(index.activeThreadId ? { activeThreadId: index.activeThreadId } : {}),
+    threads: index.threads.map((thread) => {
+      const prior = previousThreads.get(thread.id);
+      if (
+        thread.hydration !== "summary" ||
+        !prior ||
+        prior.hydration === "summary" ||
+        !sameTranscriptCoordinates(prior, thread)
+      ) return thread;
+      // An index omits event payloads by design. When its durable transcript
+      // coordinates are unchanged, retain the already-loaded event baseline
+      // so conflict retry does not resend every visited thread window.
+      return {
+        ...thread,
+        events: prior.events,
+        hydration: undefined,
+        ...(prior.transcriptWindow ? { transcriptWindow: prior.transcriptWindow } : {}),
+      };
+    }),
+    version: index.version,
+  };
+}
+
+function sameTranscriptCoordinates(left: AgentThread, right: AgentThread): boolean {
+  return left.updatedAt === right.updatedAt &&
+    left.revision === right.revision &&
+    left.session.sessionId === right.session.sessionId &&
+    left.session.streamIndex === right.session.streamIndex;
 }
 
 function snapshotCollection(collection: AgentThreadCollection): AgentThreadCollection {

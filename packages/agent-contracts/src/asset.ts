@@ -182,6 +182,11 @@ export interface AssetStore {
   }): Promise<AssetMetadata | undefined>;
   findAsset(assetId: string, owner: AssetOwner): Promise<AssetMetadata | undefined>;
   findUpload(uploadId: string, owner: AssetOwner): Promise<AssetUpload | undefined>;
+  /**
+   * Recover an interrupted idempotent upload by its stable asset id. Hosts may
+   * omit this when they do not support resumable app-authored imports.
+   */
+  findUploadByAsset?(assetId: string, owner: AssetOwner): Promise<AssetUpload | undefined>;
   /** Optional listing used by the session-assets side panel. */
   listAssets?(sessionId: string, owner: AssetOwner): Promise<readonly AssetMetadata[]>;
   /** Optional retention hook for a host-scheduled expiry worker. */

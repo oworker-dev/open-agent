@@ -133,7 +133,9 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
       startIndex: 0,
       version: 1,
     },
-    updatedAt: Date.now(),
+    // Transcript repair restores a stored projection; it is not user or agent
+    // activity and therefore must not move the thread to the top of recents.
+    updatedAt: thread.updatedAt,
   };
   const patch: ThreadCollectionPatchRecord = {
     deletedThreadIds: [],

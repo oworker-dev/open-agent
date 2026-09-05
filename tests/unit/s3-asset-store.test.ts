@@ -105,6 +105,48 @@ test("S3 AssetStore signs direct parts and durably acknowledges provider ETags",
   assert.ok(queries.some(({ sql, values }) => sql.includes("agent_asset_parts") && values[3] === "abc-1"));
 });
 
+test("S3 AssetStore recovers an upload by its stable asset id", async () => {
+  const row = {
+    asset_id: "asset-stable",
+    upload_id: "upl-stable",
+    provider_upload_id: "provider-stable",
+    tenant_id: owner.tenantId,
+    principal_id: owner.principalId,
+    session_id: "session-stable",
+    filename: "stable.bin",
+    media_type: "application/octet-stream",
+    storage_key: "open-agent/assets/tenant-1/asset-stable/content",
+    declared_size_bytes: 3,
+    chunk_size_bytes: 8 * 1024 * 1024,
+    part_count: 1,
+    status: "uploading" as const,
+    created_at: new Date().toISOString(),
+  };
+  const pool = {
+    async query(sql: string, values: readonly unknown[] = []) {
+      if (sql.includes("from \"open_agent\".\"agent_asset_uploads\" upload") && sql.includes("where upload.asset_id")) {
+        assert.deepEqual(values, [row.asset_id]);
+        return { rows: [row] };
+      }
+      if (sql.includes("from \"open_agent\".\"agent_asset_parts\"")) {
+        assert.deepEqual(values, [row.upload_id]);
+        return { rows: [{ etag: "etag-stable", part_number: 1, size_bytes: 3 }] };
+      }
+      throw new Error(`Unexpected query: ${sql}`);
+    },
+  };
+  const store = createS3AssetStore({
+    bucket: "assets",
+    client: { async send() { throw new Error("recovery lookup must not access object bytes"); } } as never,
+    database: { connectionString: "", maxPoolSize: 1, schema: "open_agent" },
+    pool: pool as never,
+  });
+
+  const upload = await store.findUploadByAsset?.(row.asset_id, owner);
+  assert.equal(upload?.uploadId, row.upload_id);
+  assert.deepEqual(upload?.parts, [{ etag: "etag-stable", partNumber: 1, sizeBytes: 3 }]);
+});
+
 test("S3 AssetStore accepts issuer-qualified authenticated principals", async () => {
   const pool = {
     async query(sql: string) {

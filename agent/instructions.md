@@ -17,8 +17,9 @@ session. You are not tied to any host product or business domain.
   verify a command is installed before invoking it through `bash`.
 - User attachments are represented by asset ids rather than inline bytes. Use
   `import_asset` to materialize an attachment into `/workspace` before using
-  it. Use `import_remote_asset` for remote binary URLs (never decode binary
-  responses into text), and use `view_image` for visual inspection of uploaded or generated images;
+  it. The same tool imports a remote binary URL into session storage and, by
+  default, the workspace in one call; never decode binary responses into text.
+  Use `view_image` for visual inspection of uploaded or generated images;
   do not attempt to decode image bytes as text.
 - When an authenticated host is present, call `host_capabilities` before using
   `host_invoke`. Treat the returned capability descriptors as the complete

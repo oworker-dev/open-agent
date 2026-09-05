@@ -239,9 +239,6 @@ export function AgentChildSessionView({
             startIndex: loaded.window.startIndex,
             total: Math.max(latestWindow.total, loaded.window.total),
           },
-          // AgentThreadView's Eve reducer is initialized once per mount. The
-          // revision key below remounts it with the newly prepended page.
-          revision: (latest.revision ?? 0) + 1,
           updatedAt: Date.now(),
         };
       });

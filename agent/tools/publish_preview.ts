@@ -4,16 +4,25 @@ import { randomUUID } from "node:crypto";
 import { publicationOwnerFromAuth } from "../lib/session-ownership-auth.ts";
 import { createPreviewToken, readPreviewTtlSeconds } from "../../lib/preview-token.ts";
 import { createPreviewStoreFromEnvironment } from "../../server/data/preview-store.ts";
+import { MAX_PUBLICATION_ALIAS_LENGTH, MAX_PUBLICATION_VERSION_LENGTH } from "../../server/data/publication-metadata.ts";
 
 const MAX_FILES = 1_000;
 const MAX_TOTAL_BYTES = 25 * 1024 * 1024;
+const publicationLabel = (maxLength: number) => z.string()
+  .trim()
+  .min(1)
+  .max(maxLength)
+  .refine((value) => !/[\u0000-\u001f\u007f]/u.test(value), "Must not contain control characters")
+  .optional();
 
 export default defineTool({
   description:
     "Publish a completed static website from the session workspace and return a temporary browser preview URL. Build and validate the site first; use this only for the final user-visible result.",
   inputSchema: z.object({
+    alias: publicationLabel(MAX_PUBLICATION_ALIAS_LENGTH).describe("Optional human-readable name for this website preview."),
     entrypoint: z.string().trim().min(1).max(256).default("index.html"),
     root: z.string().trim().min(1).max(256).default("."),
+    version: publicationLabel(MAX_PUBLICATION_VERSION_LENGTH).describe("Optional version label, such as v1 or 2026.09.05."),
   }),
   async execute(input, ctx) {
     const store = createPreviewStoreFromEnvironment();
@@ -49,6 +58,7 @@ export default defineTool({
     const previewId = `prv_${randomUUID()}`;
     const expiresAt = new Date(Date.now() + readPreviewTtlSeconds() * 1_000);
     const record = await store.create({
+      alias: input.alias,
       entrypoint,
       expiresAt,
       files,
@@ -56,12 +66,14 @@ export default defineTool({
       principalId: owner.principalId,
       sessionId: ctx.session.id,
       tenantId: owner.tenantId,
+      version: input.version,
     });
     const token = createPreviewToken(record.previewId, expiresAt);
     const baseUrl = process.env.AGENT_PUBLIC_BASE_URL?.trim();
     const path = `/api/previews/${encodeURIComponent(record.previewId)}/${encodePath(entrypoint)}?token=${encodeURIComponent(token)}`;
     const url = baseUrl ? new URL(path, `${baseUrl.replace(/\/$/u, "")}/`).toString() : path;
     return {
+      ...(record.alias ? { alias: record.alias } : {}),
       bytes: record.totalBytes,
       createdAt: record.createdAt,
       entrypoint: record.entrypoint,
@@ -70,6 +82,7 @@ export default defineTool({
       kind: "website-preview",
       previewId: record.previewId,
       url,
+      ...(record.version ? { version: record.version } : {}),
     };
   },
 });

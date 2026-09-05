@@ -164,7 +164,6 @@ export function AgentChildSessionView({ client, commands, locale, mailbox, menti
                         startIndex: loaded.window.startIndex,
                         total: Math.max(latestWindow.total, loaded.window.total),
                     },
-                    revision: (latest.revision ?? 0) + 1,
                     updatedAt: Date.now(),
                 };
             });

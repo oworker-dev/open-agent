@@ -68,6 +68,7 @@ test("filesystem asset store accepts 100 MiB declarations without inline message
   try {
     const store = createFilesystemAssetStore({ root });
     const upload = await store.createUpload({
+      assetId: "asset-stable-upload",
       filename: "large.bin",
       mediaType: "application/octet-stream",
       owner,
@@ -78,6 +79,7 @@ test("filesystem asset store accepts 100 MiB declarations without inline message
     assert.equal(upload.sizeBytes, 100 * 1024 * 1024);
     assert.equal(upload.partCount, 13);
     assert.equal(upload.chunkSizeBytes, ASSET_CHUNK_SIZE_BYTES);
+    assert.equal((await store.findUploadByAsset?.("asset-stable-upload", owner))?.uploadId, upload.uploadId);
   } finally {
     await rm(root, { force: true, recursive: true });
   }

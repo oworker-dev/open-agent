@@ -13,7 +13,7 @@ export type AgentApprovalTakeover = {
     readonly prompt: string;
     readonly toolName: string;
 };
-export declare function AssistantThreadSurface({ assetUrl, approvalTakeover, cancellationState, closedInputRequestIds, commands, composerTop, draftStorageKey, draftRestore, events, eveMessages, fallbackStartedAt, historyHasMore, historyLoading, inputDisabled, isBusy, scrollToBottomOnInitialize, scrollToBottomOnThreadSwitch, sessionTerminal, sessionSettled, onCancel, locale, mentions, messages, models, onInputResponses, onCloseInputRequest, onDraftRestoreConsumed, onOpenDeliverable, onOpenSubagent, onLoadEarlier, onPreferencesChange, onRetryRuntimeError, preferences, reasoningLevels, runtimeError, runtimeFailure, runtimeRetry, usage, }: {
+export declare function AssistantThreadSurface({ assetUrl, approvalTakeover, cancellationState, closedInputRequestIds, commands, composerTop, draftStorageKey, draftRestore, events, eveMessages, fallbackStartedAt, historyHasMore, historyLoading, historyStartIndex, inputDisabled, isBusy, scrollToBottomOnInitialize, scrollToBottomOnThreadSwitch, sessionTerminal, sessionSettled, onCancel, locale, mentions, messages, models, onInputResponses, onCloseInputRequest, onDraftRestoreConsumed, onOpenDeliverable, onOpenSubagent, onLoadEarlier, onPreferencesChange, onRetryRuntimeError, preferences, reasoningLevels, runtimeError, runtimeFailure, runtimeRetry, usage, }: {
     readonly assetUrl?: (assetId: string) => string;
     readonly approvalTakeover?: AgentApprovalTakeover;
     readonly cancellationState: AgentCancellationState;
@@ -27,6 +27,7 @@ export declare function AssistantThreadSurface({ assetUrl, approvalTakeover, can
     readonly fallbackStartedAt?: number;
     readonly historyHasMore?: boolean;
     readonly historyLoading?: boolean;
+    readonly historyStartIndex?: number;
     readonly inputDisabled?: boolean;
     readonly isBusy: boolean;
     readonly scrollToBottomOnInitialize?: boolean;
@@ -43,7 +44,7 @@ export declare function AssistantThreadSurface({ assetUrl, approvalTakeover, can
     readonly onDraftRestoreConsumed: (id: string) => void;
     readonly onOpenDeliverable?: (deliverable: AgentSessionDeliverable) => void;
     readonly onOpenSubagent?: (sessionId: string) => void;
-    readonly onLoadEarlier?: () => void;
+    readonly onLoadEarlier?: () => void | Promise<void>;
     readonly onPreferencesChange: (preferences: AgentThreadPreferences) => void;
     readonly onRetryRuntimeError?: () => void;
     readonly preferences: AgentThreadPreferences;

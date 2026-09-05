@@ -5,7 +5,7 @@ import { ClientError, defaultMessageReducer, type ClientSession, type MessageStr
 import { useEveAgent, type EveDynamicToolPart, type EveMessage } from "eve/react";
 import { AssistantRuntimeProvider, unstable_defaultDirectiveFormatter, useExternalStoreRuntime, type AppendMessage, type ExternalStoreAdapter, type ExternalThreadQueueAdapter, type RespondToToolApprovalOptions } from "@assistant-ui/react";
 import { AlertCircleIcon, Clock3Icon, HammerIcon, LoaderCircleIcon, RotateCcwIcon, SearchIcon, ShieldCheckIcon, SparklesIcon, XIcon } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Button } from "../ui/button.js";
 import { cn } from "../utils.js";
 import { attachAgentSession, createAgentSession } from "./agent-client.js";
@@ -145,6 +145,7 @@ export function AgentThreadView({
   const recoveryRequestedRef = useRef(false);
   const initialEventCountRef = useRef(thread.events.length);
   const initialStreamIndexRef = useRef(thread.session.streamIndex);
+  const initialHistoryStartIndexRef = useRef(thread.transcriptWindow?.startIndex);
   const compactedEventsRef = useRef<MessageStreamEvent[]>([...thread.events]);
   const compactedEventIdsRef = useRef(new Set(thread.events.map(eventIdentity)));
   const consumedStreamIndexRef = useRef(thread.session.streamIndex);
@@ -282,9 +283,11 @@ export function AgentThreadView({
     );
     retainedContextRef.current = recoveredContext;
     if (!sameContextEntries(recoveredContext, thread.retainedContext)) {
-      onChange({ retainedContext: recoveredContext, updatedAt: Date.now() });
+      // Rebuilding derived interruption context while opening history is not
+      // new conversation activity and must not move the thread in recents.
+      onChange({ retainedContext: recoveredContext, updatedAt: thread.updatedAt });
     }
-  }, [onChange, recoveryContextWindowTokens, thread.events, thread.retainedContext]);
+  }, [onChange, recoveryContextWindowTokens, thread.events, thread.retainedContext, thread.updatedAt]);
 
   useEffect(() => {
     closedInputRequestIdsRef.current = new Set(thread.closedInputRequestIds);
@@ -616,6 +619,15 @@ export function AgentThreadView({
   const liveRenderSnapshot = useThrottledSnapshot(liveRenderSource, 32);
   const renderEvents = liveRenderSnapshot.events;
   const renderMessages = liveRenderSnapshot.messages;
+  const historyWasPrepended = initialHistoryStartIndexRef.current !== undefined &&
+    thread.transcriptWindow?.startIndex !== undefined &&
+    thread.transcriptWindow.startIndex < initialHistoryStartIndexRef.current;
+  useLayoutEffect(() => {
+    if (!historyWasPrepended) return;
+    const merged = mergeThreadEventSnapshots(compactedEventsRef.current, thread.events);
+    compactedEventsRef.current = [...merged];
+    compactedEventIdsRef.current = new Set(merged.map(eventIdentity));
+  }, [historyWasPrepended, thread.events]);
   // Recovery is owned by the workspace so it can reconnect from Eve's durable
   // cursor. Keep the live snapshot visible while the worker catches up. The
   // worker may still be writing a shorter checkpoint during that handoff; using
@@ -658,12 +670,23 @@ export function AgentThreadView({
         : messagesFromEvents(recoveryMergedRenderEvents),
     [recoveryMergedRenderEvents, recoveryRenderEvents, recoveryRenderMessages, renderEvents, renderMessages],
   );
-  const effectiveRenderEvents = useRecoverySnapshot
+  const baseRenderEvents = useRecoverySnapshot
     ? recoveryMergedRenderEvents
     : renderEvents;
-  const effectiveRenderMessages = useRecoverySnapshot
-    ? recoveryMergedRenderMessages
-    : renderMessages;
+  const effectiveRenderEvents = useMemo(
+    () => historyWasPrepended
+      ? mergeThreadEventSnapshots(baseRenderEvents, thread.events)
+      : baseRenderEvents,
+    [baseRenderEvents, historyWasPrepended, thread.events],
+  );
+  const effectiveRenderMessages = useMemo(
+    () => effectiveRenderEvents === renderEvents
+      ? renderMessages
+      : effectiveRenderEvents === recoveryMergedRenderEvents
+        ? recoveryMergedRenderMessages
+        : messagesFromEvents(effectiveRenderEvents),
+    [effectiveRenderEvents, recoveryMergedRenderEvents, recoveryMergedRenderMessages, renderEvents, renderMessages],
+  );
   // Keep an accepted edit's superseded branch hidden until the replacement
   // assistant settles. `optimisticPendingTurn` is cleared at Eve's
   // message.received acknowledgement to release admission state, while the
@@ -788,6 +811,9 @@ export function AgentThreadView({
   const durableTurnSettled = !pendingTurnInFlight &&
     hasSettledLatestTurn(authoritativeEvents) &&
     hasSettledSessionBoundary(authoritativeEvents);
+  const editBoundarySettled = durableTurnSettled || (
+    admissionPendingTurn?.state === "interrupted" && cancellationState === "idle"
+  );
   const serverFollowUpInFlight = thread.queuedTurns.some((turn) =>
     turn.delivery === "server" &&
     (turn.state === "queued" || turn.state === "accepted" ||
@@ -2004,7 +2030,15 @@ export function AgentThreadView({
       try {
         const receipt = await mailbox.inspect(pendingTurn.mailboxItemId!);
         if (disposed || pendingTurnRef.current?.id !== pendingTurn.id) return;
-        if (receipt.status === "committed") return;
+        if (receipt.status === "committed") {
+          // Edits are admitted by the server mailbox rather than by this
+          // mounted Eve client. Once the worker commits the edit, attach from
+          // the last UI-consumed cursor so the replacement turn is streamed
+          // without requiring a page refresh. The recovery guard makes this
+          // handoff idempotent when later status polls observe the same receipt.
+          requestRecovery();
+          return;
+        }
         if (receipt.status === "failed" || receipt.status === "cancelled") {
           const failed = { ...pendingTurn, state: "delivery-failed" as const };
           pendingTurnRef.current = failed;
@@ -2371,13 +2405,14 @@ export function AgentThreadView({
           draftStorageKey={draftStorageKey}
           historyHasMore={historyHasMore}
           historyLoading={historyLoading}
+          historyStartIndex={thread.transcriptWindow?.startIndex}
           events={displayEvents}
           eveMessages={visibleMessages}
           fallbackStartedAt={displayPendingTurn?.submittedAt}
           inputDisabled={inputLocked}
           isBusy={isBusy}
           sessionTerminal={sessionTerminal}
-          sessionSettled={durableTurnSettled}
+          sessionSettled={editBoundarySettled}
           onCancel={requestCancellation}
           locale={locale}
           mentions={mentions}

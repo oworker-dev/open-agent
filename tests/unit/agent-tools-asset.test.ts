@@ -8,7 +8,6 @@ import {
   createFilesystemAssetStore,
 } from "../../server/data/asset-store.ts";
 import importAssetTool from "../../agent/tools/import_asset.ts";
-import importRemoteAssetTool from "../../agent/tools/import_remote_asset.ts";
 
 const owner = { principalId: "user-1", tenantId: "tenant-1" };
 
@@ -60,6 +59,8 @@ test("import_asset streams a persisted upload into the current Eve workspace and
       },
     };
     const context = {
+      abortSignal: new AbortController().signal,
+      callId: "call-existing-asset",
       getSandbox: async () => sandbox,
       session: {
         auth: {
@@ -109,6 +110,8 @@ test("import_asset rejects materialization that exceeds the per-session workspac
       () => (importAssetTool as unknown as { execute(input: { assetId: string; destination: string }, context: unknown): Promise<unknown> }).execute(
         { assetId: asset.assetId, destination: ".open-agent/assets/" },
         {
+          abortSignal: new AbortController().signal,
+          callId: "call-quota",
           getSandbox: async () => ({
             id: "session-quota",
             async readTextFile() { return null; },
@@ -157,6 +160,8 @@ test("import_asset rejects a ready asset already bound to another Agent session"
       () => (importAssetTool as unknown as { execute(input: { assetId: string }, context: unknown): Promise<unknown> }).execute(
         { assetId: asset.assetId },
         {
+          abortSignal: new AbortController().signal,
+          callId: "call-foreign-session",
           getSandbox: async () => ({ writeFile: async () => undefined }),
           session: {
             auth: {
@@ -206,6 +211,8 @@ test("import_asset rejects an asset whose content scan is not clean", async () =
       () => (importAssetTool as unknown as { execute(input: { assetId: string }, context: unknown): Promise<unknown> }).execute(
         { assetId: asset.assetId },
         {
+          abortSignal: new AbortController().signal,
+          callId: "call-rejected-scan",
           getSandbox: async () => ({ writeFile: async () => undefined }),
           session: {
             auth: {
@@ -226,7 +233,7 @@ test("import_asset rejects an asset whose content scan is not clean", async () =
   }
 });
 
-test("import_remote_asset streams a bounded remote body into session storage", async () => {
+test("import_asset can persist a bounded remote body without starting a sandbox", async () => {
   const root = await mkdtemp(join(tmpdir(), "open-agent-remote-asset-tool-"));
   const originalFetch = globalThis.fetch;
   try {
@@ -241,6 +248,8 @@ test("import_remote_asset streams a bounded remote body into session storage", a
     });
     const context = {
       abortSignal: new AbortController().signal,
+      callId: "call-remote-persist-only",
+      getSandbox: async () => { throw new Error("persist-only import must not start a sandbox"); },
       session: {
         auth: {
           current: {
@@ -252,21 +261,23 @@ test("import_remote_asset streams a bounded remote body into session storage", a
         id: "session-remote",
       },
     };
-    const result = await (importRemoteAssetTool as unknown as {
-      execute(input: { url: string }, context: unknown): Promise<{
+    const result = await (importAssetTool as unknown as {
+      execute(input: { destination: false; url: string }, context: unknown): Promise<{
         assetId: string;
         bytes: number;
         filename: string;
         mediaType: string;
+        path?: string;
         sessionId: string;
         sourceUrl: string;
       }>;
-    }).execute({ url: "https://1.1.1.1/assets/reference.png" }, context);
+    }).execute({ destination: false, url: "https://1.1.1.1/assets/reference.png" }, context);
     assert.equal(result.bytes, 4);
     assert.equal(result.filename, "reference.png");
     assert.equal(result.mediaType, "image/png");
     assert.equal(result.sessionId, "session-remote");
     assert.equal(result.sourceUrl, "https://1.1.1.1/assets/reference.png");
+    assert.equal(result.path, undefined);
     const metadata = await store.findAsset(result.assetId, owner);
     assert.equal(metadata?.sizeBytes, 4);
     assert.equal(metadata?.sessionId, "session-remote");
@@ -279,7 +290,99 @@ test("import_remote_asset streams a bounded remote body into session storage", a
   }
 });
 
-test("import_remote_asset rejects a response without Content-Length before reserving storage", async () => {
+test("import_asset reuses a persisted remote asset when sandbox materialization is retried", async () => {
+  const root = await mkdtemp(join(tmpdir(), "open-agent-remote-asset-retry-"));
+  const originalFetch = globalThis.fetch;
+  try {
+    const store = createFilesystemAssetStore({ root });
+    configureAssetStore(store);
+    let fetchCalls = 0;
+    globalThis.fetch = async () => {
+      fetchCalls += 1;
+      return new Response(new TextEncoder().encode("asset body"), {
+        headers: {
+          "content-length": "10",
+          "content-type": "text/plain",
+        },
+        status: 200,
+      });
+    };
+
+    const files = new Map<string, string | Uint8Array>();
+    let failMaterialization = true;
+    const sandbox = {
+      id: "session-remote-retry",
+      async readTextFile({ path }: { path: string }) {
+        const value = files.get(path);
+        return typeof value === "string" ? value : null;
+      },
+      async writeTextFile({ content, path }: { content: string; path: string }) {
+        files.set(path, content);
+      },
+      async writeFile({ content, path }: { content: ReadableStream<Uint8Array>; path: string }) {
+        if (failMaterialization) {
+          failMaterialization = false;
+          throw new Error("sandbox temporarily unavailable");
+        }
+        files.set(path, await readStream(content));
+      },
+      async removePath({ path }: { path: string }) {
+        files.delete(path);
+      },
+      async run({ command }: { command: string }) {
+        const match = /^mv -f -- '([^']+)' '([^']+)'$/u.exec(command);
+        if (match) {
+          const value = files.get(match[1]!);
+          if (value !== undefined) {
+            files.set(match[2]!, value);
+            files.delete(match[1]!);
+          }
+        }
+        return { exitCode: 0, stderr: "", stdout: "" };
+      },
+    };
+    const context = {
+      abortSignal: new AbortController().signal,
+      callId: "call-remote-retry",
+      getSandbox: async () => sandbox,
+      session: {
+        auth: {
+          current: {
+            attributes: { tenantId: owner.tenantId },
+            principalId: owner.principalId,
+            principalType: "user",
+          },
+        },
+        id: "session-remote-retry",
+      },
+    };
+    const execute = (importAssetTool as unknown as {
+      execute(input: { url: string }, context: unknown): Promise<{
+        assetId: string;
+        path?: string;
+      }>;
+    }).execute;
+
+    await assert.rejects(
+      () => execute({ url: "https://1.1.1.1/assets/reference.txt" }, context),
+      /sandbox temporarily unavailable/u,
+    );
+    const result = await execute(
+      { url: "https://1.1.1.1/assets/reference.txt" },
+      context,
+    );
+
+    assert.equal(fetchCalls, 1);
+    assert.equal(result.path, "/workspace/.open-agent/assets/reference.txt");
+    assert.deepEqual(files.get(result.path), new TextEncoder().encode("asset body"));
+    assert.equal((await store.findAsset(result.assetId, owner))?.status, "ready");
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("import_asset rejects a remote response without Content-Length before reserving storage", async () => {
   const root = await mkdtemp(join(tmpdir(), "open-agent-remote-asset-tool-"));
   const originalFetch = globalThis.fetch;
   try {
@@ -290,10 +393,12 @@ test("import_remote_asset rejects a response without Content-Length before reser
       status: 200,
     });
     await assert.rejects(
-      () => (importRemoteAssetTool as unknown as { execute(input: { url: string }, context: unknown): Promise<unknown> }).execute(
-        { url: "https://1.1.1.1/assets/reference.txt" },
+      () => (importAssetTool as unknown as { execute(input: { destination: false; url: string }, context: unknown): Promise<unknown> }).execute(
+        { destination: false, url: "https://1.1.1.1/assets/reference.txt" },
         {
           abortSignal: new AbortController().signal,
+          callId: "call-no-content-length",
+          getSandbox: async () => { throw new Error("invalid remote input must not start a sandbox"); },
           session: {
             auth: {
               current: {

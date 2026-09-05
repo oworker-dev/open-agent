@@ -183,11 +183,16 @@ set `AGENT_ASSET_SCAN_MODE=disabled`. `import_asset` and sandbox mounts admit
 only `clean` or explicitly `disabled` assets. The built-in S3 adapter is not,
 by itself, a malware-scanning solution.
 
-The built-in `import_asset` tool materializes an authenticated asset into the
-current workspace through Eve's streaming sandbox primitive. A first-turn
-browser upload is provisionally tagged with a `browser-*` session id; the first
-successful import atomically binds it to the current durable session. Assets
-already bound to another session are rejected, even for the same principal.
+The built-in `import_asset` tool accepts either an authenticated `assetId` or a
+remote HTTP(S) URL. Existing assets are materialized into the current workspace
+through Eve's streaming sandbox primitive. Remote assets first pass the same
+SSRF, quota, checksum, and content-scan boundary in `AssetStore`, then enter the
+workspace in the same tool call by default. A remote caller may set
+`destination: false` to retain the asset without creating or waking a sandbox.
+A first-turn browser upload is provisionally tagged with a `browser-*` session
+id; the first successful import atomically binds it to the current durable
+session. Assets already bound to another session are rejected, even for the
+same principal.
 `view_image`
 validates sandbox paths and common image signatures and emits a typed Eve file
 part capped at 3 MiB. When the sandbox provides ImageMagick, oversized images
@@ -294,7 +299,7 @@ an authorized asset resolver instead of a durable Base64 result.
 
 `web_fetch` is intentionally a bounded metadata/text tool and currently drops
 binary response bodies. It must not be changed to put arbitrary binary bytes in
-an Eve observation. Add a separate `import_asset` operation for an explicitly
+an Eve observation. The unified `import_asset` operation accepts an explicitly
 requested remote resource:
 
 ```ts
@@ -302,15 +307,17 @@ type ImportAssetInput = {
   url: string;
   filename?: string;
   mediaTypeHint?: string;
+  destination?: string | false;
 };
 ```
 
 The operation applies host SSRF policy, DNS/IP restrictions, response-size and
 redirect limits, content-type sniffing, checksum calculation, and tenant quota.
-It streams the response into `AssetStore`, returns an `assetId`, and makes the
-asset available for a later sandbox mount or `view_image` call. It does not
-return the binary body in the model observation. A host may disable remote
-import completely.
+It streams the response into `AssetStore`, returns an `assetId`, and copies the
+clean asset into the requested workspace destination unless `destination` is
+`false`. The storage and sandbox stages remain separate internally so unscanned
+bytes never cross into the sandbox. The operation does not return the binary
+body in the model observation. A host may disable remote import completely.
 
 Generated images, screenshots, and files created by tools use the same Asset
 contract. A tool may publish an asset explicitly; automatic persistence is

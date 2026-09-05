@@ -1,99 +1,79 @@
 import { defineTool } from "eve/tools";
 import { z } from "zod";
-import { publicationOwnerFromAuth } from "../lib/session-ownership-auth.ts";
-import { AssetStoreError, createAssetStoreFromEnvironment } from "../../server/data/asset-store.ts";
-import { writeSandboxImport } from "../lib/import-asset-quota.ts";
+import {
+  materializeAssetToSandbox,
+  persistRemoteAsset,
+} from "../lib/asset-import.ts";
+
+export { assertAssetSession } from "../lib/asset-import.ts";
+
+const destinationSchema = z.string().trim().min(1).max(512);
+
+const inputSchema = z.union([
+  z.strictObject({
+    assetId: z.string().trim().min(1).max(512),
+    destination: destinationSchema.default(".open-agent/assets/"),
+  }),
+  z.strictObject({
+    destination: z.union([destinationSchema, z.literal(false)]).default(".open-agent/assets/"),
+    filename: z.string().trim().min(1).max(255).optional(),
+    mediaTypeHint: z.string().trim().min(1).max(200).optional(),
+    timeout: z.number().finite().positive().max(120).optional(),
+    url: z.string().url(),
+  }),
+]);
 
 const outputSchema = z.object({
   assetId: z.string(),
-  bytes: z.number(),
+  bytes: z.number().int().positive(),
+  checksumSha256: z.string().length(64).optional(),
   filename: z.string(),
   mediaType: z.string(),
-  path: z.string(),
+  path: z.string().optional(),
   sessionId: z.string(),
+  sourceUrl: z.string().url().optional(),
 });
 
-/** Materialize a persisted host asset into the current isolated workspace. */
 export default defineTool({
   description: [
-    "Import a user or host asset into the current sandbox workspace.",
-    "The asset stays in object storage until this tool is used; do not ask users to paste large files into chat.",
-    "The imported file is read-only from the asset store and copied to the requested path under /workspace.",
+    "Import an existing session asset into the current sandbox workspace.",
+    "For user or host attachments, pass their assetId; the clean object-store asset is copied to the requested path under /workspace.",
+    "When no assetId exists yet, a remote HTTP(S) URL may be used as the source: it is SSRF-checked, persisted, scanned, and then copied to /workspace in the same call.",
+    "For a remote URL only, set destination to false to persist the asset without creating or waking the sandbox.",
+    "Imported workspace files are read-only source snapshots; copy them elsewhere before editing.",
   ].join(" "),
-  inputSchema: z.strictObject({
-    assetId: z.string().trim().min(1).max(512),
-    destination: z.string().trim().min(1).max(512).default(".open-agent/assets/"),
-  }),
+  inputSchema,
   outputSchema,
   async execute(input, ctx) {
-    const auth = ctx.session.auth.current;
-    if (!auth) throw new Error("Asset import requires an authenticated Agent session.");
-    const owner = publicationOwnerFromAuth(auth);
-    const store = createAssetStoreFromEnvironment();
-    let asset = await store.findAsset(input.assetId, owner);
-    if (!asset || asset.status !== "ready") throw new Error("The requested asset is not available.");
-    if (asset.scanStatus !== "clean" && asset.scanStatus !== "disabled") {
-      throw new Error("The requested asset is not available until its content scan completes.");
+    if ("assetId" in input) {
+      return materializeAssetToSandbox({
+        assetId: input.assetId,
+        destination: input.destination ?? ".open-agent/assets/",
+      }, ctx);
     }
-    if (asset.sessionId !== ctx.session.id) {
-      if (!asset.sessionId.startsWith("browser-") || !store.bindAssetSession) {
-        throw new Error("The requested asset belongs to a different Agent session.");
-      }
-      asset = await store.bindAssetSession({ assetId: asset.assetId, owner, sessionId: ctx.session.id });
-      if (!asset || asset.status !== "ready") {
-        throw new Error("The requested asset belongs to a different Agent session.");
-      }
-      if (asset.scanStatus !== "clean" && asset.scanStatus !== "disabled") {
-        throw new Error("The requested asset is not available until its content scan completes.");
-      }
-    }
-    const download = await store.openReadStream(asset.assetId, owner);
-    if (!download) throw new Error("The requested asset could not be read.");
-    const destination = normalizeWorkspacePath(input.destination, asset.filename);
-    const sandbox = await ctx.getSandbox();
-    await writeSandboxImport(sandbox, {
-      assetId: asset.assetId,
-      bytes: asset.sizeBytes,
-      content: download.stream,
+    const persisted = await persistRemoteAsset({
+      ...(input.filename ? { filename: input.filename } : {}),
+      ...(input.mediaTypeHint ? { mediaTypeHint: input.mediaTypeHint } : {}),
+      ...(input.timeout ? { timeout: input.timeout } : {}),
+      url: input.url,
+    }, ctx);
+    const destination = input.destination ?? ".open-agent/assets/";
+    if (destination === false) return persisted;
+    return materializeAssetToSandbox({
+      assetId: persisted.assetId,
       destination,
-    });
-    // Imported bytes are a source snapshot. Keep the source immutable inside
-    // the workspace while allowing the Agent to copy it elsewhere for edits.
-    try {
-      await sandbox.run({
-        command: `chmod a-w -- ${shellQuote(destination)}`,
-      });
-    } catch {
-      // Some development backends do not implement chmod. The object-store
-      // copy remains source-scoped; production Docker/microVM images support
-      // the immutable mode.
-    }
+    }, ctx).then((materialized) => ({
+      ...materialized,
+      sourceUrl: persisted.sourceUrl,
+      ...(persisted.checksumSha256 ? { checksumSha256: persisted.checksumSha256 } : {}),
+    }));
+  },
+  toModelOutput(output) {
     return {
-      assetId: asset.assetId,
-      bytes: asset.sizeBytes,
-      filename: asset.filename,
-      mediaType: asset.mediaType,
-      path: destination,
-      sessionId: ctx.session.id,
+      type: "text",
+      value: output.path
+        ? `Imported ${output.filename} (${output.mediaType}, ${output.bytes} bytes) as session asset ${output.assetId} at ${output.path}.`
+        : `Imported ${output.filename} (${output.mediaType}, ${output.bytes} bytes) as session asset ${output.assetId}.`,
     };
   },
 });
-
-function normalizeWorkspacePath(value: string, filename: string): string {
-  const normalized = value.startsWith("/") ? value : `/workspace/${value}`;
-  const path = normalized.endsWith("/") ? `${normalized}${filename}` : normalized;
-  if (!path.startsWith("/workspace/") || path.split("/").includes("..") || path.includes("\\")) {
-    throw new AssetStoreError("invalid", "Asset destinations must stay inside /workspace.");
-  }
-  return path;
-}
-
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/gu, `'\\''`)}'`;
-}
-
-export function assertAssetSession(assetSessionId: string, currentSessionId: string): void {
-  if (assetSessionId !== currentSessionId) {
-    throw new Error("The requested asset belongs to a different Agent session.");
-  }
-}

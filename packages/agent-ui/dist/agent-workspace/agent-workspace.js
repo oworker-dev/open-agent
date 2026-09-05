@@ -279,7 +279,9 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                                 : Math.max(thread.session.streamIndex, effectivePatch.session.streamIndex),
                         }
                         : thread.session,
-                    updatedAt: patch.updatedAt ?? Math.max(Date.now(), thread.updatedAt + 1),
+                    updatedAt: options?.preserveUpdatedAt
+                        ? thread.updatedAt
+                        : patch.updatedAt ?? Math.max(Date.now(), thread.updatedAt + 1),
                 };
             });
             threadsRef.current = next;
@@ -333,7 +335,6 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
             ...(settledPendingTurn ? { pendingTurn: settledPendingTurn } : { pendingTurn: undefined }),
             session: settledSession,
             status: settledStatus,
-            updatedAt: Date.now(),
         };
         if (caughtUpSettledRange && activeThreadIdRef.current === thread.id && !preserveRuntimeIdentity) {
             flushSync(() => {
@@ -345,11 +346,11 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                     next.set(thread.id, seed);
                     return next;
                 });
-                updateThread(thread.id, settledPatch);
+                updateThread(thread.id, settledPatch, { preserveUpdatedAt: true });
             });
         }
         else {
-            updateThread(thread.id, settledPatch);
+            updateThread(thread.id, settledPatch, { preserveUpdatedAt: true });
         }
         const transcriptComplete = hasCompleteTranscriptCoverage(thread, settledCursor) ||
             settledCursor <= settledEvents.length;
@@ -367,8 +368,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                         ...repaired,
                         events: compactThreadEvents(repaired.events),
                         ...(repairedPendingTurn ? { pendingTurn: repairedPendingTurn } : { pendingTurn: undefined }),
-                        updatedAt: Date.now(),
-                    });
+                    }, { preserveUpdatedAt: true });
                     return;
                 }
             }
@@ -420,8 +420,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                 revision: (thread.revision ?? 0) + 1,
                 session: settledSession,
                 status: settledStatus,
-                updatedAt: Date.now(),
-            });
+            }, { preserveUpdatedAt: true });
         }
         catch {
         }
@@ -437,8 +436,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
             if (thread.status === "streaming" || thread.status === "submitted") {
                 updateThread(thread.id, {
                     status: statusFromEvents(thread.events, new Set(thread.closedInputRequestIds)),
-                    updatedAt: Date.now(),
-                });
+                }, { preserveUpdatedAt: true });
             }
             return;
         }
@@ -859,7 +857,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                     ...(!reconciledPendingTurn ? { pendingTurn: undefined } : {}),
                     ...(healedCoverage ? { transcriptCoverage: healedCoverage } : {}),
                     ...(loaded.window ? { transcriptWindow: loaded.window } : {}),
-                    updatedAt: Date.now(),
+                    updatedAt: Math.max(thread.updatedAt, hydrated.updatedAt),
                 };
             const withWindow = loaded.window && nextThread.transcriptWindow !== loaded.window
                 ? { ...nextThread, transcriptWindow: loaded.window }
@@ -910,9 +908,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                     startIndex: loaded.window.startIndex,
                     total: Math.max(latestWindow.total, loaded.window.total),
                 },
-                revision: (latest.revision ?? 0) + 1,
-                updatedAt: Date.now(),
-            });
+            }, { preserveUpdatedAt: true });
         }
         catch (error) {
             onStorageError?.(error);
@@ -1454,6 +1450,10 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                         ? "error"
                         : recoveryStatus(),
             };
+            const recoveryUpdateOptions = {
+                ...(recoveryCursorReconciled ? { allowCursorRewind: true } : {}),
+                preserveUpdatedAt: true,
+            };
             if (activeThreadIdRef.current === thread.id && events.length > thread.events.length && !editRecovery) {
                 flushSync(() => {
                     setThreadRuntimeSeeds((current) => {
@@ -1464,11 +1464,11 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                         next.set(thread.id, seed);
                         return next;
                     });
-                    updateThread(thread.id, recoveryPatch, recoveryCursorReconciled ? { allowCursorRewind: true } : undefined);
+                    updateThread(thread.id, recoveryPatch, recoveryUpdateOptions);
                 });
             }
             else {
-                updateThread(thread.id, recoveryPatch, recoveryCursorReconciled ? { allowCursorRewind: true } : undefined);
+                updateThread(thread.id, recoveryPatch, recoveryUpdateOptions);
             }
         }
         catch (error) {
@@ -1476,7 +1476,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                 return;
             if (recoveryControllers.current.get(thread.id) !== controller)
                 return;
-            updateThread(thread.id, { status: "error", updatedAt: Date.now() });
+            updateThread(thread.id, { status: "error" }, { preserveUpdatedAt: true });
             setRecoveryErrors((current) => new Map(current).set(thread.id, error instanceof Error ? error.message : messages.recoveryFailed));
             console.error("Agent session recovery failed", error);
         }
@@ -1504,7 +1504,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
     const activeIsRecovering = activeThread ? recoveringIds.has(activeThread.id) : false;
     const activeIsReconnecting = activeThread ? reconnectingIds.has(activeThread.id) : false;
     const activeThreadRuntimeKey = activeThread
-        ? `${activeThread.id}:${activeThread.transcriptWindow?.startIndex ?? 0}:${threadRuntimeSeeds.get(activeThread.id) ?? "initial"}`
+        ? `${activeThread.id}:${threadRuntimeSeeds.get(activeThread.id) ?? "initial"}`
         : "none";
     const activeIsHydrating = activeThread?.hydration === "summary";
     if (!isHydrated || !activeThread)
@@ -2018,19 +2018,24 @@ async function saveThreadCollectionWithConflictRecovery(storageKey, collection, 
         catch (error) {
             if (!(error instanceof AgentThreadStorageConflictError) || attempt === 2)
                 throw error;
-            const remote = await loadConflictCollection(storageKey, storage);
+            const remote = await loadConflictCollection(storageKey, storage, candidate);
             candidate = mergeThreadCollectionsForConflict(candidate, remote);
         }
     }
     return candidate;
 }
-async function loadConflictCollection(storageKey, storage) {
+async function loadConflictCollection(storageKey, storage, local) {
     const index = await storage.load(storageKey);
     if (!storage.loadThread && !storage.loadThreadWindow)
         return index;
+    const localThreads = new Map(local.threads.map((thread) => [thread.id, thread]));
     const threads = [];
     for (const thread of index.threads) {
-        if (thread.hydration !== "summary") {
+        const localThread = localThreads.get(thread.id);
+        if (thread.hydration !== "summary" ||
+            !localThread ||
+            localThread.hydration === "summary" ||
+            !threadSnapshotsMayConflict(localThread, thread)) {
             threads.push(thread);
             continue;
         }
@@ -2047,6 +2052,12 @@ async function loadConflictCollection(storageKey, storage) {
         }
     }
     return { ...index, threads };
+}
+function threadSnapshotsMayConflict(local, remote) {
+    return local.updatedAt !== remote.updatedAt ||
+        local.revision !== remote.revision ||
+        local.session.sessionId !== remote.session.sessionId ||
+        local.session.streamIndex !== remote.session.streamIndex;
 }
 function mergeVisibleThreads(current, persisted, ephemeralIds) {
     const ephemeral = current.filter((thread) => ephemeralIds.has(thread.id));

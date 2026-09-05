@@ -20,6 +20,7 @@ test("session deliverable registry unifies uploads, artifacts, and website previ
     const previewStore = createPreviewStoreFromEnvironment({ AGENT_PREVIEW_STORAGE_PATH: join(root, "previews") });
     await artifactStore.create({
       artifactId: "art_123e4567-e89b-12d3-a456-426614174000",
+      alias: "Release notes",
       content: new TextEncoder().encode("# Delivered report"),
       expiresAt,
       filename: "report.md",
@@ -27,6 +28,7 @@ test("session deliverable registry unifies uploads, artifacts, and website previ
       principalId: owner.principalId,
       sessionId: "session-1",
       tenantId: owner.tenantId,
+      version: "2026.09.05",
     });
     await artifactStore.create({
       artifactId: "art_123e4567-e89b-12d3-a456-426614174001",
@@ -39,6 +41,7 @@ test("session deliverable registry unifies uploads, artifacts, and website previ
       tenantId: owner.tenantId,
     });
     await previewStore.create({
+      alias: "Marketing site",
       entrypoint: "index.html",
       expiresAt,
       files: [{ content: new TextEncoder().encode("<!doctype html><title>Site</title>"), mediaType: "text/html; charset=utf-8", path: "index.html" }],
@@ -46,6 +49,7 @@ test("session deliverable registry unifies uploads, artifacts, and website previ
       principalId: owner.principalId,
       sessionId: "session-1",
       tenantId: owner.tenantId,
+      version: "2",
     });
     const assetStore = {
       async listAssets(sessionId: string) {
@@ -71,6 +75,8 @@ test("session deliverable registry unifies uploads, artifacts, and website previ
 
     const artifact = deliverables.find((item) => item.kind === "artifact");
     assert.ok(artifact);
+    assert.equal(artifact.alias, "Release notes");
+    assert.equal(artifact.version, "2026.09.05");
     const artifactUrl = new URL(artifact.url, "https://agent.test");
     assert.deepEqual(
       verifyArtifactToken(artifactUrl.searchParams.get("token") ?? "", artifact.id, new Date("2029-01-01T00:00:00.000Z"), secret),
@@ -79,6 +85,8 @@ test("session deliverable registry unifies uploads, artifacts, and website previ
 
     const preview = deliverables.find((item) => item.kind === "website-preview");
     assert.ok(preview);
+    assert.equal(preview.alias, "Marketing site");
+    assert.equal(preview.version, "2");
     const previewUrl = new URL(preview.url, "https://agent.test");
     assert.deepEqual(
       verifyPreviewToken(previewUrl.searchParams.get("token") ?? "", preview.id, new Date("2029-01-01T00:00:00.000Z"), secret),

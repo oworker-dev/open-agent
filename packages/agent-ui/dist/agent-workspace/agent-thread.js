@@ -4,7 +4,7 @@ import { ClientError, defaultMessageReducer } from "eve/client";
 import { useEveAgent } from "eve/react";
 import { AssistantRuntimeProvider, unstable_defaultDirectiveFormatter, useExternalStoreRuntime } from "@assistant-ui/react";
 import { Clock3Icon, HammerIcon, LoaderCircleIcon, RotateCcwIcon, SearchIcon, ShieldCheckIcon, SparklesIcon, XIcon } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Button } from "../ui/button.js";
 import { cn } from "../utils.js";
 import { attachAgentSession, createAgentSession } from "./agent-client.js";
@@ -47,6 +47,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     const recoveryRequestedRef = useRef(false);
     const initialEventCountRef = useRef(thread.events.length);
     const initialStreamIndexRef = useRef(thread.session.streamIndex);
+    const initialHistoryStartIndexRef = useRef(thread.transcriptWindow?.startIndex);
     const compactedEventsRef = useRef([...thread.events]);
     const compactedEventIdsRef = useRef(new Set(thread.events.map(eventIdentity)));
     const consumedStreamIndexRef = useRef(thread.session.streamIndex);
@@ -141,9 +142,9 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         const recoveredContext = interruptedTurnContextsFromEvents(thread.events, thread.retainedContext, recoveryContextWindowTokens);
         retainedContextRef.current = recoveredContext;
         if (!sameContextEntries(recoveredContext, thread.retainedContext)) {
-            onChange({ retainedContext: recoveredContext, updatedAt: Date.now() });
+            onChange({ retainedContext: recoveredContext, updatedAt: thread.updatedAt });
         }
-    }, [onChange, recoveryContextWindowTokens, thread.events, thread.retainedContext]);
+    }, [onChange, recoveryContextWindowTokens, thread.events, thread.retainedContext, thread.updatedAt]);
     useEffect(() => {
         closedInputRequestIdsRef.current = new Set(thread.closedInputRequestIds);
     }, [thread.closedInputRequestIds]);
@@ -379,6 +380,16 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     const liveRenderSnapshot = useThrottledSnapshot(liveRenderSource, 32);
     const renderEvents = liveRenderSnapshot.events;
     const renderMessages = liveRenderSnapshot.messages;
+    const historyWasPrepended = initialHistoryStartIndexRef.current !== undefined &&
+        thread.transcriptWindow?.startIndex !== undefined &&
+        thread.transcriptWindow.startIndex < initialHistoryStartIndexRef.current;
+    useLayoutEffect(() => {
+        if (!historyWasPrepended)
+            return;
+        const merged = mergeThreadEventSnapshots(compactedEventsRef.current, thread.events);
+        compactedEventsRef.current = [...merged];
+        compactedEventIdsRef.current = new Set(merged.map(eventIdentity));
+    }, [historyWasPrepended, thread.events]);
     const recoveryRenderEvents = useThrottledSnapshot(thread.events, 75);
     const durableEditBoundary = thread.events.some((event) => event.type === "context.cleared");
     const liveEditBoundary = agent.events.some((event) => event.type === "context.cleared");
@@ -395,12 +406,17 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         : recoveryMergedRenderEvents === recoveryRenderEvents
             ? recoveryRenderMessages
             : messagesFromEvents(recoveryMergedRenderEvents), [recoveryMergedRenderEvents, recoveryRenderEvents, recoveryRenderMessages, renderEvents, renderMessages]);
-    const effectiveRenderEvents = useRecoverySnapshot
+    const baseRenderEvents = useRecoverySnapshot
         ? recoveryMergedRenderEvents
         : renderEvents;
-    const effectiveRenderMessages = useRecoverySnapshot
-        ? recoveryMergedRenderMessages
-        : renderMessages;
+    const effectiveRenderEvents = useMemo(() => historyWasPrepended
+        ? mergeThreadEventSnapshots(baseRenderEvents, thread.events)
+        : baseRenderEvents, [baseRenderEvents, historyWasPrepended, thread.events]);
+    const effectiveRenderMessages = useMemo(() => effectiveRenderEvents === renderEvents
+        ? renderMessages
+        : effectiveRenderEvents === recoveryMergedRenderEvents
+            ? recoveryMergedRenderMessages
+            : messagesFromEvents(effectiveRenderEvents), [effectiveRenderEvents, recoveryMergedRenderEvents, recoveryMergedRenderMessages, renderEvents, renderMessages]);
     const pendingEditOperation = optimisticPendingTurn ?? optimisticDisplayTurn ?? thread.pendingTurn;
     const pendingEditTurnId = pendingEditOperation?.operation === "edit" &&
         isPendingTurnInFlight(pendingEditOperation)
@@ -463,6 +479,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     const durableTurnSettled = !pendingTurnInFlight &&
         hasSettledLatestTurn(authoritativeEvents) &&
         hasSettledSessionBoundary(authoritativeEvents);
+    const editBoundarySettled = durableTurnSettled || (admissionPendingTurn?.state === "interrupted" && cancellationState === "idle");
     const serverFollowUpInFlight = thread.queuedTurns.some((turn) => turn.delivery === "server" &&
         (turn.state === "queued" || turn.state === "accepted" ||
             turn.state === "delivering" || turn.state === "committed" ||
@@ -1371,8 +1388,10 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
                 const receipt = await mailbox.inspect(pendingTurn.mailboxItemId);
                 if (disposed || pendingTurnRef.current?.id !== pendingTurn.id)
                     return;
-                if (receipt.status === "committed")
+                if (receipt.status === "committed") {
+                    requestRecovery();
                     return;
+                }
                 if (receipt.status === "failed" || receipt.status === "cancelled") {
                     const failed = { ...pendingTurn, state: "delivery-failed" };
                     pendingTurnRef.current = failed;
@@ -1636,7 +1655,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         turn.state !== "accepted" &&
         turn.state !== "committed");
     const showRecoveryStatus = isReconnecting && displayPendingTurn?.operation !== "edit";
-    return (_jsx(AssistantRuntimeProvider, { runtime: assistantRuntime, children: _jsx("main", { className: "flex min-h-0 flex-1 flex-col overflow-hidden", children: _jsx(AssistantThreadSurface, { assetUrl: client?.assetUrl, approvalTakeover: approvalTakeover, cancellationState: cancellationState, commands: commands, composerTop: showRecoveryStatus || visibleQueuedTurns.length > 0 || queueError ? (_jsxs(_Fragment, { children: [showRecoveryStatus ? (_jsxs("div", { className: "flex items-center gap-2 border-b border-border/60 px-1 pb-2 text-xs text-muted-foreground", "data-agent-recovery-status": true, role: "status", children: [_jsx(LoaderCircleIcon, { className: "size-3.5 animate-spin" }), _jsx("span", { children: messages.reconnecting })] })) : null, visibleQueuedTurns.length > 0 || queueError ? (_jsx(FollowUpQueue, { error: queueError, messages: messages, onRemove: removeQueuedTurn, onRetry: markQueuedTurnForRetry, turns: visibleQueuedTurns })) : null] })) : undefined, draftStorageKey: draftStorageKey, historyHasMore: historyHasMore, historyLoading: historyLoading, events: displayEvents, eveMessages: visibleMessages, fallbackStartedAt: displayPendingTurn?.submittedAt, inputDisabled: inputLocked, isBusy: isBusy, sessionTerminal: sessionTerminal, sessionSettled: durableTurnSettled, onCancel: requestCancellation, locale: locale, mentions: mentions, messages: messages, models: models, onInputResponses: respond, onCloseInputRequest: closeInputRequest, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, onLoadEarlier: onLoadEarlier, onPreferencesChange: (preferences) => onChange({ preferences }), onDraftRestoreConsumed: (id) => {
+    return (_jsx(AssistantRuntimeProvider, { runtime: assistantRuntime, children: _jsx("main", { className: "flex min-h-0 flex-1 flex-col overflow-hidden", children: _jsx(AssistantThreadSurface, { assetUrl: client?.assetUrl, approvalTakeover: approvalTakeover, cancellationState: cancellationState, commands: commands, composerTop: showRecoveryStatus || visibleQueuedTurns.length > 0 || queueError ? (_jsxs(_Fragment, { children: [showRecoveryStatus ? (_jsxs("div", { className: "flex items-center gap-2 border-b border-border/60 px-1 pb-2 text-xs text-muted-foreground", "data-agent-recovery-status": true, role: "status", children: [_jsx(LoaderCircleIcon, { className: "size-3.5 animate-spin" }), _jsx("span", { children: messages.reconnecting })] })) : null, visibleQueuedTurns.length > 0 || queueError ? (_jsx(FollowUpQueue, { error: queueError, messages: messages, onRemove: removeQueuedTurn, onRetry: markQueuedTurnForRetry, turns: visibleQueuedTurns })) : null] })) : undefined, draftStorageKey: draftStorageKey, historyHasMore: historyHasMore, historyLoading: historyLoading, historyStartIndex: thread.transcriptWindow?.startIndex, events: displayEvents, eveMessages: visibleMessages, fallbackStartedAt: displayPendingTurn?.submittedAt, inputDisabled: inputLocked, isBusy: isBusy, sessionTerminal: sessionTerminal, sessionSettled: editBoundarySettled, onCancel: requestCancellation, locale: locale, mentions: mentions, messages: messages, models: models, onInputResponses: respond, onCloseInputRequest: closeInputRequest, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, onLoadEarlier: onLoadEarlier, onPreferencesChange: (preferences) => onChange({ preferences }), onDraftRestoreConsumed: (id) => {
                     if (thread.draftRestore?.id === id)
                         onChange({ draftRestore: undefined });
                 }, onRetryRuntimeError: recoveryError ? onRetryRecovery : undefined, closedInputRequestIds: closedInputRequestIdsRef.current, preferences: thread.preferences, reasoningLevels: reasoningLevels, draftRestore: thread.draftRestore, runtimeFailure: runtimeFailure, runtimeError: runtimeError, runtimeRetry: providerRetry, usage: usage }) }) }));

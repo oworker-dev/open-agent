@@ -319,6 +319,20 @@ export function createFilesystemAssetStore(options: FilesystemAssetStoreOptions)
       return publicUpload(record);
     },
 
+    async findUploadByAsset(assetId, owner) {
+      assertIdentifier(assetId, "assetId");
+      for (const uploadId of await childDirectories(join(root, "uploads"))) {
+        const record = await readUpload(root, uploadId).catch((error: unknown) => {
+          if (error instanceof AssetStoreError && error.code === "not_found") return undefined;
+          throw error;
+        });
+        if (!record || record.assetId !== assetId) continue;
+        assertOwner(record.owner, owner);
+        return publicUpload(record);
+      }
+      return undefined;
+    },
+
     async listAssets(sessionId, owner) {
       if (sessionId.trim().length === 0 || sessionId.length > 512) {
         throw new AssetStoreError("invalid", "The session id is invalid.");

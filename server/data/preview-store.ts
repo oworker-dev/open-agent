@@ -17,6 +17,7 @@ import {
   writePublicationObject,
 } from "./publication-object.ts";
 import { iterateDirectoryEntries } from "./filesystem-directory.ts";
+import { normalizePublicationMetadata } from "./publication-metadata.ts";
 
 const MAX_PREVIEW_BYTES = 25 * 1024 * 1024;
 
@@ -27,6 +28,7 @@ export type PreviewFileInput = {
 };
 
 export type PreviewRecord = {
+  readonly alias?: string;
   readonly createdAt: string;
   readonly entrypoint: string;
   readonly expiresAt: string;
@@ -36,6 +38,7 @@ export type PreviewRecord = {
   readonly sessionId: string;
   readonly tenantId: string;
   readonly totalBytes: number;
+  readonly version?: string;
 };
 
 export type PreviewFile = {
@@ -51,6 +54,7 @@ type PersistedPreviewFile = {
 
 export interface PreviewStore {
   create(input: {
+    readonly alias?: string;
     readonly entrypoint: string;
     readonly expiresAt: Date;
     readonly files: readonly PreviewFileInput[];
@@ -58,6 +62,7 @@ export interface PreviewStore {
     readonly principalId: string;
     readonly sessionId: string;
     readonly tenantId: string;
+    readonly version?: string;
   }): Promise<PreviewRecord>;
   find(previewId: string): Promise<PreviewRecord | undefined>;
   list(sessionId: string, owner: PublicationOwner): Promise<readonly PreviewRecord[]>;
@@ -104,6 +109,7 @@ function postgresPreviewStore(
   return {
     async create(input) {
       assertPreviewInput(input);
+      const metadata = normalizePublicationMetadata(input);
       const previewId = input.previewId ?? `prv_${randomUUID()}`;
       const owner = { principalId: input.principalId, tenantId: input.tenantId };
       const persisted: readonly PersistedPreviewFile[] = assetStore
@@ -117,10 +123,10 @@ function postgresPreviewStore(
         return await withTransaction(pool, async (client) => {
           const result = await client.query<PreviewRow>(
             `insert into ${previews}
-              (preview_id, session_id, tenant_id, principal_id, entrypoint, expires_at, file_count, total_bytes)
-             values ($1, $2, $3, $4, $5, $6, $7, $8)
+              (preview_id, session_id, tenant_id, principal_id, entrypoint, expires_at, file_count, total_bytes, alias, version)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              returning preview_id, session_id, tenant_id, principal_id, entrypoint,
-               expires_at, created_at, file_count, total_bytes`,
+               expires_at, created_at, file_count, total_bytes, alias, version`,
             [
               previewId,
               input.sessionId,
@@ -130,6 +136,8 @@ function postgresPreviewStore(
               input.expiresAt,
               input.files.length,
               input.files.reduce((total, file) => total + file.content.byteLength, 0),
+              metadata.alias ?? null,
+              metadata.version ?? null,
             ],
           );
           for (const item of persisted) {
@@ -161,7 +169,7 @@ function postgresPreviewStore(
     async find(previewId) {
       const result = await pool.query<PreviewRow>(
         `select preview_id, session_id, tenant_id, principal_id, entrypoint,
-           expires_at, created_at, file_count, total_bytes
+           expires_at, created_at, file_count, total_bytes, alias, version
          from ${previews}
          where preview_id = $1`,
         [previewId],
@@ -172,7 +180,7 @@ function postgresPreviewStore(
       assertListInput(sessionId, owner);
       const result = await pool.query<PreviewRow>(
         `select preview_id, session_id, tenant_id, principal_id, entrypoint,
-           expires_at, created_at, file_count, total_bytes
+           expires_at, created_at, file_count, total_bytes, alias, version
          from ${previews}
          where session_id = $1 and tenant_id = $2 and principal_id = $3 and expires_at > now()
          order by created_at desc
@@ -279,8 +287,10 @@ function createFilesystemPreviewStore(root: string): PreviewStore {
   return {
     async create(input) {
       assertPreviewInput(input);
+      const metadata = normalizePublicationMetadata(input);
       const previewId = input.previewId ?? `prv_${randomUUID()}`;
       const record: PreviewRecord = {
+        ...metadata,
         createdAt: new Date().toISOString(),
         entrypoint: input.entrypoint,
         expiresAt: input.expiresAt.toISOString(),
@@ -359,6 +369,7 @@ function createFilesystemPreviewStore(root: string): PreviewStore {
 }
 
 type PreviewRow = {
+  alias?: string | null;
   created_at: Date | string;
   entrypoint: string;
   expires_at: Date | string;
@@ -367,12 +378,14 @@ type PreviewRow = {
   principal_id: string;
   session_id: string;
   tenant_id: string;
-  total_bytes: number;
+  total_bytes: number | string;
+  version?: string | null;
 };
 
 function toRecord(row: PreviewRow): PreviewRecord {
   if (!row) throw new Error("The preview store returned no created preview.");
   return {
+    ...(row.alias ? { alias: row.alias } : {}),
     createdAt: asIso(row.created_at),
     entrypoint: row.entrypoint,
     expiresAt: asIso(row.expires_at),
@@ -381,18 +394,22 @@ function toRecord(row: PreviewRow): PreviewRecord {
     principalId: row.principal_id,
     sessionId: row.session_id,
     tenantId: row.tenant_id,
-    totalBytes: row.total_bytes,
+    totalBytes: asByteCount(row.total_bytes),
+    ...(row.version ? { version: row.version } : {}),
   };
 }
 
 function assertPreviewInput(input: {
+  readonly alias?: string;
   readonly entrypoint: string;
   readonly expiresAt: Date;
   readonly files: readonly PreviewFileInput[];
   readonly principalId: string;
   readonly sessionId: string;
   readonly tenantId: string;
+  readonly version?: string;
 }): void {
+  normalizePublicationMetadata(input);
   if (!input.sessionId || !input.tenantId || !input.principalId) {
     throw new Error("A preview requires a session and authenticated owner.");
   }
@@ -438,6 +455,7 @@ function isPreviewRecord(value: unknown): value is PreviewRecord {
   if (!value || typeof value !== "object") return false;
   const record = value as Partial<PreviewRecord>;
   return typeof record.previewId === "string"
+    && (record.alias === undefined || typeof record.alias === "string")
     && typeof record.entrypoint === "string"
     && typeof record.expiresAt === "string"
     && typeof record.createdAt === "string"
@@ -445,7 +463,14 @@ function isPreviewRecord(value: unknown): value is PreviewRecord {
     && typeof record.totalBytes === "number"
     && typeof record.sessionId === "string"
     && typeof record.tenantId === "string"
-    && typeof record.principalId === "string";
+    && typeof record.principalId === "string"
+    && (record.version === undefined || typeof record.version === "string");
+}
+
+function asByteCount(value: number | string): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) throw new Error("The preview size is invalid.");
+  return parsed;
 }
 
 function mediaTypeFromPath(path: string): string {

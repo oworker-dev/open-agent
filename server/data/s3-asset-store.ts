@@ -528,6 +528,14 @@ export function createS3AssetStore(options: S3AssetStoreOptions): AssetStore {
       return toUpload(row, maxBytes, parts);
     },
 
+    async findUploadByAsset(assetId, owner) {
+      const row = await readUploadByAsset(pool, table, assetId);
+      if (!row) return undefined;
+      assertOwner({ principalId: row.principal_id, principalType: row.principal_type ?? undefined, issuer: row.issuer ?? undefined, tenantId: row.tenant_id }, owner);
+      const parts = await readParts(pool, table.parts, row.upload_id);
+      return toUpload(row, maxBytes, parts);
+    },
+
     async listAssets(sessionId, owner) {
       assertIdentifier(sessionId, "sessionId");
       assertOwnerInput(owner);
@@ -700,6 +708,26 @@ async function readUpload(pool: SqlExecutor, tables: ReturnType<typeof tableName
   const row = result.rows[0];
   if (!row) throw new AssetStoreError("not_found", "The asset upload was not found.");
   return row;
+}
+
+async function readUploadByAsset(
+  pool: SqlExecutor,
+  tables: ReturnType<typeof tableNames>,
+  assetId: string,
+): Promise<UploadRow | undefined> {
+  assertIdentifier(assetId, "assetId");
+  const result = await pool.query<UploadRow>(
+    `select upload.asset_id, upload.upload_id, upload.provider_upload_id,
+       upload.tenant_id, upload.principal_id, upload.principal_type, upload.issuer, upload.session_id,
+       asset.filename, asset.media_type, asset.storage_key,
+       upload.declared_size_bytes, upload.chunk_size_bytes, upload.part_count,
+       upload.status, upload.created_at, upload.updated_at, asset.scan_status, asset.expires_at
+     from ${tables.uploads} upload
+     join ${tables.assets} asset on asset.asset_id = upload.asset_id
+     where upload.asset_id = $1`,
+    [assetId],
+  );
+  return result.rows[0];
 }
 
 async function readAsset(pool: SqlExecutor, tables: ReturnType<typeof tableNames>, assetId: string): Promise<AssetRow | undefined> {
