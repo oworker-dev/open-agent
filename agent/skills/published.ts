@@ -7,6 +7,7 @@ import {
 import { readAgentRunPolicy } from "../lib/run-policy.ts";
 import { createPostgresAgentExtensionStoreFromEnvironment } from "../../server/data/agent-extension-store.ts";
 import { readAgentRuntimeConfig } from "../lib/runtime-config.ts";
+import { definePublishedSkill } from "../lib/published-skill.ts";
 
 const SOFTWARE_TASK = {
   id: "software-task",
@@ -45,10 +46,7 @@ async function resolvePublishedSkills(ctx: DynamicResolveContext) {
     skills.flatMap((skill) => {
       const runtimeExtension = runtimeExtensionForRef(config, "skill", skill);
       if (runtimeExtension?.skill) {
-        return [[skill.id, defineSkill({
-          description: runtimeExtension.description,
-          markdown: runtimeExtension.skill.markdown,
-        })]];
+        return [[skill.id, definePublishedSkill(runtimeExtension)]];
       }
       if (skill.id === SOFTWARE_TASK.id && skill.version === SOFTWARE_TASK.version) {
         return [["software-task", defineSkill({

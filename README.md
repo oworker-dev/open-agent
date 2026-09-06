@@ -429,6 +429,8 @@ For an explicit Docker deployment, configure finite per-container limits:
 AGENT_DOCKER_MEMORY_LIMIT_BYTES=2GiB \
 AGENT_DOCKER_CPU_LIMIT=2 \
 AGENT_DOCKER_PIDS_LIMIT=512 \
+AGENT_SANDBOX_COMMAND_TIMEOUT_MS=1800000 \
+AGENT_SANDBOX_NETWORK_MODE=isolated \
 AGENT_SANDBOX_IDLE_TIMEOUT_MS=1800000 \
 AGENT_SANDBOX_MAX_ACTIVE=2 \
 AGENT_SANDBOX_MAX_QUEUED=1024 \
@@ -607,7 +609,14 @@ It prevents future calls; it cannot roll back a side effect that already
 completed, so write capabilities still require approval and idempotency.
 
 The current standalone catalog contains `software-task@1.0.0`. Runtime Config can
-publish tenant procedure text as a dynamic Skill without rebuilding the Agent.
+publish tenant procedure text or a bounded standard Skill package as a dynamic
+Skill without rebuilding the Agent. Package files are validated and materialized
+only in the owning Eve session sandbox; they do not run in the Open Agent
+process or add tools, credentials, network access, or approval authority.
+The parser caps one package at 1 MiB, but hosts should keep inline packages
+small because Runtime Config is carried in authenticated session attributes and
+may be transported in a JWT. Larger immutable packages should use a future
+object-store reference instead of being placed in a token.
 It can also publish MCP lifecycle metadata, but Eve MCP connection adapters are
 build-time capabilities: a manifest alone does not create a network connection.
 AgentRun policy resolution fails closed when MCP metadata has no matching
@@ -704,5 +713,6 @@ list exposes no optional tools. The grant is stored in the durable session
 authentication snapshot and Eve filters the model-visible tool set before each
 call, so a no-sandbox profile does not merely fail sandbox calls after the
 model has already seen them. Tool names select capabilities compiled into the
-deployment; Runtime Config cannot inject executable code or an unreviewed MCP
-adapter.
+deployment; Runtime Config cannot inject Open Agent tools or an unreviewed MCP
+adapter. Skill package scripts are only sandbox files and execute only through
+already-granted tools.

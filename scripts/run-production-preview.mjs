@@ -85,6 +85,7 @@ const runtimeEnvironment = {
   AGENT_HOST_REQUIRE_DOCKER_LIMITS: process.env.AGENT_HOST_REQUIRE_DOCKER_LIMITS || "1",
   AGENT_METRICS_SECRET: metricsSecret,
   AGENT_MODEL_MAX_OUTPUT_TOKENS: "4096",
+  AGENT_SANDBOX_COMMAND_TIMEOUT_MS: process.env.AGENT_SANDBOX_COMMAND_TIMEOUT_MS || "1800000",
   // Admission is persisted in PostgreSQL so multiple Web replicas cannot
   // oversubscribe this small single-host preview. Hosts with a scheduler may
   // override both values with their measured safe limits.
@@ -106,6 +107,8 @@ const runtimeEnvironment = {
   // Docker remains the local-preview default, while allowing a deployment to
   // select a provider-owned backend without starting the Docker-only reaper.
   AGENT_SANDBOX_BACKEND: process.env.AGENT_SANDBOX_BACKEND?.trim() || "docker",
+  AGENT_SANDBOX_NETWORK_MODE: process.env.AGENT_SANDBOX_NETWORK_MODE?.trim() || "isolated",
+  AGENT_SANDBOX_NETWORK_ALLOWLIST: process.env.AGENT_SANDBOX_NETWORK_ALLOWLIST || "",
   AGENT_SANDBOX_MAX_ACTIVE: process.env.AGENT_SANDBOX_MAX_ACTIVE || "2",
   AGENT_SANDBOX_MAX_QUEUED: process.env.AGENT_SANDBOX_MAX_QUEUED || "1024",
   AGENT_SANDBOX_ADMISSION_TIMEOUT_MS: process.env.AGENT_SANDBOX_ADMISSION_TIMEOUT_MS || "30000",

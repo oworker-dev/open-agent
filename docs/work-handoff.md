@@ -74,7 +74,9 @@ Muses 是第一个宿主，但不是 Open Agent 的编译期依赖。模型凭�
 - 当前沙箱镜像包含 Node/npm、Python、Git、FFmpeg、ImageMagick、ripgrep 和
   Playwright/Chromium；
 - Docker、microsandbox、Vercel 后端可选，生产必须显式选择后端和不可变镜像；
-- 当前策略默认 `deny-all` 出站网络；
+- 当前策略默认 `isolated`（`deny-all`）出站网络；部署可显式选择
+  `standard`（受控依赖/代码托管域名白名单）或受信单租户的 `trusted`
+  （`allow-all`）；
 - 当前生产预览基线约为 2 vCPU、2 GiB 内存、512 PID、10 GiB 逻辑工作区配额，
   活动沙箱和等待队列有上限，空闲后释放计算许可；
 - Docker 单租户 alpha/staging 可接受，多租户互不信任场景需要 microsandbox、
@@ -202,7 +204,8 @@ Web / VS Code
 
 ### 阶段 4：网络、依赖和数据库能力
 
-- 默认仍为 `deny-all`；工作区模式提供用户可见的开发网络开关；
+- 默认仍为 `isolated`（`deny-all`）；工作区模式未来可提供用户可见的开发
+  网络开关，当前 `standard` 仅允许经审查的依赖/代码托管域名；
 - 优先使用域名白名单、出站代理和凭据代理，不把密钥写入沙箱；
 - 小任务使用 SQLite；普通项目使用 Host 提供的共享数据库命名空间；
 - 独立数据库只作为更高资源等级，由远程服务提供，并设置连接、存储、TTL 和

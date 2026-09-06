@@ -230,6 +230,20 @@ after a durable checkpoint without retiring the session. For Docker, also run
 the authorized sandbox deletion worker; a stopped container keeps its filesystem
 and the next sandbox access resumes the same `/workspace`.
 
+The built-in foreground `bash` tool enforces
+`AGENT_SANDBOX_COMMAND_TIMEOUT_MS` (30 minutes by default). The deadline is
+composed with Eve's cancellation signal, so a user cancellation still follows
+the normal `turn.cancelled` path and a timed-out command returns a typed tool
+failure after the backend terminates it. This does not turn `bash` into an
+asynchronous process manager; long-lived servers and watchers require a future
+explicit process lifecycle capability.
+
+Set `AGENT_SANDBOX_NETWORK_MODE` explicitly in production. `isolated` blocks
+all sandbox egress, `standard` allows the built-in dependency/source domains
+plus `AGENT_SANDBOX_NETWORK_ALLOWLIST` on microsandbox or Vercel, and `trusted`
+enables allow-all only for a trusted single-tenant deployment. Docker supports
+only `isolated` and `trusted` because its Eve backend has no domain-level policy.
+
 ```bash
 AGENT_SANDBOX_IDLE_TIMEOUT_MS=1800000 \
 AGENT_SANDBOX_MAX_ACTIVE=2 \

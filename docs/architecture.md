@@ -361,9 +361,12 @@ production doctor rejects implicit selection and requires
 `sandbox/Dockerfile` pins Eve's base image and adds Node/npm, Python, Git,
 FFmpeg, ImageMagick, ripgrep, and Playwright/Chromium. The authored policy applies
 2 vCPU/2048 MiB limits where supported, writes a session marker into the
-session-owned `/workspace`, and applies `deny-all` egress at backend creation
-and session start. Docker and microsandbox enforce the coarse policy; Vercel
-Sandbox receives the live policy through Eve's network-policy API.
+session-owned `/workspace`, and applies the configured network mode at backend
+creation and session start. `isolated` is deny-all, `standard` is a bounded
+dependency/source allow-list on microsandbox or Vercel, and `trusted` is
+explicit allow-all for a trusted single-tenant deployment. Docker enforces only
+the coarse allow-all/deny-all forms; Vercel and microsandbox receive the
+fine-grained policy through Eve's network-policy API.
 
 `AGENT_DEPLOYMENT_TENANCY` makes the trust model explicit. Eve 0.31.1's Docker
 backend does not expose CPU, memory, PID, Linux capability, or non-root controls
@@ -383,6 +386,12 @@ Every backend also uses `AGENT_SANDBOX_MAX_ACTIVE` and
 plus `AGENT_SANDBOX_MAX_QUEUED` to bound waiting sessions and memory during a
 burst. A full queue fails before a backend is allocated; it is not a
 conversation or event-history limit.
+The authored `bash` wrapper also applies `AGENT_SANDBOX_COMMAND_TIMEOUT_MS`
+(30 minutes by default, bounded to one hour) to each foreground command. It
+composes that deadline with Eve's turn `AbortSignal`, so user cancellation and
+timeout both terminate the current command through the backend's normal kill
+path. This is a command safety bound, not a sandbox idle timer: a command that
+is still running is never considered idle.
 After each durable sandbox checkpoint, the idle timer stops compute but
 preserves the container filesystem and reconnect metadata. A later sandbox call
 reattaches the same `/workspace` and reacquires a FIFO permit. These are
@@ -430,14 +439,22 @@ file bytes.
 Skills add instructions; they do not add authority. MCP connections and tools
 must be scoped by the current principal, session, and approval policy.
 
-Host-published Skill manifests and procedure markdown may be carried in the
-credential-free `AgentRuntimeConfigSnapshot.extensions` field. The Agent pins
-that snapshot at session start, validates that Profile grants have matching
-manifests, and resolves the Skill dynamically for the session. MCP entries may
-be declared as HTTPS endpoint metadata only; the runtime never turns that
-metadata into network code. A deployment must explicitly author a compiled
-connection with the reviewed `@oworker/open-agent-mcp-adapter` factory, and its
-exact id/version must also exist in the deployment catalog.
+Host-published Skill manifests and bounded standard Skill packages may be carried
+in the credential-free `AgentRuntimeConfigSnapshot.extensions` field. A package
+contains validated `SKILL.md` content and optional relative files. The Agent pins
+the exact version at session start and Eve materializes the package only inside
+that session's sandbox. Package scripts run only through tools already granted to
+the AgentRun; a Skill cannot add tools, credentials, network access, or approval
+authority. Hosts should use immutable versions and limit package content to the
+trusted host's own sessions. The parser caps one package at 1 MiB, but hosts
+should keep inline packages small because Runtime Config travels through
+authenticated session attributes and may be carried in a JWT. Larger packages
+need a future immutable object-store reference rather than a JWT claim.
+
+MCP entries may be declared as HTTPS endpoint metadata only; the runtime never
+turns that metadata into network code. A deployment must explicitly author a
+compiled connection with the reviewed `@oworker/open-agent-mcp-adapter` factory,
+and its exact id/version must also exist in the deployment catalog.
 
 Eve compaction remains deployment-level configuration. The Runtime Config
 contract exposes the selected threshold for UI and audit consistency, but it
@@ -458,7 +475,7 @@ Only JWT principals with `agent.extensions.manage` may change installations.
 Every enable/revoke mutation is appended to `agent_extension_audit_events`;
 credential references and values are excluded from audit state. A revocation
 takes effect on the next Run or continuation boundary, not retroactively on a
-completed external side effect. Runtime Config Skill text resolves dynamically
+completed external side effect. Runtime Config Skill packages resolve dynamically
 after the same lifecycle check. MCP manifest metadata can enter the lifecycle
 catalog, but Eve connections are still build-time authored capabilities; a
 manifest cannot create an unreviewed network adapter, and AgentRun policy

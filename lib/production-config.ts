@@ -1,5 +1,8 @@
 import { validateHostGatewayRegistry } from "../agent/lib/host-capabilities.ts";
-
+import {
+  readAgentSandboxNetworkAllowlist,
+  readAgentSandboxNetworkMode,
+} from "./sandbox-network-policy.ts";
 export type ProductionDiagnostic = {
   readonly code: string;
   readonly level: "error" | "warning";
@@ -32,6 +35,9 @@ export const DEFAULT_AGENT_DOCKER_PIDS_LIMIT = 512;
 export const MAX_AGENT_DOCKER_PIDS_LIMIT = 32_768;
 export const DEFAULT_AGENT_SANDBOX_IDLE_TIMEOUT_MS = 30 * 60 * 1_000;
 export const MAX_AGENT_SANDBOX_IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
+/** Maximum wall-clock time for one foreground sandbox command. */
+export const DEFAULT_AGENT_SANDBOX_COMMAND_TIMEOUT_MS = 30 * 60 * 1_000;
+export const MAX_AGENT_SANDBOX_COMMAND_TIMEOUT_MS = 60 * 60 * 1_000;
 export const DEFAULT_AGENT_SANDBOX_MAX_ACTIVE = 2;
 export const DEFAULT_AGENT_SANDBOX_ADMISSION_TIMEOUT_MS = 30_000;
 export const DEFAULT_AGENT_SANDBOX_MAX_QUEUED = 1_024;
@@ -93,6 +99,24 @@ export function readAgentSandboxIdleTimeoutMs(
   ) {
     throw new Error(
       `AGENT_SANDBOX_IDLE_TIMEOUT_MS must be an integer from 60000 to ${MAX_AGENT_SANDBOX_IDLE_TIMEOUT_MS}.`,
+    );
+  }
+  return milliseconds;
+}
+
+export function readAgentSandboxCommandTimeoutMs(
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+): number {
+  const value = environment.AGENT_SANDBOX_COMMAND_TIMEOUT_MS?.trim();
+  if (!value) return DEFAULT_AGENT_SANDBOX_COMMAND_TIMEOUT_MS;
+  const milliseconds = Number(value);
+  if (
+    !Number.isSafeInteger(milliseconds)
+    || milliseconds < 1_000
+    || milliseconds > MAX_AGENT_SANDBOX_COMMAND_TIMEOUT_MS
+  ) {
+    throw new Error(
+      `AGENT_SANDBOX_COMMAND_TIMEOUT_MS must be an integer from 1000 to ${MAX_AGENT_SANDBOX_COMMAND_TIMEOUT_MS}.`,
     );
   }
   return milliseconds;
@@ -298,6 +322,7 @@ export function inspectProductionConfiguration(
   requireValue(environment, "AGENT_DATABASE_URL", error);
   requireValue(environment, "AGENT_RUNTIME_URL", error);
   requireValue(environment, "AGENT_SANDBOX_IMAGE", error);
+  requireValue(environment, "AGENT_SANDBOX_NETWORK_MODE", error);
   requireValue(environment, "AGENT_HOST_JWT_SECRET", error);
   requireValue(environment, "AGENT_HOST_JWT_ISSUER", error);
   requireValue(environment, "AGENT_HOST_JWT_AUDIENCE", error);
@@ -366,6 +391,23 @@ export function inspectProductionConfiguration(
     error(
       "deployment-tenancy",
       cause instanceof Error ? cause.message : "Invalid deployment tenancy.",
+    );
+  }
+
+  let sandboxNetworkMode: ReturnType<typeof readAgentSandboxNetworkMode> | undefined;
+  try {
+    sandboxNetworkMode = readAgentSandboxNetworkMode(environment);
+    readAgentSandboxNetworkAllowlist(environment);
+  } catch (cause) {
+    error(
+      "sandbox-network-policy",
+      cause instanceof Error ? cause.message : "Invalid sandbox network policy.",
+    );
+  }
+  if (sandboxNetworkMode === "trusted" && deploymentTenancy === "multi-tenant") {
+    error(
+      "sandbox-network-policy-trusted-multi-tenant",
+      "AGENT_SANDBOX_NETWORK_MODE=trusted is not allowed for untrusted multi-tenant production.",
     );
   }
 
@@ -525,6 +567,12 @@ export function inspectProductionConfiguration(
       );
     }
     if (backend === "docker") {
+      if (sandboxNetworkMode === "standard") {
+        error(
+          "sandbox-network-policy-docker",
+          "AGENT_SANDBOX_NETWORK_MODE=standard requires microsandbox or vercel; Docker only supports allow-all or deny-all.",
+        );
+      }
       try {
         readAgentDockerResourceLimits(environment);
       } catch (cause) {
@@ -636,6 +684,13 @@ export function inspectProductionConfiguration(
     "AGENT_PROVIDER_HTTP_TIMEOUT_MS",
     1_000,
     900_000,
+    error,
+  );
+  inspectInteger(
+    environment.AGENT_SANDBOX_COMMAND_TIMEOUT_MS,
+    "AGENT_SANDBOX_COMMAND_TIMEOUT_MS",
+    1_000,
+    MAX_AGENT_SANDBOX_COMMAND_TIMEOUT_MS,
     error,
   );
 

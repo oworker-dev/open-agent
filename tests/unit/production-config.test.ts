@@ -8,6 +8,7 @@ import {
   readAgentDeploymentTenancy,
   readAgentSandboxBackend,
   readAgentSandboxIdleTimeoutMs,
+  readAgentSandboxCommandTimeoutMs,
   readAgentSandboxWorkspaceQuota,
 } from "../../lib/production-config.ts";
 import { readAgentDatabaseConfig } from "../../server/data/agent-database.ts";
@@ -45,6 +46,8 @@ const validEnvironment = {
   AGENT_SANDBOX_CLEANUP_INTERVAL_MS: "900000",
   AGENT_SANDBOX_CLEANUP_MAX_SESSIONS: "25",
   AGENT_BASH_APPROVAL_MODE: "risky",
+  AGENT_SANDBOX_COMMAND_TIMEOUT_MS: "1800000",
+  AGENT_SANDBOX_NETWORK_MODE: "isolated",
   AGENT_ASSET_STORAGE_BACKEND: "host",
   AGENT_ASSET_CLEANUP_INTERVAL_MS: "3600000",
   AGENT_ASSET_CLEANUP_LIMIT: "100",
@@ -63,6 +66,22 @@ const validEnvironment = {
 
 test("accepts the verified production topology", () => {
   assert.deepEqual(inspectProductionConfiguration(validEnvironment, "24.18.1"), []);
+});
+
+test("parses a bounded foreground sandbox command timeout", () => {
+  assert.equal(readAgentSandboxCommandTimeoutMs({}), 1_800_000);
+  assert.equal(
+    readAgentSandboxCommandTimeoutMs({ AGENT_SANDBOX_COMMAND_TIMEOUT_MS: "45000" }),
+    45_000,
+  );
+  assert.throws(
+    () => readAgentSandboxCommandTimeoutMs({ AGENT_SANDBOX_COMMAND_TIMEOUT_MS: "999" }),
+    /from 1000 to 3600000/,
+  );
+  assert.throws(
+    () => readAgentSandboxCommandTimeoutMs({ AGENT_SANDBOX_COMMAND_TIMEOUT_MS: "3600001" }),
+    /from 1000 to 3600000/,
+  );
 });
 
 test("validates terminal Workflow archive configuration only when enabled", () => {
@@ -206,6 +225,27 @@ test("rejects an implicit production sandbox and shared Workflow database", () =
   assert.ok(codes.includes("node-version"));
   assert.ok(codes.includes("sandbox-backend"));
   assert.ok(codes.includes("workflow-world-isolation"));
+});
+
+test("rejects standard egress on Docker and trusted egress for multi-tenant production", () => {
+  const dockerStandard = inspectProductionConfiguration({
+    ...validEnvironment,
+    AGENT_SANDBOX_BACKEND: "docker",
+    AGENT_DEPLOYMENT_TENANCY: "single-tenant",
+    AGENT_SANDBOX_NETWORK_MODE: "standard",
+    EVE_SANDBOX_REAPER_MAX_REMOVALS: "50",
+    EVE_SANDBOX_RETENTION_HOURS: "168",
+    AGENT_DOCKER_MEMORY_LIMIT_BYTES: "2GiB",
+    AGENT_DOCKER_CPU_LIMIT: "2",
+    AGENT_DOCKER_PIDS_LIMIT: "512",
+  }, "24.18.1");
+  assert.ok(dockerStandard.some((item) => item.code === "sandbox-network-policy-docker"));
+
+  const multiTenantTrusted = inspectProductionConfiguration({
+    ...validEnvironment,
+    AGENT_SANDBOX_NETWORK_MODE: "trusted",
+  }, "24.18.1");
+  assert.ok(multiTenantTrusted.some((item) => item.code === "sandbox-network-policy-trusted-multi-tenant"));
 });
 
 test("rejects insecure origins, partial Host tools, and colliding queue prefix", () => {

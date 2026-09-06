@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { normalizeSkillPackage } from "../../node_modules/eve/dist/src/shared/skill-package.js";
 
 import {
   AGENT_RUNTIME_CONFIG_CONTRACT_VERSION,
@@ -10,6 +11,7 @@ import {
   readDeploymentAgentRuntimeConfig,
   runtimeDefinitionLimits,
 } from "../../lib/agent-runtime-config.ts";
+import { definePublishedSkill } from "../../agent/lib/published-skill.ts";
 import { createAgentUiConfig } from "../../lib/agent-ui-config.ts";
 
 test("standalone defaults match the Codex GPT-5.6 context policy", () => {
@@ -175,5 +177,144 @@ test("accepts host-published Skill content but rejects credentials and insecure 
       }],
     }),
     /unknown field apiKey/,
+  );
+});
+
+test("accepts a bounded standard Skill package with text and binary files", () => {
+  const skill = { id: "research", version: "1.0.0" };
+  const config = parseAgentRuntimeConfigSnapshot({
+    ...DEFAULT_AGENT_RUNTIME_CONFIG,
+    profile: {
+      ...DEFAULT_AGENT_RUNTIME_CONFIG.profile,
+      allowedSkills: [skill],
+      defaultSkills: [skill],
+    },
+    extensions: [{
+      ...skill,
+      kind: "skill",
+      label: "Research",
+      description: "Research procedure",
+      skill: {
+        markdown: "Use the checklist.",
+        files: {
+          "references/checklist.md": "# Checklist",
+          "scripts/pixel.bin": { encoding: "base64", data: "AAEC" },
+        },
+        license: "MIT",
+        metadata: { owner: "research" },
+      },
+    }],
+  });
+  assert.deepEqual(config.extensions?.[0]?.skill, {
+    markdown: "Use the checklist.",
+    files: {
+      "references/checklist.md": "# Checklist",
+      "scripts/pixel.bin": { encoding: "base64", data: "AAEC" },
+    },
+    license: "MIT",
+    metadata: { owner: "research" },
+  });
+});
+
+test("converts a host Skill package to Eve's native package shape", () => {
+  const published = definePublishedSkill({
+    id: "research",
+    version: "1.0.0",
+    kind: "skill",
+    label: "Research",
+    description: "Research procedure",
+    skill: {
+      markdown: "Use the checklist.",
+      files: {
+        "references/checklist.md": "# Checklist",
+        "assets/icon.bin": { encoding: "base64", data: "AAEC" },
+      },
+      license: "MIT",
+      metadata: { owner: "research" },
+    },
+  });
+  assert.equal(published.description, "Research procedure");
+  assert.equal(published.markdown, "Use the checklist.");
+  assert.equal(published.files?.["references/checklist.md"], "# Checklist");
+  assert.ok(published.files?.["assets/icon.bin"] instanceof Uint8Array);
+  assert.deepEqual(
+    [...(published.files?.["assets/icon.bin"] as Uint8Array)],
+    [0, 1, 2],
+  );
+  assert.equal(published.license, "MIT");
+  assert.deepEqual(published.metadata, { owner: "research" });
+
+  const normalized = normalizeSkillPackage({ ...published, name: "research" });
+  assert.deepEqual(normalized.files.map((file) => file.relativePath), [
+    "SKILL.md",
+    "assets/icon.bin",
+    "references/checklist.md",
+  ]);
+  assert.equal(normalized.files[1]?.content.toString("hex"), "000102");
+});
+
+test("rejects unsafe or oversized Skill package files", () => {
+  const skill = { id: "research", version: "1.0.0" };
+  const base = {
+    ...DEFAULT_AGENT_RUNTIME_CONFIG,
+    profile: {
+      ...DEFAULT_AGENT_RUNTIME_CONFIG.profile,
+      allowedSkills: [skill],
+      defaultSkills: [skill],
+    },
+  };
+  const withFile = (files: unknown) => parseAgentRuntimeConfigSnapshot({
+    ...base,
+    extensions: [{
+      ...skill,
+      kind: "skill",
+      label: "Research",
+      description: "Research procedure",
+      skill: { markdown: "Use the checklist.", files },
+    }],
+  });
+  assert.throws(() => withFile({ "../escape.sh": "bad" }), /file path .*invalid/);
+  assert.throws(() => withFile({ "scripts/\u0000run.sh": "bad" }), /file path .*invalid/);
+  assert.throws(() => withFile({ "SKILL.md": "duplicate" }), /must not contain/);
+  const prototypeKeyConfig = withFile({ ["__proto__"]: "safe script name" });
+  const prototypeKeyFiles = prototypeKeyConfig.extensions?.[0]?.skill?.files;
+  assert.equal(Object.prototype.hasOwnProperty.call(prototypeKeyFiles, "__proto__"), true);
+  assert.equal(Object.getPrototypeOf(prototypeKeyFiles), Object.prototype);
+  assert.throws(() => withFile({ "scripts/run.sh": { encoding: "base64", data: "%%%" } }), /valid base64/);
+  assert.throws(() => withFile({ "scripts/run.sh": "x".repeat(256 * 1024 + 1) }), /exceeds/);
+  const oversizedFiles = Object.fromEntries(
+    Array.from({ length: 5 }, (_, index) => [`references/overflow-${index}.txt`, "x".repeat(220 * 1024)]),
+  );
+  assert.throws(() => withFile(oversizedFiles), /package exceeds/);
+});
+
+test("rejects extension identifiers that cannot become Eve names", () => {
+  assert.throws(
+    () => parseAgentRuntimeConfigSnapshot({
+      ...DEFAULT_AGENT_RUNTIME_CONFIG,
+      extensions: [{
+        id: "unsafe/name",
+        version: "1.0.0",
+        kind: "skill",
+        label: "Unsafe",
+        description: "Unsafe",
+        skill: { markdown: "Procedure" },
+      }],
+    }),
+    /extension\.id is invalid/,
+  );
+  assert.throws(
+    () => parseAgentRuntimeConfigSnapshot({
+      ...DEFAULT_AGENT_RUNTIME_CONFIG,
+      extensions: [{
+        id: "safe",
+        version: "latest",
+        kind: "skill",
+        label: "Unsafe",
+        description: "Unsafe",
+        skill: { markdown: "Procedure" },
+      }],
+    }),
+    /extension\.version is invalid/,
   );
 });

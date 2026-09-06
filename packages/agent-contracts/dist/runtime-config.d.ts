@@ -36,16 +36,30 @@ export type AgentRuntimeProfile = {
     readonly defaultTools?: readonly string[];
 };
 /**
- * Host-published extension metadata. Skill content is procedure text only;
- * credentials and opaque provider secrets are never valid in this contract.
+ * A JSON-safe representation of one file in a host-provided Skill package.
+ * Text is the common path for Markdown, references, and scripts. Binary
+ * assets use explicit base64 so the runtime never guesses an encoding.
+ */
+export type AgentRuntimeSkillFile = string | {
+    readonly encoding: "base64";
+    readonly data: string;
+};
+export type AgentRuntimeSkillPackage = {
+    readonly markdown: string;
+    readonly files?: Readonly<Record<string, AgentRuntimeSkillFile>>;
+    readonly license?: string;
+    readonly metadata?: Readonly<Record<string, string>>;
+};
+/**
+ * Host-published extension metadata. Skill content is an explicitly bounded
+ * procedure package; credentials and opaque provider secrets are never valid
+ * in this contract.
  */
 export type AgentRuntimeExtension = AgentExtensionRef & {
     readonly kind: "mcp" | "skill";
     readonly label: string;
     readonly description: string;
-    readonly skill?: {
-        readonly markdown: string;
-    };
+    readonly skill?: AgentRuntimeSkillPackage;
     readonly mcp?: {
         readonly endpoint: string;
         readonly authProvider?: string;

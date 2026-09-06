@@ -71,8 +71,8 @@ function parseExtensions(value) {
         if (!isRecord(item))
             throw invalid("extensions contains an invalid entry");
         assertOnlyKeys(item, ["description", "id", "kind", "label", "mcp", "skill", "version"], "extension");
-        const id = text(item.id, "extension.id", 120);
-        const version = text(item.version, "extension.version", 80);
+        const id = extensionId(item.id, "extension.id");
+        const version = extensionVersion(item.version, "extension.version");
         const kind = item.kind === "skill" || item.kind === "mcp" ? item.kind : invalid("extension.kind is invalid");
         const key = `${kind}:${id}@${version}`;
         if (seen.has(key))
@@ -107,8 +107,131 @@ function parseExtensions(value) {
 function parseSkill(value) {
     if (!isRecord(value))
         throw invalid("extension.skill must be an object");
-    assertOnlyKeys(value, ["markdown"], "extension.skill");
-    return { markdown: text(value.markdown, "extension.skill.markdown", 100_000) };
+    assertOnlyKeys(value, ["files", "license", "markdown", "metadata"], "extension.skill");
+    const markdown = text(value.markdown, "extension.skill.markdown", MAX_SKILL_MARKDOWN_BYTES);
+    if (utf8ByteLength(markdown) > MAX_SKILL_MARKDOWN_BYTES) {
+        throw invalid(`extension.skill.markdown exceeds ${MAX_SKILL_MARKDOWN_BYTES} bytes`);
+    }
+    const license = value.license === undefined
+        ? undefined
+        : text(value.license, "extension.skill.license", 256);
+    const metadata = value.metadata === undefined
+        ? undefined
+        : stringRecord(value.metadata, "extension.skill.metadata", 32, 4_096);
+    const files = value.files === undefined
+        ? undefined
+        : parseSkillFiles(value.files);
+    let packageBytes = utf8ByteLength(markdown);
+    for (const [path, file] of Object.entries(files ?? {})) {
+        const bytes = skillFileByteLength(file);
+        packageBytes += bytes;
+        if (packageBytes > MAX_SKILL_PACKAGE_BYTES) {
+            throw invalid(`extension.skill package exceeds ${MAX_SKILL_PACKAGE_BYTES} bytes`);
+        }
+        if (path === "SKILL.md") {
+            throw invalid('extension.skill.files must not contain "SKILL.md"');
+        }
+    }
+    packageBytes += license === undefined ? 0 : utf8ByteLength(license);
+    packageBytes += metadata === undefined ? 0 : utf8ByteLength(JSON.stringify(metadata));
+    if (packageBytes > MAX_SKILL_PACKAGE_BYTES) {
+        throw invalid(`extension.skill package exceeds ${MAX_SKILL_PACKAGE_BYTES} bytes`);
+    }
+    return {
+        markdown,
+        ...(files ? { files } : {}),
+        ...(license ? { license } : {}),
+        ...(metadata ? { metadata } : {}),
+    };
+}
+const MAX_SKILL_MARKDOWN_BYTES = 100_000;
+const MAX_SKILL_FILE_COUNT = 128;
+const MAX_SKILL_FILE_PATH_LENGTH = 512;
+const MAX_SKILL_FILE_BYTES = 256 * 1024;
+const MAX_SKILL_PACKAGE_BYTES = 1024 * 1024;
+const MAX_SKILL_FILE_BASE64_CHARS = Math.ceil(MAX_SKILL_FILE_BYTES / 3) * 4;
+const EXTENSION_ID_PATTERN = /^[a-z0-9][a-z0-9._-]*$/u;
+const EXTENSION_VERSION_PATTERN = /^[0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.-]+)?$/u;
+function parseSkillFiles(value) {
+    if (!isRecord(value))
+        throw invalid("extension.skill.files must be an object");
+    const entries = Object.entries(value);
+    if (entries.length > MAX_SKILL_FILE_COUNT) {
+        throw invalid(`extension.skill.files must contain at most ${MAX_SKILL_FILE_COUNT} files`);
+    }
+    const files = {};
+    for (const [path, content] of entries) {
+        assertSkillFilePath(path);
+        if (typeof content === "string") {
+            if (utf8ByteLength(content) > MAX_SKILL_FILE_BYTES) {
+                throw invalid(`extension.skill file ${path} exceeds ${MAX_SKILL_FILE_BYTES} bytes`);
+            }
+            defineOwn(files, path, content);
+            continue;
+        }
+        if (!isRecord(content)) {
+            throw invalid(`extension.skill file ${path} must be a string or base64 object`);
+        }
+        assertOnlyKeys(content, ["data", "encoding"], `extension.skill file ${path}`);
+        if (content.encoding !== "base64" || typeof content.data !== "string" ||
+            content.data.length > MAX_SKILL_FILE_BASE64_CHARS || !isBase64(content.data)) {
+            throw invalid(`extension.skill file ${path} must contain valid base64 data`);
+        }
+        if (base64ByteLength(content.data) > MAX_SKILL_FILE_BYTES) {
+            throw invalid(`extension.skill file ${path} exceeds ${MAX_SKILL_FILE_BYTES} bytes`);
+        }
+        defineOwn(files, path, { data: content.data, encoding: "base64" });
+    }
+    return files;
+}
+function assertSkillFilePath(path) {
+    if (path.length === 0 ||
+        path.length > MAX_SKILL_FILE_PATH_LENGTH ||
+        path.startsWith("/") ||
+        path.includes("\\") ||
+        path.includes("\u0000") ||
+        /^[A-Za-z]:/.test(path) ||
+        path.split("/").some((segment) => segment.length === 0 || segment === "." || segment === "..")) {
+        throw invalid(`extension.skill file path ${path || "(empty)"} is invalid`);
+    }
+}
+function skillFileByteLength(file) {
+    return typeof file === "string" ? utf8ByteLength(file) : base64ByteLength(file.data);
+}
+function isBase64(value) {
+    return /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value);
+}
+function base64ByteLength(value) {
+    if (value.length === 0)
+        return 0;
+    const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
+    return (value.length * 3) / 4 - padding;
+}
+function utf8ByteLength(value) {
+    return new TextEncoder().encode(value).byteLength;
+}
+function stringRecord(value, name, maximumEntries, maximumValueLength) {
+    if (!isRecord(value))
+        throw invalid(`${name} must be an object`);
+    const entries = Object.entries(value);
+    if (entries.length > maximumEntries)
+        throw invalid(`${name} has too many entries`);
+    const result = {};
+    for (const [key, item] of entries) {
+        if (!key || key.length > 120 || typeof item !== "string" || item.length > maximumValueLength) {
+            throw invalid(`${name} contains an invalid entry`);
+        }
+        defineOwn(result, key, item);
+    }
+    return result;
+}
+function defineOwn(target, key, value) {
+    Object.defineProperty(target, key, {
+        configurable: true,
+        enumerable: true,
+        value,
+        writable: true,
+    });
 }
 function parseMcp(value) {
     if (!isRecord(value))
@@ -247,11 +370,23 @@ function extensionRefs(value, name) {
             throw invalid(`${name} contains an invalid reference`);
         assertOnlyKeys(item, ["id", "version"], `${name} reference`);
         return {
-            id: text(item.id, `${name}.id`, 120),
-            version: text(item.version, `${name}.version`, 80),
+            id: extensionId(item.id, `${name}.id`),
+            version: extensionVersion(item.version, `${name}.version`),
         };
     });
     return [...new Map(refs.map((ref) => [`${ref.id}@${ref.version}`, ref])).values()];
+}
+function extensionId(value, name) {
+    const id = text(value, name, 120);
+    if (!EXTENSION_ID_PATTERN.test(id))
+        throw invalid(`${name} is invalid`);
+    return id;
+}
+function extensionVersion(value, name) {
+    const version = text(value, name, 80);
+    if (!EXTENSION_VERSION_PATTERN.test(version))
+        throw invalid(`${name} is invalid`);
+    return version;
 }
 function assertDefaultsAllowed(defaults, allowed, kind) {
     const keys = new Set(allowed.map((ref) => `${ref.id}@${ref.version}`));

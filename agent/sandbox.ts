@@ -15,6 +15,12 @@ import {
   readAgentSandboxIdleTimeoutMs,
   readAgentSandboxImage,
 } from "../lib/production-config.ts";
+import {
+  readAgentSandboxNetworkAllowlist,
+  readAgentSandboxNetworkMode,
+  resolveAgentDockerNetworkPolicy,
+  resolveAgentSandboxNetworkPolicy,
+} from "../lib/sandbox-network-policy.ts";
 import { withIdleSandboxShutdown } from "../lib/idle-sandbox-backend.ts";
 import { withSandboxAdmission } from "../lib/sandbox-admission-backend.ts";
 
@@ -23,11 +29,11 @@ const execFileAsync = promisify(execFile);
 /**
  * The sandbox is an Agent capability boundary, not a convenience default.
  * Keep the backend selectable for local development and hosted deployment,
- * while applying the same deny-by-default network policy to every backend.
+ * while applying an explicit deployment-selected network policy to every backend.
  */
 export default defineSandbox({
   description:
-    "One isolated workspace per durable Agent session with deny-by-default egress.",
+    "One isolated workspace per durable Agent session with policy-controlled egress.",
   backend: selectBackend(),
 });
 
@@ -36,11 +42,13 @@ function selectBackend() {
   const image = readAgentSandboxImage();
   const admission = readAgentSandboxAdmissionConfig();
   const idleTimeoutMs = readAgentSandboxIdleTimeoutMs();
+  const networkMode = readAgentSandboxNetworkMode();
+  const networkAllowlist = readAgentSandboxNetworkAllowlist();
   if (selected === "docker") {
     return withManagedSandboxCapacity(
       withDockerResourceLimits(docker({
         ...(image ? { image } : {}),
-        networkPolicy: "deny-all",
+        networkPolicy: resolveAgentDockerNetworkPolicy(networkMode),
         pullPolicy: "if-not-present",
       }), readAgentDockerResourceLimits()),
       admission,
@@ -52,27 +60,40 @@ function selectBackend() {
       ...(image ? { image } : {}),
       cpus: 2,
       memoryMiB: 2048,
-      networkPolicy: "deny-all",
+      networkPolicy: resolveAgentSandboxNetworkPolicy(networkMode, "microsandbox", networkAllowlist),
       pullPolicy: "if-missing",
     }), admission, idleTimeoutMs);
   }
   if (selected === "vercel") {
     return withManagedSandboxCapacity(vercel({
       ...(image ? { image } : {}),
-      networkPolicy: "deny-all",
+      networkPolicy: resolveAgentSandboxNetworkPolicy(networkMode, "vercel", networkAllowlist),
       resources: { vcpus: 2 },
     }), admission, idleTimeoutMs);
   }
   return withManagedSandboxCapacity(defaultBackend({
-    docker: { ...(image ? { image } : {}), networkPolicy: "deny-all", pullPolicy: "if-not-present" },
+    docker: {
+      ...(image ? { image } : {}),
+      // `auto` may select Docker on a local host. Keep that fallback isolated
+      // when the requested standard policy needs domain-level firewall rules;
+      // production requires an explicit microVM-capable backend for standard.
+      networkPolicy: networkMode === "standard"
+        ? "deny-all"
+        : resolveAgentDockerNetworkPolicy(networkMode),
+      pullPolicy: "if-not-present",
+    },
     microsandbox: {
       ...(image ? { image } : {}),
       cpus: 2,
       memoryMiB: 2048,
-      networkPolicy: "deny-all",
+      networkPolicy: resolveAgentSandboxNetworkPolicy(networkMode, "microsandbox", networkAllowlist),
       pullPolicy: "if-missing",
     },
-    vercel: { ...(image ? { image } : {}), resources: { vcpus: 2 } },
+    vercel: {
+      ...(image ? { image } : {}),
+      networkPolicy: resolveAgentSandboxNetworkPolicy(networkMode, "vercel", networkAllowlist),
+      resources: { vcpus: 2 },
+    },
   }), admission, idleTimeoutMs);
 }
 
