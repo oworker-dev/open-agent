@@ -1796,8 +1796,23 @@ export function AgentWorkspace({
       if (!settled) throw new Error("The active Agent stream ended before reaching a durable boundary.");
       if (recoveryControllers.current.get(thread.id) !== controller) return;
       mergeLiveAdmissions();
+      // The recovery loop starts from a browser checkpoint, while the mounted
+      // Eve client may have consumed additional events in parallel before the
+      // durable hand-off.  Never publish the worker's private buffer as the
+      // final transcript by itself: doing so can replace a longer live
+      // snapshot with an older prefix and makes the previous execution group
+      // disappear until the next refresh.  Merge the two views once, at the
+      // hand-off boundary, then use that merged snapshot for both persistence
+      // and the optional reducer reseed.
+      const latestThreadAtHandoff = threadsRef.current.find((candidate) => candidate.id === thread.id);
+      const latestEventsAtHandoff = latestThreadAtHandoff?.events ?? [];
+      const handoffEvents = compactThreadEvents(
+        mergeThreadEventSnapshots(latestEventsAtHandoff, events),
+      );
+      const transcriptChangedAtHandoff = handoffEvents.length !== latestEventsAtHandoff.length ||
+        handoffEvents.some((event, index) => eventIdentity(event) !== eventIdentity(latestEventsAtHandoff[index]!));
       const recoveryPatch: AgentThreadPatch = {
-        events: compactThreadEvents(events),
+        events: handoffEvents,
         interruptedTurns,
         inputResponseSubmissions,
         pendingTurn,
@@ -1819,7 +1834,7 @@ export function AgentWorkspace({
       // would replace the freshly recovered transcript. Reseed exactly once
       // at the durable handoff so edited replies remain visible after the
       // recovery worker releases its stream.
-      if (activeThreadIdRef.current === thread.id && events.length > thread.events.length && !editRecovery) {
+      if (activeThreadIdRef.current === thread.id && transcriptChangedAtHandoff && !editRecovery) {
         flushSync(() => {
           setThreadRuntimeSeeds((current) => {
             const seed = `recovery:${thread.session.sessionId}:${cursor}`;

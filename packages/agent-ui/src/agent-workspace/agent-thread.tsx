@@ -610,7 +610,13 @@ export function AgentThreadView({
   // external-store updates: the latest snapshot is always published after the
   // same short interval.
   const liveRenderSource = useMemo(
-    () => ({ events: agent.events, messages: agent.data.messages }),
+    // Eve keeps every raw cumulative delta in `agent.events` for replay. The
+    // UI does not need those superseded snapshots: the append-only projection
+    // already retains the latest value for each logical message/tool step.
+    // Feeding that bounded projection to the expensive timeline presenter
+    // prevents a hot file edit from making the browser render O(rawEvents) on
+    // every frame while the reducer and cursor remain fully authoritative.
+    () => ({ events: [...compactedEventsRef.current], messages: agent.data.messages }),
     [agent.data.messages, agent.events],
   );
   // Eve itself publishes at frame cadence (~16ms). Keep a single short
@@ -651,7 +657,24 @@ export function AgentThreadView({
   // cumulative delta was replaced in place.
   const recoveryHasNewDurableProgress = thread.session.streamIndex > (agent.session?.streamIndex ?? -1) ||
     recoveryRenderEvents.length > renderEvents.length;
-  const useRecoverySnapshot = durableSnapshotAhead || (isRecovering && recoveryHasNewDurableProgress);
+  // A recovery checkpoint can advance its cursor before it has caught up with
+  // structural events that the mounted reducer already rendered. Switching
+  // to that partial snapshot makes the earlier execution group disappear for
+  // a render (and can reorder reasoning/tool rows). Only hand the renderer to
+  // recovery after every structural live event is present in the candidate
+  // snapshot; cumulative text/tool deltas may safely be replaced by their
+  // latest checkpoint.
+  const recoveryContainsLiveStructure = useMemo(
+    () => isRecovering
+      ? recoverySnapshotContainsLiveStructure(renderEvents, recoveryRenderEvents)
+      : true,
+    [isRecovering, recoveryRenderEvents, renderEvents],
+  );
+  const useRecoverySnapshot = durableSnapshotAhead || (
+    isRecovering &&
+    recoveryHasNewDurableProgress &&
+    recoveryContainsLiveStructure
+  );
   const recoveryMergedRenderEvents = useMemo(
     () => useRecoverySnapshot
       ? mergeThreadEventSnapshots(renderEvents, recoveryRenderEvents)
@@ -2985,6 +3008,31 @@ function messagesFromEvents(events: readonly MessageStreamEvent[]): readonly Eve
   for (const event of events) data = reducer.reduce(data, event);
   messagesByEventSnapshot.set(events as object, data.messages);
   return data.messages;
+}
+
+/**
+ * Recovery snapshots compact cumulative deltas, so their event ids are not a
+ * one-to-one match for the mounted Eve reducer's raw stream.  All other event
+ * kinds are structural boundaries or durable tool/results and must be present
+ * before a recovery view can replace the live view.  This small guard prevents
+ * a cursor-only recovery update from hiding an already-rendered execution
+ * group while catch-up is still in progress.
+ */
+function recoverySnapshotContainsLiveStructure(
+  liveEvents: readonly MessageStreamEvent[],
+  recoveryEvents: readonly MessageStreamEvent[],
+): boolean {
+  if (liveEvents.length === 0) return true;
+  const recoveryIds = new Set(recoveryEvents.map(eventIdentity));
+  for (const event of liveEvents) {
+    if (
+      event.type === "message.appended" ||
+      event.type === "reasoning.appended" ||
+      event.type === "action.input.partial"
+    ) continue;
+    if (!recoveryIds.has(eventIdentity(event))) return false;
+  }
+  return true;
 }
 
 function projectInputResponses(

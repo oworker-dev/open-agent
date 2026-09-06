@@ -376,7 +376,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         });
     }, [agent.session, onChange]);
     flushCheckpointRef.current = flushLiveCheckpoint;
-    const liveRenderSource = useMemo(() => ({ events: agent.events, messages: agent.data.messages }), [agent.data.messages, agent.events]);
+    const liveRenderSource = useMemo(() => ({ events: [...compactedEventsRef.current], messages: agent.data.messages }), [agent.data.messages, agent.events]);
     const liveRenderSnapshot = useThrottledSnapshot(liveRenderSource, 32);
     const renderEvents = liveRenderSnapshot.events;
     const renderMessages = liveRenderSnapshot.messages;
@@ -396,7 +396,12 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     const durableSnapshotAhead = durableEditBoundary && (!liveEditBoundary || thread.session.streamIndex > (agent.session?.streamIndex ?? -1));
     const recoveryHasNewDurableProgress = thread.session.streamIndex > (agent.session?.streamIndex ?? -1) ||
         recoveryRenderEvents.length > renderEvents.length;
-    const useRecoverySnapshot = durableSnapshotAhead || (isRecovering && recoveryHasNewDurableProgress);
+    const recoveryContainsLiveStructure = useMemo(() => isRecovering
+        ? recoverySnapshotContainsLiveStructure(renderEvents, recoveryRenderEvents)
+        : true, [isRecovering, recoveryRenderEvents, renderEvents]);
+    const useRecoverySnapshot = durableSnapshotAhead || (isRecovering &&
+        recoveryHasNewDurableProgress &&
+        recoveryContainsLiveStructure);
     const recoveryMergedRenderEvents = useMemo(() => useRecoverySnapshot
         ? mergeThreadEventSnapshots(renderEvents, recoveryRenderEvents)
         : renderEvents, [recoveryRenderEvents, renderEvents, useRecoverySnapshot]);
@@ -1998,6 +2003,20 @@ function messagesFromEvents(events) {
         data = reducer.reduce(data, event);
     messagesByEventSnapshot.set(events, data.messages);
     return data.messages;
+}
+function recoverySnapshotContainsLiveStructure(liveEvents, recoveryEvents) {
+    if (liveEvents.length === 0)
+        return true;
+    const recoveryIds = new Set(recoveryEvents.map(eventIdentity));
+    for (const event of liveEvents) {
+        if (event.type === "message.appended" ||
+            event.type === "reasoning.appended" ||
+            event.type === "action.input.partial")
+            continue;
+        if (!recoveryIds.has(eventIdentity(event)))
+            return false;
+    }
+    return true;
 }
 function projectInputResponses(messages, responses) {
     if (responses.length === 0)

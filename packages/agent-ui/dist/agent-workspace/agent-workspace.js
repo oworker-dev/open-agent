@@ -1437,8 +1437,13 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
             if (recoveryControllers.current.get(thread.id) !== controller)
                 return;
             mergeLiveAdmissions();
+            const latestThreadAtHandoff = threadsRef.current.find((candidate) => candidate.id === thread.id);
+            const latestEventsAtHandoff = latestThreadAtHandoff?.events ?? [];
+            const handoffEvents = compactThreadEvents(mergeThreadEventSnapshots(latestEventsAtHandoff, events));
+            const transcriptChangedAtHandoff = handoffEvents.length !== latestEventsAtHandoff.length ||
+                handoffEvents.some((event, index) => eventIdentity(event) !== eventIdentity(latestEventsAtHandoff[index]));
             const recoveryPatch = {
-                events: compactThreadEvents(events),
+                events: handoffEvents,
                 interruptedTurns,
                 inputResponseSubmissions,
                 pendingTurn,
@@ -1454,7 +1459,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                 ...(recoveryCursorReconciled ? { allowCursorRewind: true } : {}),
                 preserveUpdatedAt: true,
             };
-            if (activeThreadIdRef.current === thread.id && events.length > thread.events.length && !editRecovery) {
+            if (activeThreadIdRef.current === thread.id && transcriptChangedAtHandoff && !editRecovery) {
                 flushSync(() => {
                     setThreadRuntimeSeeds((current) => {
                         const seed = `recovery:${thread.session.sessionId}:${cursor}`;
