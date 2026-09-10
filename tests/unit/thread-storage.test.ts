@@ -58,6 +58,26 @@ test("recovery snapshot merge retains events unique to either snapshot", () => {
   ]);
 });
 
+test("recovery merge never orders different turns by their reset sequence", () => {
+  const first = editEvent("message.received", {
+    message: "first",
+    sequence: 0,
+    turnId: "turn-first",
+  });
+  const second = editEvent("message.received", {
+    message: "second",
+    sequence: 0,
+    turnId: "turn-second",
+  });
+  // Equal timestamps model the common same-tick recovery merge. The existing
+  // live order must remain stable because sequence is scoped to each turn.
+  const merged = mergeThreadEventSnapshots([first], [second]);
+  assert.deepEqual(merged.map((event) => eventIdentity(event)), [
+    eventIdentity(first),
+    eventIdentity(second),
+  ]);
+});
+
 function editEvent(type: string, data: Record<string, unknown>): MessageStreamEvent {
   return {
     data,

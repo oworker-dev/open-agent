@@ -125,7 +125,17 @@ export async function dispatchNextAgentMailboxMessage(options: {
     return { item: deferred, status: "deferred" };
   }
 
+  // A queued follow-up is a steering command while the session is running.
+  // The browser's turn id is only a hint and can lag the durable Eve stream
+  // during a burst of tool events. Requiring an exact client id here parks
+  // the message until `session.waiting`, defeating steering and making the
+  // follow-up appear to be sent minutes late. The runtime adapter below
+  // rewrites the operation to the boundary's current turn id immediately
+  // before admission, so a stale hint cannot target the wrong turn.
   if (boundary.state === "running" && !canSteerBoundary(item, boundary)) {
+    if (item.payload.operation?.kind === "steer") {
+      // Continue to admission with the authoritative boundary identity.
+    } else {
     return await deferClaimedMessage({
       availableAt: nextAttemptAt(options.now, options.busyRetryMs),
       claimToken,
@@ -133,6 +143,7 @@ export async function dispatchNextAgentMailboxMessage(options: {
       owner,
       store: options.store,
     });
+    }
   }
   if (boundary.state === "terminal") {
     const failed = await options.store.fail(
@@ -145,11 +156,20 @@ export async function dispatchNextAgentMailboxMessage(options: {
 
   try {
     await options.store.beginAdmission(item.itemId, claimToken);
+    const payload = item.payload.operation?.kind === "steer" && boundary.state === "running"
+      ? {
+          ...item.payload,
+          operation: {
+            ...item.payload.operation,
+            expectedTurnId: boundary.turnId,
+          },
+        }
+      : item.payload;
     const delivered = await options.runtime.deliver({
       clientMessageId: item.clientMessageId,
       itemId: item.itemId,
       owner,
-      payload: item.payload,
+      payload,
       sessionId: item.sessionId,
     });
     const accepted = await options.store.accept(item.itemId, claimToken, delivered.sessionId);

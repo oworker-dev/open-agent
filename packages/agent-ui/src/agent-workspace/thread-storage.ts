@@ -646,7 +646,21 @@ export function mergeThreadEventSnapshots(
     candidates.push({ event, position });
     position += 1;
   }
-  candidates.sort((a, b) => compareEventOrder(a.event, b.event) || a.position - b.position);
+  // Persisted snapshots no longer carry the in-memory absolute cursor. Keep
+  // the first observed order of turns as the primary key; Eve's sequence and
+  // stepIndex restart for every turn and therefore cannot establish a global
+  // order. This prevents a follow-up turn (sequence 0) from being sorted
+  // before the original turn's later steps during recovery handoff.
+  const turnOrder = new Map<string, number>();
+  let nextTurnOrder = 0;
+  for (const candidate of candidates) {
+    const turnId = eventTurnId(candidate.event);
+    if (turnId !== undefined && !turnOrder.has(turnId)) {
+      turnOrder.set(turnId, nextTurnOrder);
+      nextTurnOrder += 1;
+    }
+  }
+  candidates.sort((a, b) => compareEventOrder(a.event, b.event, turnOrder) || a.position - b.position);
   return compactThreadEvents(candidates.map((candidate) => candidate.event));
 }
 
@@ -666,23 +680,45 @@ function sameEventIdentityOrder(
  * their durable emission timestamp is used as the fallback. The final stable
  * insertion position is supplied by the caller for same-timestamp ties.
  */
-function compareEventOrder(left: MessageStreamEvent, right: MessageStreamEvent): number {
+function compareEventOrder(
+  left: MessageStreamEvent,
+  right: MessageStreamEvent,
+  turnOrder?: ReadonlyMap<string, number>,
+): number {
   const leftCursor = eventCursors.get(left as object);
   const rightCursor = eventCursors.get(right as object);
   if (leftCursor !== undefined && rightCursor !== undefined && leftCursor !== rightCursor) {
     return leftCursor - rightCursor;
   }
 
-  const leftSequence = eventSequence(left);
-  const rightSequence = eventSequence(right);
-  if (leftSequence !== undefined && rightSequence !== undefined && leftSequence !== rightSequence) {
-    return leftSequence - rightSequence;
+  if (turnOrder) {
+    const leftTurn = eventTurnId(left);
+    const rightTurn = eventTurnId(right);
+    const leftOrder = leftTurn === undefined ? undefined : turnOrder.get(leftTurn);
+    const rightOrder = rightTurn === undefined ? undefined : turnOrder.get(rightTurn);
+    if (leftOrder !== undefined && rightOrder !== undefined && leftOrder !== rightOrder) {
+      return leftOrder - rightOrder;
+    }
   }
 
-  const leftStep = eventStepIndex(left);
-  const rightStep = eventStepIndex(right);
-  if (leftStep !== undefined && rightStep !== undefined && leftStep !== rightStep) {
-    return leftStep - rightStep;
+  // sequence and stepIndex restart at zero for every turn. They are only
+  // meaningful when both events belong to the same turn; comparing them
+  // across turns moves a follow-up before the original execution group when
+  // persisted events do not carry an in-memory absolute cursor.
+  const leftTurnId = eventTurnId(left);
+  const rightTurnId = eventTurnId(right);
+  if (leftTurnId !== undefined && leftTurnId === rightTurnId) {
+    const leftSequence = eventSequence(left);
+    const rightSequence = eventSequence(right);
+    if (leftSequence !== undefined && rightSequence !== undefined && leftSequence !== rightSequence) {
+      return leftSequence - rightSequence;
+    }
+
+    const leftStep = eventStepIndex(left);
+    const rightStep = eventStepIndex(right);
+    if (leftStep !== undefined && rightStep !== undefined && leftStep !== rightStep) {
+      return leftStep - rightStep;
+    }
   }
 
   const leftAt = eventTimestamp(left);

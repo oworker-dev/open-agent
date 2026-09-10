@@ -502,27 +502,49 @@ export function mergeThreadEventSnapshots(left, right) {
         candidates.push({ event, position });
         position += 1;
     }
-    candidates.sort((a, b) => compareEventOrder(a.event, b.event) || a.position - b.position);
+    const turnOrder = new Map();
+    let nextTurnOrder = 0;
+    for (const candidate of candidates) {
+        const turnId = eventTurnId(candidate.event);
+        if (turnId !== undefined && !turnOrder.has(turnId)) {
+            turnOrder.set(turnId, nextTurnOrder);
+            nextTurnOrder += 1;
+        }
+    }
+    candidates.sort((a, b) => compareEventOrder(a.event, b.event, turnOrder) || a.position - b.position);
     return compactThreadEvents(candidates.map((candidate) => candidate.event));
 }
 function sameEventIdentityOrder(left, right) {
     return left.length === right.length && left.every((event, index) => eventIdentity(event) === eventIdentity(right[index]));
 }
-function compareEventOrder(left, right) {
+function compareEventOrder(left, right, turnOrder) {
     const leftCursor = eventCursors.get(left);
     const rightCursor = eventCursors.get(right);
     if (leftCursor !== undefined && rightCursor !== undefined && leftCursor !== rightCursor) {
         return leftCursor - rightCursor;
     }
-    const leftSequence = eventSequence(left);
-    const rightSequence = eventSequence(right);
-    if (leftSequence !== undefined && rightSequence !== undefined && leftSequence !== rightSequence) {
-        return leftSequence - rightSequence;
+    if (turnOrder) {
+        const leftTurn = eventTurnId(left);
+        const rightTurn = eventTurnId(right);
+        const leftOrder = leftTurn === undefined ? undefined : turnOrder.get(leftTurn);
+        const rightOrder = rightTurn === undefined ? undefined : turnOrder.get(rightTurn);
+        if (leftOrder !== undefined && rightOrder !== undefined && leftOrder !== rightOrder) {
+            return leftOrder - rightOrder;
+        }
     }
-    const leftStep = eventStepIndex(left);
-    const rightStep = eventStepIndex(right);
-    if (leftStep !== undefined && rightStep !== undefined && leftStep !== rightStep) {
-        return leftStep - rightStep;
+    const leftTurnId = eventTurnId(left);
+    const rightTurnId = eventTurnId(right);
+    if (leftTurnId !== undefined && leftTurnId === rightTurnId) {
+        const leftSequence = eventSequence(left);
+        const rightSequence = eventSequence(right);
+        if (leftSequence !== undefined && rightSequence !== undefined && leftSequence !== rightSequence) {
+            return leftSequence - rightSequence;
+        }
+        const leftStep = eventStepIndex(left);
+        const rightStep = eventStepIndex(right);
+        if (leftStep !== undefined && rightStep !== undefined && leftStep !== rightStep) {
+            return leftStep - rightStep;
+        }
     }
     const leftAt = eventTimestamp(left);
     const rightAt = eventTimestamp(right);

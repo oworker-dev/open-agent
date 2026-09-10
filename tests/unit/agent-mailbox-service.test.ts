@@ -158,7 +158,7 @@ test("structured input responses reject mixed message payloads", async () => {
   );
 });
 
-test("a stale steer remains queued and is admitted only at the waiting boundary", async () => {
+test("a stale steer retargets the current running Eve turn", async () => {
   const store = new MemoryMailboxStore();
   await enqueueAgentMailboxMessage({
     clientMessageId: "message-stale-steer-1",
@@ -172,13 +172,10 @@ test("a stale steer remains queued and is admitted only at the waiting boundary"
   });
   const runtime = new FakeMailboxRuntime({ state: "running", turnId: "turn-new" });
 
-  assert.equal((await dispatchNextAgentMailboxMessage({ runtime, store })).status, "deferred");
-  assert.equal(runtime.deliveries.length, 0);
-
-  runtime.boundary = { state: "waiting" };
   assert.equal((await dispatchNextAgentMailboxMessage({ runtime, store })).status, "accepted");
   assert.equal(runtime.deliveries.length, 1);
   assert.equal(store.items[0]?.payload.operation?.kind, "steer");
+  assert.equal(runtime.deliveries[0]?.expectedTurnId, "turn-new");
 });
 
 test("edit admission is deferred while running and delivered once at the waiting boundary", async () => {
@@ -354,6 +351,7 @@ class FakeMailboxRuntime implements AgentMailboxRuntime {
     itemId: string;
     inputResponses?: AgentMailboxItem["payload"]["inputResponses"];
     message?: string;
+    expectedTurnId?: string;
     sessionId: string;
   }> = [];
   deliveryError?: Error;
@@ -376,6 +374,9 @@ class FakeMailboxRuntime implements AgentMailboxRuntime {
       ...(input.payload.inputResponses
         ? { inputResponses: input.payload.inputResponses }
         : { message: input.payload.message }),
+      ...(input.payload.operation?.expectedTurnId
+        ? { expectedTurnId: input.payload.operation.expectedTurnId }
+        : {}),
       sessionId: input.sessionId,
     });
     if (this.deliveryError) throw this.deliveryError;
