@@ -26,13 +26,7 @@ export async function inspectMailboxBoundary(
     // Resolve the tail to an absolute cursor before reading it. Tail-relative
     // streams are live-following in Eve and can remain open indefinitely.
     if (tailIndex < 0) return { state: "running", tailIndex };
-    // Eve's absolute cursor is the count of events, so `tailIndex` points
-    // just after the last event. Reading from that cursor waits for a future
-    // event and can consume the whole inspection deadline while a running
-    // step is quiet. Eve provides `-1` specifically for the latest event;
-    // use it for an immediate boundary probe and retain the absolute tail in
-    // the returned metadata for callers' cursor bookkeeping.
-    const stream = await deadline.wait(session.getEventStream({ startIndex: -1 }));
+    const stream = await deadline.wait(session.getEventStream({ startIndex: tailIndex }));
     reader = stream.getReader();
     const latest = await deadline.wait(reader.read(), () => reader?.cancel());
     if (latest.done || !latest.value) return { state: "running", tailIndex };

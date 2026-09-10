@@ -6,7 +6,7 @@ import {
   MailboxBoundaryInspectionTimeoutError,
 } from "../../agent/lib/mailbox-boundary.ts";
 
-test("mailbox boundary inspection reads the latest tail event and closes", async () => {
+test("mailbox boundary inspection reads one absolute tail event and closes", async () => {
   let startIndex: number | undefined;
   let cancelled = false;
   const event = {
@@ -34,7 +34,7 @@ test("mailbox boundary inspection reads the latest tail event and closes", async
   }, 100);
 
   assert.deepEqual(boundary, { state: "waiting", tailIndex: 17 });
-  assert.equal(startIndex, -1);
+  assert.equal(startIndex, 17);
   assert.equal(cancelled, true);
 });
 
