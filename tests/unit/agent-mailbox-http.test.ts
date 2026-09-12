@@ -102,10 +102,11 @@ test("mailbox HTTP rejects an edit without an exact target turn", async () => {
   });
 });
 
-function mailboxRequest(): Request {
+function mailboxRequest(operation?: { beforeTurnId: string; operationId: string; operationKind: "edit" }): Request {
   return new Request("https://agent.test/api/standalone/mailbox", {
     body: JSON.stringify({
       clientMessageId: "message-1",
+      ...operation,
       message: "Continue after the current Agent boundary.",
       preferences: {
         executionMode: "standard",
@@ -118,6 +119,21 @@ function mailboxRequest(): Request {
     method: "POST",
   });
 }
+
+test("mailbox HTTP rejects unsupported steer edits without a queued item", async () => {
+  const response = await enqueueAgentMailboxHttpRequest({
+    owner,
+    request: mailboxRequest({ beforeTurnId: "turn-0", operationId: "message-1", operationKind: "edit" }),
+    runtimeConfig: DEFAULT_AGENT_RUNTIME_CONFIG,
+    store: enqueueOnlyStore([{ status: "unsupported-edit" }]),
+  });
+  assert.equal(response.status, 409);
+  assert.deepEqual(await response.json(), {
+    code: "mailbox_steered_message_not_editable",
+    error: "A steered message has no independent edit checkpoint. Send a new message instead.",
+    ok: false,
+  });
+});
 
 function mailboxItem(): AgentMailboxItem {
   return {
@@ -150,6 +166,7 @@ function enqueueOnlyStore(results: EnqueueAgentMailboxResult[]): AgentMailboxSto
     cancelOwned: unsupported,
     claimNext: unsupported,
     commit: unsupported,
+    consumeEdit: unsupported,
     defer: unsupported,
     deferRejectedAdmission: unsupported,
     async enqueue() {

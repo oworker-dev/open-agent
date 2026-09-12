@@ -10,6 +10,9 @@ import {
 } from "./agent-database.ts";
 import type { AgentSessionOwner } from "./session-ownership-store.ts";
 
+export const EDIT_ADMISSION_TIMEOUT_MS = 120_000;
+export const EDIT_ADMISSION_EXPIRED = "edit_admission_expired";
+
 export type AgentMailboxStatus =
   | "accepted"
   | "cancelled"
@@ -27,6 +30,8 @@ type AgentMailboxPayloadBase = {
     readonly expectedTurnId?: string;
     readonly kind: "send" | "steer" | "edit" | "respond";
     readonly operationId: string;
+    /** Set only after the runtime advertises a pre-revert consumption guard. */
+    readonly consumptionGuard?: "edit-v1";
   };
   readonly preferences?: {
     readonly executionMode: "automation" | "cautious" | "standard";
@@ -67,11 +72,18 @@ export type AgentMailboxItem = {
 export type EnqueueAgentMailboxResult =
   | { readonly item: AgentMailboxItem; readonly status: "created" | "replay" }
   | { readonly item: AgentMailboxItem; readonly status: "conflict" }
-  | { readonly status: "forbidden" | "full" | "missing-session" };
+  | { readonly status: "forbidden" | "full" | "missing-session" | "unsupported-edit" };
 
 export interface AgentMailboxStore {
   accept(itemId: string, claimToken: string, acceptedSessionId: string): Promise<AgentMailboxItem>;
-  beginAdmission(itemId: string, claimToken: string): Promise<AgentMailboxItem>;
+  beginAdmission(itemId: string, claimToken: string, options?: { readonly guardEdit?: boolean }): Promise<AgentMailboxItem>;
+  consumeEdit(input: {
+    readonly beforeTurnId: string;
+    readonly clientMessageId: string;
+    readonly itemId: string;
+    readonly owner: AgentSessionOwner;
+    readonly sessionId: string;
+  }): Promise<boolean>;
   cancelOwned(owner: AgentSessionOwner, itemId: string): Promise<AgentMailboxItem | undefined>;
   claimNext(options?: { readonly leaseMs?: number }): Promise<AgentMailboxItem | undefined>;
   commit(itemId: string, acceptedSessionId: string): Promise<AgentMailboxItem>;
@@ -147,6 +159,21 @@ function postgresAgentMailboxStore(
           } as const;
         }
 
+        // A legacy client can offer Edit on a consumed steer. The public edit
+        // contract targets a whole turn, so reject before storing any command.
+        if (input.payload.operation?.kind === "edit") {
+          const steered = await client.query(
+            `select 1 from ${mailboxTable}
+              where session_id = $1 and tenant_id = $2 and principal_id = $3
+                and payload->'operation'->>'kind' = 'steer'
+                and payload->'operation'->>'expectedTurnId' = $4
+                and status not in ('cancelled', 'failed')
+              limit 1`,
+            [input.sessionId, input.owner.tenantId, input.owner.principalId, input.payload.operation.beforeTurnId],
+          );
+          if (steered.rows.length > 0) return { status: "unsupported-edit" } as const;
+        }
+
         const pending = await client.query<{ count: string }>(
           `select count(*)::text as count from ${mailboxTable}
             where session_id = $1
@@ -183,6 +210,18 @@ function postgresAgentMailboxStore(
     async claimNext(options) {
       const leaseMs = options?.leaseMs ?? 60_000;
       assertLease(leaseMs);
+      // Consumption and expiry compete on this same row. A late delivery must
+      // pass consumeEdit before it can rewind context, so expiry cannot race
+      // into a second edit after the browser has released its pending state.
+      await pool.query(
+        `update ${mailboxTable}
+            set status = 'cancelled', claim_token = null, claim_expires_at = null,
+                last_error = $1, updated_at = now()
+          where status in ('delivering', 'accepted', 'submission-ambiguous')
+            and payload->'operation'->>'consumptionGuard' = 'edit-v1'
+            and admission_started_at < now() - ($2::bigint * interval '1 millisecond')`,
+        [EDIT_ADMISSION_EXPIRED, EDIT_ADMISSION_TIMEOUT_MS],
+      );
       await pool.query(
         `update ${mailboxTable}
             set status = 'submission-ambiguous', claim_token = null,
@@ -230,18 +269,52 @@ function postgresAgentMailboxStore(
       );
       return result.rows[0] ? toRecord(result.rows[0]) : undefined;
     },
-    async beginAdmission(itemId, claimToken) {
+    async beginAdmission(itemId, claimToken, options) {
       assertText(itemId, "itemId", 512);
       assertText(claimToken, "claimToken", 512);
       const result = await pool.query<AgentMailboxRow>(
         `update ${mailboxTable}
-            set admission_started_at = now(), updated_at = now()
+            set admission_started_at = now(), updated_at = now(),
+                payload = case when $3 and payload->'operation'->>'kind' = 'edit'
+                  then jsonb_set(payload, '{operation,consumptionGuard}', '"edit-v1"'::jsonb)
+                  else payload end
           where item_id = $1 and status = 'delivering' and claim_token = $2
             and admission_started_at is null and claim_expires_at >= now()
          returning ${selectColumns()}`,
-        [itemId, claimToken],
+        [itemId, claimToken, options?.guardEdit === true],
       );
       return toRecord(requireRow(result.rows[0]));
+    },
+    async consumeEdit(input) {
+      assertOwner(input.owner);
+      return await inTransaction(pool, async (client) => {
+        const result = await client.query<AgentMailboxRow>(
+          `select ${selectColumns()} from ${mailboxTable}
+            where item_id = $1 and session_id = $2 and client_message_id = $3
+              and tenant_id = $4 and principal_id = $5
+              and payload->'operation'->>'kind' = 'edit'
+              and payload->'operation'->>'beforeTurnId' = $6
+            for update`,
+          [input.itemId, input.sessionId, input.clientMessageId,
+            input.owner.tenantId, input.owner.principalId, input.beforeTurnId],
+        );
+        if (!result.rows[0]) return false;
+        const item = toRecord(result.rows[0]);
+        // Old durable deliveries keep their recorded protocol. They are never
+        // expired by the guarded-edit reaper above.
+        if (item.payload.operation?.consumptionGuard !== "edit-v1") return true;
+        if (!["delivering", "accepted", "submission-ambiguous", "committed"].includes(item.status)) return false;
+        await client.query(
+          `update ${mailboxTable}
+              set status = 'committed', accepted_session_id = $2,
+                  accepted_at = coalesce(accepted_at, now()),
+                  committed_at = coalesce(committed_at, now()),
+                  claim_token = null, claim_expires_at = null, updated_at = now()
+            where item_id = $1`,
+          [input.itemId, input.sessionId],
+        );
+        return true;
+      });
     },
     async defer(itemId, claimToken, availableAt, reason) {
       assertText(itemId, "itemId", 512);

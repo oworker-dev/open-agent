@@ -1303,6 +1303,7 @@ export function AgentWorkspace({
     let recoverySnapshotDirty = false;
     let recoveryEventsSinceFlush = 0;
     let lastRecoveryFlushAt = Date.now();
+    let recoveryFlushTimer: number | undefined;
     let checkedTailBoundary = false;
     let recoveryCursorReconciled = false;
     let needsBoundedCatchUp = true;
@@ -1353,10 +1354,14 @@ export function AgentWorkspace({
         liveThread.inputResponseSubmissions ?? [],
       );
 
-      const liveQueuedTurnIds = new Set(liveThread.queuedTurns.map((turn) => turn.id));
+      const liveQueuedTurns = new Map(liveThread.queuedTurns.map((turn) => [turn.id, turn]));
       queuedTurns = queuedTurns.filter((turn) =>
         !consumedQueuedTurnIds.has(turn.id) &&
-        (recoveryOwnedQueuedTurnIds.has(turn.id) || liveQueuedTurnIds.has(turn.id))
+        (recoveryOwnedQueuedTurnIds.has(turn.id) || liveQueuedTurns.has(turn.id))
+      ).map((turn) =>
+        // Until mailbox admission, the composer owns target resolution and
+        // the enqueue receipt. Do not overwrite either with the recovery seed.
+        turn.mailboxItemId ? turn : liveQueuedTurns.get(turn.id) ?? turn,
       );
       const localQueuedTurnIds = new Set(queuedTurns.map((turn) => turn.id));
       for (const turn of liveThread.queuedTurns) {
@@ -1489,11 +1494,16 @@ export function AgentWorkspace({
       return status;
     };
     const flushRecoverySnapshot = (force = false) => {
+      window.clearTimeout(recoveryFlushTimer);
+      recoveryFlushTimer = undefined;
       // A new recovery worker may have taken ownership after navigation back
       // to this thread. The old worker can finish its aborted iterator, but it
       // must not publish its stale snapshot over the newer worker's state.
       if (recoveryControllers.current.get(thread.id) !== controller) return;
       if (!force && !recoverySnapshotDirty && cursor === persistedCursor) return;
+      // A trailing flush can run after a user queues/removes a message but
+      // before another stream event arrives. Preserve those live admissions.
+      mergeLiveAdmissions();
       persistedCursor = cursor;
       recoverySnapshotDirty = false;
       recoveryEventsSinceFlush = 0;
@@ -1648,6 +1658,9 @@ export function AgentWorkspace({
                 recoveryEventsSinceFlush >= 32 ||
                 Date.now() - lastRecoveryFlushAt >= 75
               ) flushRecoverySnapshot();
+              else if (recoveryFlushTimer === undefined) {
+                recoveryFlushTimer = window.setTimeout(flushRecoverySnapshot, 75);
+              }
               // Durable boundaries are user-visible state transitions. Publish
               // them immediately even when the provider keeps the HTTP stream
               // open between events (notably during cancellation recovery).
@@ -1863,6 +1876,7 @@ export function AgentWorkspace({
       setRecoveryErrors((current) => new Map(current).set(thread.id, error instanceof Error ? error.message : messages.recoveryFailed));
       console.error("Agent session recovery failed", error);
     } finally {
+      window.clearTimeout(recoveryFlushTimer);
       // A rapid switch away and back can replace this worker with a newer
       // controller for the same thread. The old worker must not clear the new
       // worker's ownership marker or make its stream look inactive.

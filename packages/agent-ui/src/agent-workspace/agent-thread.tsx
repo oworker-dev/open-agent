@@ -777,7 +777,10 @@ export function AgentThreadView({
   // show Thinking instead of falling back to the previous settled turn.
   const committedFollowUp = thread.queuedTurns.find((turn) =>
     turn.delivery === "server" &&
-    (turn.state === "committed" || turn.state === "accepted") &&
+    turn.state === "committed" &&
+    // Steering already has an active display root. A send placeholder here
+    // would rebind the entire existing turn to the follow-up's optimistic id.
+    (!turn.expectedTurnId || turn.expectedTurnId !== latestActiveTurnId(effectiveRenderEvents)) &&
     !hasDurableQueuedTurnMessage(turn, effectiveRenderMessages, effectiveRenderEvents),
   );
   const displayAdmissionTurn = displayPendingTurn ?? (committedFollowUp
@@ -831,6 +834,10 @@ export function AgentThreadView({
   const pendingTurnAccepted = admissionPendingTurn !== undefined &&
     reconcilePendingTurnWithEvents(admissionPendingTurn, authoritativeEvents) === undefined;
   const pendingTurnInFlight = isPendingTurnInFlight(admissionPendingTurn) && !pendingTurnAccepted;
+  const effectiveTurnError = turnError ?? (
+    admissionPendingTurn?.operation === "edit" && admissionPendingTurn.state === "delivery-failed"
+      ? messages.queueDeliveryFailed : undefined
+  );
   const durableTurnSettled = !pendingTurnInFlight &&
     hasSettledLatestTurn(authoritativeEvents) &&
     hasSettledSessionBoundary(authoritativeEvents);
@@ -1161,7 +1168,9 @@ export function AgentThreadView({
     }
     const nextStatus: AgentThread["status"] = cancellationRef.current.requested
       ? "cancelling"
-      : turnError ? "error" : awaitingInput ? "waiting" : agent.status;
+      : effectiveTurnError ? "error" : awaitingInput ? "waiting"
+        : pendingTurnInFlight ? "submitted"
+          : liveTurnOpen && agent.status === "ready" ? "streaming" : agent.status;
     const metadataChanged = acceptedPendingTurn || acceptedQueuedTurn ||
       cancelledTurn !== undefined || nextStatus !== persistedThreadStatusRef.current;
     if (metadataChanged) {
@@ -1189,7 +1198,7 @@ export function AgentThreadView({
         updatedAt: Date.now(),
       });
     }
-  }, [agent.events, agent.session, agent.status, awaitingInput, isRecovering, localInterruption, onChange, recoveryContextWindowTokens, turnError]);
+  }, [agent.events, agent.session, agent.status, awaitingInput, effectiveTurnError, isRecovering, liveTurnOpen, localInterruption, onChange, pendingTurnInFlight, recoveryContextWindowTokens]);
 
   const hasTurnFailure = Boolean(latestTurnFailure(authoritativeEvents));
   // Turn/step failures are rendered against their exact execution step by the
@@ -1203,15 +1212,15 @@ export function AgentThreadView({
     : undefined;
   const runtimeError = recoveryError
     ? sanitizeAgentError(recoveryError)
-    : !hasTurnFailure && (providerRetry || turnError || errorMessage)
-      ? sanitizeAgentError(providerRetry?.error.message ?? turnError ?? errorMessage ?? "The Agent request failed.")
+    : !hasTurnFailure && (providerRetry || effectiveTurnError || errorMessage)
+      ? sanitizeAgentError(providerRetry?.error.message ?? effectiveTurnError ?? errorMessage ?? "The Agent request failed.")
       : undefined;
   const runtimeFailure: AgentTurnFailure | undefined = recoveryError
     ? { code: "agent_recovery_failed", message: recoveryError }
     : agent.error
       ? toAgentFailure(agent.error)
-      : turnError
-        ? { code: "agent_turn_failed", message: turnError }
+      : effectiveTurnError
+        ? { code: "agent_turn_failed", message: effectiveTurnError }
         : undefined;
   const usage = summarizeUsage(agent.events);
 
@@ -1584,8 +1593,8 @@ export function AgentThreadView({
     // durable boundary. A render can still carry the previous `admissionBusy`
     // value for one frame; trust the current Eve transcript in that window so
     // a normal next message is not misclassified as a queued follow-up.
-    const liveSessionSettled = hasSettledLatestTurn(agent.events) &&
-      hasSettledSessionBoundary(agent.events);
+    const liveSessionSettled = hasSettledLatestTurn(authoritativeEvents) &&
+      hasSettledSessionBoundary(authoritativeEvents);
     if (liveSessionSettled) turnAdmissionBusyRef.current = false;
     if ((admissionBusy || turnAdmissionBusyRef.current) && !liveSessionSettled) {
       if (message.files.length > 0) {
@@ -1597,7 +1606,7 @@ export function AgentThreadView({
         return;
       }
       if (text.length > 0) {
-        const expectedTurnId = latestActiveTurnId(latestEventsRef.current);
+        const expectedTurnId = latestActiveTurnId(authoritativeEvents);
         setQueueError(undefined);
         updateQueuedTurns([
           ...queuedTurnsRef.current,
@@ -1824,12 +1833,12 @@ export function AgentThreadView({
     // assistant-ui sourceId is the rendered message id. After an edit we may
     // intentionally stabilize that id to an older display root, so resolve
     // the durable checkpoint from Eve's latest projected receipt first.
-    const beforeTurnId = latestEditableTurnId(projectionEvents) ??
-      editedTurnId(message, displayMessageIdentityRef.current);
-    if (!beforeTurnId) {
+    const beforeTurnId = latestEditableTurnId(projectThreadEditBranches(authoritativeEvents));
+    const latestUserMessage = visibleMessages.findLast((candidate) => candidate.role === "user");
+    if (!beforeTurnId || message.sourceId !== latestUserMessage?.id) {
       setTurnError(locale === "zh-CN"
-        ? "无法确定要编辑的消息，请刷新会话后重试。"
-        : "The edited message has no durable turn identity. Reload and try again.");
+        ? "这条消息没有独立的编辑检查点。请通过输入框发送新消息。"
+        : "This message has no independent edit checkpoint. Send a new message instead.");
       return;
     }
     if (!mailbox) {
@@ -1858,11 +1867,18 @@ export function AgentThreadView({
     prepareTurn();
     turnAdmissionBusyRef.current = true;
     setTurnError(undefined);
+    const previousEdit = pendingTurnRef.current;
+    const baseOperationId = editOperationId(sessionId, beforeTurnId, text);
     const pendingTurn = {
       beforeTurnId,
       delivery: "server" as const,
       eventCountAtSubmission: compactedEventsRef.current.length,
-      id: editOperationId(sessionId, beforeTurnId, text),
+      // A cancelled delivery remains fenced forever. An explicit retry is a
+      // new operation; refresh still reuses this operation's persisted id.
+      id: previousEdit?.operation === "edit" && previousEdit.state === "delivery-failed" &&
+          previousEdit.beforeTurnId === beforeTurnId
+        ? `${baseOperationId}-${createPendingTurnId()}`
+        : baseOperationId,
       operation: "edit" as const,
       state: "submitting" as const,
       submittedAt: Date.now(),
@@ -2012,7 +2028,7 @@ export function AgentThreadView({
         turnAdmissionBusyRef.current = false;
         setOptimisticPendingTurn(failed);
         onChange({ pendingTurn: failed, status: "error", updatedAt: Date.now() });
-        setTurnError(receipt.lastError ?? messages.queueDeliveryFailed);
+        setTurnError(receipt.lastError === "edit_admission_expired" ? messages.queueDeliveryFailed : receipt.lastError ?? messages.queueDeliveryFailed);
         return;
       }
       const admitted = { ...pendingTurn, mailboxItemId: receipt.itemId };
@@ -2068,7 +2084,7 @@ export function AgentThreadView({
           turnAdmissionBusyRef.current = false;
           setOptimisticPendingTurn(failed);
           onChange({ pendingTurn: failed, status: "error", updatedAt: Date.now() });
-          setTurnError(receipt.lastError ?? messages.queueDeliveryFailed);
+          setTurnError(receipt.lastError === "edit_admission_expired" ? messages.queueDeliveryFailed : receipt.lastError ?? messages.queueDeliveryFailed);
         }
       } catch {
         // Keep the last durable receipt while the mailbox endpoint is transiently unavailable.
@@ -2094,7 +2110,9 @@ export function AgentThreadView({
     if (!next) return;
 
     if (next.intent === "active-turn" && !next.expectedTurnId) {
-      const expectedTurnId = latestActiveTurnId(agent.events);
+      // Recovery owns the current stream after a reconnect. The mounted Eve
+      // store still contains its old seed until the recovery handoff.
+      const expectedTurnId = latestActiveTurnId(authoritativeEvents);
       if (expectedTurnId) {
         // Persist the authoritative turn before admission. A follow-up can be
         // submitted while the first turn is still emitting its preamble; a
@@ -2165,7 +2183,7 @@ export function AgentThreadView({
     }).finally(() => {
       mailboxEnqueueIdsRef.current.delete(next.id);
     });
-  }, [agent.events, agent.session?.sessionId, cancellationSettling, durableTurnOpen, isRecovering, liveTurnOpen, mailbox, messages.queueDeliveryFailed, pendingTurnInFlight, runtimeIsBusy, thread.queuedTurns]);
+  }, [authoritativeEvents, agent.session?.sessionId, cancellationSettling, durableTurnOpen, isRecovering, liveTurnOpen, mailbox, messages.queueDeliveryFailed, pendingTurnInFlight, runtimeIsBusy, thread.queuedTurns]);
 
   useEffect(() => {
     if (!mailbox || isRecovering) return;
@@ -2385,8 +2403,7 @@ export function AgentThreadView({
 
   const visibleQueuedTurns = thread.queuedTurns.filter((turn) =>
     turn.intent !== "post-cancellation" &&
-    turn.state !== "accepted" &&
-    turn.state !== "committed"
+    !queuedTurnWasConsumed(turn)
   );
   // A mailbox edit intentionally reattaches the durable Eve stream after the
   // server commits the rewind. That is normal turn execution, not a transport
@@ -2434,6 +2451,7 @@ export function AgentThreadView({
           fallbackStartedAt={displayPendingTurn?.submittedAt}
           inputDisabled={inputLocked}
           isBusy={isBusy}
+          messageEditingAllowed={latestEditableTurnId(projectionEvents) !== undefined}
           sessionTerminal={sessionTerminal}
           sessionSettled={editBoundarySettled}
           onCancel={requestCancellation}
@@ -2730,7 +2748,9 @@ function stableAssistantMessageId(sourceId: string, turnId: string, stableRoot: 
   if (sourceId.startsWith(`${prefix}:`)) {
     return `${stableRoot}:assistant:${sourceId.slice(prefix.length + 1)}`;
   }
-  return `${stableRoot}:assistant`;
+  // An earlier projection may already have stabilized this id. Keep its
+  // segment suffix; collapsing it aliases every steered reply to one row.
+  return sourceId;
 }
 
 
@@ -2917,16 +2937,11 @@ export function projectStagedUserMessages(
   if (turns.length === 0) return messages;
   const projected = [...messages];
   for (const turn of turns) {
-    // A queued/delivering mailbox item is already represented by the compact
-    // composer queue. Project it into the transcript only once admission has
-    // been accepted/committed (or for a post-cancellation browser draft,
-    // whose queue row is intentionally the optimistic transcript). This
-    // avoids showing the same pending follow-up twice while still bridging
-    // the accepted-receipt → Eve reducer handoff where messages used to vanish.
+    // Server `accepted` means the inbox owns the command, not that the model
+    // has consumed it. Only the durable message receipt commits it to history.
     if (
       turn.intent !== "post-cancellation" &&
-      turn.state !== "accepted" &&
-      turn.state !== "committed"
+      !queuedTurnWasConsumed(turn)
     ) continue;
     const id = `${turn.id}:user`;
     if (projected.some((message) => message.id === id)) continue;
@@ -2966,6 +2981,10 @@ export function projectStagedUserMessages(
     else projected.push(stagedMessage);
   }
   return projected;
+}
+
+function queuedTurnWasConsumed(turn: AgentQueuedTurn): boolean {
+  return turn.state === "committed" || (turn.delivery !== "server" && turn.state === "accepted");
 }
 
 function isPendingTurnInFlight(pendingTurn?: AgentThread["pendingTurn"]): boolean {
@@ -3175,34 +3194,6 @@ function promptFromAssistantMessage(content: Parameters<ClientSession["send"]>[0
     };
   });
   return { files, text };
-}
-
-function editedTurnId(
-  message: AppendMessage,
-  identities?: DisplayMessageIdentityState,
-): string | undefined {
-  const metadataTurnId = message.metadata?.custom?.turnId ??
-    (message.metadata as { readonly turnId?: unknown } | undefined)?.turnId;
-  if (typeof metadataTurnId === "string" && metadataTurnId.trim()) return metadataTurnId;
-  if (!message.sourceId) return undefined;
-
-  // assistant-ui's edit composer preserves the displayed message id as
-  // `sourceId`, but our live handoff intentionally replaces Eve's
-  // `<turnId>:user` id with a stable optimistic root. Resolve that alias back
-  // to Eve's durable turn before submitting the revert transaction. Without
-  // this reverse lookup an edit targets `pending-...` and Eve correctly
-  // rejects the revert precondition, which can look like a normal duplicate
-  // send after refresh.
-  if (identities) {
-    for (const [turnId, stableRoot] of identities.assistantByTurn) {
-      if (message.sourceId === `${stableRoot}:user` ||
-          message.sourceId.startsWith(`${stableRoot}:user:`)) {
-        return turnId;
-      }
-    }
-  }
-  const userSuffix = message.sourceId.indexOf(":user");
-  return userSuffix > 0 ? message.sourceId.slice(0, userSuffix) : undefined;
 }
 
 function mailboxPromptText(prompt: PromptInputMessage): string | undefined {

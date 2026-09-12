@@ -646,21 +646,7 @@ export function mergeThreadEventSnapshots(
     candidates.push({ event, position });
     position += 1;
   }
-  // Persisted snapshots no longer carry the in-memory absolute cursor. Keep
-  // the first observed order of turns as the primary key; Eve's sequence and
-  // stepIndex restart for every turn and therefore cannot establish a global
-  // order. This prevents a follow-up turn (sequence 0) from being sorted
-  // before the original turn's later steps during recovery handoff.
-  const turnOrder = new Map<string, number>();
-  let nextTurnOrder = 0;
-  for (const candidate of candidates) {
-    const turnId = eventTurnId(candidate.event);
-    if (turnId !== undefined && !turnOrder.has(turnId)) {
-      turnOrder.set(turnId, nextTurnOrder);
-      nextTurnOrder += 1;
-    }
-  }
-  candidates.sort((a, b) => compareEventOrder(a.event, b.event, turnOrder) || a.position - b.position);
+  candidates.sort((a, b) => compareEventOrder(a.event, b.event) || a.position - b.position);
   return compactThreadEvents(candidates.map((candidate) => candidate.event));
 }
 
@@ -683,7 +669,6 @@ function sameEventIdentityOrder(
 function compareEventOrder(
   left: MessageStreamEvent,
   right: MessageStreamEvent,
-  turnOrder?: ReadonlyMap<string, number>,
 ): number {
   const leftCursor = eventCursors.get(left as object);
   const rightCursor = eventCursors.get(right as object);
@@ -691,20 +676,7 @@ function compareEventOrder(
     return leftCursor - rightCursor;
   }
 
-  if (turnOrder) {
-    const leftTurn = eventTurnId(left);
-    const rightTurn = eventTurnId(right);
-    const leftOrder = leftTurn === undefined ? undefined : turnOrder.get(leftTurn);
-    const rightOrder = rightTurn === undefined ? undefined : turnOrder.get(rightTurn);
-    if (leftOrder !== undefined && rightOrder !== undefined && leftOrder !== rightOrder) {
-      return leftOrder - rightOrder;
-    }
-  }
-
-  // sequence and stepIndex restart at zero for every turn. They are only
-  // meaningful when both events belong to the same turn; comparing them
-  // across turns moves a follow-up before the original execution group when
-  // persisted events do not carry an in-memory absolute cursor.
+  // Step coordinates are only comparable inside their owning turn.
   const leftTurnId = eventTurnId(left);
   const rightTurnId = eventTurnId(right);
   if (leftTurnId !== undefined && leftTurnId === rightTurnId) {
@@ -1036,6 +1008,7 @@ export function projectPendingThreadEdit(
   if (!beforeTurnId || events.some((event) =>
     event.type === "context.cleared" && event.data.turnId === beforeTurnId
   )) return events;
+  if (hasSteeredMessages(events, beforeTurnId)) return events;
   const targetIndex = events.findIndex((event) => eventTurnId(event) === beforeTurnId);
   if (targetIndex < 0) return events;
   const turnStartIndex = events.findLastIndex((event, index) =>
@@ -1064,9 +1037,23 @@ export function latestEditableTurnId(
   for (const event of [...events].reverse()) {
     if (event.type !== "message.received" || typeof event.data.turnId !== "string") continue;
     if (conflictTurns.has(event.data.turnId)) continue;
+    // The latest user row may be a steer inside an older turn. Its turn-level
+    // checkpoint precedes all work in that turn, not just this user message.
+    if (hasSteeredMessages(events, event.data.turnId)) return undefined;
+    if (!events.some((candidate) => candidate.type === "turn.started" && candidate.data.turnId === event.data.turnId)) return undefined;
     return event.data.turnId;
   }
   return undefined;
+}
+
+function hasSteeredMessages(events: readonly MessageStreamEvent[], turnId: string): boolean {
+  let received = false;
+  for (const event of events) {
+    if (event.type !== "message.received" || event.data.turnId !== turnId) continue;
+    if (received) return true;
+    received = true;
+  }
+  return false;
 }
 
 function eventTurnId(event: MessageStreamEvent): string | undefined {

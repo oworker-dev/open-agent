@@ -20,6 +20,7 @@ import {
 import type { AgentRunPolicy } from "@oworker/open-agent-contracts/agent-run";
 import { isBoundedAgentClientContext } from "@oworker/open-agent-contracts/client-context";
 import { createPostgresSessionOwnershipStoreFromEnvironment } from "../../server/data/session-ownership-store";
+import { createPostgresAgentMailboxStoreFromEnvironment } from "../../server/data/agent-mailbox-store";
 import { createPostgresAgentExtensionStoreFromEnvironment } from "../../server/data/agent-extension-store";
 import { hostJwtAuthFromEnvironment } from "../lib/host-auth";
 import { standaloneCookieAuth } from "../lib/standalone-auth";
@@ -33,6 +34,7 @@ import {
   type MailboxBoundary,
 } from "../lib/mailbox-boundary.ts";
 import type { MessageStreamEvent } from "eve/client";
+import { withMailboxEditAdmission } from "../lib/mailbox-edit-admission.ts";
 
 const MODEL_HEADER = "x-agent-model";
 const REASONING_HEADER = "x-agent-reasoning";
@@ -46,6 +48,7 @@ const TRACE_PARENT_HEADER = "traceparent";
 const MAILBOX_ROUTE = "/eve/v1/internal/mailbox";
 const MAX_MAILBOX_REQUEST_BYTES = 128 * 1024;
 const sessionOwnershipStore = createPostgresSessionOwnershipStoreFromEnvironment();
+const mailboxStore = createPostgresAgentMailboxStoreFromEnvironment();
 const extensionStore = createPostgresAgentExtensionStoreFromEnvironment();
 
 if (process.env.AGENT_HOST_JWT_SECRET?.trim() && !sessionOwnershipStore) {
@@ -252,7 +255,7 @@ const mailboxRoute = POST(MAILBOX_ROUTE, async (request, {
     return mailboxProblem(404, "mailbox_session_not_found", "The Agent session was not found.");
   }
   if (input.action === "inspect") {
-    return Response.json({ ...boundary, ok: true }, { headers: { "cache-control": "no-store" } });
+    return Response.json({ ...boundary, ...(mailboxStore ? { editAdmissionGuard: true } : {}), ok: true }, { headers: { "cache-control": "no-store" } });
   }
   if (boundary.state === "terminal" ||
       boundary.state === "running" && !canSteerMailboxRequest(input, boundary)) {
@@ -315,7 +318,7 @@ const mailboxRoute = POST(MAILBOX_ROUTE, async (request, {
 // Keep the canonical Eve channel identity so this internal route resumes the
 // same continuation namespace instead of creating a second transport session.
 export default {
-  ...channel,
+  ...(mailboxStore ? withMailboxEditAdmission(channel, mailboxStore) : channel),
   routes: [...channel.routes, mailboxRoute],
 };
 

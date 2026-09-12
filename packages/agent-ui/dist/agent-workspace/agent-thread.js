@@ -450,7 +450,8 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         ? undefined
         : displayPendingCandidate;
     const committedFollowUp = thread.queuedTurns.find((turn) => turn.delivery === "server" &&
-        (turn.state === "committed" || turn.state === "accepted") &&
+        turn.state === "committed" &&
+        (!turn.expectedTurnId || turn.expectedTurnId !== latestActiveTurnId(effectiveRenderEvents)) &&
         !hasDurableQueuedTurnMessage(turn, effectiveRenderMessages, effectiveRenderEvents));
     const displayAdmissionTurn = displayPendingTurn ?? (committedFollowUp
         ? {
@@ -481,6 +482,8 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     const pendingTurnAccepted = admissionPendingTurn !== undefined &&
         reconcilePendingTurnWithEvents(admissionPendingTurn, authoritativeEvents) === undefined;
     const pendingTurnInFlight = isPendingTurnInFlight(admissionPendingTurn) && !pendingTurnAccepted;
+    const effectiveTurnError = turnError ?? (admissionPendingTurn?.operation === "edit" && admissionPendingTurn.state === "delivery-failed"
+        ? messages.queueDeliveryFailed : undefined);
     const durableTurnSettled = !pendingTurnInFlight &&
         hasSettledLatestTurn(authoritativeEvents) &&
         hasSettledSessionBoundary(authoritativeEvents);
@@ -719,7 +722,9 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         }
         const nextStatus = cancellationRef.current.requested
             ? "cancelling"
-            : turnError ? "error" : awaitingInput ? "waiting" : agent.status;
+            : effectiveTurnError ? "error" : awaitingInput ? "waiting"
+                : pendingTurnInFlight ? "submitted"
+                    : liveTurnOpen && agent.status === "ready" ? "streaming" : agent.status;
         const metadataChanged = acceptedPendingTurn || acceptedQueuedTurn ||
             cancelledTurn !== undefined || nextStatus !== persistedThreadStatusRef.current;
         if (metadataChanged) {
@@ -742,7 +747,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
                 updatedAt: Date.now(),
             });
         }
-    }, [agent.events, agent.session, agent.status, awaitingInput, isRecovering, localInterruption, onChange, recoveryContextWindowTokens, turnError]);
+    }, [agent.events, agent.session, agent.status, awaitingInput, effectiveTurnError, isRecovering, liveTurnOpen, localInterruption, onChange, pendingTurnInFlight, recoveryContextWindowTokens]);
     const hasTurnFailure = Boolean(latestTurnFailure(authoritativeEvents));
     const transportError = agent.error?.message;
     const errorMessage = !hasTurnFailure
@@ -750,15 +755,15 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         : undefined;
     const runtimeError = recoveryError
         ? sanitizeAgentError(recoveryError)
-        : !hasTurnFailure && (providerRetry || turnError || errorMessage)
-            ? sanitizeAgentError(providerRetry?.error.message ?? turnError ?? errorMessage ?? "The Agent request failed.")
+        : !hasTurnFailure && (providerRetry || effectiveTurnError || errorMessage)
+            ? sanitizeAgentError(providerRetry?.error.message ?? effectiveTurnError ?? errorMessage ?? "The Agent request failed.")
             : undefined;
     const runtimeFailure = recoveryError
         ? { code: "agent_recovery_failed", message: recoveryError }
         : agent.error
             ? toAgentFailure(agent.error)
-            : turnError
-                ? { code: "agent_turn_failed", message: turnError }
+            : effectiveTurnError
+                ? { code: "agent_turn_failed", message: effectiveTurnError }
                 : undefined;
     const usage = summarizeUsage(agent.events);
     useEffect(() => {
@@ -1047,8 +1052,8 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             }
             return;
         }
-        const liveSessionSettled = hasSettledLatestTurn(agent.events) &&
-            hasSettledSessionBoundary(agent.events);
+        const liveSessionSettled = hasSettledLatestTurn(authoritativeEvents) &&
+            hasSettledSessionBoundary(authoritativeEvents);
         if (liveSessionSettled)
             turnAdmissionBusyRef.current = false;
         if ((admissionBusy || turnAdmissionBusyRef.current) && !liveSessionSettled) {
@@ -1061,7 +1066,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
                 return;
             }
             if (text.length > 0) {
-                const expectedTurnId = latestActiveTurnId(latestEventsRef.current);
+                const expectedTurnId = latestActiveTurnId(authoritativeEvents);
                 setQueueError(undefined);
                 updateQueuedTurns([
                     ...queuedTurnsRef.current,
@@ -1204,12 +1209,12 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         const prompt = promptFromAssistantMessage(getEveMessageContent(message));
         if (!prompt.text && prompt.files.length === 0)
             return;
-        const beforeTurnId = latestEditableTurnId(projectionEvents) ??
-            editedTurnId(message, displayMessageIdentityRef.current);
-        if (!beforeTurnId) {
+        const beforeTurnId = latestEditableTurnId(projectThreadEditBranches(authoritativeEvents));
+        const latestUserMessage = visibleMessages.findLast((candidate) => candidate.role === "user");
+        if (!beforeTurnId || message.sourceId !== latestUserMessage?.id) {
             setTurnError(locale === "zh-CN"
-                ? "无法确定要编辑的消息，请刷新会话后重试。"
-                : "The edited message has no durable turn identity. Reload and try again.");
+                ? "这条消息没有独立的编辑检查点。请通过输入框发送新消息。"
+                : "This message has no independent edit checkpoint. Send a new message instead.");
             return;
         }
         if (!mailbox) {
@@ -1239,11 +1244,16 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         prepareTurn();
         turnAdmissionBusyRef.current = true;
         setTurnError(undefined);
+        const previousEdit = pendingTurnRef.current;
+        const baseOperationId = editOperationId(sessionId, beforeTurnId, text);
         const pendingTurn = {
             beforeTurnId,
             delivery: "server",
             eventCountAtSubmission: compactedEventsRef.current.length,
-            id: editOperationId(sessionId, beforeTurnId, text),
+            id: previousEdit?.operation === "edit" && previousEdit.state === "delivery-failed" &&
+                previousEdit.beforeTurnId === beforeTurnId
+                ? `${baseOperationId}-${createPendingTurnId()}`
+                : baseOperationId,
             operation: "edit",
             state: "submitting",
             submittedAt: Date.now(),
@@ -1351,7 +1361,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
                 turnAdmissionBusyRef.current = false;
                 setOptimisticPendingTurn(failed);
                 onChange({ pendingTurn: failed, status: "error", updatedAt: Date.now() });
-                setTurnError(receipt.lastError ?? messages.queueDeliveryFailed);
+                setTurnError(receipt.lastError === "edit_admission_expired" ? messages.queueDeliveryFailed : receipt.lastError ?? messages.queueDeliveryFailed);
                 return;
             }
             const admitted = { ...pendingTurn, mailboxItemId: receipt.itemId };
@@ -1403,7 +1413,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
                     turnAdmissionBusyRef.current = false;
                     setOptimisticPendingTurn(failed);
                     onChange({ pendingTurn: failed, status: "error", updatedAt: Date.now() });
-                    setTurnError(receipt.lastError ?? messages.queueDeliveryFailed);
+                    setTurnError(receipt.lastError === "edit_admission_expired" ? messages.queueDeliveryFailed : receipt.lastError ?? messages.queueDeliveryFailed);
                 }
             }
             catch {
@@ -1427,7 +1437,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         if (!next)
             return;
         if (next.intent === "active-turn" && !next.expectedTurnId) {
-            const expectedTurnId = latestActiveTurnId(agent.events);
+            const expectedTurnId = latestActiveTurnId(authoritativeEvents);
             if (expectedTurnId) {
                 updateQueuedTurns(queuedTurnsRef.current.map((turn) => turn.id === next.id ? { ...turn, expectedTurnId } : turn));
                 return;
@@ -1474,7 +1484,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         }).finally(() => {
             mailboxEnqueueIdsRef.current.delete(next.id);
         });
-    }, [agent.events, agent.session?.sessionId, cancellationSettling, durableTurnOpen, isRecovering, liveTurnOpen, mailbox, messages.queueDeliveryFailed, pendingTurnInFlight, runtimeIsBusy, thread.queuedTurns]);
+    }, [authoritativeEvents, agent.session?.sessionId, cancellationSettling, durableTurnOpen, isRecovering, liveTurnOpen, mailbox, messages.queueDeliveryFailed, pendingTurnInFlight, runtimeIsBusy, thread.queuedTurns]);
     useEffect(() => {
         if (!mailbox || isRecovering)
             return;
@@ -1657,10 +1667,9 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     };
     const closeInputRequest = (requestId) => closeInputRequests([requestId]);
     const visibleQueuedTurns = thread.queuedTurns.filter((turn) => turn.intent !== "post-cancellation" &&
-        turn.state !== "accepted" &&
-        turn.state !== "committed");
+        !queuedTurnWasConsumed(turn));
     const showRecoveryStatus = isReconnecting && displayPendingTurn?.operation !== "edit";
-    return (_jsx(AssistantRuntimeProvider, { runtime: assistantRuntime, children: _jsx("main", { className: "flex min-h-0 flex-1 flex-col overflow-hidden", children: _jsx(AssistantThreadSurface, { assetUrl: client?.assetUrl, approvalTakeover: approvalTakeover, cancellationState: cancellationState, commands: commands, composerTop: showRecoveryStatus || visibleQueuedTurns.length > 0 || queueError ? (_jsxs(_Fragment, { children: [showRecoveryStatus ? (_jsxs("div", { className: "flex items-center gap-2 border-b border-border/60 px-1 pb-2 text-xs text-muted-foreground", "data-agent-recovery-status": true, role: "status", children: [_jsx(LoaderCircleIcon, { className: "size-3.5 animate-spin" }), _jsx("span", { children: messages.reconnecting })] })) : null, visibleQueuedTurns.length > 0 || queueError ? (_jsx(FollowUpQueue, { error: queueError, messages: messages, onRemove: removeQueuedTurn, onRetry: markQueuedTurnForRetry, turns: visibleQueuedTurns })) : null] })) : undefined, draftStorageKey: draftStorageKey, historyHasMore: historyHasMore, historyLoading: historyLoading, historyStartIndex: thread.transcriptWindow?.startIndex, events: displayEvents, eveMessages: visibleMessages, fallbackStartedAt: displayPendingTurn?.submittedAt, inputDisabled: inputLocked, isBusy: isBusy, sessionTerminal: sessionTerminal, sessionSettled: editBoundarySettled, onCancel: requestCancellation, locale: locale, mentions: mentions, messages: messages, models: models, onInputResponses: respond, onCloseInputRequest: closeInputRequest, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, onLoadEarlier: onLoadEarlier, onPreferencesChange: (preferences) => onChange({ preferences }), onDraftRestoreConsumed: (id) => {
+    return (_jsx(AssistantRuntimeProvider, { runtime: assistantRuntime, children: _jsx("main", { className: "flex min-h-0 flex-1 flex-col overflow-hidden", children: _jsx(AssistantThreadSurface, { assetUrl: client?.assetUrl, approvalTakeover: approvalTakeover, cancellationState: cancellationState, commands: commands, composerTop: showRecoveryStatus || visibleQueuedTurns.length > 0 || queueError ? (_jsxs(_Fragment, { children: [showRecoveryStatus ? (_jsxs("div", { className: "flex items-center gap-2 border-b border-border/60 px-1 pb-2 text-xs text-muted-foreground", "data-agent-recovery-status": true, role: "status", children: [_jsx(LoaderCircleIcon, { className: "size-3.5 animate-spin" }), _jsx("span", { children: messages.reconnecting })] })) : null, visibleQueuedTurns.length > 0 || queueError ? (_jsx(FollowUpQueue, { error: queueError, messages: messages, onRemove: removeQueuedTurn, onRetry: markQueuedTurnForRetry, turns: visibleQueuedTurns })) : null] })) : undefined, draftStorageKey: draftStorageKey, historyHasMore: historyHasMore, historyLoading: historyLoading, historyStartIndex: thread.transcriptWindow?.startIndex, events: displayEvents, eveMessages: visibleMessages, fallbackStartedAt: displayPendingTurn?.submittedAt, inputDisabled: inputLocked, isBusy: isBusy, messageEditingAllowed: latestEditableTurnId(projectionEvents) !== undefined, sessionTerminal: sessionTerminal, sessionSettled: editBoundarySettled, onCancel: requestCancellation, locale: locale, mentions: mentions, messages: messages, models: models, onInputResponses: respond, onCloseInputRequest: closeInputRequest, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, onLoadEarlier: onLoadEarlier, onPreferencesChange: (preferences) => onChange({ preferences }), onDraftRestoreConsumed: (id) => {
                     if (thread.draftRestore?.id === id)
                         onChange({ draftRestore: undefined });
                 }, onRetryRuntimeError: recoveryError ? onRetryRecovery : undefined, closedInputRequestIds: closedInputRequestIdsRef.current, preferences: thread.preferences, reasoningLevels: reasoningLevels, draftRestore: thread.draftRestore, runtimeFailure: runtimeFailure, runtimeError: runtimeError, runtimeRetry: providerRetry, usage: usage }) }) }));
@@ -1817,7 +1826,7 @@ function stableAssistantMessageId(sourceId, turnId, stableRoot) {
     if (sourceId.startsWith(`${prefix}:`)) {
         return `${stableRoot}:assistant:${sourceId.slice(prefix.length + 1)}`;
     }
-    return `${stableRoot}:assistant`;
+    return sourceId;
 }
 function projectPendingUserMessage(messages, pendingTurn, events = []) {
     if (!pendingTurn)
@@ -1941,8 +1950,7 @@ export function projectStagedUserMessages(messages, turns, events = []) {
     const projected = [...messages];
     for (const turn of turns) {
         if (turn.intent !== "post-cancellation" &&
-            turn.state !== "accepted" &&
-            turn.state !== "committed")
+            !queuedTurnWasConsumed(turn))
             continue;
         const id = `${turn.id}:user`;
         if (projected.some((message) => message.id === id))
@@ -1971,6 +1979,9 @@ export function projectStagedUserMessages(messages, turns, events = []) {
             projected.push(stagedMessage);
     }
     return projected;
+}
+function queuedTurnWasConsumed(turn) {
+    return turn.state === "committed" || (turn.delivery !== "server" && turn.state === "accepted");
 }
 function isPendingTurnInFlight(pendingTurn) {
     return pendingTurn?.state === "clearing" ||
@@ -2131,24 +2142,6 @@ function promptFromAssistantMessage(content) {
         };
     });
     return { files, text };
-}
-function editedTurnId(message, identities) {
-    const metadataTurnId = message.metadata?.custom?.turnId ??
-        message.metadata?.turnId;
-    if (typeof metadataTurnId === "string" && metadataTurnId.trim())
-        return metadataTurnId;
-    if (!message.sourceId)
-        return undefined;
-    if (identities) {
-        for (const [turnId, stableRoot] of identities.assistantByTurn) {
-            if (message.sourceId === `${stableRoot}:user` ||
-                message.sourceId.startsWith(`${stableRoot}:user:`)) {
-                return turnId;
-            }
-        }
-    }
-    const userSuffix = message.sourceId.indexOf(":user");
-    return userSuffix > 0 ? message.sourceId.slice(0, userSuffix) : undefined;
 }
 function mailboxPromptText(prompt) {
     if (prompt.files.some((file) => !file.assetId))

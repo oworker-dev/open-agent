@@ -1234,6 +1234,10 @@ test("same-turn steering remains between the Agent output produced before and af
     { id: "turn-root:user:client-steer-1", role: "user" },
     { id: "turn-root:assistant:client-steer-1", role: "assistant" },
   ]);
+  const stabilized = messages.map((message) => ({ ...message, id: message.id.replace("turn-root:", "pending-root:") }));
+  const stabilizedProjection = projectAgentDisplayTimeline(stabilized, events);
+  assert.deepEqual(stabilizedProjection.messages.map((message) => message.id), stabilized.map((message) => message.id));
+  assert.deepEqual(projectAgentDisplayTimeline(stabilizedProjection.messages, events).messages, stabilizedProjection.messages);
   const beforeSteering = projection.messages[1];
   const afterSteering = projection.messages[3];
   assert.ok(beforeSteering);
@@ -1580,6 +1584,10 @@ test("same-turn steering scopes tool process groups to their assistant segment",
 
   assert.equal(before?.status, "completed");
   assert.equal(before?.endedAt, Date.parse(steeredAt));
+  const stableBefore = { ...projection.messages[1]!, id: projection.messages[1]!.id.replace("turn-root:", "pending-root:") };
+  const stableAfter = { ...projection.messages[3]!, id: projection.messages[3]!.id.replace("turn-root:", "pending-root:") };
+  assert.deepEqual(presentAgentTurn(stableBefore, projection.events), before);
+  assert.deepEqual(presentAgentTurn(stableAfter, projection.events), presentAgentTurn(projection.messages[3]!, projection.events));
   assert.deepEqual(
     before?.processParts.filter((part) => part.type === "dynamic-tool").map((part) => part.toolCallId),
     ["call-before"],

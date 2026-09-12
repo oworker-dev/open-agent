@@ -8,6 +8,15 @@ const environment = {
   AGENT_RUNTIME_URL: "https://runtime.test",
 };
 
+test("edit admission expiry requires an explicit runtime capability", async () => {
+  for (const capability of [undefined, false, "true", true]) {
+    const runtime = createEveAgentMailboxRuntime(environment, async () =>
+      Response.json({ ok: true, state: "waiting", editAdmissionGuard: capability }));
+    const result = await runtime.inspect({ owner: owner(), sessionId: "session-1" });
+    assert.equal(result.editAdmissionGuard, capability === true ? true : undefined);
+  }
+});
+
 test("Eve mailbox runtime reads waiting boundaries and admits messages", async () => {
   const requests: unknown[] = [];
   const runtime = createEveAgentMailboxRuntime(environment, async (_input, init) => {

@@ -11,9 +11,11 @@ import type { AgentSessionOwner } from "../data/session-ownership-store.ts";
 const DEFAULT_BUSY_RETRY_MS = 2_000;
 
 export type AgentMailboxBoundary =
-  | { readonly lastEventAt?: string; readonly state: "running"; readonly tailIndex?: number; readonly turnId?: string }
-  | { readonly state: "waiting"; readonly tailIndex?: number }
-  | { readonly state: "terminal"; readonly tailIndex?: number; readonly terminalStatus?: "completed" | "failed" };
+  ({ readonly editAdmissionGuard?: true } & (
+    | { readonly lastEventAt?: string; readonly state: "running"; readonly tailIndex?: number; readonly turnId?: string }
+    | { readonly state: "waiting"; readonly tailIndex?: number }
+    | { readonly state: "terminal"; readonly tailIndex?: number; readonly terminalStatus?: "completed" | "failed" }
+  ));
 
 export interface AgentMailboxRuntime {
   deliver(input: {
@@ -144,7 +146,9 @@ export async function dispatchNextAgentMailboxMessage(options: {
   }
 
   try {
-    await options.store.beginAdmission(item.itemId, claimToken);
+    await options.store.beginAdmission(item.itemId, claimToken, {
+      guardEdit: item.payload.operation?.kind === "edit" && boundary.editAdmissionGuard === true,
+    });
     const delivered = await options.runtime.deliver({
       clientMessageId: item.clientMessageId,
       itemId: item.itemId,
@@ -165,6 +169,7 @@ export async function dispatchNextAgentMailboxMessage(options: {
     if (current?.status === "committed") {
       return { item: current, status: "accepted" };
     }
+    if (current?.status === "cancelled") return { item: current, status: "cancelled" };
     if (error instanceof AgentMailboxAdmissionError && error.disposition === "rejected") {
       const failed = await options.store.fail(item.itemId, claimToken, error.message);
       return { item: failed, status: "failed" };

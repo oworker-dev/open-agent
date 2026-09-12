@@ -13,7 +13,7 @@ export type AgentApprovalTakeover = {
     readonly prompt: string;
     readonly toolName: string;
 };
-export declare function AssistantThreadSurface({ assetUrl, approvalTakeover, cancellationState, closedInputRequestIds, commands, composerTop, draftStorageKey, draftRestore, events, eveMessages, fallbackStartedAt, historyHasMore, historyLoading, historyStartIndex, inputDisabled, isBusy, scrollToBottomOnInitialize, scrollToBottomOnThreadSwitch, sessionTerminal, sessionSettled, onCancel, locale, mentions, messages, models, onInputResponses, onCloseInputRequest, onDraftRestoreConsumed, onOpenDeliverable, onOpenSubagent, onLoadEarlier, onPreferencesChange, onRetryRuntimeError, preferences, reasoningLevels, runtimeError, runtimeFailure, runtimeRetry, usage, }: {
+export declare function AssistantThreadSurface({ assetUrl, approvalTakeover, cancellationState, closedInputRequestIds, commands, composerTop, draftStorageKey, draftRestore, events, eveMessages, fallbackStartedAt, historyHasMore, historyLoading, historyStartIndex, inputDisabled, isBusy, scrollToBottomOnInitialize, scrollToBottomOnThreadSwitch, sessionTerminal, sessionSettled, messageEditingAllowed, onCancel, locale, mentions, messages, models, onInputResponses, onCloseInputRequest, onDraftRestoreConsumed, onOpenDeliverable, onOpenSubagent, onLoadEarlier, onPreferencesChange, onRetryRuntimeError, preferences, reasoningLevels, runtimeError, runtimeFailure, runtimeRetry, usage, }: {
     readonly assetUrl?: (assetId: string) => string;
     readonly approvalTakeover?: AgentApprovalTakeover;
     readonly cancellationState: AgentCancellationState;
@@ -34,6 +34,7 @@ export declare function AssistantThreadSurface({ assetUrl, approvalTakeover, can
     readonly scrollToBottomOnThreadSwitch?: boolean;
     readonly sessionTerminal?: boolean;
     readonly sessionSettled?: boolean;
+    readonly messageEditingAllowed: boolean;
     readonly onCancel?: () => void;
     readonly locale: AgentLocale;
     readonly mentions: readonly AgentPromptMenuItem[];

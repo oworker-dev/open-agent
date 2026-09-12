@@ -86,6 +86,14 @@ function editEvent(type: string, data: Record<string, unknown>): MessageStreamEv
   } as unknown as MessageStreamEvent;
 }
 
+test("recovery merge does not put newly loaded earlier history after the live turn", () => {
+  const older = editEvent("message.received", { message: "older", sequence: 0, turnId: "turn-old" });
+  const newer = editEvent("message.received", { message: "newer", sequence: 1, turnId: "turn-new" });
+  const left = [{ ...newer, meta: { ...newer.meta, at: "2026-09-11T00:00:01.000Z" } }];
+  const right = [{ ...older, meta: { ...older.meta, at: "2026-09-11T00:00:00.000Z" } }];
+  assert.deepEqual(mergeThreadEventSnapshots(left, right).map(eventIdentity), [eventIdentity(older), eventIdentity(newer)]);
+});
+
 function editTurnEvents(turnId: string, message: string, reply: string): readonly MessageStreamEvent[] {
   const sequence = Number.parseInt(turnId.replace(/\D/gu, ""), 10) || 0;
   return [
@@ -272,6 +280,25 @@ test("latest editable turn skips an Eve revert-conflict turn", () => {
   ];
 
   assert.equal(latestEditableTurnId([...turn0, ...failed]), "turn-0");
+});
+
+test("a consumed steer is not an independent edit checkpoint and never hides the original turn", () => {
+  const original = editTurnEvents("turn-0", "Original task", "Original work");
+  const steer = editEvent("message.received", {
+    turnId: "turn-0", sequence: 0, clientMessageId: "follow-up-1", message: "Additional request",
+  });
+  const events = [...original.slice(0, -1), steer, original.at(-1)!];
+  assert.equal(latestEditableTurnId(events), undefined);
+  assert.equal(projectPendingThreadEdit(events, "turn-0"), events);
+  const nextTurn = editTurnEvents("turn-1", "Next ordinary request", "Next reply");
+  assert.equal(latestEditableTurnId([...events, ...nextTurn]), "turn-1");
+});
+
+test("a partial history window cannot mistake its first visible steer for a turn root", () => {
+  const receipt = editEvent("message.received", {
+    turnId: "turn-0", sequence: 0, clientMessageId: "follow-up-window", message: "Additional request",
+  });
+  assert.equal(latestEditableTurnId([receipt]), undefined);
 });
 
 test("unknown clear markers never guess and remove a preceding turn", () => {

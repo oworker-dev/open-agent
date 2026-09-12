@@ -95,6 +95,7 @@ export function AssistantThreadSurface({
   scrollToBottomOnThreadSwitch = true,
   sessionTerminal,
   sessionSettled,
+  messageEditingAllowed,
   onCancel,
   locale,
   mentions,
@@ -140,6 +141,7 @@ export function AssistantThreadSurface({
   readonly sessionTerminal?: boolean;
   /** Authoritative Eve session boundary; overrides a stale local hook state. */
   readonly sessionSettled?: boolean;
+  readonly messageEditingAllowed: boolean;
   readonly onCancel?: () => void;
   readonly locale: AgentLocale;
   readonly mentions: readonly AgentPromptMenuItem[];
@@ -313,7 +315,7 @@ export function AssistantThreadSurface({
             {({ message }) => message.composer.isEditing ? (
               <EditMessage messages={messages} />
             ) : message.role === "user" ? (
-              <UserMessage isBusy={isBusy} messages={messages} sessionTerminal={sessionTerminal} sessionSettled={sessionSettled} />
+              <UserMessage isBusy={isBusy} messages={messages} messageEditingAllowed={messageEditingAllowed} sessionTerminal={sessionTerminal} sessionSettled={sessionSettled} />
           ) : (
             <AssistantMessage
               assetUrl={assetUrl}
@@ -515,7 +517,7 @@ function failureSummary(locale: AgentLocale, failure: AgentTurnFailure): string 
   }
 }
 
-function UserMessage({ isBusy, messages, sessionTerminal = false, sessionSettled }: { readonly isBusy: boolean; readonly messages: AgentMessages; readonly sessionTerminal?: boolean; readonly sessionSettled?: boolean }) {
+function UserMessage({ isBusy, messages, messageEditingAllowed, sessionTerminal = false, sessionSettled }: { readonly isBusy: boolean; readonly messages: AgentMessages; readonly messageEditingAllowed: boolean; readonly sessionTerminal?: boolean; readonly sessionSettled?: boolean }) {
   const [actionsVisible, setActionsVisible] = useState(false);
   const isLastUserMessage = useAuiState((state) => {
     const lastUser = [...state.thread.messages].reverse().find((message) => message.role === "user");
@@ -524,7 +526,7 @@ function UserMessage({ isBusy, messages, sessionTerminal = false, sessionSettled
   // The host supplies the durable boundary once the latest request has
   // completed, failed, or been interrupted. Keep editing unavailable during
   // the boundary hand-off to avoid racing the active runtime.
-  const canEdit = isLastUserMessage && !isBusy && !sessionTerminal && sessionSettled !== false;
+  const canEdit = messageEditingAllowed && isLastUserMessage && !isBusy && !sessionTerminal && sessionSettled !== false;
   return (
     <MessagePrimitive.Root
       className="group fade-in slide-in-from-bottom-1 animate-in mx-auto grid w-full max-w-(--thread-max-width) auto-rows-auto grid-cols-[minmax(72px,1fr)_auto] content-start gap-y-2 px-2 duration-150 [&:where(>*)]:col-start-2"

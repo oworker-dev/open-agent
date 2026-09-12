@@ -279,7 +279,7 @@ export function normalizeSettledAgentMessages(messages, events) {
     const rootEventsCache = new Map();
     const segmentEventsCache = new Map();
     const segmentEventsFor = (message, turnId) => {
-        const clientMessageId = assistantSegmentClientMessageId(message, turnId);
+        const clientMessageId = assistantSegmentClientMessageId(message);
         const cacheKey = `${turnId}\u0000${clientMessageId ?? ""}`;
         const cached = segmentEventsCache.get(cacheKey);
         if (cached)
@@ -1134,7 +1134,7 @@ function eventsForAssistantSegment(message, events) {
     if (!turnId)
         return { events: [] };
     const rootEvents = eventsForRootTurn(events, turnId);
-    const clientMessageId = assistantSegmentClientMessageId(message, turnId);
+    const clientMessageId = assistantSegmentClientMessageId(message);
     const receiptIndex = rootEvents.findIndex((event) => event.type === "message.received" &&
         event.data.turnId === turnId &&
         (clientMessageId === undefined
@@ -1154,9 +1154,10 @@ function eventsForAssistantSegment(message, events) {
             : {}),
     };
 }
-function assistantSegmentClientMessageId(message, turnId) {
-    const prefix = `${turnId}:assistant:`;
-    return message.id.startsWith(prefix) ? message.id.slice(prefix.length) || undefined : undefined;
+function assistantSegmentClientMessageId(message) {
+    const delimiter = ":assistant:";
+    const index = message.id.indexOf(delimiter);
+    return index < 0 ? undefined : message.id.slice(index + delimiter.length) || undefined;
 }
 function toProxiedInputPart(request) {
     return {
@@ -1287,6 +1288,8 @@ function eventStepIndex(event) {
 }
 function remapAssistantMessage(message, rootTurnId, stepOffset) {
     const sourceTurnId = message.metadata?.turnId;
+    if (sourceTurnId === rootTurnId && stepOffset === 0)
+        return message;
     const segmentPrefix = sourceTurnId ? `${sourceTurnId}:assistant:` : undefined;
     const segmentId = segmentPrefix && message.id.startsWith(segmentPrefix)
         ? message.id.slice(segmentPrefix.length)

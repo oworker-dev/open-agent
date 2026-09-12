@@ -502,35 +502,17 @@ export function mergeThreadEventSnapshots(left, right) {
         candidates.push({ event, position });
         position += 1;
     }
-    const turnOrder = new Map();
-    let nextTurnOrder = 0;
-    for (const candidate of candidates) {
-        const turnId = eventTurnId(candidate.event);
-        if (turnId !== undefined && !turnOrder.has(turnId)) {
-            turnOrder.set(turnId, nextTurnOrder);
-            nextTurnOrder += 1;
-        }
-    }
-    candidates.sort((a, b) => compareEventOrder(a.event, b.event, turnOrder) || a.position - b.position);
+    candidates.sort((a, b) => compareEventOrder(a.event, b.event) || a.position - b.position);
     return compactThreadEvents(candidates.map((candidate) => candidate.event));
 }
 function sameEventIdentityOrder(left, right) {
     return left.length === right.length && left.every((event, index) => eventIdentity(event) === eventIdentity(right[index]));
 }
-function compareEventOrder(left, right, turnOrder) {
+function compareEventOrder(left, right) {
     const leftCursor = eventCursors.get(left);
     const rightCursor = eventCursors.get(right);
     if (leftCursor !== undefined && rightCursor !== undefined && leftCursor !== rightCursor) {
         return leftCursor - rightCursor;
-    }
-    if (turnOrder) {
-        const leftTurn = eventTurnId(left);
-        const rightTurn = eventTurnId(right);
-        const leftOrder = leftTurn === undefined ? undefined : turnOrder.get(leftTurn);
-        const rightOrder = rightTurn === undefined ? undefined : turnOrder.get(rightTurn);
-        if (leftOrder !== undefined && rightOrder !== undefined && leftOrder !== rightOrder) {
-            return leftOrder - rightOrder;
-        }
     }
     const leftTurnId = eventTurnId(left);
     const rightTurnId = eventTurnId(right);
@@ -755,6 +737,8 @@ export function projectThreadEditBranches(events) {
 export function projectPendingThreadEdit(events, beforeTurnId) {
     if (!beforeTurnId || events.some((event) => event.type === "context.cleared" && event.data.turnId === beforeTurnId))
         return events;
+    if (hasSteeredMessages(events, beforeTurnId))
+        return events;
     const targetIndex = events.findIndex((event) => eventTurnId(event) === beforeTurnId);
     if (targetIndex < 0)
         return events;
@@ -770,9 +754,24 @@ export function latestEditableTurnId(events) {
             continue;
         if (conflictTurns.has(event.data.turnId))
             continue;
+        if (hasSteeredMessages(events, event.data.turnId))
+            return undefined;
+        if (!events.some((candidate) => candidate.type === "turn.started" && candidate.data.turnId === event.data.turnId))
+            return undefined;
         return event.data.turnId;
     }
     return undefined;
+}
+function hasSteeredMessages(events, turnId) {
+    let received = false;
+    for (const event of events) {
+        if (event.type !== "message.received" || event.data.turnId !== turnId)
+            continue;
+        if (received)
+            return true;
+        received = true;
+    }
+    return false;
 }
 function eventTurnId(event) {
     return "data" in event && "turnId" in event.data && typeof event.data.turnId === "string"

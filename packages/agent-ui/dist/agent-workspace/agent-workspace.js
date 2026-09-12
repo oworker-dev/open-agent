@@ -1041,6 +1041,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
         let recoverySnapshotDirty = false;
         let recoveryEventsSinceFlush = 0;
         let lastRecoveryFlushAt = Date.now();
+        let recoveryFlushTimer;
         let checkedTailBoundary = false;
         let recoveryCursorReconciled = false;
         let needsBoundedCatchUp = true;
@@ -1070,9 +1071,9 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                 interruptedTurns = liveThread.interruptedTurns ?? [];
             }
             inputResponseSubmissions = mergeInputResponseSubmissions(inputResponseSubmissions, liveThread.inputResponseSubmissions ?? []);
-            const liveQueuedTurnIds = new Set(liveThread.queuedTurns.map((turn) => turn.id));
+            const liveQueuedTurns = new Map(liveThread.queuedTurns.map((turn) => [turn.id, turn]));
             queuedTurns = queuedTurns.filter((turn) => !consumedQueuedTurnIds.has(turn.id) &&
-                (recoveryOwnedQueuedTurnIds.has(turn.id) || liveQueuedTurnIds.has(turn.id)));
+                (recoveryOwnedQueuedTurnIds.has(turn.id) || liveQueuedTurns.has(turn.id))).map((turn) => turn.mailboxItemId ? turn : liveQueuedTurns.get(turn.id) ?? turn);
             const localQueuedTurnIds = new Set(queuedTurns.map((turn) => turn.id));
             for (const turn of liveThread.queuedTurns) {
                 if (!localQueuedTurnIds.has(turn.id) &&
@@ -1187,10 +1188,13 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
             return status;
         };
         const flushRecoverySnapshot = (force = false) => {
+            window.clearTimeout(recoveryFlushTimer);
+            recoveryFlushTimer = undefined;
             if (recoveryControllers.current.get(thread.id) !== controller)
                 return;
             if (!force && !recoverySnapshotDirty && cursor === persistedCursor)
                 return;
+            mergeLiveAdmissions();
             persistedCursor = cursor;
             recoverySnapshotDirty = false;
             recoveryEventsSinceFlush = 0;
@@ -1312,6 +1316,9 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                             if (recoveryEventsSinceFlush >= 32 ||
                                 Date.now() - lastRecoveryFlushAt >= 75)
                                 flushRecoverySnapshot();
+                            else if (recoveryFlushTimer === undefined) {
+                                recoveryFlushTimer = window.setTimeout(flushRecoverySnapshot, 75);
+                            }
                             if (event.type === "turn.cancelled" ||
                                 event.type === "turn.completed" ||
                                 event.type === "turn.failed" ||
@@ -1486,6 +1493,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
             console.error("Agent session recovery failed", error);
         }
         finally {
+            window.clearTimeout(recoveryFlushTimer);
             const ownsRecovery = recoveryControllers.current.get(thread.id) === controller;
             if (ownsRecovery) {
                 releaseRecovery();

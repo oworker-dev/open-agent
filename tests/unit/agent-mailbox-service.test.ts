@@ -323,6 +323,20 @@ test("a durable message.received commit wins over a lost admission response", as
   assert.equal(store.items[0]?.acceptedSessionId, "session-1");
 });
 
+test("expired edit admission wins over a late transport failure", async () => {
+  const store = await queuedStore();
+  const runtime: AgentMailboxRuntime = {
+    async inspect() { return { state: "waiting" }; },
+    async deliver() {
+      store.items[0] = { ...store.items[0]!, status: "cancelled", claimToken: undefined, lastError: "edit_admission_expired" };
+      throw new AgentMailboxAdmissionError("ambiguous", "The response connection closed.");
+    },
+  };
+  const result = await dispatchNextAgentMailboxMessage({ runtime, store });
+  assert.equal(result.status, "cancelled");
+  assert.equal(store.items[0]?.lastError, "edit_admission_expired");
+});
+
 test("a rejected admission fails without claiming it was accepted", async () => {
   const store = await queuedStore();
   const runtime = new FakeMailboxRuntime({ state: "waiting" });
@@ -385,6 +399,10 @@ class FakeMailboxRuntime implements AgentMailboxRuntime {
 class MemoryMailboxStore implements AgentMailboxStore {
   items: AgentMailboxItem[] = [];
   private sequence = 0;
+
+  async consumeEdit(): Promise<boolean> {
+    throw new Error("Consumption is exercised by the PostgreSQL and Eve adapter tests.");
+  }
 
   async enqueue(input: Parameters<AgentMailboxStore["enqueue"]>[0]): Promise<EnqueueAgentMailboxResult> {
     const existing = this.items.find((item) =>

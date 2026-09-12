@@ -1,6 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 import type { MessageStreamEvent } from "eve/client";
-import { compactThreadEvents } from "@oworker/open-agent-ui/agent-workspace";
+import { compactThreadEvents, editOperationId } from "@oworker/open-agent-ui/agent-workspace";
 const threadStores = new WeakMap<Page, FakeThreadStore>();
 
 test.beforeEach(async ({ page }, testInfo) => {
@@ -1646,6 +1646,7 @@ for (const editScenario of [
     editedReply: "Edited delivery.",
     editedRequest: "Edited request",
     label: "changed content",
+    priorSteer: false,
     sessionId: "mock-edit-changed-session",
   },
   {
@@ -1653,7 +1654,16 @@ for (const editScenario of [
     editedReply: "Repeated delivery.",
     editedRequest: "Original request",
     label: "unchanged content",
+    priorSteer: false,
     sessionId: "mock-edit-unchanged-session",
+  },
+  {
+    delayedCommit: false,
+    editedReply: "Edited delivery after steering.",
+    editedRequest: "Edited request",
+    label: "a preceding steered turn",
+    priorSteer: true,
+    sessionId: "mock-edit-after-steering-session",
   },
 ] as const) {
 test(`editing the latest user turn with ${editScenario.label} submits one durable revert transaction`, async ({ page }) => {
@@ -1694,10 +1704,24 @@ test(`editing the latest user turn with ${editScenario.label} submits one durabl
       else invokeNativeScrollTo.call(this, optionsOrX);
     };
   });
-  const originalEvents = eventsFromNdjson(mockSuccessfulTurn("Original request", "Original delivery."));
-  const editedEvents = eventsFromNdjson(mockContinuationTurn(editedRequest, editedReply, 1));
+  const originalSequence = editScenario.priorSteer ? 1 : 0;
+  const beforeTurnId = `turn_${originalSequence}`;
+  const earlierTurn = eventsFromNdjson(mockSuccessfulTurn("Earlier task", "Earlier work."));
+  const earlierSteer = [
+    { type: "message.received", data: { turnId: "turn_0", sequence: 0, message: "Earlier steer", clientMessageId: "earlier-steer" } },
+    { type: "message.completed", data: { turnId: "turn_0", sequence: 0, stepIndex: 1, message: "Earlier follow-up reply.", finishReason: "stop" } },
+  ];
+  const originalEvents = [
+    ...(editScenario.priorSteer ? [...earlierTurn.slice(0, -2), ...earlierSteer, ...earlierTurn.slice(-2)] : []),
+    ...eventsFromNdjson(editScenario.priorSteer
+      ? mockContinuationTurn("Original request", "Original delivery.", originalSequence)
+      : mockSuccessfulTurn("Original request", "Original delivery.", originalSequence)),
+  ].map((event, index) => editScenario.priorSteer
+    ? { ...event as MessageStreamEvent, meta: { at: new Date(Date.now() - 1_000 + index).toISOString(), id: `${sessionId}-history-${index}` } }
+    : event);
+  const editedEvents = eventsFromNdjson(mockContinuationTurn(editedRequest, editedReply, originalSequence + 1));
   const clearEvent = {
-    data: { sequence: 1, sessionId, turnId: "turn_0" },
+    data: { sequence: originalSequence + 1, sessionId, turnId: beforeTurnId },
     meta: { at: new Date().toISOString(), id: `evt-${sessionId}-edit-boundary` },
     type: "context.cleared" as const,
   } as MessageStreamEvent;
@@ -1801,10 +1825,24 @@ test(`editing the latest user turn with ${editScenario.label} submits one durabl
     });
   });
 
-  await page.goto("/");
-  const composer = page.getByRole("textbox", { name: "Do anything" });
-  await composer.fill("Original request");
-  await composer.press("Enter");
+  if (editScenario.priorSteer) {
+    setFakeThreadCollection(page, {
+      activeThreadId: sessionId,
+      threads: [{
+        id: sessionId, title: "Original request", events: originalEvents,
+        createdAt: Date.now(), updatedAt: Date.now(),
+        preferences: { executionMode: "standard", modelId: "gpt-5.6-sol", reasoning: "medium" },
+        session: { sessionId, streamIndex: originalEvents.length }, status: "ready", queuedTurns: [],
+      }],
+      version: 2,
+    });
+    await page.goto(`/threads/${sessionId}`);
+  } else {
+    await page.goto("/");
+    const composer = page.getByRole("textbox", { name: "Do anything" });
+    await composer.fill("Original request");
+    await composer.press("Enter");
+  }
   await expect(page.getByText("Original delivery.", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Send", exact: true })).toHaveCount(1);
 
@@ -1861,7 +1899,7 @@ test(`editing the latest user turn with ${editScenario.label} submits one durabl
   expect(clearCalls).toBe(0);
   expect(turnCalls).toBe(0);
   expect(mailboxBody).toMatchObject({
-    beforeTurnId: "turn_0",
+    beforeTurnId,
     message: editedRequest,
     operationKind: "edit",
     sessionId,
@@ -1872,6 +1910,11 @@ test(`editing the latest user turn with ${editScenario.label} submits one durabl
   await expect(page.getByRole("log").getByText(editedRequest, { exact: true })).toHaveCount(1);
   await expect(page.getByText(editedReply, { exact: true })).toHaveCount(1);
   await expect(page.getByRole("log").getByText("Original delivery.", { exact: true })).toHaveCount(0);
+  if (editScenario.priorSteer) {
+    await expect(page.getByRole("log").getByText("Earlier task", { exact: true })).toHaveCount(1);
+    await expect(page.getByRole("log").getByText("Earlier steer", { exact: true })).toHaveCount(1);
+    await expect(page.getByText("Earlier follow-up reply.", { exact: true })).toHaveCount(1);
+  }
 });
 }
 
@@ -2650,6 +2693,229 @@ test("a follow-up steers the active Eve turn without opening a second session", 
   });
   expect(mailboxBody?.operationId).toBe(mailboxBody?.clientMessageId);
 });
+
+test("live steering preserves every assistant segment through streaming and refresh", async ({ page }, testInfo) => {
+  const sessionId = "mock-live-steering-segments";
+  const turnId = "turn-live-steering-segments";
+  const consoleErrors: string[] = [];
+  page.on("console", (message) => {
+    if (message.type() === "error") consoleErrors.push(message.text());
+  });
+  let mailboxBody: Record<string, unknown> | undefined;
+  const durable: MessageStreamEvent[] = [];
+  const emit = async (type: string, data: Record<string, unknown>) => {
+    const event = {
+      type, data,
+      meta: { at: new Date().toISOString(), id: `evt-live-segment-${durable.length}` },
+    } as MessageStreamEvent;
+    durable.push(event);
+    await page.evaluate((serializedEvent) => {
+      (window as typeof window & { __pushSteeringEvent: (event: unknown) => void }).__pushSteeringEvent(JSON.parse(serializedEvent));
+    }, JSON.stringify(event));
+  };
+  await page.addInitScript((targetSessionId) => {
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (input, init) => {
+      const url = new URL(typeof input === "string" || input instanceof URL ? input.toString() : input.url, location.href);
+      if (url.pathname !== `/eve/v1/session/${targetSessionId}/stream`) return nativeFetch(input, init);
+      if (url.searchParams.get("includeTailIndex") === "1") {
+        return new Response("", { headers: { "x-eve-stream-tail-index": "-1" } });
+      }
+      const stream = new ReadableStream({
+        start(controller) {
+          (window as typeof window & { __pushSteeringEvent?: (event: unknown) => void }).__pushSteeringEvent = (event) => {
+            controller.enqueue(new TextEncoder().encode(`${JSON.stringify(event)}\n`));
+          };
+          init?.signal?.addEventListener("abort", () => controller.error(new DOMException("Aborted", "AbortError")), { once: true });
+        },
+      });
+      return new Response(stream, { headers: { "content-type": "application/x-ndjson" } });
+    };
+  }, sessionId);
+  await page.route("**/eve/v1/session", async (route) => {
+    await route.fulfill({ json: { sessionId }, headers: { "x-eve-session-id": sessionId } });
+  });
+  await page.route("**/api/standalone/mailbox", async (route) => {
+    mailboxBody = route.request().postDataJSON() as Record<string, unknown>;
+    await route.fulfill({ status: 202, json: { ok: true, item: {
+      clientMessageId: mailboxBody.clientMessageId, itemId: "mail-live-segments", status: "accepted",
+    } } });
+  });
+  await page.route("**/api/standalone/mailbox/mail-live-segments", async (route) => {
+    await route.fulfill({ json: { ok: true, item: {
+      clientMessageId: mailboxBody?.clientMessageId, itemId: "mail-live-segments", status: "accepted",
+    } } });
+  });
+  await page.goto("/");
+  const composer = page.getByRole("textbox", { name: "Do anything" });
+  await composer.fill("Build the page");
+  await composer.press("Enter");
+  await page.waitForFunction(() => typeof (window as typeof window & { __pushSteeringEvent?: unknown }).__pushSteeringEvent === "function");
+  await emit("turn.started", { turnId, sequence: 0 });
+  await emit("message.received", { turnId, sequence: 0, message: "Build the page" });
+  await emit("step.started", { turnId, sequence: 0, stepIndex: 0 });
+  await emit("message.completed", { turnId, sequence: 0, stepIndex: 0, message: "Original work stays here.", finishReason: "tool-calls" });
+  const patch = "*** Begin Patch\n*** Add File: index.html\n" + Array.from({ length: 256 }, (_, i) => `+<p>Line ${i}</p>\n`).join("") + "*** End Patch";
+  const action = { callId: "call-original-patch", kind: "tool-call", toolName: "apply_patch", input: { patch } };
+  await emit("action.input.partial", { turnId, sequence: 0, stepIndex: 0, ...action, inputTextSoFar: JSON.stringify(action.input), inputTextDelta: "" });
+  await expect(page.getByText("Original work stays here.", { exact: true })).toBeVisible();
+  await composer.fill("Add the footer");
+  await composer.press("Enter");
+  await expect.poll(() => mailboxBody?.operationKind).toBe("steer");
+  expect(mailboxBody?.expectedTurnId).toBe(turnId);
+  await expect(page.locator("[data-agent-steer-queue]")).toContainText("Add the footer");
+  await emit("actions.requested", { turnId, sequence: 0, stepIndex: 0, actions: [action] });
+  await emit("action.result", { turnId, sequence: 0, stepIndex: 0, status: "completed", result: {
+    callId: action.callId, kind: "tool-result", toolName: action.toolName,
+    output: { changes: [{ path: "/workspace/index.html", kind: "add", addedLines: 256, deletedLines: 0 }] },
+  } });
+  await emit("step.completed", { turnId, sequence: 0, stepIndex: 0, finishReason: "tool-calls" });
+  await emit("message.received", { turnId, sequence: 0, clientMessageId: mailboxBody?.clientMessageId, message: "Add the footer" });
+  await emit("step.started", { turnId, sequence: 0, stepIndex: 1 });
+  await emit("reasoning.appended", { turnId, sequence: 0, stepIndex: 1, reasoningSoFar: "Checking the footer", reasoningDelta: "Checking the footer" });
+  await emit("message.completed", { turnId, sequence: 0, stepIndex: 1, message: "Follow-up work stays here.", finishReason: "tool-calls" });
+  await expect(page.getByText("Follow-up work stays here.", { exact: true })).toBeVisible();
+  await expect(page.getByText("Original work stays here.", { exact: true })).toBeVisible();
+  await page.getByText("Original work stays here.", { exact: true }).scrollIntoViewIfNeeded();
+  await page.screenshot({ path: testInfo.outputPath("live-steering.png"), fullPage: true });
+  await expect(page.getByRole("log").getByText("Add the footer", { exact: true })).toHaveCount(1);
+  await expect(page.locator("[data-agent-steer-queue]")).toHaveCount(0);
+  await expect(page.getByText("Reconnecting to the active run...")).toHaveCount(0);
+  await emit("step.completed", { turnId, sequence: 0, stepIndex: 1, finishReason: "tool-calls" });
+  await emit("step.started", { turnId, sequence: 0, stepIndex: 2 });
+  await emit("message.completed", { turnId, sequence: 0, stepIndex: 2, message: "Both parts are complete.", finishReason: "stop" });
+  await emit("turn.completed", { turnId, sequence: 0 });
+  await emit("session.waiting", { wait: "next-user-message" });
+  await expect(page.getByText("Both parts are complete.", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Edit message" })).toHaveCount(0);
+  expect(consoleErrors.filter((error) => /same key|unique.*key/iu.test(error))).toEqual([]);
+  await expect.poll(() => threadEvents(page).some((event) => isEventType(event, "session.waiting"))).toBeTruthy();
+  await page.reload();
+  await expect(page.getByText("Both parts are complete.", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: /Worked for/u }).first().click();
+  await expect(page.getByText("Original work stays here.", { exact: true })).toBeVisible();
+  await expect(page.getByRole("log").getByText("Add the footer", { exact: true })).toHaveCount(1);
+  await expect(page.getByRole("button", { name: "Edit message" })).toHaveCount(0);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.getByText("Original work stays here.", { exact: true }).scrollIntoViewIfNeeded();
+  await page.screenshot({ path: testInfo.outputPath("recovered-steering-mobile.png"), fullPage: true });
+});
+
+for (const { hasHistory, queueBeforeStart } of [
+  { hasHistory: false, queueBeforeStart: false },
+  { hasHistory: true, queueBeforeStart: false },
+  { hasHistory: false, queueBeforeStart: true },
+]) {
+  test(`steering uses the active recovery stream instead of the ${hasHistory ? "previous-turn" : "empty"} Eve seed${queueBeforeStart ? " with an early queued message" : ""}`, async ({ page }) => {
+    const sessionId = `mock-recovery-steering-${hasHistory}`;
+    const threadId = `recovery-steering-${hasHistory}`;
+    const turnId = "turn_recovered_active";
+    const previous = eventsFromNdjson(mockSuccessfulTurn("Previous request", "Previous response.")) as readonly MessageStreamEvent[];
+    const seed = hasHistory ? previous.slice(0, 4) : [];
+    setFakeThreadCollection(page, {
+      activeThreadId: threadId,
+      threads: [{
+        id: threadId, title: "Recovery steering", events: seed,
+        createdAt: Date.now(), updatedAt: Date.now(),
+        preferences: { executionMode: "standard", modelId: "gpt-5.6-sol", reasoning: "medium" },
+        session: { sessionId, streamIndex: seed.length }, status: "streaming", queuedTurns: [],
+      }],
+      version: 2,
+    });
+    await page.addInitScript(({ sessionId, serializedSeed }) => {
+      const nativeFetch = window.fetch.bind(window);
+      const state = window as typeof window & { __emitRecoveredSteering?: (event: unknown) => void };
+      const events: unknown[] = JSON.parse(serializedSeed);
+      window.fetch = async (input, init) => {
+        const url = new URL(typeof input === "string" || input instanceof URL ? input.toString() : input.url, location.href);
+        if (url.pathname !== `/eve/v1/session/${sessionId}/stream`) return nativeFetch(input, init);
+        const startIndex = Number(url.searchParams.get("startIndex") ?? 0);
+        const prefix = events.slice(startIndex).map((event) => `${JSON.stringify(event)}\n`).join("");
+        const headers = { "content-type": "application/x-ndjson", "x-eve-stream-tail-index": String(events.length - 1) };
+        if (url.searchParams.get("includeTailIndex") === "1") return new Response(prefix, { headers });
+        return new Response(new ReadableStream({ start(controller) {
+          if (prefix) controller.enqueue(new TextEncoder().encode(prefix));
+          state.__emitRecoveredSteering = (event) => {
+            events.push(event);
+            controller.enqueue(new TextEncoder().encode(`${JSON.stringify(event)}\n`));
+          };
+          init?.signal?.addEventListener("abort", () => controller.error(new DOMException("Aborted", "AbortError")), { once: true });
+        } }), { headers });
+      };
+    }, { sessionId, serializedSeed: JSON.stringify(seed) });
+    let mailboxBody: Record<string, unknown> | undefined;
+    let mailboxRequests = 0;
+    let normalSends = 0;
+    await page.route(`**/eve/v1/session/${sessionId}`, async (route) => {
+      normalSends += 1;
+      await route.fulfill({ status: 409 });
+    });
+    await page.route("**/api/standalone/mailbox", async (route) => {
+      mailboxRequests += 1;
+      mailboxBody = route.request().postDataJSON() as Record<string, unknown>;
+      await route.fulfill({ status: 202, json: { ok: true, item: {
+        clientMessageId: mailboxBody.clientMessageId, itemId: "mail-recovery-steering", status: "accepted",
+      } } });
+    });
+    await page.route("**/api/standalone/mailbox/mail-recovery-steering", async (route) => {
+      await route.fulfill({ json: { ok: true, item: {
+        clientMessageId: mailboxBody?.clientMessageId, itemId: "mail-recovery-steering", status: "accepted",
+      } } });
+    });
+    await page.goto(`/threads/${threadId}`);
+    await page.waitForFunction(() => typeof (window as typeof window & { __emitRecoveredSteering?: unknown }).__emitRecoveredSteering === "function");
+    const composer = page.getByRole("textbox", { name: "Do anything" });
+    if (queueBeforeStart) {
+      await composer.fill("Steer before the task ends");
+      await composer.press("Enter");
+      await expect(page.locator("[data-agent-steer-queue]")).toContainText("Steer before the task ends");
+    }
+    let eventIndex = 0;
+    const emit = async (type: string, data: Record<string, unknown>) => {
+      await page.evaluate((event) => {
+        (window as typeof window & { __emitRecoveredSteering: (event: unknown) => void }).__emitRecoveredSteering(event);
+      }, { type, data: { turnId, sequence: 1, ...data }, meta: { at: new Date().toISOString(), id: `evt-recovery-steer-${eventIndex++}` } });
+    };
+    if (hasHistory) {
+      const previousTurnId = previous.find((event) => event.type === "turn.started")?.data.turnId;
+      await emit("turn.completed", { turnId: previousTurnId });
+    }
+    await emit("turn.started", {});
+    await emit("message.received", { message: "Continue the long task" });
+    await emit("step.started", { stepIndex: 0 });
+    await emit("message.completed", { stepIndex: 0, message: "Recovered work remains visible.", finishReason: "tool-calls" });
+    await expect(page.getByText("Recovered work remains visible.", { exact: true })).toBeVisible({ timeout: 1_500 });
+    if (!queueBeforeStart) {
+      await composer.fill("Steer before the task ends");
+      await composer.press("Enter");
+    }
+    // No completion event has been emitted. Admission must not wait for one.
+    await expect.poll(() => mailboxBody?.operationKind, { timeout: 3_000 }).toBe("steer");
+    expect(mailboxBody?.expectedTurnId).toBe(turnId);
+    expect(normalSends).toBe(0);
+    await expect(page.locator("[data-agent-steer-queue]")).toContainText("Steer before the task ends");
+    // An unrelated recovery checkpoint must not erase the mailbox receipt or
+    // the resolved target of a message queued before turn.started arrived.
+    await emit("reasoning.completed", { stepIndex: 0, reasoning: "Finishing this safe step" });
+    await expect.poll(() => {
+      const queued = threadStores.get(page)?.collection.threads.find((thread) => thread.id === threadId)?.queuedTurns;
+      return queued;
+    }).toEqual([expect.objectContaining({ expectedTurnId: turnId, mailboxItemId: "mail-recovery-steering" })]);
+    await emit("step.completed", { stepIndex: 0, finishReason: "tool-calls" });
+    await emit("message.received", { message: "Steer before the task ends", clientMessageId: mailboxBody?.clientMessageId });
+    await emit("step.started", { stepIndex: 1 });
+    await emit("message.completed", { stepIndex: 1, message: "Recovered steering response.", finishReason: "tool-calls" });
+    await expect(page.getByText("Recovered steering response.", { exact: true })).toBeVisible();
+    await expect(page.getByText("Recovered work remains visible.", { exact: true })).toBeVisible();
+    await expect(page.locator("[data-agent-steer-queue]")).toHaveCount(0);
+    expect(mailboxRequests).toBe(1);
+    await emit("turn.completed", {});
+    await emit("session.waiting", { wait: "next-user-message" });
+    await expect.poll(() => (threadEvents(page) as readonly MessageStreamEvent[]).some((event) => event.type === "session.waiting" && event.meta?.id === `evt-recovery-steer-${eventIndex - 1}`)).toBeTruthy();
+    await page.reload();
+    await expect(page.getByText("Recovered steering response.", { exact: true })).toBeVisible();
+  });
+}
 
 test("cancelling a queued follow-up prevents browser delivery before admission", async ({ page }) => {
   const sessionId = "mock-cancel-follow-up-session";
@@ -4025,11 +4291,11 @@ test("settled recovery consumes events after the previous waiting boundary befor
 test("an accepted edited turn keeps prior history and recovers its latest reply after refresh", async ({ page }) => {
   const sessionId = "mock-accepted-edit-refresh-session";
   const firstTurn = eventsFromNdjson(mockSuccessfulTurn("第一轮", "第一轮回复。", 0));
+  const originalTurn = eventsFromNdjson(mockContinuationTurn("原来的第二轮", "原来的第二轮回复。", 1));
   const at = new Date().toISOString();
   const editedTurnId = "turn_edited_refresh";
   const clearBoundary = [
-    { data: { sequence: 1, sessionId, turnId: "clear_edit_refresh" }, meta: { at, id: "evt-edit-clear" }, type: "context.cleared" },
-    { data: { wait: "next-user-message" }, meta: { at, id: "evt-edit-clear-waiting" }, type: "session.waiting" },
+    { data: { sequence: 2, sessionId, turnId: "turn_1" }, meta: { at, id: "evt-edit-clear" }, type: "context.cleared" },
   ];
   const acceptedPrefix = [
     { data: { sequence: 2, turnId: editedTurnId }, meta: { at, id: "evt-edit-turn" }, type: "turn.started" },
@@ -4083,8 +4349,24 @@ test("an accepted edited turn keeps prior history and recovers its latest reply 
     { data: { sequence: 2, turnId: editedTurnId }, meta: { at, id: "evt-edit-turn-completed" }, type: "turn.completed" },
     { data: { wait: "next-user-message" }, meta: { at, id: "evt-edit-waiting" }, type: "session.waiting" },
   ];
-  const persistedEvents = [...firstTurn, ...clearBoundary, ...acceptedPrefix];
+  const priorEvents = [...firstTurn, ...originalTurn].map((event, index) => ({
+    ...event as MessageStreamEvent, meta: { at, id: `evt-edit-history-${index}` },
+  }));
+  const persistedEvents = [...priorEvents, ...clearBoundary, ...acceptedPrefix];
   const durableEvents = [...persistedEvents, ...completedSuffix];
+  let unexpectedDispatches = 0;
+  await page.route("**/api/standalone/mailbox", async (route) => {
+    unexpectedDispatches += 1;
+    await route.fulfill({ status: 500, body: "Unexpected duplicate edit" });
+  });
+  await page.route(`**/api/standalone/mailbox/mail-accepted-edit-refresh`, (route) => route.fulfill({
+    body: JSON.stringify({ ok: true, item: { itemId: "mail-accepted-edit-refresh", clientMessageId: "accepted-edit-message", status: "committed" } }),
+    contentType: "application/json", status: 200,
+  }));
+  await page.route(new RegExp(`/eve/v1/session/${sessionId}(/clear)?$`), async (route) => {
+    unexpectedDispatches += 1;
+    await route.fulfill({ status: 500, body: "Unexpected browser resend" });
+  });
 
   await page.route(`**/api/standalone/sessions/${sessionId}`, (route) => route.fulfill({
     body: JSON.stringify({ ok: true, state: "waiting", tailIndex: durableEvents.length - 1 }),
@@ -4110,8 +4392,11 @@ test("an accepted edited turn keeps prior history and recovers its latest reply 
       events: persistedEvents,
       id: "accepted-edit-refresh-thread",
       pendingTurn: {
-        eventCountAtSubmission: firstTurn.length + clearBoundary.length,
+        beforeTurnId: "turn_1",
+        delivery: "server",
+        eventCountAtSubmission: priorEvents.length,
         id: "accepted-edit-message",
+        mailboxItemId: "mail-accepted-edit-refresh",
         operation: "edit",
         state: "submitting",
         submittedAt: now - 1_000,
@@ -4136,7 +4421,129 @@ test("an accepted edited turn keeps prior history and recovers its latest reply 
   await page.reload();
   await expect(page.getByText("第一轮回复。", { exact: true })).toBeVisible();
   await expect(page.getByText("编辑后的最终回复。", { exact: true })).toHaveCount(1);
+  await expect(page.getByRole("log").getByText("原来的第二轮", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("原来的第二轮回复。", { exact: true })).toHaveCount(0);
+  expect(unexpectedDispatches).toBe(0);
 });
+
+for (const outcome of ["confirmed", "expired"] as const) {
+test(`an ambiguous edit stays Thinking until ${outcome} and preserves history on refresh`, async ({ page }) => {
+  test.skip(!process.env.AGENT_DATABASE_URL, "Requires the server-backed mailbox/edit boundary.");
+  const sessionId = `mock-ambiguous-edit-${outcome}`;
+  const operationId = editOperationId(sessionId, "turn_1", "Edited request");
+  const at = new Date().toISOString();
+  const history = [
+    ...eventsFromNdjson(mockSuccessfulTurn("Earlier request", "Earlier reply.", 0)),
+    ...eventsFromNdjson(mockContinuationTurn("Original request", "Original reply.", 1)),
+  ].map((event, index) => ({ ...event as MessageStreamEvent, meta: { at, id: `${sessionId}-history-${index}` } }));
+  let status = "submission-ambiguous";
+  let polls = 0;
+  let unexpectedDispatches = 0;
+  let retryBody: Record<string, unknown> | undefined;
+  let events: readonly unknown[] = history;
+  const complete = (clientMessageId: string) => {
+    events = [...history,
+      { type: "context.cleared", data: { turnId: "turn_1", sequence: 2, sessionId }, meta: { at, id: `${sessionId}-clear` } },
+      ...withClientMessageId(eventsFromNdjson(mockContinuationTurn("Edited request", "Edited reply.", 2)), clientMessageId)
+        .map((event, index) => ({ ...event as MessageStreamEvent, meta: { at, id: `${sessionId}-replacement-${index}` } })),
+    ];
+    status = "committed";
+  };
+  await page.route("**/api/standalone/mailbox/*", (route) => {
+    polls += 1;
+    const isRetry = new URL(route.request().url()).pathname.endsWith("mail-edit-retry");
+    return route.fulfill({
+      body: JSON.stringify({ ok: true, item: {
+        itemId: isRetry ? "mail-edit-retry" : "mail-edit-ambiguous",
+        clientMessageId: isRetry ? retryBody?.clientMessageId : operationId,
+        status: isRetry ? "committed" : status,
+        ...(status === "cancelled" ? { lastError: "edit_admission_expired" } : {}),
+      } }), contentType: "application/json", status: 200,
+    });
+  });
+  await page.route("**/api/standalone/mailbox", (route) => {
+    retryBody = route.request().postDataJSON() as Record<string, unknown>;
+    unexpectedDispatches += 1;
+    complete(String(retryBody.clientMessageId));
+    return route.fulfill({
+      body: JSON.stringify({ ok: true, disposition: "created", item: {
+        itemId: "mail-edit-retry", clientMessageId: retryBody.clientMessageId, status: "committed",
+      } }), contentType: "application/json", status: 202,
+    });
+  });
+  await page.route(new RegExp(`/eve/v1/session/${sessionId}(/clear)?$`), (route) => {
+    unexpectedDispatches += 1;
+    return route.fulfill({ status: 500, body: "Unexpected browser resend" });
+  });
+  await page.route(`**/api/standalone/sessions/${sessionId}`, (route) => route.fulfill({
+    body: JSON.stringify({ ok: true, state: "waiting", tailIndex: events.length - 1 }),
+    contentType: "application/json", status: 200,
+  }));
+  await page.route(`**/eve/v1/session/${sessionId}/stream**`, (route) => {
+    const startIndex = Number(new URL(route.request().url()).searchParams.get("startIndex") ?? "0");
+    return route.fulfill({
+      body: ndjson(events.slice(startIndex)), contentType: "application/x-ndjson",
+      headers: { "x-eve-stream-tail-index": String(events.length - 1) }, status: 200,
+    });
+  });
+  const now = Date.now();
+  setFakeThreadCollection(page, { activeThreadId: sessionId, version: 2, threads: [{
+    id: sessionId, title: "Edit admission", createdAt: now, updatedAt: now,
+    events: history, closedInputRequestIds: [], queuedTurns: [],
+    preferences: { executionMode: "standard", modelId: "gpt-5.6-sol", reasoning: "medium" },
+    session: { sessionId, streamIndex: history.length }, status: "submitted",
+    pendingTurn: {
+      beforeTurnId: "turn_1", delivery: "server", eventCountAtSubmission: history.length,
+      id: operationId, mailboxItemId: "mail-edit-ambiguous", operation: "edit",
+      state: "submitting", submittedAt: now - 1_000, text: "Edited request",
+    },
+  }] });
+  await page.goto(`/threads/${sessionId}`);
+  const log = page.getByRole("log");
+  await expect(log.getByText("Earlier reply.", { exact: true })).toBeVisible();
+  await expect(log.getByText("Edited request", { exact: true })).toHaveCount(1);
+  await expect(log.getByText(/^(Thinking|正在思考)/)).toBeVisible();
+  await expect(page.locator("[data-agent-failure-alert]")).toHaveCount(0);
+  await expect.poll(() => polls).toBeGreaterThan(1);
+  expect(firstStoredThread(page)?.pendingTurn).toMatchObject({ state: "submitting" });
+  expect(unexpectedDispatches).toBe(0);
+
+  await page.reload();
+  await expect(log.getByText(/^(Thinking|正在思考)/)).toBeVisible();
+  await expect(log.getByText("Earlier reply.", { exact: true })).toBeVisible();
+  expect(unexpectedDispatches).toBe(0);
+  if (outcome === "expired") {
+    status = "cancelled";
+    await expect(page.locator("[data-agent-failure-alert]")).toBeVisible();
+    await expect(log.getByText("Original reply.", { exact: true })).toBeVisible();
+    await expect(log.getByText(/^(Thinking|正在思考)/)).toHaveCount(0);
+    await expect.poll(() => firstStoredThread(page)?.pendingTurn).toMatchObject({ state: "delivery-failed" });
+    await page.reload();
+    await expect(page.locator("[data-agent-failure-alert]")).toBeVisible();
+    await expect(log.getByText("Original reply.", { exact: true })).toBeVisible();
+    await log.getByText("Original request", { exact: true }).hover();
+    await page.getByRole("button", { name: "Edit message", exact: true }).click();
+    const editor = page.locator("[data-agent-edit-composer]");
+    await editor.getByRole("textbox").fill("Edited request");
+    await editor.getByRole("button", { name: "Send", exact: true }).click();
+    await expect.poll(() => retryBody).toBeTruthy();
+    expect(retryBody?.clientMessageId).not.toBe(operationId);
+    expect(retryBody?.operationId).toBe(retryBody?.clientMessageId);
+    expect(retryBody?.beforeTurnId).toBe("turn_1");
+  } else {
+    complete(operationId);
+  }
+  await expect(log.getByText("Edited reply.", { exact: true })).toBeVisible();
+  await expect(log.getByText("Edited request", { exact: true })).toHaveCount(1);
+  await expect(log.getByText("Original reply.", { exact: true })).toHaveCount(0);
+  await expect.poll(() => firstStoredThread(page)?.pendingTurn).toBeUndefined();
+  await page.reload();
+  await expect(log.getByText("Earlier reply.", { exact: true })).toBeVisible();
+  await expect(log.getByText("Edited reply.", { exact: true })).toHaveCount(1);
+  await expect(log.getByText("Edited request", { exact: true })).toHaveCount(1);
+  expect(unexpectedDispatches).toBe(outcome === "expired" ? 1 : 0);
+});
+}
 
 test("editing an unacknowledged optimistic message requires durable mailbox support", async ({ page }) => {
   const sessionId = "mock-unacknowledged-edit-session";
@@ -5122,7 +5529,9 @@ test("stop before session admission preserves the optimistic user message", asyn
   await expect(page.getByRole("button", { name: "Send", exact: true })).toBeVisible();
   await expect(page.getByRole("log").getByText("Keep this message after stopping", { exact: true })).toBeVisible();
   await page.getByRole("log").getByText("Keep this message after stopping", { exact: true }).hover();
-  await expect(page.getByRole("button", { name: "Edit message", exact: true })).toBeVisible();
+  // There is no durable session or turn checkpoint to edit. Preserve the
+  // stopped text, but do not offer a whole-turn revert for a local-only draft.
+  await expect(page.getByRole("button", { name: "Edit message", exact: true })).toHaveCount(0);
   await expect.poll(() => {
     const pending = firstStoredThread(page)?.pendingTurn;
     if (typeof pending !== "object" || pending === null) return "";

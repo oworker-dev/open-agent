@@ -493,7 +493,7 @@ export function normalizeSettledAgentMessages(
   const rootEventsCache = new Map<string, readonly MessageStreamEvent[]>();
   const segmentEventsCache = new Map<string, readonly MessageStreamEvent[]>();
   const segmentEventsFor = (message: EveMessage, turnId: string): readonly MessageStreamEvent[] => {
-    const clientMessageId = assistantSegmentClientMessageId(message, turnId);
+    const clientMessageId = assistantSegmentClientMessageId(message);
     const cacheKey = `${turnId}\u0000${clientMessageId ?? ""}`;
     const cached = segmentEventsCache.get(cacheKey);
     if (cached) return cached;
@@ -1662,7 +1662,7 @@ function eventsForAssistantSegment(
   if (!turnId) return { events: [] };
 
   const rootEvents = eventsForRootTurn(events, turnId);
-  const clientMessageId = assistantSegmentClientMessageId(message, turnId);
+  const clientMessageId = assistantSegmentClientMessageId(message);
   const receiptIndex = rootEvents.findIndex((event) =>
     event.type === "message.received" &&
     event.data.turnId === turnId &&
@@ -1688,10 +1688,12 @@ function eventsForAssistantSegment(
 
 function assistantSegmentClientMessageId(
   message: EveMessage,
-  turnId: string,
 ): string | undefined {
-  const prefix = `${turnId}:assistant:`;
-  return message.id.startsWith(prefix) ? message.id.slice(prefix.length) || undefined : undefined;
+  // The optimistic display root can differ from the durable turn id. Only
+  // the suffix identifies the receipt; both roots share this delimiter.
+  const delimiter = ":assistant:";
+  const index = message.id.indexOf(delimiter);
+  return index < 0 ? undefined : message.id.slice(index + delimiter.length) || undefined;
 }
 
 function toProxiedInputPart(request: InputRequest): EveDynamicToolPart {
@@ -1858,6 +1860,9 @@ function remapAssistantMessage(
   stepOffset: number,
 ): EveMessage {
   const sourceTurnId = message.metadata?.turnId;
+  // Ordinary turns and same-turn steering need no coordinate rewrite. Their
+  // ids may already use an optimistic root, so preserve them verbatim.
+  if (sourceTurnId === rootTurnId && stepOffset === 0) return message;
   const segmentPrefix = sourceTurnId ? `${sourceTurnId}:assistant:` : undefined;
   const segmentId = segmentPrefix && message.id.startsWith(segmentPrefix)
     ? message.id.slice(segmentPrefix.length)

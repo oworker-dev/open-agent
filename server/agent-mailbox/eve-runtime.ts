@@ -107,6 +107,7 @@ export function createEveAgentMailboxRuntime(
       }
       if (parsed.state === "running") {
         return {
+          ...(parsed.editAdmissionGuard === true ? { editAdmissionGuard: true as const } : {}),
           ...(validText(parsed.lastEventAt) ? { lastEventAt: parsed.lastEventAt } : {}),
           state: "running",
           ...(safeNonNegativeInteger(parsed.tailIndex) ? { tailIndex: parsed.tailIndex } : {}),
@@ -124,6 +125,7 @@ export function createEveAgentMailboxRuntime(
       }
       if (parsed.state === "waiting") {
         return {
+          ...(parsed.editAdmissionGuard === true ? { editAdmissionGuard: true as const } : {}),
           state: "waiting",
           ...(safeNonNegativeInteger(parsed.tailIndex) ? { tailIndex: parsed.tailIndex } : {}),
         };

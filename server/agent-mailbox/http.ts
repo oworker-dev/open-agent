@@ -70,6 +70,9 @@ export async function enqueueAgentMailboxHttpRequest(options: {
     if (result.status === "conflict") {
       return problem(409, "mailbox_idempotency_conflict", "This client message id was used for another payload.", options.setCookie);
     }
+    if (result.status === "unsupported-edit") {
+      return problem(409, "mailbox_steered_message_not_editable", "A steered message has no independent edit checkpoint. Send a new message instead.", options.setCookie);
+    }
     if (!("item" in result)) {
       return problem(500, "mailbox_state_invalid", "The mailbox returned an invalid state.", options.setCookie);
     }

@@ -52,7 +52,7 @@ test("rejects a malformed host registry id even when the JWT signature is valid"
     secret: SECRET,
   });
   await assert.rejects(
-    () => auth(new Request("https://agent.example.test/eve/v1/session", {
+    async () => auth(new Request("https://agent.example.test/eve/v1/session", {
       headers: {
         authorization: `Bearer ${signJwt({
           actorType: "user",
