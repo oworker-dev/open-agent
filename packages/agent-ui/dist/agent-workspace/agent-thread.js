@@ -1,5 +1,7 @@
 "use client";
 import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-runtime";
+import { parseAssetPrompt, serializeAssetPrompt } from "@oworker/open-agent-contracts/asset";
+import { receivedClientMessageId, legacyPendingPromptMatches } from "./thread-storage.js";
 import { ClientError, defaultMessageReducer } from "eve/client";
 import { useEveAgent } from "eve/react";
 import { AssistantRuntimeProvider, unstable_defaultDirectiveFormatter, useExternalStoreRuntime } from "@assistant-ui/react";
@@ -240,14 +242,14 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             setOptimisticPendingTurn((current) => {
                 if (!current)
                     return current;
-                if (event.data.clientMessageId === current.id)
+                if (receivedClientMessageId(event) === current.id)
                     return undefined;
-                if (event.data.clientMessageId)
+                if (receivedClientMessageId(event))
                     return current;
                 const eventIndex = compactedEventsRef.current.lastIndexOf(event);
                 const isAfterSubmission = current.eventCountAtSubmission === undefined ||
                     eventIndex >= current.eventCountAtSubmission;
-                return isAfterSubmission && event.data.message.trim() === current.text.trim() ? undefined : current;
+                return isAfterSubmission && legacyPendingPromptMatches(current, event.data.message) ? undefined : current;
             });
             const clientMessageId = event.data.clientMessageId;
             const dispatchedId = dispatchingQueuedTurnIdRef.current;
@@ -815,7 +817,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             void sendPrompt(agent.send, {
                 files: pending.files ?? [],
                 text: pending.text,
-            }, thread.retainedContext).then(() => {
+            }, thread.retainedContext, pending.id).then(() => {
                 if (pendingTurnRef.current?.id === pending.id)
                     turnAdmissionBusyRef.current = false;
             }).catch((retryError) => {
@@ -1105,7 +1107,7 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             onChange({ title: titleFromPrompt(text) });
         }
         try {
-            await sendPrompt(agent.send, { files: message.files, text }, thread.retainedContext);
+            await sendPrompt(agent.send, { files: message.files, text }, thread.retainedContext, pendingTurnRef.current?.id);
             turnAdmissionBusyRef.current = false;
         }
         catch (error) {
@@ -1867,7 +1869,7 @@ function orderPendingUserMessage(messages, pendingTurn, events, state) {
         return messages;
     const userIndex = messages.findIndex((message) => message.role === "user" &&
         messageBelongsToTurn(message, targetTurnId) &&
-        (!pendingTurn || message.parts.some((part) => part.type === "text" && part.text.trim() === pendingTurn.text.trim())));
+        (!pendingTurn || messageMatchesReceipt(message, acceptedMessageReceivedEvent(pendingTurn, events))));
     if (userIndex < 0)
         return messages;
     const assistantIndex = messages.findIndex((message) => message.role === "assistant" && message.metadata?.turnId === targetTurnId);
@@ -1884,7 +1886,18 @@ function hasVisiblePendingUserMessage(pendingTurn, messages, events) {
         return false;
     return messages.some((message) => message.role === "user" &&
         messageBelongsToTurn(message, received.data.turnId) &&
-        message.parts.some((part) => part.type === "text" && part.text.trim() === pendingTurn.text.trim()));
+        messageMatchesReceipt(message, received));
+}
+function messageMatchesReceipt(message, received) {
+    if (!received)
+        return false;
+    const clientId = receivedClientMessageId(received);
+    if (clientId && (message.id.endsWith(`:user:${clientId}`) || message.id === `${clientId}:user`))
+        return true;
+    const text = message.parts.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+    if (clientId && parseAssetPrompt(text).clientMessageId === clientId)
+        return true;
+    return message.id === `${received.data.turnId}:user` || text === received.data.message;
 }
 function messageBelongsToTurn(message, turnId) {
     return message.metadata?.turnId === turnId ||
@@ -1895,9 +1908,9 @@ function acceptedMessageReceivedEvent(pendingTurn, events) {
     const receivedIndex = events.findLastIndex((event, eventIndex) => {
         if (event.type !== "message.received")
             return false;
-        if (event.data.clientMessageId === pendingTurn.id)
+        if (receivedClientMessageId(event) === pendingTurn.id)
             return true;
-        if (event.data.clientMessageId)
+        if (receivedClientMessageId(event))
             return false;
         const projectedEditBoundary = pendingTurn.operation === "edit" &&
             events.some((candidate) => candidate.type === "context.cleared");
@@ -1909,7 +1922,7 @@ function acceptedMessageReceivedEvent(pendingTurn, events) {
             ? eventAt >= pendingTurn.submittedAt - 5_000
             : isAfterSubmission;
         return isAfterSubmission && eventCanAcknowledge &&
-            event.data.message.trim() === pendingTurn.text.trim();
+            legacyPendingPromptMatches(pendingTurn, event.data.message);
     });
     if (receivedIndex < 0)
         return undefined;
@@ -2149,11 +2162,11 @@ function mailboxPromptText(prompt) {
         return undefined;
     return serializedPromptText(prompt);
 }
-function serializedPromptText(prompt) {
+function serializedPromptText(prompt, clientMessageId) {
     const assetNotes = prompt.files
         .filter((file) => file.assetId)
-        .map((file) => `[open-agent-asset ${JSON.stringify({ id: file.assetId, mediaType: file.mediaType, name: file.filename ?? "file", ...(file.sizeBytes ? { size: file.sizeBytes } : {}) })}] Attached asset ${file.filename ?? "file"}. Use import_asset before inspecting or processing it.`);
-    return [prompt.text, ...assetNotes].filter((value) => value.trim().length > 0).join("\n\n");
+        .map((file) => ({ id: file.assetId, mediaType: file.mediaType, name: file.filename ?? "file", ...(file.sizeBytes ? { size: file.sizeBytes } : {}) }));
+    return serializeAssetPrompt(prompt.text, assetNotes, assetNotes.length ? clientMessageId : undefined);
 }
 function retainedContextOptions(context) {
     return {
@@ -2161,8 +2174,8 @@ function retainedContextOptions(context) {
         streamReconnectPolicy: LONG_RUNNING_STREAM_RECONNECT_POLICY,
     };
 }
-async function sendPrompt(send, prompt, context) {
-    const text = serializedPromptText(prompt);
+async function sendPrompt(send, prompt, context, clientMessageId) {
+    const text = serializedPromptText(prompt, clientMessageId);
     const inlineFiles = prompt.files.filter((file) => !file.assetId);
     if (inlineFiles.length === 0) {
         await send(text, retainedContextOptions(context));

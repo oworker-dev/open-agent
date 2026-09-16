@@ -36,6 +36,8 @@ const server = http.createServer(async (request, response) => {
 function injectFailure(response, body) {
   const raw = JSON.stringify(body);
   const transient = [
+    ["PROVIDER_403_RECOVER", 403, "temporarily_forbidden"],
+    ["PROVIDER_403_THREE", 403, "insufficient_quota"],
     ["PROVIDER_404_RECOVER", 404, "temporary_route_unavailable"],
     ["PROVIDER_404_THREE", 404, "temporary_route_unavailable"],
     ["PROVIDER_404_MODEL_NOT_FOUND", 404, "model_not_found"],
@@ -46,7 +48,7 @@ function injectFailure(response, body) {
   for (const [marker, status, type] of transient) {
     if (!raw.includes(marker)) continue;
     const attempt = recordScenarioAttempt(marker);
-    const failureAttempts = marker === "PROVIDER_404_THREE" || marker === "PROVIDER_404_MODEL_NOT_FOUND" ? 3 : 2;
+    const failureAttempts = marker.endsWith("_THREE") || marker === "PROVIDER_404_MODEL_NOT_FOUND" ? 3 : 2;
     if (attempt <= failureAttempts) {
       sendProviderError(response, status, type, `${marker} injected attempt ${attempt}.`);
       return true;

@@ -1,7 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { PendingAttachment } from "@assistant-ui/react";
-import { createBrowserAttachmentAdapter } from "../../packages/agent-ui/src/agent-workspace/browser-asset-upload.ts";
+import {
+  createBrowserAssetId,
+  createBrowserAttachmentAdapter,
+} from "../../packages/agent-ui/src/agent-workspace/browser-asset-upload.ts";
+
+test("browser attachment ids fall back on non-secure HTTP origins", () => {
+  assert.match(createBrowserAssetId({}), /^[a-z0-9]+-[a-z0-9]+$/u);
+  assert.equal(
+    createBrowserAssetId({ randomUUID: () => "fixture-uuid" }),
+    "fixture-uuid",
+  );
+});
 
 test("browser attachment uploads expose progress and send only an asset reference", async () => {
   const adapter = createBrowserAttachmentAdapter({

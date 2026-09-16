@@ -1,4 +1,5 @@
 import type { MessageStreamEvent } from "eve/client";
+import { parseAssetPrompt } from "@oworker/open-agent-contracts/asset";
 import type { AgentInputResponseSubmission, AgentPendingTurn, AgentQueuedTurn, AgentThread, AgentThreadPreferences, AgentThreadSessionState, AgentThreadStatus, AgentTranscriptCoverage, AgentTranscriptWindow, PromptInputMessage } from "./contracts.js";
 import { sanitizeRetainedContext } from "./retained-context.js";
 
@@ -921,17 +922,31 @@ export function reconcilePendingTurnWithEvents(
   const eventAt = latestReceived?.meta.at ? Date.parse(latestReceived.meta.at) : Number.NaN;
   const submittedAt = pendingTurn.submittedAt;
   const eventCanAcknowledge = !Number.isFinite(eventAt) || eventAt >= submittedAt - 5_000;
-  const hasAuthoritativeClientId = latestReceived?.type === "message.received" &&
-    typeof latestReceived.data.clientMessageId === "string" &&
-    latestReceived.data.clientMessageId.trim().length > 0;
+  const clientMessageId = latestReceived?.type === "message.received" ? receivedClientMessageId(latestReceived) : undefined;
   const isAfterSubmission = pendingTurn.eventCountAtSubmission === undefined ||
     latestReceivedIndex >= pendingTurn.eventCountAtSubmission;
   const accepted = latestReceived?.type === "message.received" && (
-    latestReceived.data.clientMessageId === pendingTurn.id ||
-    (!hasAuthoritativeClientId && isAfterSubmission && eventCanAcknowledge && pendingTurn.text.trim().length > 0 &&
-      latestReceived.data.message.trim() === pendingTurn.text.trim())
+    clientMessageId === pendingTurn.id ||
+    (!clientMessageId && isAfterSubmission && eventCanAcknowledge && legacyPendingPromptMatches(pendingTurn, latestReceived.data.message))
   );
   return accepted ? undefined : pendingTurn;
+}
+
+/** Attachment sends carry an immutable id in the durable message envelope;
+ * mailbox admissions already expose Eve's structured clientMessageId.
+ */
+export function receivedClientMessageId(event: Extract<MessageStreamEvent, { type: "message.received" }>): string | undefined {
+  return event.data.clientMessageId || parseAssetPrompt(event.data.message).clientMessageId;
+}
+
+/** Compatibility for pre-envelope history, matching the attachment identity too. */
+export function legacyPendingPromptMatches(pending: Pick<AgentPendingTurn, "text" | "files">, message: string): boolean {
+  const parsed = parseAssetPrompt(message);
+  if (parsed.text !== pending.text.trim()) return false;
+  const files = pending.files ?? [];
+  if (!files.length) return pending.text.trim().length > 0 && !parsed.assets.length;
+  return files.length === parsed.assets.length && files.every((file, index) =>
+    file.url === `asset://${parsed.assets[index]?.id}` && file.mediaType === parsed.assets[index]?.mediaType);
 }
 
 /** Hydration must never replay a persisted clear/resubmit operation. */

@@ -21,6 +21,8 @@ import { readAgentRuntimeConfig } from "./lib/runtime-config.ts";
 import { createProviderFetch } from "../lib/provider-http";
 import { providerOutputBudgetMiddleware } from "../lib/provider-output-budget";
 import { eveOwnedProviderRetryMiddleware } from "../lib/provider-retry-boundary";
+import { assetModelInputMiddleware } from "./lib/asset-model-input.ts";
+import { imageRootSession, type ImageContext } from "./lib/image-input.ts";
 
 const openai = createOpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -47,6 +49,7 @@ function createAgentModel(
   providerModelId: string,
   reasoning?: AgentReasoningLevel,
   maxOutputTokens = modelMaxOutputTokens,
+  imageContext?: ImageContext,
 ) {
   return wrapLanguageModel({
     middleware: [
@@ -62,12 +65,14 @@ function createAgentModel(
       }),
       providerOutputBudgetMiddleware(Math.min(modelMaxOutputTokens, maxOutputTokens)),
       eveOwnedProviderRetryMiddleware,
+      ...(imageContext ? [assetModelInputMiddleware(imageContext)] : []),
     ],
     model: openai(providerModelId),
   });
 }
 
 export default defineAgent({
+  build: { externalDependencies: ["sharp"] },
   description: "A general-purpose autonomous agent for research, software, and knowledge work.",
   model: defineDynamic({
     fallback: evalFixtureModel ?? createAgentModel(
@@ -94,7 +99,11 @@ export default defineAgent({
           : model.defaultReasoning;
 
         return {
-          model: createAgentModel(model.providerModelId, reasoning, model.maxOutputTokens),
+          model: createAgentModel(model.providerModelId, reasoning, model.maxOutputTokens, { session: {
+            id: ctx.session.id,
+            auth: ctx.session.auth,
+            parent: { rootSessionId: imageRootSession.get() ?? ctx.session.id },
+          } }),
           modelContextWindowTokens: model.contextWindowTokens,
           modelOptions: {
             providerOptions: {

@@ -368,8 +368,8 @@ test("transient session admission errors retry with a stable bounded counter", a
   expect(attempts).toBe(3);
 });
 
-test("a Provider 404 remains recoverable and keeps the edit affordance", async ({ page }) => {
-  const sessionId = "recoverable-provider-404-session";
+for (const statusCode of [403, 404]) test(`a Provider ${statusCode} remains recoverable and keeps the edit affordance after refresh`, async ({ page }) => {
+  const sessionId = `recoverable-provider-${statusCode}-session`;
   await page.route("**/eve/v1/session", async (route) => {
     await route.fulfill({
       body: JSON.stringify({ sessionId }),
@@ -379,7 +379,7 @@ test("a Provider 404 remains recoverable and keeps the edit affordance", async (
   });
   await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
     await route.fulfill({
-      body: mockProviderFailureTurn("Use the unavailable model", { retryAttempts: 3, statusCode: 404 }),
+      body: mockProviderFailureTurn("Use the unavailable model", { retryAttempts: 3, statusCode }),
       contentType: "application/x-ndjson",
       status: 200,
     });
@@ -395,6 +395,9 @@ test("a Provider 404 remains recoverable and keeps the edit affordance", async (
   await expect(page.locator('[data-agent-retry]')).toHaveAttribute("data-state", "closed");
   await expect(page.locator('[data-agent-failure-alert]')).toBeVisible();
   await expect(page.getByRole("log").getByText("Use the unavailable model", { exact: true })).toHaveCount(1);
+  await expect(page.getByRole("button", { name: "Edit message", exact: true })).toHaveCount(1);
+  await expect.poll(() => firstStoredThread(page)?.session?.streamIndex ?? 0).toBeGreaterThan(0);
+  await page.reload();
   await expect(page.getByRole("button", { name: "Edit message", exact: true })).toHaveCount(1);
 });
 
@@ -989,6 +992,85 @@ test("a settled transcript with stale coverage is not replayed from Eve", async 
   await page.waitForTimeout(250);
   expect(repairRequests).toBe(0);
   expect(runtimeInspectionRequests).toBe(0);
+});
+
+test("attachment admission keeps the user above its execution group through refresh", async ({ page }) => {
+  const asset = { assetId: "asset-order-test", filename: "reference.png", mediaType: "image/png", sizeBytes: 68 };
+  await page.route("**/api/assets/uploads", (route) => route.fulfill({ json: { upload: { ...asset, uploadId: "upload-order-test", chunkSizeBytes: 8388608, partCount: 1 } } }));
+  await page.route("**/api/assets/uploads/upload-order-test/parts/1", (route) => route.fulfill({ json: { part: { partNumber: 1, sizeBytes: route.request().postDataBuffer()!.length } } }));
+  await page.route("**/api/assets/uploads/upload-order-test/complete", (route) => route.fulfill({ json: { asset } }));
+  let message = "";
+  await page.route("**/eve/v1/session", async (route) => {
+    message = route.request().postDataJSON().message;
+    await route.fulfill({ json: { sessionId: "attachment-order-session" } });
+  });
+  await page.route("**/eve/v1/session/attachment-order-session/stream**", (route) => route.fulfill({
+    body: mockToolTurn(message, "Image checked."), contentType: "application/x-ndjson",
+  }));
+  await page.goto("/");
+  const chooser = page.waitForEvent("filechooser");
+  await page.getByRole("button", { name: "Add files" }).click();
+  await (await chooser).setFiles({ name: asset.filename, mimeType: asset.mediaType, buffer: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64") });
+  await expect(page.getByRole("button", { name: "Attachment: reference.png" })).toBeVisible();
+  const composer = page.getByRole("textbox", { name: "Do anything" });
+  await composer.fill("Inspect this image");
+  await composer.press("Enter");
+  await expect(page.getByText("Image checked.", { exact: true })).toBeVisible();
+  expect(message).toContain("[open-agent-message ");
+  const assertOrder = async () => {
+    const rows = page.getByRole("log").locator("[data-message-id]");
+    await expect(rows).toHaveCount(2);
+    await expect(rows.first()).toContainText("Inspect this image");
+    await expect(rows.last()).toContainText("Image checked.");
+    await expect(page.getByRole("log")).not.toContainText("open-agent-asset");
+    await expect(page.getByRole("button", { name: "Stop", exact: true })).toHaveCount(0);
+  };
+  await assertOrder();
+  await page.reload();
+  await assertOrder();
+});
+
+for (const checkpoint of [
+  { name: "stale four-event", size: 4, live: false },
+  { name: "previously settled", size: 8, live: false },
+  { name: "still running", size: 4, live: true },
+]) test(`a child with a ${checkpoint.name} checkpoint recovers from its cursor`, async ({ page }) => {
+  const parentEvents = [...eventsFromNdjson(mockSuccessfulTurn("Parent task", "Parent ready."))];
+  parentEvents.splice(4, 0,
+    { type: "actions.requested", meta: { at: new Date().toISOString(), id: "child-requested" }, data: { actions: [{ kind: "subagent-call", callId: "child-call", name: "agent", input: { task: "Child task" } }], turnId: "turn_0", sequence: 0, stepIndex: 0 } },
+    { type: "subagent.called", meta: { at: new Date().toISOString(), id: "child-called" }, data: { callId: "child-call", childSessionId: "child-recovery-session", name: "agent", toolName: "agent", sessionId: "parent-recovery-session", turnId: "turn_0", sequence: 0, workflowId: "child-workflow" } },
+    { type: "subagent.completed", meta: { at: new Date().toISOString(), id: "child-done" }, data: { callId: "child-call", output: "Child recovered.", subagentName: "agent" } },
+  );
+  const childHistory = checkpoint.size === 8
+    ? [...eventsFromNdjson(mockSuccessfulTurn("First child task", "First child reply.")), ...eventsFromNdjson(mockSuccessfulTurn("Child task", "Child recovered.", 1)).slice(1)]
+    : eventsFromNdjson(mockSuccessfulTurn("Child task", "Child recovered."));
+  const childEvents = (childHistory as readonly MessageStreamEvent[]).map((event, index) => ({
+    ...event, meta: { ...event.meta, id: `child-event-${index}` },
+  }));
+  setFakeThreadCollection(page, { activeThreadId: "child-recovery-parent", threads: [{
+    id: "child-recovery-parent", title: "Parent task", events: parentEvents,
+    session: { sessionId: "parent-recovery-session", streamIndex: parentEvents.length },
+    preferences: { executionMode: "standard", modelId: "gpt-5.6-sol", reasoning: "medium" },
+    createdAt: Date.now(), updatedAt: Date.now(), status: "ready",
+  }], version: 2 });
+  await page.route(/thread-collections\/[^?]*subagent[^?]*\?/, (route) => route.fulfill({ json: {
+    revision: 1, eventWindow: { startIndex: 0, endIndex: checkpoint.size, total: checkpoint.size, hasMoreBefore: false },
+    thread: { id: "child-recovery-session", title: "Child", events: childEvents.slice(0, checkpoint.size),
+      session: { sessionId: "child-recovery-session", streamIndex: checkpoint.size },
+      preferences: { modelId: "gpt-5.6-sol", reasoning: "medium" }, status: "streaming", createdAt: Date.now(), updatedAt: Date.now(), queuedTurns: [], closedInputRequestIds: [] },
+  } }));
+  let streamRequests = 0;
+  await page.route("**/eve/v1/session/child-recovery-session/stream**", async (route) => {
+    streamRequests++;
+    expect(new URL(route.request().url()).searchParams.get("startIndex")).toBe(String(checkpoint.size));
+    const liveTail = checkpoint.live && streamRequests === 1;
+    await route.fulfill({ body: liveTail ? "" : ndjson(childEvents.slice(checkpoint.size)), contentType: "application/x-ndjson", headers: { "x-eve-stream-tail-index": String((liveTail ? checkpoint.size : childEvents.length) - 1) } });
+  });
+  await page.goto("/threads/child-recovery-parent/agents/child-recovery-session");
+  await expect(page.getByText("Child recovered.", { exact: true })).toBeVisible();
+  await expect(page.getByText("Loading sub-agent history…", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Stop", exact: true })).toHaveCount(0);
+  expect(streamRequests).toBe(checkpoint.live ? 2 : 1);
 });
 
 test("composer exposes assistant-ui attachments, permissions, and safe trigger selection", async ({ page }) => {
@@ -2139,12 +2221,12 @@ test(`editing the latest user turn with ${editScenario.label} submits one durabl
 });
 }
 
-test("editing after a final failure uses one durable revert transaction", async ({ page }) => {
+for (const statusCode of [403, 404]) test(`editing after a final failure (HTTP ${statusCode}) uses one durable revert transaction`, async ({ page }) => {
   test.skip(!process.env.AGENT_DATABASE_URL, "Requires the server-backed mailbox/edit boundary.");
   const sessionId = "failed-edit-transition-session";
   const failedEvents = eventsFromNdjson(mockProviderFailureTurn("Original request", {
     retryAttempts: 3,
-    statusCode: 404,
+    statusCode,
   }));
   const failedCollection: FakeThreadCollection = {
     activeThreadId: "failed-edit-transition-thread",
@@ -5896,8 +5978,8 @@ function mockProviderFailureTurn(
   const failure = {
     code: "MODEL_CALL_FAILED",
     ...(details === undefined ? {} : { details }),
-    message: options.statusCode === 404
-      ? "The model Provider request failed (HTTP 404)."
+    message: options.statusCode !== undefined
+      ? `The model Provider request failed (HTTP ${options.statusCode}).`
       : "The model Provider request timed out.",
     sequence: 0,
     stepIndex: 0,

@@ -15,7 +15,7 @@ import type {
   AgentWorkspaceMailbox,
 } from "./contracts.js";
 import type { AgentLocale } from "./i18n.js";
-import { AGENT_THREAD_STORAGE_VERSION, compactThreadEvents, type AgentThreadCollection, type AgentThreadStorage } from "./thread-storage.js";
+import { AGENT_THREAD_STORAGE_VERSION, appendThreadEventIndexed, eventIdentity, rememberThreadEventCursor, compactThreadEvents, type AgentThreadCollection, type AgentThreadStorage } from "./thread-storage.js";
 
 /**
  * Child sessions intentionally use the same thread controller and assistant-ui
@@ -61,7 +61,13 @@ export function AgentChildSessionView({
   const [thread, setThread] = useState<AgentThread>();
   const [loadError, setLoadError] = useState<string>();
   const [historyLoading, setHistoryLoading] = useState(false);
-  const [reloadGeneration, setReloadGeneration] = useState(0);
+  const [following, setFollowing] = useState(false);
+  const [followError, setFollowError] = useState<string>();
+  const threadRef = useRef(thread);
+  threadRef.current = thread;
+  const preferencesRef = useRef(preferences);
+  preferencesRef.current = preferences;
+  const followController = useRef<AbortController | undefined>(undefined);
   const pendingPersistRef = useRef<AgentThread | undefined>(undefined);
   const persistTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const childStorageKey = storageKey ? `${storageKey}:subagent:${sessionId}` : undefined;
@@ -105,17 +111,76 @@ export function AgentChildSessionView({
   }, [childStorageKey, flushPersistedChild, threadStorage]);
 
   const handleThreadChange = useCallback((patch: AgentThreadPatch) => {
-    setThread((current) => {
-      if (!current) return current;
-      const next = { ...current, ...patch, updatedAt: patch.updatedAt ?? Date.now() };
-      // Persist event/checkpoint deltas as well as presentation state. The
-      // storage adapter coalesces hot updates and converts the transcript to
-      // an append-only PATCH, so long streams never send the full history.
-      const hasClientStateChange = Object.keys(patch).some((key) => key !== "updatedAt");
-      if (hasClientStateChange) schedulePersistedChild(next);
-      return next;
-    });
+    const current = threadRef.current;
+    if (!current) return;
+    const next = { ...current, ...patch, updatedAt: patch.updatedAt ?? Date.now() };
+    // Recovery can be requested in the same callback, before React commits.
+    threadRef.current = next;
+    setThread(next);
+    // The storage adapter coalesces checkpoints into append-only PATCHes.
+    if (Object.keys(patch).some((key) => key !== "updatedAt")) schedulePersistedChild(next);
   }, [schedulePersistedChild]);
+
+  const followChild = useCallback((initial: AgentThread) => {
+    followController.current?.abort();
+    const controller = new AbortController();
+    followController.current = controller;
+    setFollowing(true);
+    setFollowError(undefined);
+    const connection = createAgentSession(client, () => preferencesRef.current, initial.session);
+    const session = attachAgentSession(connection, connection.initialSession)!;
+    const events = [...initial.events];
+    const ids = new Set(events.map(eventIdentity));
+    let cursor = initial.session.streamIndex;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const flush = (settled = false) => {
+      if (controller.signal.aborted) return;
+      if (timer) clearTimeout(timer);
+      timer = undefined;
+      setThread((current) => {
+        if (!current || current.id !== initial.id) return current;
+        const next: AgentThread = {
+          ...current,
+          // Earlier pages can load while recovery is running. Keep that prefix.
+          events: compactThreadEvents([...current.events, ...events]),
+          session: { sessionId, streamIndex: cursor },
+          status: statusFromEvents(events),
+          ...(settled && cursor !== initial.session.streamIndex ? { revision: (current.revision ?? 0) + 1 } : {}),
+          updatedAt: Date.now(),
+        };
+        threadRef.current = next;
+        schedulePersistedChild(next);
+        return next;
+      });
+    };
+    void (async () => {
+      try {
+        const read = async (follow: boolean) => {
+          for await (const event of session.stream({ follow, startIndex: cursor, signal: controller.signal })) {
+            if (controller.signal.aborted) return;
+            rememberThreadEventCursor(event, cursor++);
+            appendThreadEventIndexed(events, ids, event);
+            onEvent?.(event);
+            if (follow && isChildSnapshotBoundary(event)) break;
+            if (!timer) timer = setTimeout(() => flush(), 50);
+          }
+        };
+        // A persisted waiting boundary can precede later resumed work. Catch
+        // up to the current tail before deciding whether to follow live events.
+        await read(false);
+        if (!controller.signal.aborted && (!events.length || !isChildSnapshotBoundary(events.at(-1)!))) await read(true);
+        flush(true);
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          flush(true);
+          setFollowError(error instanceof Error ? error.message : "The sub-agent stream could not be recovered.");
+        }
+      } finally {
+        if (timer) clearTimeout(timer);
+        if (followController.current === controller && !controller.signal.aborted) setFollowing(false);
+      }
+    })();
+  }, [client, onEvent, schedulePersistedChild, sessionId]);
 
   useEffect(() => {
     let disposed = false;
@@ -123,6 +188,9 @@ export function AgentChildSessionView({
     setThread(undefined);
     setLoadError(undefined);
     setHistoryLoading(false);
+    setFollowing(false);
+    setFollowError(undefined);
+    const preferences = preferencesRef.current;
     const connection = createAgentSession(client, preferences, { sessionId, streamIndex: 0 });
     const session = attachAgentSession(connection, connection.initialSession);
     if (!session) {
@@ -133,8 +201,8 @@ export function AgentChildSessionView({
       try {
         // Prefer the host's bounded transcript window. Eve snapshot() always
         // reads from index zero and becomes an unbounded browser payload for
-        // long-running children. AgentThreadView owns the single live stream
-        // after this prefix and resumes from its absolute end cursor.
+        // long-running children. Recovery below starts at the absolute end
+        // cursor; attaching useEveAgent alone does not subscribe to a stream.
         let storedThread: AgentThread | undefined;
         let storedWindow: AgentThread["transcriptWindow"];
         if (childStorageKey && threadStorage?.loadThreadWindow) {
@@ -181,10 +249,12 @@ export function AgentChildSessionView({
           preferences: childDefaults,
           ...(storedWindow ? { transcriptWindow: storedWindow } : {}),
           session: initialSession,
-          status: storedThread?.status ?? statusFromEvents(initialEvents),
+          status: statusFromEvents(initialEvents),
           updatedAt: Date.now(),
         };
         setThread(hydratedThread);
+        threadRef.current = hydratedThread;
+        if (storedWindow || !initialEvents.length || !isChildSnapshotBoundary(initialEvents.at(-1)!)) followChild(hydratedThread);
         // A child has no parent-side transcript window API of its own. Write
         // the first checkpoint immediately after snapshot hydration so future
         // opens use the bounded event-window path instead of replaying Eve
@@ -199,8 +269,9 @@ export function AgentChildSessionView({
     return () => {
       disposed = true;
       controller.abort();
+      followController.current?.abort();
     };
-  }, [childStorageKey, client, preferences, reloadGeneration, schedulePersistedChild, sessionId, threadStorage]);
+  }, [childStorageKey, client, followChild, schedulePersistedChild, sessionId, threadStorage]);
 
   useEffect(() => () => {
     if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
@@ -250,12 +321,8 @@ export function AgentChildSessionView({
   }, [childStorageKey, historyLoading, onStorageError, sessionId, thread, threadStorage]);
 
   const recoverChild = useCallback(() => {
-    // Rehydrate from Eve's durable snapshot. The thread controller will attach
-    // its one live stream after the snapshot commits; no browser-local cursor
-    // is used as an authority during recovery.
-    setThread(undefined);
-    setReloadGeneration((value) => value + 1);
-  }, []);
+    if (threadRef.current) followChild(threadRef.current);
+  }, [followChild]);
 
   if (loadError) {
     return <div className="flex min-h-0 flex-1 items-center justify-center px-6 text-sm text-destructive" role="alert">{loadError}</div>;
@@ -278,6 +345,9 @@ export function AgentChildSessionView({
       onOpenDeliverable={onOpenDeliverable}
       onOpenSubagent={onOpenSubagent}
       onRecoveryNeeded={recoverChild}
+      onRetryRecovery={recoverChild}
+      isRecovering={following}
+      recoveryError={followError}
       providerReady={providerReady}
       reasoningLevels={reasoningLevels}
       thread={thread}
@@ -310,7 +380,8 @@ function persistedChildControls(thread: AgentThread): Pick<AgentThread,
  * proxies that strip x-eve-stream-tail-index cannot satisfy the bounded
  * snapshot contract, so read one non-reconnecting stream as a compatibility
  * fallback. The fallback stops at a durable session boundary and never starts
- * a second live reader; AgentThreadView owns live follow-up streaming.
+ * a second live reader. Cursor recovery below follows unfinished work;
+ * AgentThreadView owns streaming for subsequent user submissions.
  */
 async function readChildSnapshot(
   session: NonNullable<ReturnType<typeof attachAgentSession>>,
@@ -326,8 +397,8 @@ async function readChildSnapshot(
   // header required by `snapshot()`. Keep this compatibility path bounded:
   // an unbounded follow stream here makes a child page wait forever whenever
   // the child is still running or the upstream connection is half-open. The
-  // live AgentThreadView stream is attached after this snapshot and remains
-  // responsible for following future events. `follow:true` is intentional:
+  // cursor recovery starts after this snapshot and remains responsible for
+  // following future events. `follow:true` is intentional:
   // older clients reject bounded streams when the proxy cannot provide the
   // tail header, so the timeout is the compatibility boundary.
   const events: MessageStreamEvent[] = [];

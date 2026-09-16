@@ -22,6 +22,7 @@ import type {
   EveMessagePart,
 } from "eve/react";
 import type { ClientSession } from "eve/client";
+import { parseAssetPrompt } from "@oworker/open-agent-contracts/asset";
 
 type ConvertOptions = {
   readonly assetUrl?: (assetId: string) => string;
@@ -267,25 +268,12 @@ export function getEveMessageContent(message: AppendMessage): Parameters<ClientS
   return parts.length === 1 && parts[0]?.type === "text" ? parts[0].text : parts;
 }
 
-type AssetReference = { readonly id: string; readonly mediaType: string; readonly name: string; readonly size?: number };
-
-function parseAssetReferences(text: string): AssetReference[] {
-  const references: AssetReference[] = [];
-  for (const match of text.matchAll(/\[open-agent-asset (\{[^\n\]]+\})\]/gu)) {
-    try {
-      const value = JSON.parse(match[1]) as Partial<AssetReference>;
-      if (typeof value.id === "string" && typeof value.name === "string" && typeof value.mediaType === "string") {
-        references.push({ id: value.id, mediaType: value.mediaType, name: value.name, ...(typeof value.size === "number" ? { size: value.size } : {}) });
-      }
-    } catch {
-      // Ignore malformed display markers; the raw text remains available to the Agent.
-    }
-  }
-  return references;
+function parseAssetReferences(text: string) {
+  return parseAssetPrompt(text).assets;
 }
 
 function stripAssetReferences(text: string): string {
-  return text.replace(/\s*\[open-agent-asset \{[^\n\]]+\}\]/gu, "").trim();
+  return parseAssetPrompt(text).text;
 }
 
 function jsonObject(value: unknown): ToolCallMessagePart["args"] {

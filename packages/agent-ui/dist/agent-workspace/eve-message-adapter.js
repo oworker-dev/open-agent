@@ -1,4 +1,5 @@
 import { fromThreadMessageLike, } from "@assistant-ui/react";
+import { parseAssetPrompt } from "@oworker/open-agent-contracts/asset";
 const COMPLETE = { reason: "stop", type: "complete" };
 const RUNNING = { type: "running" };
 const CANCELLED = { reason: "cancelled", type: "incomplete" };
@@ -207,21 +208,10 @@ export function getEveMessageContent(message) {
     return parts.length === 1 && parts[0]?.type === "text" ? parts[0].text : parts;
 }
 function parseAssetReferences(text) {
-    const references = [];
-    for (const match of text.matchAll(/\[open-agent-asset (\{[^\n\]]+\})\]/gu)) {
-        try {
-            const value = JSON.parse(match[1]);
-            if (typeof value.id === "string" && typeof value.name === "string" && typeof value.mediaType === "string") {
-                references.push({ id: value.id, mediaType: value.mediaType, name: value.name, ...(typeof value.size === "number" ? { size: value.size } : {}) });
-            }
-        }
-        catch {
-        }
-    }
-    return references;
+    return parseAssetPrompt(text).assets;
 }
 function stripAssetReferences(text) {
-    return text.replace(/\s*\[open-agent-asset \{[^\n\]]+\}\]/gu, "").trim();
+    return parseAssetPrompt(text).text;
 }
 function jsonObject(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value)

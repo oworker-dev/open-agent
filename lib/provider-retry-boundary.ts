@@ -77,32 +77,19 @@ function providerRetryable(
   error: unknown,
   statusCode: number | undefined,
 ): boolean | undefined {
-  // AI SDK marks every HTTP 404 as non-retryable before the provider response
-  // body is inspected. A 404 during model admission is still recoverable for
-  // an interactive session: it may be a temporary route outage, or a model
-  // selection the user can correct without losing the conversation. Mark all
-  // provider 404s retryable so Eve performs its bounded model-call retry and
-  // parks the session at `session.waiting` if the attempts are exhausted.
-  // `session.failed` remains reserved for failures that Eve cannot safely
-  // resume, such as structural workflow or authorization failures.
+  // Provider 403/404 rejections can be resolved by restoring upstream service,
+  // credit, or model access. Keep the existing bounded retry/park behavior so
+  // a rejected model call does not retire the whole interactive session.
+  // This boundary wraps model calls only; application/session authorization
+  // failures never pass through it.
+  if (statusCode === 403 || statusCode === 404) return true;
   if (error && typeof error === "object") {
     const explicit = Reflect.get(error, "isRetryable");
-    if (typeof explicit === "boolean") {
-      if (explicit === true) return true;
-      // A provider's `false` flag is commonly derived from HTTP status. Do
-      // not let that classification turn an otherwise recoverable 404 into a
-      // terminal Eve session.
-      if (statusCode === 404) return true;
-      return false;
-    }
+    if (typeof explicit === "boolean") return explicit;
   }
   if (isTransientNetworkError(error)) return true;
   if (statusCode === undefined) return undefined;
-  // Gateways can temporarily return 404 while a model route is being
-  // deployed or recovered. Treat an otherwise-unclassified 404 as
-  // retryable; Eve owns a bounded three-attempt budget and parks an
-  // interactive session after exhaustion instead of killing its context.
-  return statusCode === 404 || statusCode === 408 || statusCode === 409 || statusCode === 429 || statusCode >= 500;
+  return statusCode === 408 || statusCode === 409 || statusCode === 429 || statusCode >= 500;
 }
 
 const TRANSIENT_NETWORK_CODES = new Set([

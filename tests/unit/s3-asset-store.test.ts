@@ -57,6 +57,56 @@ test("S3 AssetStore keeps provider multipart ids private and persists public met
   assert.ok(queries.every((query) => !query.includes("provider-secret-id")));
 });
 
+test("S3 AssetStore keeps an explicit proxy transfer strategy across upload recovery", async () => {
+  const row = {
+    asset_id: "asset-proxy",
+    upload_id: "upl-proxy",
+    provider_upload_id: "provider-proxy",
+    tenant_id: owner.tenantId,
+    principal_id: owner.principalId,
+    session_id: "session-proxy",
+    filename: "proxy.bin",
+    media_type: "application/octet-stream",
+    storage_key: "open-agent/assets/tenant-1/asset-proxy/content",
+    declared_size_bytes: 1,
+    chunk_size_bytes: 8 * 1024 * 1024,
+    part_count: 1,
+    status: "uploading" as const,
+    created_at: new Date().toISOString(),
+  };
+  const pool = {
+    async query(sql: string) {
+      if (sql.includes("insert into \"open_agent\".\"agent_assets\"")) return { rows: [{ asset_id: row.asset_id }] };
+      if (sql.includes("insert into \"open_agent\".\"agent_asset_uploads\"")) return { rows: [] };
+      if (sql.includes("from \"open_agent\".\"agent_asset_uploads\" upload")) return { rows: [row] };
+      if (sql.includes("from \"open_agent\".\"agent_asset_parts\"")) return { rows: [] };
+      throw new Error(`Unexpected query: ${sql}`);
+    },
+  };
+  const store = createS3AssetStore({
+    bucket: "assets",
+    client: {
+      async send(command: unknown) {
+        if (command instanceof CreateMultipartUploadCommand) return { UploadId: row.provider_upload_id };
+        throw new Error("unexpected command");
+      },
+    } as never,
+    database: { connectionString: "", maxPoolSize: 1, schema: "open_agent" },
+    pool: pool as never,
+    transferStrategy: "proxy",
+  });
+
+  const created = await store.createUpload({
+    filename: row.filename,
+    mediaType: row.media_type,
+    owner,
+    sessionId: row.session_id,
+    sizeBytes: 1,
+  });
+  assert.equal(created.transferStrategy, "proxy");
+  assert.equal((await store.findUpload(row.upload_id, owner))?.transferStrategy, "proxy");
+});
+
 test("S3 AssetStore signs direct parts and durably acknowledges provider ETags", async () => {
   const row = {
     asset_id: "asset-direct",

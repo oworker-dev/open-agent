@@ -54,6 +54,23 @@ try {
     "PROVIDER_429_RECOVER. Do not use tools. Reply exactly: RATE_LIMIT_RECOVERED");
   assert(messageText(rateLimit) === "RATE_LIMIT_RECOVERED", "429 recovery returned the wrong result.");
 
+  const temporaryForbidden = await completedTurn(eveUrl,
+    "PROVIDER_403_RECOVER. Do not use tools. Reply exactly: FORBIDDEN_RECOVERED");
+  assert(messageText(temporaryForbidden) === "FORBIDDEN_RECOVERED",
+    "The temporary 403 provider rejection did not recover automatically.");
+
+  const exhaustedForbidden = await createAndConsume(eveUrl,
+    "PROVIDER_403_THREE. Reply exactly: STALE_FORBIDDEN");
+  assertRecoverableFailure(exhaustedForbidden.events, "exhausted Provider 403");
+  assertRetryProgress(exhaustedForbidden.events, "exhausted Provider 403");
+  assert(exhaustedForbidden.events.some((event) => event.type === "turn.failed" && event.data.details?.statusCode === 403),
+    "Provider 403 did not retain the status code needed for UI classification.");
+  const continuedAfterForbidden = await consume(exhaustedForbidden.session,
+    "Continue after restoring upstream access. Reply exactly: FORBIDDEN_CONTINUED");
+  assertCompleted(continuedAfterForbidden, "Provider 403 continuation");
+  assert(completedMessageText(continuedAfterForbidden) === "FORBIDDEN_CONTINUED",
+    "The same session could not continue after exhausting Provider 403 retries.");
+
   const temporaryNotFound = await completedTurn(eveUrl,
     "PROVIDER_404_RECOVER. Do not use tools. Reply exactly: NOT_FOUND_RECOVERED");
   assert(messageText(temporaryNotFound) === "NOT_FOUND_RECOVERED",
@@ -150,6 +167,10 @@ try {
   const state = await fetch(`${providerUrl}/debug/state`).then((response) => response.json());
   assert(state.scenarioAttempts.PROVIDER_429_RECOVER === 3,
     `Expected three 429 attempts, received ${state.scenarioAttempts.PROVIDER_429_RECOVER}.`);
+  assert(state.scenarioAttempts.PROVIDER_403_RECOVER === 3,
+    `Expected three temporary 403 attempts, received ${state.scenarioAttempts.PROVIDER_403_RECOVER}.`);
+  assert(state.scenarioAttempts.PROVIDER_403_THREE === 3,
+    `Expected three exhausted 403 attempts, received ${state.scenarioAttempts.PROVIDER_403_THREE}.`);
   assert(state.scenarioAttempts.PROVIDER_404_RECOVER === 3,
     `Expected three 404 attempts, received ${state.scenarioAttempts.PROVIDER_404_RECOVER}.`);
   assert(state.scenarioAttempts.PROVIDER_404_THREE === 3,
@@ -170,6 +191,8 @@ try {
   console.log(JSON.stringify({
     automaticRecovery: {
       rateLimitAttempts: state.scenarioAttempts.PROVIDER_429_RECOVER,
+      temporaryForbiddenAttempts: state.scenarioAttempts.PROVIDER_403_RECOVER,
+      exhaustedForbiddenAttempts: state.scenarioAttempts.PROVIDER_403_THREE,
       temporaryNotFoundAttempts: state.scenarioAttempts.PROVIDER_404_RECOVER,
       exhaustedTemporaryNotFoundAttempts: state.scenarioAttempts.PROVIDER_404_THREE,
       exhaustedModelNotFoundAttempts: state.scenarioAttempts.PROVIDER_404_MODEL_NOT_FOUND,
@@ -180,7 +203,7 @@ try {
     },
     sandboxLifecycle: { permitReuse: true, sequentialSessions: 2 },
     ok: true,
-    recoverableFailures: ["provider-timeout-retry-budget-exhausted"],
+    recoverableFailures: ["provider-403-retry-budget-exhausted", "provider-timeout-retry-budget-exhausted"],
     sameSessionContinuation: true,
   }));
 } catch (error) {

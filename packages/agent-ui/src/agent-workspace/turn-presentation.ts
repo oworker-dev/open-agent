@@ -55,6 +55,12 @@ function durableStatus(status: AgentSubagentSummary["status"]): SubagentSessionP
 }
 
 export type AgentTurnPresentation = {
+  /**
+   * Visual execution-segment timing. Lifecycle status still comes from the
+   * complete root turn when `mergeSameTurn` is enabled, but each assistant
+   * segment gets its own clock so same-turn steering does not repeat the
+   * aggregate duration in every segment.
+   */
   readonly endedAt?: number;
   readonly finalPart?: Extract<EveMessagePart, { type: "text" }>;
   /** A terminal step failure is rendered by the step's own activity row. */
@@ -68,9 +74,10 @@ export type AgentTurnPresentation = {
 
 export type AgentTurnPresentationOptions = {
   /**
-   * Use the complete root-turn event range for the visual execution group.
-   * Eve steering messages intentionally share a turn id, so their assistant
-   * segments must share one timer and terminal status in the UI.
+   * Use the complete root-turn event range for lifecycle status and process
+   * projection. Eve steering messages intentionally share a turn id; their
+   * assistant segments retain independent visual timing while continuing to
+   * share that root lifecycle.
    */
   readonly mergeSameTurn?: boolean;
 };
@@ -103,12 +110,13 @@ export function classifyAgentFailure(failure: AgentTurnFailure): AgentFailureCat
 export function isRetryableAgentFailure(failure: AgentTurnFailure): boolean {
   if (failure.retryable !== undefined) return failure.retryable;
   if (failure.statusCode !== undefined && failure.statusCode >= 400 && failure.statusCode < 500) {
-    // Provider 404s are recoverable in Open Agent even when Eve's durable
+    // Provider 403/404s are recoverable in Open Agent even when Eve's durable
     // failure details omit its internal retryable flag. A missing route or
     // model selection must not turn a long-lived interactive session into a
     // terminal conversation; an explicit `retryable: false` above still wins
     // for genuinely terminal failures from older/runtime-specific events.
-    return failure.statusCode === 404 || failure.statusCode === 408 || failure.statusCode === 409 || failure.statusCode === 425 || failure.statusCode === 429;
+    return (failure.statusCode === 403 && failure.code === "MODEL_CALL_FAILED") ||
+      failure.statusCode === 404 || failure.statusCode === 408 || failure.statusCode === 409 || failure.statusCode === 425 || failure.statusCode === 429;
   }
   const category = classifyAgentFailure(failure);
   if (category === "unknown") return false;
@@ -1128,6 +1136,18 @@ export function presentAgentTurn(
     (event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled" || event.type === "session.failed") &&
     !isLocalInterruptedBoundary(event),
   );
+  // Keep lifecycle status scoped to the complete root turn, but calculate the
+  // visible clock from this assistant segment. A same-turn steering segment
+  // ends at the next `message.received`; the final segment ends at the root
+  // terminal boundary. `step.started` is a compatibility fallback for
+  // compact streams that contain a segment's model step but no action event.
+  const segmentStarted = partEvents.find((event) =>
+    event.type === "actions.requested" || event.type === "step.started",
+  );
+  const segmentTerminal = [...messageSegment.events].reverse().find((event) =>
+    (event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled" || event.type === "session.failed") &&
+    !isLocalInterruptedBoundary(event),
+  );
   const status = pendingRequests.length > 0
     ? "waiting"
     : terminal?.type === "turn.completed"
@@ -1188,9 +1208,7 @@ export function presentAgentTurn(
   );
 
   return {
-    endedAt: eventTimestamp(terminal) ?? (
-      options.mergeSameTurn ? undefined : messageSegment.settledAt
-    ),
+    endedAt: eventTimestamp(segmentTerminal) ?? messageSegment.settledAt ?? eventTimestamp(terminal),
     finalPart,
     ...(failureAnchored ? { failureAnchored: true } : {}),
     proxiedInputParts: pendingRequests
@@ -1204,7 +1222,7 @@ export function presentAgentTurn(
     // from an earlier step is not sufficient: without this tail marker the
     // failure is silently hidden by AgentMessage's duplicate suppression.
     processParts: displayProcessParts,
-    startedAt: eventTimestamp(firstAction),
+    startedAt: eventTimestamp(segmentStarted),
     status,
     ...(pendingRequests[0]?.kind ? { waitingFor: pendingRequests[0].kind } : {}),
   };

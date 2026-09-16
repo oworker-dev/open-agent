@@ -961,8 +961,14 @@ export function AgentWorkspace({
     return () => controller.abort();
   }, [activeThread?.session.sessionId, client, deliverableEndpoint]);
 
+  const previousAssetThreadId = useRef<string | undefined>(undefined);
   useEffect(() => {
-    setActiveSubagentSessionId(undefined);
+    // Hydration already selected the child from the URL. Only an actual
+    // switch between parent threads should clear that selection.
+    if (previousAssetThreadId.current && previousAssetThreadId.current !== activeThread?.id) {
+      setActiveSubagentSessionId(undefined);
+    }
+    previousAssetThreadId.current = activeThread?.id;
     setSecondaryTab("home");
     setSecondaryChildSessionId(undefined);
     setRequestedDeliverable(undefined);

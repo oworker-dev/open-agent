@@ -1,3 +1,4 @@
+import { parseAssetPrompt } from "@oworker/open-agent-contracts/asset";
 import { sanitizeRetainedContext } from "./retained-context.js";
 export const AGENT_THREAD_STORAGE_VERSION = 2;
 const EMPTY_SESSION = { streamIndex: 0 };
@@ -691,15 +692,24 @@ export function reconcilePendingTurnWithEvents(pendingTurn, events) {
     const eventAt = latestReceived?.meta.at ? Date.parse(latestReceived.meta.at) : Number.NaN;
     const submittedAt = pendingTurn.submittedAt;
     const eventCanAcknowledge = !Number.isFinite(eventAt) || eventAt >= submittedAt - 5_000;
-    const hasAuthoritativeClientId = latestReceived?.type === "message.received" &&
-        typeof latestReceived.data.clientMessageId === "string" &&
-        latestReceived.data.clientMessageId.trim().length > 0;
+    const clientMessageId = latestReceived?.type === "message.received" ? receivedClientMessageId(latestReceived) : undefined;
     const isAfterSubmission = pendingTurn.eventCountAtSubmission === undefined ||
         latestReceivedIndex >= pendingTurn.eventCountAtSubmission;
-    const accepted = latestReceived?.type === "message.received" && (latestReceived.data.clientMessageId === pendingTurn.id ||
-        (!hasAuthoritativeClientId && isAfterSubmission && eventCanAcknowledge && pendingTurn.text.trim().length > 0 &&
-            latestReceived.data.message.trim() === pendingTurn.text.trim()));
+    const accepted = latestReceived?.type === "message.received" && (clientMessageId === pendingTurn.id ||
+        (!clientMessageId && isAfterSubmission && eventCanAcknowledge && legacyPendingPromptMatches(pendingTurn, latestReceived.data.message)));
     return accepted ? undefined : pendingTurn;
+}
+export function receivedClientMessageId(event) {
+    return event.data.clientMessageId || parseAssetPrompt(event.data.message).clientMessageId;
+}
+export function legacyPendingPromptMatches(pending, message) {
+    const parsed = parseAssetPrompt(message);
+    if (parsed.text !== pending.text.trim())
+        return false;
+    const files = pending.files ?? [];
+    if (!files.length)
+        return pending.text.trim().length > 0 && !parsed.assets.length;
+    return files.length === parsed.assets.length && files.every((file, index) => file.url === `asset://${parsed.assets[index]?.id}` && file.mediaType === parsed.assets[index]?.mediaType);
 }
 export function reconcileHydratedPendingTurn(pendingTurn, events) {
     const reconciled = reconcilePendingTurnWithEvents(pendingTurn, events);

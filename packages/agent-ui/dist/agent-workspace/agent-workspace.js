@@ -747,8 +747,12 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
         });
         return () => controller.abort();
     }, [activeThread?.session.sessionId, client, deliverableEndpoint]);
+    const previousAssetThreadId = useRef(undefined);
     useEffect(() => {
-        setActiveSubagentSessionId(undefined);
+        if (previousAssetThreadId.current && previousAssetThreadId.current !== activeThread?.id) {
+            setActiveSubagentSessionId(undefined);
+        }
+        previousAssetThreadId.current = activeThread?.id;
         setSecondaryTab("home");
         setSecondaryChildSessionId(undefined);
         setRequestedDeliverable(undefined);

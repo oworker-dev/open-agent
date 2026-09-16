@@ -190,14 +190,13 @@ SSRF, quota, checksum, and content-scan boundary in `AssetStore`, then enter the
 workspace in the same tool call by default. A remote caller may set
 `destination: false` to retain the asset without creating or waking a sandbox.
 A first-turn browser upload is provisionally tagged with a `browser-*` session
-id; the first successful import atomically binds it to the current durable
-session. Assets already bound to another session are rejected, even for the
-same principal.
-`view_image`
-validates sandbox paths and common image signatures and emits a typed Eve file
-part capped at 3 MiB. When the sandbox provides ImageMagick, oversized images
-are downscaled to a bounded JPEG preview before being sent to the model;
-otherwise the tool returns a recoverable instruction to resize the image. The
+id; the first successful import or model image read atomically binds it to the
+durable session. Child agents may read their root session's image assets;
+assets belonging to unrelated sessions are rejected even for the same principal.
+`view_image` accepts an authorized `assetId`, remote HTTP(S) URL, or workspace
+`path`. Only the workspace path needs a sandbox. Workspace reads above 3 MiB
+use the existing sandbox ImageMagick fallback; assets and remote images use
+bounded application-side decoding. The
 S3 adapter is storage-production-capable once its object-store lifecycle,
 quota, retention, credentials, CORS, and scanner are configured. The repository
 contains a 100 MiB direct-upload load gate covering interrupted-part retry,
@@ -236,6 +235,14 @@ capability to extract text, OCR, metadata, or a thumbnail when the task asks
 for it. This keeps large or opaque files usable without imposing a costly parse
 on every request.
 
+Uploaded images are the exception: the model adapter resolves their authorized
+asset references into typed image parts immediately before the provider call.
+The main agent can answer an image question directly, without `import_asset`,
+`view_image`, or a child agent. Image processing can still use those tools when
+the task calls for it. Attachment receipts carry a stable client message ID;
+display and acknowledgment share one reference parser, including legacy
+attachment messages, so receipt matching does not depend on the expanded text.
+
 At the beginning of a turn, the runtime authorizes referenced assets against
 the current tenant, principal, session, and message. On demand, the sandbox
 adapter mounts them read-only at a stable path:
@@ -267,15 +274,14 @@ type ViewImageInput = {
 
 The tool must:
 
-- accept only a sandbox path under `/workspace` (or an authorized `assetId`
-  resolved by the runtime);
-- verify the path exists, is a regular image, and is inside the current
-  session sandbox;
+- accept exactly one sandbox path under `/workspace`, authorized `assetId`,
+  or remote HTTP(S) URL subject to the existing SSRF/import policy;
+- verify the source belongs to the current authorized context and decodes as
+  a supported image;
 - preserve the original image in the sandbox/object store;
-- resize or encode a model-facing copy with a bounded byte size (target less
-  than 3 MiB per image, configurable by model capability);
-- return a typed file/image part through the Eve tool output so a vision-capable
-  model can actually see the pixels;
+- resize or encode a model-facing copy bounded to 512 KiB;
+- supply typed file/image parts at the model boundary so a vision-capable model
+  can actually see the pixels;
 - return dimensions, media type, and a stable asset reference for the UI;
 - fail with a useful typed error for missing files, unsupported formats, or a
   non-vision model.
@@ -284,16 +290,31 @@ The model adapter must declare `vision` capability. If the selected model is
 text-only, the runtime must report that limitation instead of silently sending
 an unusable image part. Multiple images are bounded by turn and tenant quota.
 
-Eve 0.31 projects the final tool result into model content through
-`toModelOutput`, but still publishes and persists the complete final result on
-`action.result`. Consequently, model-facing image bytes must never be returned
-from `execute()`. `view_image` keeps the bounded preview in a process-local,
-strictly capped one-shot observation registry until Eve immediately invokes
-`toModelOutput`; the entry is consumed and deleted while the public result
-contains only `assetId`, `assetRef`, path, media type, dimensions, and byte
-counts. For authenticated sessions the same bounded preview is written to the
-host-neutral `AssetStore`, so the default UI and embedded hosts render it from
-an authorized asset resolver instead of a durable Base64 result.
+Eve 0.31 persists model-facing tool history as well as public tool events and
+uses a JSON-length estimate for text context budgeting. Returning image Base64
+from `toModelOutput` therefore makes a small image look like enormous text.
+Open Agent keeps Eve's native estimator unchanged and adds no tokenizer.
+
+`view_image.execute()` persists a workspace preview in `AssetStore` and returns
+only `assetId`, `assetRef`, path, media type, dimensions, and byte counts.
+`toModelOutput` also returns those references. The model middleware resolves
+them into native image content parts after Eve's context preparation, for both
+fresh tool results and durable replay. No one-shot in-memory registry is used.
+Storage failure remains an explicit tool error rather than claiming the model
+has seen pixels that are no longer available. UI previews use the same
+authenticated asset resolver.
+
+Image preparation leaves original assets unchanged. It accepts sources up to
+32 MiB and 32 million decoded pixels; previews have a maximum edge of 2048
+pixels and size of 512 KiB. Small valid static PNG/JPEG/WebP images remain
+lossless; larger, rotated, animated, or other supported formats become a
+bounded JPEG preview (the first frame for animation). Each conversion has a
+time limit and observes cancellation. At most eight recent unique images are
+included in a model request, each at its latest reference. Older references
+remain available for an explicit `view_image` read. An unavailable historical
+image does not break a later unrelated text request; a current image that
+cannot be read fails explicitly. These are visual-input bounds, not an exact
+vision-token estimator.
 
 ### Remote binary import
 

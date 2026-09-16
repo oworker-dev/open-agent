@@ -19,6 +19,8 @@ export type PersistRemoteAssetInput = {
   readonly mediaTypeHint?: string;
   readonly timeout?: number;
   readonly url: string;
+  /** Optional tighter bound for image inspection; ordinary imports retain their quota. */
+  readonly maxBytes?: number;
 };
 
 export type PersistedAsset = {
@@ -63,8 +65,9 @@ export async function persistRemoteAsset(
   if (declaredSize === undefined) {
     throw new AssetStoreError("invalid", "Remote assets must provide a valid Content-Length before import.");
   }
-  if (declaredSize > MAX_REMOTE_ASSET_BYTES) {
-    throw new AssetStoreError("quota", "The remote asset exceeds the 10 GiB asset limit.");
+  if (declaredSize > Math.min(input.maxBytes ?? MAX_REMOTE_ASSET_BYTES, MAX_REMOTE_ASSET_BYTES)) {
+    await response.body?.cancel();
+    throw new AssetStoreError("quota", "The remote asset exceeds the permitted size limit.");
   }
   if (!response.body) throw new Error("The remote asset response has no readable body.");
 

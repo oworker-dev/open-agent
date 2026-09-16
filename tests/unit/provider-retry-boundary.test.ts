@@ -60,11 +60,21 @@ test("classifies transient Provider HTTP, timeout, and network failures for Eve"
 });
 
 test("keeps known permanent Provider rejections out of the transient retry budget", async () => {
-  for (const statusCode of [400, 401, 403]) {
+  for (const statusCode of [400, 401]) {
     await assert.rejects(
       oneProviderAttempt(async () => { throw Object.assign(new Error("rejected"), { statusCode }); }),
       (error: unknown) => error instanceof EveOwnedProviderAttemptError && error.isRetryable === false,
     );
+  }
+});
+
+test("keeps Provider 403 resumable even when the SDK labels it non-retryable", async () => {
+  for (const isRetryable of [undefined, false]) {
+    const failure = Object.assign(new Error("upstream access unavailable"), { statusCode: 403, isRetryable });
+    await assert.rejects(oneProviderAttempt(async () => { throw failure; }),
+      (error: unknown) => error instanceof EveOwnedProviderAttemptError &&
+        error.statusCode === 403 && error.isRetryable === true &&
+        error.message === "The model Provider rejected this request (HTTP 403).");
   }
 });
 

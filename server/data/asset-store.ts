@@ -451,6 +451,7 @@ export function createAssetStoreFromEnvironment(
     const quotaBytes = parseOptionalAssetQuota(environment.AGENT_ASSET_QUOTA_BYTES);
     const prefix = environment.AGENT_ASSET_S3_PREFIX;
     const scanMode = readAssetScanMode(environment);
+    const transferStrategy = parseAssetTransferStrategy(environment.AGENT_ASSET_TRANSFER_STRATEGY);
     const uploadUrlExpiresSeconds = parseUploadUrlExpiry(environment.AGENT_ASSET_UPLOAD_URL_TTL_SECONDS);
     const fingerprint = createHash("sha256").update(JSON.stringify({
       accessKeyId,
@@ -468,6 +469,7 @@ export function createAssetStoreFromEnvironment(
       scannerTimeoutMs: environment.AGENT_ASSET_CLAMAV_TIMEOUT_MS?.trim(),
       scanMode,
       secretAccessKey,
+      transferStrategy,
       uploadUrlExpiresSeconds,
     })).digest("hex");
     if (cachedS3AssetStore?.fingerprint === fingerprint) return cachedS3AssetStore.store;
@@ -492,6 +494,7 @@ export function createAssetStoreFromEnvironment(
       prefix,
       scanner,
       scanMode,
+      transferStrategy,
       uploadUrlExpiresSeconds,
     });
     cachedS3AssetStore = { client, fingerprint, store };
@@ -583,6 +586,16 @@ function parseUploadUrlExpiry(value: string | undefined): number | undefined {
     throw new Error("AGENT_ASSET_UPLOAD_URL_TTL_SECONDS must be between 60 and 3600.");
   }
   return parsed;
+}
+
+function parseAssetTransferStrategy(
+  value: string | undefined,
+): NonNullable<AssetUpload["transferStrategy"]> {
+  const normalized = value?.trim().toLowerCase() || "direct";
+  if (normalized !== "direct" && normalized !== "proxy") {
+    throw new Error("AGENT_ASSET_TRANSFER_STRATEGY must be direct or proxy.");
+  }
+  return normalized;
 }
 
 function normalizeCleanupLimit(value: number | undefined): number {

@@ -1,16 +1,16 @@
-import { defineTool, toolOutput, toolOutputPart } from "eve/tools";
+import { defineTool, toolOutput } from "eve/tools";
 import type { SandboxSession } from "eve/sandbox";
 import type { SessionAuthContext } from "eve/context";
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
 import { publicationOwnerFromAuth } from "../lib/session-ownership-auth.ts";
 import { createAssetStoreFromEnvironment } from "../../server/data/asset-store.ts";
+import { persistRemoteAsset } from "../lib/asset-import.ts";
+import { assertVisionCapability, readAssetImage, prepareImagePreview, MAX_IMAGE_SOURCE_BYTES } from "../lib/image-input.ts";
+export { assertVisionCapability } from "../lib/image-input.ts";
 
-/** Maximum inline image payload sent through the durable model transcript. */
+/** Maximum workspace read before falling back to sandbox-side resizing. */
 export const MAX_VIEW_IMAGE_BYTES = 3 * 1024 * 1024;
-const MAX_PENDING_MODEL_OBSERVATIONS = 16;
-const MAX_PENDING_MODEL_OBSERVATION_BYTES = 32 * 1024 * 1024;
-const MAX_IMAGE_PROBE_BYTES = 64 * 1024;
 const SUPPORTED_MEDIA_TYPES = ["image/jpeg", "image/png", "image/gif", "image/webp", "image/svg+xml"] as const;
 export type ViewImageMediaType = (typeof SUPPORTED_MEDIA_TYPES)[number];
 
@@ -27,34 +27,41 @@ const outputSchema = z.object({
 
 export type ViewImageOutput = z.infer<typeof outputSchema>;
 
-type ModelImageObservation = {
-  readonly bytes: Uint8Array;
-  readonly filename: string;
-  readonly mediaType: ViewImageMediaType;
-};
-
-const pendingModelObservations = new WeakMap<object, ModelImageObservation>();
-let pendingModelObservationBytes = 0;
-let pendingModelObservationCount = 0;
-const observationFinalizer = new FinalizationRegistry<number>((bytes) => {
-  pendingModelObservationBytes = Math.max(0, pendingModelObservationBytes - bytes);
-  pendingModelObservationCount = Math.max(0, pendingModelObservationCount - 1);
-});
-
 export default defineTool({
   description: [
-    "View an image from the current sandbox so a vision-capable model can inspect it.",
-    "Supports PNG, JPEG, GIF, WebP, and SVG. The path must stay inside /workspace.",
-    `Images over ${MAX_VIEW_IMAGE_BYTES} bytes are resized in the sandbox before being sent to the model; the original file is never modified.`,
+    "View an image from the current sandbox or an authorized asset so a vision-capable model can inspect it.",
+    "Supports PNG, JPEG, GIF, WebP, and SVG. Provide exactly one source: assetId for uploaded images, path for workspace images, or url for remote images.",
+    "Uploaded assets and remote URLs do not require a sandbox. Previews are bounded and the original is never modified.",
     "Use only when the active model accepts image input.",
   ].join(" "),
   inputSchema: z.strictObject({
-    path: z.string().trim().min(1).max(512),
-  }),
+    path: z.string().trim().min(1).max(512).optional(),
+    assetId: z.string().trim().min(1).max(512).optional(),
+    url: z.string().url().optional(),
+    mediaTypeHint: z.string().trim().min(1).max(200).optional(),
+  }).refine((input) => [input.path, input.assetId, input.url].filter(Boolean).length === 1 &&
+    (!input.mediaTypeHint || Boolean(input.url)), "Provide exactly one image source; mediaTypeHint applies only to URLs."),
   outputSchema,
   async execute(input, ctx) {
     assertVisionCapability(ctx);
-    const path = normalizeWorkspacePath(input.path);
+    if (input.assetId || input.url) {
+      const persisted = input.url
+        ? await persistRemoteAsset({ url: input.url, ...(input.mediaTypeHint ? { mediaTypeHint: input.mediaTypeHint } : {}), maxBytes: MAX_IMAGE_SOURCE_BYTES }, ctx)
+        : { assetId: input.assetId! };
+      const preview = await readAssetImage(persisted.assetId, ctx, ctx.abortSignal);
+      const output: ViewImageOutput = {
+        assetId: persisted.assetId,
+        assetRef: `asset:${persisted.assetId}`,
+        bytes: preview.bytes.byteLength,
+        ...(preview.width && preview.height ? { dimensions: { width: preview.width, height: preview.height } } : {}),
+        mediaType: preview.mediaType,
+        originalBytes: preview.originalBytes,
+        path: `asset://${persisted.assetId}`,
+        resized: preview.resized,
+      };
+      return output;
+    }
+    const path = normalizeWorkspacePath(input.path!);
     const sandbox = await ctx.getSandbox();
     const preview = await readBoundedImage(sandbox, path, ctx.abortSignal);
     if (!preview || preview.bytes.byteLength === 0) throw new Error("The image does not exist or is empty.");
@@ -75,7 +82,11 @@ export default defineTool({
     if (bytes.byteLength === 0 || bytes.byteLength > MAX_VIEW_IMAGE_BYTES) {
       throw new Error(`The image preview exceeds the ${MAX_VIEW_IMAGE_BYTES}-byte inline limit after resizing.`);
     }
-    const dimensions = readImageDimensions(bytes, outputMediaType);
+    const prepared = await prepareImagePreview(bytes, ctx.abortSignal);
+    bytes = prepared.bytes;
+    outputMediaType = prepared.mediaType;
+    resized ||= prepared.resized;
+    const dimensions = { width: prepared.width, height: prepared.height };
     const output: ViewImageOutput = {
       assetRef: `workspace:${path}`,
       bytes: bytes.byteLength,
@@ -85,76 +96,24 @@ export default defineTool({
       path,
       resized,
     };
-    rememberModelObservation(output, {
-      bytes,
-      filename: basename(path),
-      mediaType: outputMediaType,
-    });
-    // The model observation is the capability of this tool; the persisted
-    // asset is only a UI convenience for a host's artifact panel. A temporary
-    // object-store outage, quota rejection, or an unconfigured standalone
-    // store must not turn a readable image into a failed vision turn. The
-    // private observation remains available for toModelOutput below.
-    try {
-      const assetId = await persistPreviewAsset({
-        bytes,
-        ctx,
-        filename: basename(path),
-        mediaType: outputMediaType,
-      });
-      if (assetId) output.assetId = assetId;
-    } catch {
-      // Best effort only. The image bytes never leave the model output path
-      // unless Eve asks toModelOutput, and that path is independent of UI
-      // asset persistence.
-    }
+    // A durable reference survives tool replay and keeps binary bytes out of
+    // compaction. Failure to store the observation must remain a tool error.
+    output.assetId = await persistPreviewAsset({ bytes, ctx, filename: basename(path), mediaType: outputMediaType });
     return output;
   },
   toModelOutput(output) {
-    const observation = consumeModelObservation(output);
-    return toolOutput.content([
-      toolOutputPart.text(`${output.resized ? "Resized image" : "Image"} ${output.path} (${output.bytes} bytes${output.resized ? `, original ${output.originalBytes} bytes` : ""}${output.dimensions ? `, ${output.dimensions.width}x${output.dimensions.height}` : ""}).`),
-      toolOutputPart.file(Buffer.from(observation.bytes).toString("base64"), {
-        filename: observation.filename,
-        mediaType: observation.mediaType,
-      }),
-    ]);
+    return toolOutput.json(output);
   },
 });
-
-function rememberModelObservation(output: ViewImageOutput, observation: ModelImageObservation): void {
-  if (
-    pendingModelObservationCount >= MAX_PENDING_MODEL_OBSERVATIONS ||
-    pendingModelObservationBytes + observation.bytes.byteLength > MAX_PENDING_MODEL_OBSERVATION_BYTES
-  ) {
-    throw new Error("The image observation buffer is busy. Retry after the active vision calls settle.");
-  }
-  pendingModelObservations.set(output, observation);
-  pendingModelObservationBytes += observation.bytes.byteLength;
-  pendingModelObservationCount += 1;
-  observationFinalizer.register(output, observation.bytes.byteLength, output);
-}
-
-function consumeModelObservation(output: ViewImageOutput): ModelImageObservation {
-  const observation = pendingModelObservations.get(output);
-  if (!observation) {
-    throw new Error("The private image observation is no longer available. Run view_image again.");
-  }
-  pendingModelObservations.delete(output);
-  observationFinalizer.unregister(output);
-  pendingModelObservationBytes = Math.max(0, pendingModelObservationBytes - observation.bytes.byteLength);
-  pendingModelObservationCount = Math.max(0, pendingModelObservationCount - 1);
-  return observation;
-}
 
 async function persistPreviewAsset(input: {
   readonly bytes: Uint8Array;
   readonly ctx: ViewImageContext;
   readonly filename: string;
   readonly mediaType: ViewImageMediaType;
-}): Promise<string | undefined> {
+}): Promise<string> {
   const auth = input.ctx.session.auth.current;
-  if (!auth) return undefined;
+  if (!auth) throw new Error("Image inspection requires an authenticated Agent session.");
   const owner = publicationOwnerFromAuth(auth);
   const store = createAssetStoreFromEnvironment();
   const upload = await store.createUpload({
@@ -183,37 +142,6 @@ type ViewImageContext = {
   };
 };
 
-type VisionCapabilityContext = {
-  readonly session: {
-    readonly auth: {
-      readonly current?: {
-        readonly attributes?: Readonly<Record<string, unknown>>;
-      } | null;
-    };
-  };
-};
-
-/**
- * Eve does not expose a provider capability object on ToolContext. Hosts may
- * nevertheless fail closed by publishing one of these neutral attributes on
- * the authenticated session; absence means "unknown" and preserves the
- * standalone Agent's normal behavior.
- */
-export function assertVisionCapability(ctx: VisionCapabilityContext): void {
-  const attributes = ctx.session.auth.current?.attributes;
-  const enabled = attributes?.agentVisionEnabled ?? attributes?.visionEnabled;
-  if (enabled === false) throw new Error("The selected Agent model does not support image input.");
-  const capabilities = attributes?.agentModelCapabilities;
-  if (capabilities && typeof capabilities === "object" && !Array.isArray(capabilities) && "vision" in capabilities && capabilities.vision === false) {
-    throw new Error("The selected Agent model does not support image input.");
-  }
-  const modelId = typeof attributes?.agentModelId === "string" ? attributes.agentModelId : process.env.AGENT_MODEL_ID?.trim();
-  const configuredModels = process.env.AGENT_VISION_MODEL_IDS?.split(",").map((value) => value.trim()).filter(Boolean) ?? [];
-  if (configuredModels.length > 0 && (!modelId || !configuredModels.includes(modelId))) {
-    throw new Error("The selected Agent model is not declared vision-capable by the runtime.");
-  }
-}
-
 export function normalizeWorkspacePath(value: string): string {
   const path = value.startsWith("/") ? value : `/workspace/${value}`;
   const relative = path.slice("/workspace/".length);
@@ -236,27 +164,6 @@ export function detectMediaType(bytes: Uint8Array, path: string): ViewImageMedia
 
 function ascii(bytes: Uint8Array, start: number, end: number): string {
   return String.fromCharCode(...bytes.slice(start, end));
-}
-
-function readImageDimensions(bytes: Uint8Array, mediaType: ViewImageMediaType): { width: number; height: number } | undefined {
-  if (mediaType === "image/png" && bytes.length >= 24) {
-    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    return { width: view.getUint32(16), height: view.getUint32(20) };
-  }
-  if (mediaType === "image/gif" && bytes.length >= 10) {
-    return { width: bytes[6]! | (bytes[7]! << 8), height: bytes[8]! | (bytes[9]! << 8) };
-  }
-  if (mediaType === "image/webp" && bytes.length >= 30 && ascii(bytes, 12, 16) === "VP8X") {
-    const width = 1 + bytes[24]! + (bytes[25]! << 8) + (bytes[26]! << 16);
-    const height = 1 + bytes[27]! + (bytes[28]! << 8) + (bytes[29]! << 16);
-    return { width, height };
-  }
-  if (mediaType === "image/svg+xml") {
-    const head = new TextDecoder().decode(bytes.slice(0, 16_384));
-    const viewBox = /viewBox\s*=\s*["']\s*[-+\d.e]+\s+[-+\d.e]+\s+([-+\d.e]+)\s+([-+\d.e]+)\s*["']/iu.exec(head);
-    if (viewBox) return { width: Math.max(1, Math.round(Number(viewBox[1]))), height: Math.max(1, Math.round(Number(viewBox[2]))) };
-  }
-  return undefined;
 }
 
 async function readImageFileSize(

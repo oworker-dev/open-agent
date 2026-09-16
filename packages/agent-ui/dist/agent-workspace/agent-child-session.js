@@ -3,12 +3,18 @@ import { jsx as _jsx } from "react/jsx-runtime";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AgentThreadView } from "./agent-thread.js";
 import { attachAgentSession, createAgentSession } from "./agent-client.js";
-import { AGENT_THREAD_STORAGE_VERSION, compactThreadEvents } from "./thread-storage.js";
+import { AGENT_THREAD_STORAGE_VERSION, appendThreadEventIndexed, eventIdentity, rememberThreadEventCursor, compactThreadEvents } from "./thread-storage.js";
 export function AgentChildSessionView({ client, commands, locale, mailbox, mentions, models, onEvent, onOpenDeliverable, onOpenSubagent, onStorageError, preferences, providerReady = true, reasoningLevels, sessionId, storageKey, threadStorage, }) {
     const [thread, setThread] = useState();
     const [loadError, setLoadError] = useState();
     const [historyLoading, setHistoryLoading] = useState(false);
-    const [reloadGeneration, setReloadGeneration] = useState(0);
+    const [following, setFollowing] = useState(false);
+    const [followError, setFollowError] = useState();
+    const threadRef = useRef(thread);
+    threadRef.current = thread;
+    const preferencesRef = useRef(preferences);
+    preferencesRef.current = preferences;
+    const followController = useRef(undefined);
     const pendingPersistRef = useRef(undefined);
     const persistTimerRef = useRef(undefined);
     const childStorageKey = storageKey ? `${storageKey}:subagent:${sessionId}` : undefined;
@@ -46,22 +52,92 @@ export function AgentChildSessionView({ client, commands, locale, mailbox, menti
         }, 120);
     }, [childStorageKey, flushPersistedChild, threadStorage]);
     const handleThreadChange = useCallback((patch) => {
-        setThread((current) => {
-            if (!current)
-                return current;
-            const next = { ...current, ...patch, updatedAt: patch.updatedAt ?? Date.now() };
-            const hasClientStateChange = Object.keys(patch).some((key) => key !== "updatedAt");
-            if (hasClientStateChange)
-                schedulePersistedChild(next);
-            return next;
-        });
+        const current = threadRef.current;
+        if (!current)
+            return;
+        const next = { ...current, ...patch, updatedAt: patch.updatedAt ?? Date.now() };
+        threadRef.current = next;
+        setThread(next);
+        if (Object.keys(patch).some((key) => key !== "updatedAt"))
+            schedulePersistedChild(next);
     }, [schedulePersistedChild]);
+    const followChild = useCallback((initial) => {
+        followController.current?.abort();
+        const controller = new AbortController();
+        followController.current = controller;
+        setFollowing(true);
+        setFollowError(undefined);
+        const connection = createAgentSession(client, () => preferencesRef.current, initial.session);
+        const session = attachAgentSession(connection, connection.initialSession);
+        const events = [...initial.events];
+        const ids = new Set(events.map(eventIdentity));
+        let cursor = initial.session.streamIndex;
+        let timer;
+        const flush = (settled = false) => {
+            if (controller.signal.aborted)
+                return;
+            if (timer)
+                clearTimeout(timer);
+            timer = undefined;
+            setThread((current) => {
+                if (!current || current.id !== initial.id)
+                    return current;
+                const next = {
+                    ...current,
+                    events: compactThreadEvents([...current.events, ...events]),
+                    session: { sessionId, streamIndex: cursor },
+                    status: statusFromEvents(events),
+                    ...(settled && cursor !== initial.session.streamIndex ? { revision: (current.revision ?? 0) + 1 } : {}),
+                    updatedAt: Date.now(),
+                };
+                threadRef.current = next;
+                schedulePersistedChild(next);
+                return next;
+            });
+        };
+        void (async () => {
+            try {
+                const read = async (follow) => {
+                    for await (const event of session.stream({ follow, startIndex: cursor, signal: controller.signal })) {
+                        if (controller.signal.aborted)
+                            return;
+                        rememberThreadEventCursor(event, cursor++);
+                        appendThreadEventIndexed(events, ids, event);
+                        onEvent?.(event);
+                        if (follow && isChildSnapshotBoundary(event))
+                            break;
+                        if (!timer)
+                            timer = setTimeout(() => flush(), 50);
+                    }
+                };
+                await read(false);
+                if (!controller.signal.aborted && (!events.length || !isChildSnapshotBoundary(events.at(-1))))
+                    await read(true);
+                flush(true);
+            }
+            catch (error) {
+                if (!controller.signal.aborted) {
+                    flush(true);
+                    setFollowError(error instanceof Error ? error.message : "The sub-agent stream could not be recovered.");
+                }
+            }
+            finally {
+                if (timer)
+                    clearTimeout(timer);
+                if (followController.current === controller && !controller.signal.aborted)
+                    setFollowing(false);
+            }
+        })();
+    }, [client, onEvent, schedulePersistedChild, sessionId]);
     useEffect(() => {
         let disposed = false;
         const controller = new AbortController();
         setThread(undefined);
         setLoadError(undefined);
         setHistoryLoading(false);
+        setFollowing(false);
+        setFollowError(undefined);
+        const preferences = preferencesRef.current;
         const connection = createAgentSession(client, preferences, { sessionId, streamIndex: 0 });
         const session = attachAgentSession(connection, connection.initialSession);
         if (!session) {
@@ -109,10 +185,13 @@ export function AgentChildSessionView({ client, commands, locale, mailbox, menti
                     preferences: childDefaults,
                     ...(storedWindow ? { transcriptWindow: storedWindow } : {}),
                     session: initialSession,
-                    status: storedThread?.status ?? statusFromEvents(initialEvents),
+                    status: statusFromEvents(initialEvents),
                     updatedAt: Date.now(),
                 };
                 setThread(hydratedThread);
+                threadRef.current = hydratedThread;
+                if (storedWindow || !initialEvents.length || !isChildSnapshotBoundary(initialEvents.at(-1)))
+                    followChild(hydratedThread);
                 if (!storedWindow)
                     schedulePersistedChild(hydratedThread);
             }
@@ -125,8 +204,9 @@ export function AgentChildSessionView({ client, commands, locale, mailbox, menti
         return () => {
             disposed = true;
             controller.abort();
+            followController.current?.abort();
         };
-    }, [childStorageKey, client, preferences, reloadGeneration, schedulePersistedChild, sessionId, threadStorage]);
+    }, [childStorageKey, client, followChild, schedulePersistedChild, sessionId, threadStorage]);
     useEffect(() => () => {
         if (persistTimerRef.current)
             clearTimeout(persistTimerRef.current);
@@ -176,16 +256,16 @@ export function AgentChildSessionView({ client, commands, locale, mailbox, menti
         }
     }, [childStorageKey, historyLoading, onStorageError, sessionId, thread, threadStorage]);
     const recoverChild = useCallback(() => {
-        setThread(undefined);
-        setReloadGeneration((value) => value + 1);
-    }, []);
+        if (threadRef.current)
+            followChild(threadRef.current);
+    }, [followChild]);
     if (loadError) {
         return _jsx("div", { className: "flex min-h-0 flex-1 items-center justify-center px-6 text-sm text-destructive", role: "alert", children: loadError });
     }
     if (!thread) {
         return _jsx("div", { className: "flex min-h-0 flex-1 items-center justify-center px-6 text-sm text-muted-foreground", role: "status", children: "Loading sub-agent history\u2026" });
     }
-    return (_jsx(AgentThreadView, { client: client, commands: commands, draftStorageKey: `open-agent:child-draft:${sessionId}`, locale: locale, mailbox: mailbox, mentions: mentions, models: models, onChange: handleThreadChange, onEvent: onEvent, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, onRecoveryNeeded: recoverChild, providerReady: providerReady, reasoningLevels: reasoningLevels, thread: thread, historyHasMore: thread.transcriptWindow?.hasMoreBefore === true, historyLoading: historyLoading, onLoadEarlier: loadEarlier }, `${thread.id}:${thread.revision ?? 0}`));
+    return (_jsx(AgentThreadView, { client: client, commands: commands, draftStorageKey: `open-agent:child-draft:${sessionId}`, locale: locale, mailbox: mailbox, mentions: mentions, models: models, onChange: handleThreadChange, onEvent: onEvent, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, onRecoveryNeeded: recoverChild, onRetryRecovery: recoverChild, isRecovering: following, recoveryError: followError, providerReady: providerReady, reasoningLevels: reasoningLevels, thread: thread, historyHasMore: thread.transcriptWindow?.hasMoreBefore === true, historyLoading: historyLoading, onLoadEarlier: loadEarlier }, `${thread.id}:${thread.revision ?? 0}`));
 }
 function persistedChildControls(thread) {
     return {

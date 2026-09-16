@@ -1,6 +1,8 @@
 "use client";
 
 import type { UserContent } from "ai";
+import { parseAssetPrompt, serializeAssetPrompt } from "@oworker/open-agent-contracts/asset";
+import { receivedClientMessageId, legacyPendingPromptMatches } from "./thread-storage.js";
 import { ClientError, defaultMessageReducer, type ClientSession, type MessageStreamEvent } from "eve/client";
 import { useEveAgent, type EveDynamicToolPart, type EveMessage } from "eve/react";
 import { AssistantRuntimeProvider, unstable_defaultDirectiveFormatter, useExternalStoreRuntime, type AppendMessage, type ExternalStoreAdapter, type ExternalThreadQueueAdapter, type RespondToToolApprovalOptions } from "@assistant-ui/react";
@@ -420,12 +422,12 @@ export function AgentThreadView({
         // copy is excluded from busy-state calculations.
         setOptimisticPendingTurn((current) => {
           if (!current) return current;
-          if (event.data.clientMessageId === current.id) return undefined;
-          if (event.data.clientMessageId) return current;
+          if (receivedClientMessageId(event) === current.id) return undefined;
+          if (receivedClientMessageId(event)) return current;
           const eventIndex = compactedEventsRef.current.lastIndexOf(event);
           const isAfterSubmission = current.eventCountAtSubmission === undefined ||
             eventIndex >= current.eventCountAtSubmission;
-          return isAfterSubmission && event.data.message.trim() === current.text.trim() ? undefined : current;
+          return isAfterSubmission && legacyPendingPromptMatches(current, event.data.message) ? undefined : current;
         });
 
         // Mark a queued admission as accepted at the receipt boundary, but do
@@ -1283,7 +1285,7 @@ export function AgentThreadView({
       void sendPrompt(agent.send, {
         files: pending.files ?? [],
         text: pending.text,
-      }, thread.retainedContext).then(() => {
+      }, thread.retainedContext, pending.id).then(() => {
         if (pendingTurnRef.current?.id === pending.id) turnAdmissionBusyRef.current = false;
       }).catch((retryError: unknown) => {
         // send() normally reports errors through useEveAgent's error state;
@@ -1646,7 +1648,7 @@ export function AgentThreadView({
     }
 
     try {
-      await sendPrompt(agent.send, { files: message.files, text }, thread.retainedContext);
+      await sendPrompt(agent.send, { files: message.files, text }, thread.retainedContext, pendingTurnRef.current?.id);
       // `sendPrompt` resolves only after Eve reaches its durable session
       // boundary. Release the synchronous admission gate after that point so
       // the next user turn is not incorrectly parked in the follow-up queue.
@@ -2819,7 +2821,7 @@ function orderPendingUserMessage(
   const userIndex = messages.findIndex((message) =>
     message.role === "user" &&
     messageBelongsToTurn(message, targetTurnId) &&
-    (!pendingTurn || message.parts.some((part) => part.type === "text" && part.text.trim() === pendingTurn.text.trim())),
+    (!pendingTurn || messageMatchesReceipt(message, acceptedMessageReceivedEvent(pendingTurn, events))),
   );
   if (userIndex < 0) return messages;
   const assistantIndex = messages.findIndex((message) =>
@@ -2842,8 +2844,18 @@ function hasVisiblePendingUserMessage(
   return messages.some((message) =>
     message.role === "user" &&
     messageBelongsToTurn(message, received.data.turnId) &&
-    message.parts.some((part) => part.type === "text" && part.text.trim() === pendingTurn.text.trim()),
+    messageMatchesReceipt(message, received),
   );
+}
+
+function messageMatchesReceipt(message: EveMessage, received: Extract<MessageStreamEvent, { type: "message.received" }> | undefined): boolean {
+  if (!received) return false;
+  const clientId = receivedClientMessageId(received);
+  if (clientId && (message.id.endsWith(`:user:${clientId}`) || message.id === `${clientId}:user`)) return true;
+  const text = message.parts.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+  if (clientId && parseAssetPrompt(text).clientMessageId === clientId) return true;
+  // Eve's normal user id is unique per turn; steering rows carry a suffix.
+  return message.id === `${received.data.turnId}:user` || text === received.data.message;
 }
 
 function messageBelongsToTurn(message: EveMessage, turnId: string): boolean {
@@ -2858,8 +2870,8 @@ function acceptedMessageReceivedEvent(
 ): Extract<MessageStreamEvent, { type: "message.received" }> | undefined {
   const receivedIndex = events.findLastIndex((event, eventIndex) => {
     if (event.type !== "message.received") return false;
-    if (event.data.clientMessageId === pendingTurn.id) return true;
-    if (event.data.clientMessageId) return false;
+    if (receivedClientMessageId(event) === pendingTurn.id) return true;
+    if (receivedClientMessageId(event)) return false;
     // Edit projections intentionally remove the superseded branch, so their
     // local array indexes no longer line up with the append-only event count
     // captured at submission. A context-cleared marker is the authoritative
@@ -2878,7 +2890,7 @@ function acceptedMessageReceivedEvent(
       ? eventAt >= pendingTurn.submittedAt - 5_000
       : isAfterSubmission;
     return isAfterSubmission && eventCanAcknowledge &&
-      event.data.message.trim() === pendingTurn.text.trim();
+      legacyPendingPromptMatches(pendingTurn, event.data.message);
   });
   if (receivedIndex < 0) return undefined;
   const received = events[receivedIndex];
@@ -3202,11 +3214,11 @@ function mailboxPromptText(prompt: PromptInputMessage): string | undefined {
   return serializedPromptText(prompt);
 }
 
-function serializedPromptText(prompt: PromptInputMessage): string {
+function serializedPromptText(prompt: PromptInputMessage, clientMessageId?: string): string {
   const assetNotes = prompt.files
     .filter((file) => file.assetId)
-    .map((file) => `[open-agent-asset ${JSON.stringify({ id: file.assetId, mediaType: file.mediaType, name: file.filename ?? "file", ...(file.sizeBytes ? { size: file.sizeBytes } : {}) })}] Attached asset ${file.filename ?? "file"}. Use import_asset before inspecting or processing it.`);
-  return [prompt.text, ...assetNotes].filter((value) => value.trim().length > 0).join("\n\n");
+    .map((file) => ({ id: file.assetId!, mediaType: file.mediaType, name: file.filename ?? "file", ...(file.sizeBytes ? { size: file.sizeBytes } : {}) }));
+  return serializeAssetPrompt(prompt.text, assetNotes, assetNotes.length ? clientMessageId : undefined);
 }
 
 function retainedContextOptions(
@@ -3222,8 +3234,9 @@ async function sendPrompt(
   send: ReturnType<typeof useEveAgent>["send"],
   prompt: PromptInputMessage,
   context: readonly string[] | undefined,
+  clientMessageId?: string,
 ): Promise<void> {
-  const text = serializedPromptText(prompt);
+  const text = serializedPromptText(prompt, clientMessageId);
   const inlineFiles = prompt.files.filter((file) => !file.assetId);
   if (inlineFiles.length === 0) {
     await send(text, retainedContextOptions(context));

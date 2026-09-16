@@ -48,6 +48,8 @@ export type S3AssetStoreOptions = {
   readonly scanMode?: AssetScanMode;
   /** Test/host injection point; defaults to the AWS SigV4 presigner. */
   readonly presignUploadPart?: (command: UploadPartCommand, expiresInSeconds: number) => Promise<string>;
+  /** Keep direct object-store uploads by default; local previews may proxy bounded parts. */
+  readonly transferStrategy?: NonNullable<AssetUpload["transferStrategy"]>;
   readonly uploadUrlExpiresSeconds?: number;
 };
 
@@ -114,6 +116,7 @@ export function createS3AssetStore(options: S3AssetStoreOptions): AssetStore {
   const quotaBytes = normalizeConfiguredQuotaBytes(options.quotaBytes);
   const prefix = normalizePrefix(options.prefix);
   const scanMode = resolveScanMode(options.scanMode, options.scanner);
+  const transferStrategy = options.transferStrategy ?? "direct";
   const uploadUrlExpiresSeconds = normalizeUploadUrlExpiry(options.uploadUrlExpiresSeconds);
   const presignUploadPart = options.presignUploadPart
     ?? ((command: UploadPartCommand, expiresInSeconds: number) =>
@@ -208,7 +211,7 @@ export function createS3AssetStore(options: S3AssetStoreOptions): AssetStore {
           sizeBytes: input.sizeBytes,
           scanStatus: scanMode === "disabled" ? "disabled" : "pending",
           status: "uploading",
-          transferStrategy: "direct",
+          transferStrategy,
           uploadId,
           owner: input.owner,
         } satisfies AssetUpload;
@@ -525,7 +528,7 @@ export function createS3AssetStore(options: S3AssetStoreOptions): AssetStore {
       const row = await readUpload(pool, table, uploadId);
       assertOwner({ principalId: row.principal_id, principalType: row.principal_type ?? undefined, issuer: row.issuer ?? undefined, tenantId: row.tenant_id }, owner);
       const parts = await readParts(pool, table.parts, uploadId);
-      return toUpload(row, maxBytes, parts);
+      return toUpload(row, maxBytes, transferStrategy, parts);
     },
 
     async findUploadByAsset(assetId, owner) {
@@ -533,7 +536,7 @@ export function createS3AssetStore(options: S3AssetStoreOptions): AssetStore {
       if (!row) return undefined;
       assertOwner({ principalId: row.principal_id, principalType: row.principal_type ?? undefined, issuer: row.issuer ?? undefined, tenantId: row.tenant_id }, owner);
       const parts = await readParts(pool, table.parts, row.upload_id);
-      return toUpload(row, maxBytes, parts);
+      return toUpload(row, maxBytes, transferStrategy, parts);
     },
 
     async listAssets(sessionId, owner) {
@@ -882,7 +885,12 @@ function toMetadata(row: AssetRow): AssetMetadata {
   };
 }
 
-function toUpload(row: UploadRow, maxBytes: number, parts: readonly PartRow[] = []): AssetUpload {
+function toUpload(
+  row: UploadRow,
+  maxBytes: number,
+  transferStrategy: NonNullable<AssetUpload["transferStrategy"]>,
+  parts: readonly PartRow[] = [],
+): AssetUpload {
   return {
     assetId: row.asset_id,
     chunkSizeBytes: row.chunk_size_bytes,
@@ -899,7 +907,7 @@ function toUpload(row: UploadRow, maxBytes: number, parts: readonly PartRow[] = 
     sizeBytes: Number(row.declared_size_bytes),
     ...(row.scan_status ? { scanStatus: row.scan_status as AssetUpload["scanStatus"] } : {}),
     status: row.status === "completing" ? "uploading" : row.status,
-    transferStrategy: "direct",
+    transferStrategy,
     uploadId: row.upload_id,
     owner: {
       ...(row.issuer ? { issuer: row.issuer } : {}),

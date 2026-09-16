@@ -3,6 +3,7 @@ import test from "node:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { z } from "zod";
 import applyPatchTool, {
   applyUpdateText,
   countLines,
@@ -15,6 +16,7 @@ import viewImageTool, {
   MAX_VIEW_IMAGE_BYTES,
   normalizeWorkspacePath,
   readBoundedImage,
+  resizeImageInSandbox,
 } from "../../agent/tools/view_image.ts";
 import { assertAssetSession } from "../../agent/tools/import_asset.ts";
 import {
@@ -213,7 +215,18 @@ test("view_image honors an explicit host model capability denial", () => {
   );
 });
 
-test("view_image resizes oversized images and emits a typed file output", async () => {
+test("view_image exposes an object tool schema and rejects ambiguous image sources", () => {
+  const schema = (viewImageTool as unknown as { inputSchema: z.ZodType }).inputSchema;
+  assert.equal(z.toJSONSchema(schema).type, "object");
+  for (const source of [{ path: "test.png" }, { assetId: "asset-test" }, { url: "https://example.com/test.png", mediaTypeHint: "image/png" }]) {
+    assert.equal(schema.safeParse(source).success, true);
+  }
+  for (const source of [{}, { assetId: "asset-test", path: "test.png" }, { path: "test.png", mediaTypeHint: "image/png" }]) {
+    assert.equal(schema.safeParse(source).success, false);
+  }
+});
+
+test("view_image bounds sandbox reads and resizes oversized workspace images", async () => {
   const source = new Uint8Array(MAX_VIEW_IMAGE_BYTES + 17);
   source.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
   const resized = Uint8Array.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x01]);
@@ -232,20 +245,9 @@ test("view_image resizes oversized images and emits a typed file output", async 
   const bounded = await readBoundedImage(sandbox as never, "/workspace/large.png");
   assert.equal(bounded?.oversized, true);
   assert.equal(bounded?.bytes.byteLength, MAX_VIEW_IMAGE_BYTES);
-  const context = { getSandbox: async () => sandbox, abortSignal: new AbortController().signal, session: { auth: { current: null } } } as never;
-  const output = await (viewImageTool as unknown as { execute(input: { path: string }, context: unknown): Promise<{ resized: boolean; mediaType: string; bytes: number }> }).execute({ path: "large.png" }, context);
-  assert.equal(output.resized, true);
+  const output = await resizeImageInSandbox(sandbox as never, "/workspace/large.png");
   assert.equal(output.mediaType, "image/jpeg");
-  assert.equal(output.bytes, resized.byteLength);
-  assert.equal("dataBase64" in output, false);
-  assert.equal(JSON.stringify(output).includes(Buffer.from(resized).toString("base64")), false);
-  const projected = (viewImageTool as unknown as { toModelOutput(value: typeof output): { type: string; value?: readonly { type: string; [key: string]: unknown }[] } }).toModelOutput(output);
-  assert.equal(projected.type, "content");
-  assert.equal(projected.value?.some((part) => part.type === "file"), true);
-  assert.throws(
-    () => (viewImageTool as unknown as { toModelOutput(value: typeof output): unknown }).toModelOutput(output),
-    /no longer available/,
-  );
+  assert.deepEqual(output.bytes, resized);
 });
 
 test("view_image persists an authenticated UI preview while keeping bytes private", async () => {
@@ -294,13 +296,24 @@ test("view_image persists an authenticated UI preview while keeping bytes privat
     assert.equal(asset?.sessionId, "view-image-session");
     assert.equal(asset?.mediaType, "image/png");
     assert.equal(asset?.sizeBytes, bytes.byteLength);
-    (viewImageTool as unknown as { toModelOutput(value: typeof output): unknown }).toModelOutput(output);
+    const tool = viewImageTool as unknown as { toModelOutput(value: typeof output): { type: string; value: unknown } };
+    const modelOutput = tool.toModelOutput(output);
+    assert.equal(modelOutput.type, "json");
+    assert.deepEqual(tool.toModelOutput(JSON.parse(JSON.stringify(output))), modelOutput);
+    assert.equal(JSON.stringify(modelOutput).includes(bytes.toString("base64")), false);
+    const remoteOutput = await (viewImageTool as unknown as {
+      execute(input: { assetId: string }, context: unknown): Promise<{ assetId: string; bytes: number }>;
+    }).execute({ assetId: output.assetId }, {
+      ...context, getSandbox: async () => { throw new Error("Asset image inspection must not create a sandbox"); },
+    });
+    assert.equal(remoteOutput.assetId, output.assetId);
+    assert.equal(remoteOutput.bytes, bytes.byteLength);
   } finally {
     await rm(root, { force: true, recursive: true });
   }
 });
 
-test("view_image keeps the model observation when optional UI asset persistence is unavailable", async () => {
+test("view_image reports unavailable durable image storage instead of claiming visual success", async () => {
   configureAssetStore({
     async createUpload() {
       throw new Error("object store temporarily unavailable");
@@ -333,11 +346,7 @@ test("view_image keeps the model observation when optional UI asset persistence 
       id: "vision-degraded-session",
     },
   };
-  const output = await (viewImageTool as unknown as {
+  await assert.rejects((viewImageTool as unknown as {
     execute(input: { path: string }, context: unknown): Promise<{ assetId?: string; bytes: number }>;
-  }).execute({ path: "reference.png" }, context);
-  assert.equal(output.bytes, bytes.byteLength);
-  assert.equal(output.assetId, undefined);
-  const modelOutput = (viewImageTool as unknown as { toModelOutput(value: typeof output): { type: string } }).toModelOutput(output);
-  assert.equal(modelOutput.type, "content");
+  }).execute({ path: "reference.png" }, context), /object store temporarily unavailable/);
 });

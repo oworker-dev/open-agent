@@ -38,6 +38,10 @@ export declare function eventIdentity(event: MessageStreamEvent): string;
 export declare function rememberThreadEventCursor(event: MessageStreamEvent, cursor: number): void;
 export declare function compactThreadEvents(events: readonly MessageStreamEvent[]): readonly MessageStreamEvent[];
 export declare function reconcilePendingTurnWithEvents(pendingTurn: AgentPendingTurn | undefined, events: readonly MessageStreamEvent[]): AgentPendingTurn | undefined;
+export declare function receivedClientMessageId(event: Extract<MessageStreamEvent, {
+    type: "message.received";
+}>): string | undefined;
+export declare function legacyPendingPromptMatches(pending: Pick<AgentPendingTurn, "text" | "files">, message: string): boolean;
 export declare function reconcileHydratedPendingTurn(pendingTurn: AgentPendingTurn | undefined, events: readonly MessageStreamEvent[]): AgentPendingTurn | undefined;
 export declare function projectThreadEditBranches(events: readonly MessageStreamEvent[]): readonly MessageStreamEvent[];
 export declare function projectPendingThreadEdit(events: readonly MessageStreamEvent[], beforeTurnId?: string): readonly MessageStreamEvent[];

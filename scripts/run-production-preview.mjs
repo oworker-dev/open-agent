@@ -70,6 +70,10 @@ const runtimeEnvironment = {
   AGENT_ASSET_S3_SECRET_ACCESS_KEY: requiredContainerValue(minioEnvironment, "MINIO_ROOT_PASSWORD", "open-agent-gate-minio"),
   AGENT_ASSET_SCAN_MODE: "required",
   AGENT_ASSET_STORAGE_BACKEND: "s3",
+  // The bundled MinIO is deliberately loopback-only. Proxy bounded parts
+  // through the existing Web origin so remote preview browsers can upload
+  // without exposing the object store or requiring a public storage domain.
+  AGENT_ASSET_TRANSFER_STRATEGY: "proxy",
   AGENT_DATABASE_URL: postgresUrl("open-agent-gate-data", 56432),
   AGENT_DEPLOYMENT_TENANCY: "single-tenant",
   AGENT_DOCKER_MEMORY_LIMIT_BYTES: process.env.AGENT_DOCKER_MEMORY_LIMIT_BYTES || "2GiB",

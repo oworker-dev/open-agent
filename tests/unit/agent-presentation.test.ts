@@ -95,6 +95,13 @@ test("permanent provider failures never fabricate a retry", () => {
   assert.equal(presentation.failure?.retryable, false);
 });
 
+test("provider 403 failures remain retryable without relaxing application authorization", () => {
+  const failure = { code: "MODEL_CALL_FAILED", message: "The model Provider rejected this request (HTTP 403).", statusCode: 403 };
+  assert.equal(isRetryableAgentFailure(failure), true);
+  assert.equal(isRetryableAgentFailure({ ...failure, retryable: false }), false);
+  assert.equal(isRetryableAgentFailure({ ...failure, code: "http_403" }), false);
+});
+
 test("provider 404 failures without an explicit flag remain retryable", () => {
   assert.equal(isRetryableAgentFailure({
     code: "MODEL_CALL_FAILED",
@@ -1318,7 +1325,7 @@ test("same-turn steering remains between the Agent output produced before and af
   assert.equal(presentAgentTurn(afterSteering, projection.events), undefined);
 });
 
-test("same-turn steering shares one visual execution timer while preserving message order", () => {
+test("same-turn steering keeps visual execution timers separate while preserving message order", () => {
   const steeredAt = "2026-08-06T01:00:05.000Z";
   const deliveredAt = "2026-08-06T01:00:12.000Z";
   const messages: EveMessage[] = [
@@ -1408,9 +1415,9 @@ test("same-turn steering shares one visual execution timer while preserving mess
 
   assert.equal(beforeTask?.status, "completed");
   assert.equal(beforeTask?.startedAt, Date.parse(startedAt));
-  assert.equal(beforeTask?.endedAt, Date.parse(deliveredAt));
+  assert.equal(beforeTask?.endedAt, Date.parse(steeredAt));
   assert.equal(beforeTask?.finalPart, undefined);
-  assert.equal(afterTask?.startedAt, Date.parse(startedAt));
+  assert.equal(afterTask?.startedAt, Date.parse(steeredAt));
   assert.equal(afterTask?.endedAt, Date.parse(deliveredAt));
   assert.equal(afterTask?.finalPart?.text, "The blue design is ready.");
   const liveProjection = projectAgentDisplayTimeline(

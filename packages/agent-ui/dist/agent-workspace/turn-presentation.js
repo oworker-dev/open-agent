@@ -48,7 +48,8 @@ export function isRetryableAgentFailure(failure) {
     if (failure.retryable !== undefined)
         return failure.retryable;
     if (failure.statusCode !== undefined && failure.statusCode >= 400 && failure.statusCode < 500) {
-        return failure.statusCode === 404 || failure.statusCode === 408 || failure.statusCode === 409 || failure.statusCode === 425 || failure.statusCode === 429;
+        return (failure.statusCode === 403 && failure.code === "MODEL_CALL_FAILED") ||
+            failure.statusCode === 404 || failure.statusCode === 408 || failure.statusCode === 409 || failure.statusCode === 425 || failure.statusCode === 429;
     }
     const category = classifyAgentFailure(failure);
     if (category === "unknown")
@@ -772,6 +773,9 @@ export function presentAgentTurn(message, events, closedInputRequestIds = new Se
         return undefined;
     const terminal = [...turnEvents].reverse().find((event) => (event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled" || event.type === "session.failed") &&
         !isLocalInterruptedBoundary(event));
+    const segmentStarted = partEvents.find((event) => event.type === "actions.requested" || event.type === "step.started");
+    const segmentTerminal = [...messageSegment.events].reverse().find((event) => (event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled" || event.type === "session.failed") &&
+        !isLocalInterruptedBoundary(event));
     const status = pendingRequests.length > 0
         ? "waiting"
         : terminal?.type === "turn.completed"
@@ -806,14 +810,14 @@ export function presentAgentTurn(message, events, closedInputRequestIds = new Se
         : processParts;
     const failureAnchored = status === "failed" && (failedStepHasPart || markerAnchored || shouldAddFailureMarker);
     return {
-        endedAt: eventTimestamp(terminal) ?? (options.mergeSameTurn ? undefined : messageSegment.settledAt),
+        endedAt: eventTimestamp(segmentTerminal) ?? messageSegment.settledAt ?? eventTimestamp(terminal),
         finalPart,
         ...(failureAnchored ? { failureAnchored: true } : {}),
         proxiedInputParts: pendingRequests
             .filter((request) => !message.parts.some((part) => part.type === "dynamic-tool" && part.approval?.id === request.requestId))
             .map(toProxiedInputPart),
         processParts: displayProcessParts,
-        startedAt: eventTimestamp(firstAction),
+        startedAt: eventTimestamp(segmentStarted),
         status,
         ...(pendingRequests[0]?.kind ? { waitingFor: pendingRequests[0].kind } : {}),
     };

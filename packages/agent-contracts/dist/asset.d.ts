@@ -92,6 +92,19 @@ export type AssetMessagePart = {
     readonly sizeBytes: number;
     readonly type: "asset";
 };
+/** Small durable references; image bytes are resolved only at the model boundary. */
+export type AssetPromptReference = {
+    readonly id: string;
+    readonly mediaType: string;
+    readonly name: string;
+    readonly size?: number;
+};
+export declare function parseAssetPrompt(value: string): {
+    readonly text: string;
+    readonly assets: readonly AssetPromptReference[];
+    readonly clientMessageId?: string;
+};
+export declare function serializeAssetPrompt(text: string, assets: readonly AssetPromptReference[], clientMessageId?: string): string;
 export type AssetQuota = {
     readonly activeUploadBytes: number;
     readonly limitBytes: number;

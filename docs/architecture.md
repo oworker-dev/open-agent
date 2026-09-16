@@ -676,6 +676,14 @@ It never skips directly to the tail when the ordered range contains events.
 Provider retry remains owned by Eve; UI elapsed-time messages describe waiting
 and durability without claiming an unobserved retry attempt.
 
+At the model-provider boundary, HTTP 403 and 404 use the existing bounded
+three-attempt policy. Exhaustion fails the current turn and parks an interactive
+session at `session.waiting`, preserving the normal edit and follow-up paths.
+Upstream access or credit problems must not retire a whole conversation.
+This classification does not apply to Open Agent's own authentication or
+session authorization endpoints. Sessions already terminally closed by an
+older policy are not resurrected by changing their UI state.
+
 Recovery also inspects the server mailbox while following durable stream
 boundaries. It stays attached while queued server items are admitted, whether
 they enter the active turn through steering or start after `session.waiting`.

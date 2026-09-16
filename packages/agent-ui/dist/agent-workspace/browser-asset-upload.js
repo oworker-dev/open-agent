@@ -9,7 +9,7 @@ export function createBrowserAttachmentAdapter(uploadAdapter, sessionId) {
         async *add({ file }) {
             if (file.size > MAX_ATTACHMENT_BYTES)
                 throw new Error("Attachments must be 10 GiB or smaller.");
-            const id = crypto.randomUUID();
+            const id = createBrowserAssetId();
             const base = {
                 contentType: file.type || "application/octet-stream",
                 file,
@@ -82,7 +82,7 @@ export function createBrowserAttachmentAdapter(uploadAdapter, sessionId) {
 export function createHttpAgentAssetUploadAdapter(config) {
     return {
         async upload({ file, onProgress, sessionId, signal }) {
-            const ownerSessionId = sessionId ?? `browser-${crypto.randomUUID()}`;
+            const ownerSessionId = sessionId ?? `browser-${createBrowserAssetId()}`;
             let uploadId;
             try {
                 const initialized = await controlRequest(config, "/api/assets/uploads", {
@@ -120,6 +120,12 @@ export function createHttpAgentAssetUploadAdapter(config) {
             });
         },
     };
+}
+export function createBrowserAssetId(cryptoApi = globalThis.crypto) {
+    const randomUuid = cryptoApi?.randomUUID;
+    return typeof randomUuid === "function"
+        ? randomUuid.call(cryptoApi)
+        : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 async function completeUpload(config, upload, parts, signal) {
     try {
