@@ -1649,7 +1649,12 @@ function eventsForRootTurn(
   );
   if (start < 0) return events.filter((event) => eventTurnId(event) === turnId);
   const next = events.findIndex((event, index) =>
-    index > start && event.type === "message.received" && event.data.turnId !== turnId
+    index > start && (
+      (event.type === "turn.started" && event.data.turnId !== turnId) ||
+      // Retain the legacy fallback for partial transcripts whose next
+      // turn.started event is outside the loaded window.
+      (event.type === "message.received" && event.data.turnId !== turnId)
+    )
   );
   return events.slice(start, next < 0 ? undefined : next);
 }

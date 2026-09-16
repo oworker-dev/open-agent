@@ -282,6 +282,51 @@ test("latest editable turn skips an Eve revert-conflict turn", () => {
   assert.equal(latestEditableTurnId([...turn0, ...failed]), "turn-0");
 });
 
+test("edit projection keeps the original branch when Eve rejects a stale edit", () => {
+  const original = editTurnEvents("turn-0", "Original", "Original reply");
+  const rejected = [
+    editEvent("turn.started", { sequence: 1, turnId: "turn-1" }),
+    editEvent("message.received", {
+      clientMessageId: "edit-stale",
+      message: "Rejected edit",
+      parts: [{ text: "Rejected edit", type: "text" }],
+      sequence: 1,
+      turnId: "turn-1",
+    }),
+    editEvent("step.started", { sequence: 1, stepIndex: 0, turnId: "turn-1" }),
+    editEvent("step.failed", {
+      code: "turn_revert_conflict",
+      message: "The edited turn is no longer the latest reversible turn.",
+      sequence: 1,
+      stepIndex: 0,
+      turnId: "turn-1",
+    }),
+    editEvent("turn.failed", {
+      code: "turn_revert_conflict",
+      message: "The edited turn is no longer the latest reversible turn.",
+      sequence: 1,
+      turnId: "turn-1",
+    }),
+    editEvent("session.waiting", { wait: "next-user-message" }),
+  ];
+
+  const auditEvents = [...original, ...rejected];
+  const projected = projectThreadEditBranches(auditEvents);
+
+  assert.equal(auditEvents.some((event) => event.type === "turn.failed"), true);
+  assert.deepEqual(
+    projected.filter((event) => event.type === "message.received").map((event) => event.data.message),
+    ["Original"],
+  );
+  assert.equal(projected.some((event) => {
+    if (!("data" in event)) return false;
+    const data = event.data as { readonly turnId?: unknown };
+    return data.turnId === "turn-1";
+  }), false);
+  assert.equal(projected.at(-1)?.type, "session.waiting");
+  assert.equal(latestEditableTurnId(projected), "turn-0");
+});
+
 test("a consumed steer is not an independent edit checkpoint and never hides the original turn", () => {
   const original = editTurnEvents("turn-0", "Original task", "Original work");
   const steer = editEvent("message.received", {

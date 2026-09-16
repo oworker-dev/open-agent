@@ -1162,6 +1162,78 @@ test("a structured HITL continuation stays in one visual execution cycle", () =>
   assert.equal(presentation?.finalPart?.text, "The temporary output was removed.");
 });
 
+test("consecutive HITL questions remain ordered and render the pending question once", () => {
+  const resumedAt = "2026-08-06T01:00:10.000Z";
+  const secondQuestionAt = "2026-08-06T01:00:14.000Z";
+  const firstRequestId = "request-first-question";
+  const secondRequestId = "request-second-question";
+  const messages: EveMessage[] = [
+    {
+      id: "turn-root:user",
+      metadata: { status: "complete", turnId: "turn-root" },
+      parts: [{ state: "done", text: "Create the document", type: "text" }],
+      role: "user",
+    },
+    {
+      id: "turn-root:assistant",
+      metadata: { status: "complete", turnId: "turn-root" },
+      parts: [
+        { type: "step-start" },
+        { state: "done", stepIndex: 0, text: "Which document should I create?", type: "text" },
+        questionPart(firstRequestId, "call-first-question", "Which document should I create?"),
+      ],
+      role: "assistant",
+    },
+    {
+      id: "turn-resume:assistant",
+      metadata: { status: "complete", turnId: "turn-resume" },
+      parts: [
+        { type: "step-start" },
+        { state: "done", stepIndex: 0, text: "I will create a new document.", type: "text" },
+        questionPart(secondRequestId, "call-second-question", "Who provides the content?"),
+      ],
+      role: "assistant",
+    },
+  ];
+  const events = [
+    event("turn.started", startedAt, { sequence: 0, turnId: "turn-root" }),
+    event("message.received", startedAt, { message: "Create the document", sequence: 0, turnId: "turn-root" }),
+    event("step.started", startedAt, { sequence: 0, stepIndex: 0, turnId: "turn-root" }),
+    inputRequested("turn-root", firstRequestId, "call-first-question"),
+    event("turn.completed", endedAt, { sequence: 0, turnId: "turn-root" }),
+    event("session.waiting", endedAt, { wait: "next-user-message" }),
+    event("turn.started", resumedAt, { sequence: 1, turnId: "turn-resume" }),
+    event("step.started", resumedAt, { sequence: 1, stepIndex: 0, turnId: "turn-resume" }),
+    event("action.input.partial", resumedAt, {
+      callId: "call-second-question",
+      input: { prompt: "Who provides the content?" },
+      inputTextDelta: "{}",
+      inputTextSoFar: "{}",
+      sequence: 1,
+      stepIndex: 0,
+      toolName: "ask_question",
+      turnId: "turn-resume",
+    }),
+    inputRequested("turn-resume", secondRequestId, "call-second-question"),
+    event("turn.completed", secondQuestionAt, { sequence: 1, turnId: "turn-resume" }),
+    event("session.waiting", secondQuestionAt, { wait: "next-user-message" }),
+  ];
+
+  const normalized = normalizeSettledAgentMessages(messages, events);
+  const projection = projectAgentDisplayTimeline(normalized, events);
+  const assistant = projection.messages.find((message) => message.role === "assistant");
+  assert.ok(assistant);
+  const tools = assistant.parts.filter((part) => part.type === "dynamic-tool");
+  assert.deepEqual(tools.map((part) => part.toolCallId), ["call-first-question", "call-second-question"]);
+  assert.equal(tools.some((part) => part.state === "output-error"), false);
+  assert.equal(tools.filter((part) => part.toolMetadata?.eve?.inputRequest?.requestId === secondRequestId).length, 1);
+
+  const presentation = presentAgentTurn(assistant, projection.events);
+  assert.equal(presentation?.status, "waiting");
+  assert.equal(presentation?.waitingFor, "question");
+  assert.equal(presentation?.proxiedInputParts.length, 0);
+});
+
 test("same-turn steering remains between the Agent output produced before and after admission", () => {
   const messages: EveMessage[] = [
     {
@@ -2081,15 +2153,28 @@ function childApprovalEvents(): MessageStreamEvent[] {
 }
 
 function inputRequested(turnId: string, requestId: string, callId: string): MessageStreamEvent {
+  const question = callId.includes("question");
   return event("input.requested", endedAt, {
     requests: [{
-      action: { callId, input: { command: "npm test && rm -f /tmp/test-output" }, kind: "tool-call", toolName: "bash" },
-      display: "confirmation",
-      options: [
-        { id: "approve", label: "Approve", style: "primary" },
-        { id: "deny", label: "Deny", style: "danger" },
-      ],
-      prompt: "Allow this terminal command?",
+      action: {
+        callId,
+        input: question ? { allowFreeform: true, prompt: "Choose an option" } : { command: "npm test && rm -f /tmp/test-output" },
+        kind: "tool-call",
+        toolName: question ? "ask_question" : "bash",
+      },
+      ...(question ? {
+        display: "select",
+        kind: "question",
+        options: [{ id: "choose", label: "Choose" }],
+        prompt: "Choose an option",
+      } : {
+        display: "confirmation",
+        options: [
+          { id: "approve", label: "Approve", style: "primary" },
+          { id: "deny", label: "Deny", style: "danger" },
+        ],
+        prompt: "Allow this terminal command?",
+      }),
       requestId,
     }],
     sequence: 0,
@@ -2122,6 +2207,32 @@ function approvalPart(requestId: string, callId: string): EveMessage["parts"][nu
       },
     },
     toolName: "bash",
+    type: "dynamic-tool",
+  };
+}
+
+function questionPart(requestId: string, callId: string, prompt: string): EveMessage["parts"][number] {
+  return {
+    approval: { id: requestId },
+    input: { allowFreeform: true, prompt },
+    state: "approval-requested",
+    stepIndex: 0,
+    toolCallId: callId,
+    toolMetadata: {
+      eve: {
+        inputRequest: {
+          allowFreeform: true,
+          display: "select",
+          kind: "question",
+          options: [{ id: "choose", label: "Let the Agent choose" }],
+          prompt,
+          requestId,
+        },
+        kind: "tool-call",
+        name: "ask_question",
+      },
+    },
+    toolName: "ask_question",
     type: "dynamic-tool",
   };
 }

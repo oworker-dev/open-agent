@@ -1200,19 +1200,20 @@ export function AgentThreadView({
     }
   }, [agent.events, agent.session, agent.status, awaitingInput, effectiveTurnError, isRecovering, liveTurnOpen, localInterruption, onChange, pendingTurnInFlight, recoveryContextWindowTokens]);
 
-  const hasTurnFailure = Boolean(latestTurnFailure(authoritativeEvents));
+  const hasInlineTurnFailure = Boolean(latestTurnFailure(projectionEvents)) ||
+    latestTurnHasStepFailure(projectionEvents);
   // Turn/step failures are rendered against their exact execution step by the
   // transcript projection. Do not also surface the transient React `turnError`
   // banner: it races the durable event reducer and used to flash at the bottom
   // of the conversation before disappearing. Only transport/recovery errors
   // without a durable failure use the global runtime banner.
   const transportError = agent.error?.message;
-  const errorMessage = !hasTurnFailure
+  const errorMessage = !hasInlineTurnFailure
     ? cancellationError ?? (transportError && !isRecoverableStreamError(agent.error) ? transportError : undefined)
     : undefined;
   const runtimeError = recoveryError
     ? sanitizeAgentError(recoveryError)
-    : !hasTurnFailure && (providerRetry || effectiveTurnError || errorMessage)
+    : !hasInlineTurnFailure && (providerRetry || effectiveTurnError || errorMessage)
       ? sanitizeAgentError(providerRetry?.error.message ?? effectiveTurnError ?? errorMessage ?? "The Agent request failed.")
       : undefined;
   const runtimeFailure: AgentTurnFailure | undefined = recoveryError
@@ -3498,4 +3499,21 @@ function latestTurnFailure(events: readonly MessageStreamEvent[]): string | unde
       candidate.data.turnId === turnId),
   );
   return event?.type === "turn.failed" || event?.type === "step.failed" || event?.type === "session.failed" ? event.data.message : undefined;
+}
+
+/**
+ * `onEvent` observes Eve's event before the React reducer publishes the same
+ * snapshot. During that one-frame handoff, turn.failed can set the global
+ * error while the transcript currently contains only the preceding
+ * step.failed. The step already owns an inline failure UI, so the global
+ * fallback must stay hidden without waiting for the turn boundary.
+ */
+function latestTurnHasStepFailure(events: readonly MessageStreamEvent[]): boolean {
+  const startedIndex = events.findLastIndex((event) => event.type === "turn.started");
+  const started = startedIndex >= 0 ? events[startedIndex] : undefined;
+  if (started?.type !== "turn.started") return false;
+  const turnId = started.data.turnId;
+  return events.slice(startedIndex + 1).some((event) =>
+    event.type === "step.failed" && event.data.turnId === turnId,
+  );
 }

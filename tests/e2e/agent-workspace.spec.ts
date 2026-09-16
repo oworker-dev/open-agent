@@ -450,6 +450,166 @@ test("a terminal Provider turn failure uses the retry presentation at its Agent 
   await expect(page.getByText("This turn failed", { exact: true })).toHaveCount(0);
 });
 
+test("an interleaved Provider failure never duplicates the inline failure alert", async ({ page }) => {
+  const sessionId = "interleaved-provider-failure-session";
+  const turnId = "turn_interleaved_provider_failure";
+  const at = new Date().toISOString();
+  const failure = {
+    code: "MODEL_CALL_FAILED",
+    details: { statusCode: 503 },
+    message: "The model Provider request failed (HTTP 503).",
+    sequence: 0,
+    stepIndex: 0,
+    turnId,
+  };
+  const prefix = [
+    { data: { runtime: { agentId: "open-agent", agentName: "open-agent", eveVersion: "test", modelId: "mock/model" } }, meta: { at, id: "interleaved-session" }, type: "session.started" },
+    { data: { sequence: 0, turnId }, meta: { at, id: "interleaved-turn" }, type: "turn.started" },
+    { data: { message: "Trigger interleaved failure", parts: [{ text: "Trigger interleaved failure", type: "text" }], sequence: 0, turnId }, meta: { at, id: "interleaved-user" }, type: "message.received" },
+    { data: { sequence: 0, stepIndex: 0, turnId }, meta: { at, id: "interleaved-step" }, type: "step.started" },
+    ...Array.from({ length: 3 }, (_, index) => ({
+      data: {
+        attempt: index + 1,
+        error: { code: "EveOwnedProviderAttemptError", message: failure.message, statusCode: 503 },
+        maximum: 3,
+        sequence: 0,
+        stepIndex: 0,
+        turnId,
+      },
+      meta: { at, id: `interleaved-retry-${index + 1}` },
+      type: "model.retrying",
+    })),
+    { data: failure, meta: { at, id: "interleaved-step-failed" }, type: "step.failed" },
+  ];
+  const turnFailure = {
+    data: { ...failure, stepIndex: undefined },
+    meta: { at, id: "interleaved-turn-failed" },
+    type: "turn.failed",
+  };
+  const waiting = {
+    data: { wait: "next-user-message" },
+    meta: { at, id: "interleaved-waiting" },
+    type: "session.waiting",
+  };
+
+  await page.route("**/eve/v1/session", async (route) => {
+    await route.fulfill({
+      body: JSON.stringify({ sessionId }),
+      contentType: "application/json",
+      headers: { "x-eve-session-id": sessionId },
+      status: 200,
+    });
+  });
+  await page.addInitScript(({ initialEvents, terminalEvent, waitingEvent, targetSessionId }) => {
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (!url.includes(`/eve/v1/session/${targetSessionId}/stream`)) return nativeFetch(input, init);
+      const encoder = new TextEncoder();
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode(`${initialEvents.map((event) => JSON.stringify(event)).join("\n")}\n`));
+          Reflect.set(window, "__openAgentEmitTerminalFailure", () => {
+            controller.enqueue(encoder.encode(`${JSON.stringify(terminalEvent)}\n`));
+          });
+          Reflect.set(window, "__openAgentFinishFailureStream", () => {
+            controller.enqueue(encoder.encode(`${JSON.stringify(waitingEvent)}\n`));
+            controller.close();
+          });
+        },
+      }), {
+        headers: { "content-type": "application/x-ndjson" },
+        status: 200,
+      });
+    };
+  }, { initialEvents: prefix, targetSessionId: sessionId, terminalEvent: turnFailure, waitingEvent: waiting });
+
+  await page.goto("/");
+  const composer = page.getByRole("textbox", { name: "Do anything" });
+  await composer.fill("Trigger interleaved failure");
+  await composer.press("Enter");
+  await expect(page.locator("[data-agent-retry]").getByText(/Retrying \(3\/3\)/)).toBeVisible();
+
+  await page.evaluate(() => {
+    const sample = () => {
+      const current = document.querySelectorAll("[data-agent-message-error]").length;
+      const previous = Number(Reflect.get(window, "__openAgentMaximumGlobalErrors") ?? 0);
+      Reflect.set(window, "__openAgentMaximumGlobalErrors", Math.max(previous, current));
+    };
+    const observer = new MutationObserver(sample);
+    observer.observe(document.body, { childList: true, subtree: true });
+    Reflect.set(window, "__openAgentFailureObserver", observer);
+    sample();
+    const emit = Reflect.get(window, "__openAgentEmitTerminalFailure");
+    if (typeof emit === "function") emit();
+  });
+  await expect(page.getByText("Retry failed", { exact: true })).toBeVisible();
+  await expect(page.locator("[data-agent-failure-alert]")).toHaveCount(1);
+  await page.waitForTimeout(100);
+  const maximumGlobalErrors = await page.evaluate(() => {
+    const observer = Reflect.get(window, "__openAgentFailureObserver");
+    if (observer instanceof MutationObserver) observer.disconnect();
+    return Number(Reflect.get(window, "__openAgentMaximumGlobalErrors") ?? 0);
+  });
+  expect(maximumGlobalErrors).toBe(0);
+
+  await page.evaluate(() => {
+    const finish = Reflect.get(window, "__openAgentFinishFailureStream");
+    if (typeof finish === "function") finish();
+  });
+  await expect(page.getByRole("button", { name: "Edit message", exact: true })).toHaveCount(1);
+});
+
+test("a rejected durable edit does not appear as a new conversation turn after refresh", async ({ page }) => {
+  const threadId = "rejected-edit-projection-thread";
+  const sessionId = "rejected-edit-projection-session";
+  const originalEvents = eventsFromNdjson(mockSuccessfulTurn("Original request", "Original reply."));
+  const at = new Date().toISOString();
+  const rejectedTurnId = "turn_rejected_edit";
+  const events = [
+    ...originalEvents,
+    { data: { sequence: 1, turnId: rejectedTurnId }, meta: { at, id: "rejected-edit-turn" }, type: "turn.started" },
+    { data: { clientMessageId: "rejected-edit-operation", message: "Rejected edited request", parts: [{ text: "Rejected edited request", type: "text" }], sequence: 1, turnId: rejectedTurnId }, meta: { at, id: "rejected-edit-message" }, type: "message.received" },
+    { data: { sequence: 1, stepIndex: 0, turnId: rejectedTurnId }, meta: { at, id: "rejected-edit-step" }, type: "step.started" },
+    { data: { code: "turn_revert_conflict", message: "The edited turn is no longer the latest reversible turn.", sequence: 1, stepIndex: 0, turnId: rejectedTurnId }, meta: { at, id: "rejected-edit-step-failed" }, type: "step.failed" },
+    { data: { code: "turn_revert_conflict", message: "The edited turn is no longer the latest reversible turn.", sequence: 1, turnId: rejectedTurnId }, meta: { at, id: "rejected-edit-turn-failed" }, type: "turn.failed" },
+    { data: { wait: "next-user-message" }, meta: { at, id: "rejected-edit-waiting" }, type: "session.waiting" },
+  ];
+  const now = Date.now();
+  setFakeThreadCollection(page, {
+    activeThreadId: threadId,
+    threads: [{
+      closedInputRequestIds: [],
+      createdAt: now,
+      events,
+      id: threadId,
+      preferences: { executionMode: "standard", modelId: "gpt-5.6-sol", reasoning: "medium" },
+      queuedTurns: [],
+      session: { sessionId, streamIndex: events.length },
+      status: "error",
+      title: "Original request",
+      updatedAt: now,
+    }],
+    version: 2,
+  });
+  await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
+    await route.fulfill({
+      body: "",
+      contentType: "application/x-ndjson",
+      headers: { "x-eve-stream-tail-index": String(events.length - 1) },
+      status: 200,
+    });
+  });
+
+  await page.goto(`/threads/${threadId}`);
+  const log = page.getByRole("log");
+  await expect(log.getByText("Original request", { exact: true })).toHaveCount(1);
+  await expect(log.getByText("Original reply.", { exact: true })).toBeVisible();
+  await expect(log.getByText("Rejected edited request", { exact: true })).toHaveCount(0);
+  await expect(page.locator("[data-agent-failure-alert]")).toHaveCount(1);
+  await expect(page.getByRole("button", { name: "Edit message", exact: true })).toHaveCount(1);
+});
+
 test("root stays clean and an unsent draft survives refresh", async ({ page }) => {
   await page.goto("/");
   const composer = page.getByRole("textbox", { name: "Do anything" });
@@ -1242,6 +1402,67 @@ test("ask_question renders a localized question card instead of raw tool JSON", 
   const restoredTrigger = restoredQuestion.getByRole("button").first();
   if (await restoredTrigger.getAttribute("aria-expanded") !== "true") await restoredTrigger.click();
   await expect(restoredQuestion.getByText("同时保持温暖的品牌语气", { exact: true })).toBeVisible();
+});
+
+test("consecutive ask_question continuations keep each question in order after refresh", async ({ page }) => {
+  const threadId = "consecutive-question-refresh-thread";
+  const sessionId = "mock-consecutive-question-session";
+  const events = [
+    ...eventsFromNdjson(mockQuestionTurn("Create a document")),
+    ...eventsFromNdjson(mockQuestionContinuationTurn()),
+  ] as readonly Record<string, unknown>[];
+  const now = Date.now();
+  setFakeThreadCollection(page, {
+    activeThreadId: threadId,
+    threads: [{
+      closedInputRequestIds: [],
+      createdAt: now,
+      events,
+      id: threadId,
+      inputResponseSubmissions: [{
+        id: "committed-consecutive-question-response",
+        mailboxItemId: "mail-consecutive-question-response",
+        responses: [{ optionId: "minimal", requestId: "call-question" }],
+        state: "committed",
+        streamIndexAtSubmission: 10,
+        submittedAt: now - 1_000,
+        settledAtStreamIndex: events.length,
+      }],
+      preferences: { executionMode: "standard", modelId: "gpt-5.6-sol", reasoning: "medium" },
+      queuedTurns: [],
+      session: { sessionId, streamIndex: events.length },
+      status: "waiting",
+      title: "Create a document",
+      updatedAt: now,
+    }],
+    version: 2,
+  });
+  await page.route(`**/eve/v1/session/${sessionId}/stream**`, async (route) => {
+    await route.fulfill({
+      body: "",
+      contentType: "application/x-ndjson",
+      headers: { "x-eve-stream-tail-index": String(events.length - 1) },
+      status: 200,
+    });
+  });
+
+  await page.goto(`/threads/${threadId}`);
+  const questions = page.locator('[data-input-request-kind="question"]');
+  await expect(questions).toHaveCount(2);
+  await expect(questions.filter({ hasText: "Responded" })).toHaveCount(1);
+  const waitingQuestion = questions.filter({ hasText: "Waiting for confirmation" });
+  await expect(waitingQuestion).toHaveCount(1);
+  await expect(waitingQuestion.getByRole("paragraph").filter({ hasText: "Who provides the joke content?" })).toHaveCount(1);
+  await expect(page.getByText("Open Agent: tool call did not complete.", { exact: true })).toHaveCount(0);
+
+  await page.reload();
+  const restoredQuestions = page.locator('[data-input-request-kind="question"]');
+  await expect(restoredQuestions).toHaveCount(2);
+  await expect(restoredQuestions.filter({ hasText: "Responded" })).toHaveCount(1);
+  const restoredWaitingQuestion = restoredQuestions.filter({ hasText: "Waiting for confirmation" });
+  await expect(restoredWaitingQuestion).toHaveCount(1);
+  await expect(restoredWaitingQuestion.getByRole("paragraph").filter({ hasText: "Who provides the joke content?" })).toHaveCount(1);
+  await expect(page.getByText("Open Agent: tool call did not complete.", { exact: true })).toHaveCount(0);
 });
 
 test("a normal composer message bypasses a pending Agent question", async ({ page }) => {
@@ -5812,6 +6033,46 @@ function mockQuestionTurn(message = "帮我确定网站的视觉方向"): string
     { data: { requests: [request], sequence: 0, stepIndex: 0, turnId }, meta: { at: at(700) }, type: "input.requested" },
     { data: { sequence: 0, turnId }, meta: { at: at(800) }, type: "turn.completed" },
     { data: { wait: "input" }, meta: { at: at(900) }, type: "session.waiting" },
+  ];
+  return `${events.map((event) => JSON.stringify(event)).join("\n")}\n`;
+}
+
+function mockQuestionContinuationTurn(): string {
+  const at = new Date().toISOString();
+  const turnId = "turn_question_continuation";
+  const request = {
+    action: {
+      callId: "call-question-follow-up",
+      input: {
+        allowFreeform: true,
+        options: [
+          { id: "provide", label: "I provide the joke" },
+          { id: "choose", label: "Let the Agent choose" },
+        ],
+        prompt: "Who provides the joke content?",
+      },
+      kind: "tool-call",
+      toolName: "ask_question",
+    },
+    allowFreeform: true,
+    display: "select",
+    kind: "question",
+    options: [
+      { id: "provide", label: "I provide the joke" },
+      { id: "choose", label: "Let the Agent choose" },
+    ],
+    prompt: "Who provides the joke content?",
+    requestId: "call-question-follow-up",
+  };
+  const events = [
+    { data: { sequence: 1, turnId }, meta: { at }, type: "turn.started" },
+    { data: { sequence: 1, stepIndex: 0, turnId }, meta: { at }, type: "step.started" },
+    { data: { finishReason: "tool-calls", message: "I will create a new document first.", sequence: 1, stepIndex: 0, turnId }, meta: { at }, type: "message.completed" },
+    { data: { actions: [request.action], sequence: 1, stepIndex: 0, turnId }, meta: { at }, type: "actions.requested" },
+    { data: { finishReason: "tool-calls", sequence: 1, stepIndex: 0, turnId, usage: { inputTokens: 120, outputTokens: 24 } }, meta: { at }, type: "step.completed" },
+    { data: { requests: [request], sequence: 1, stepIndex: 0, turnId }, meta: { at }, type: "input.requested" },
+    { data: { sequence: 1, turnId }, meta: { at }, type: "turn.completed" },
+    { data: { wait: "next-user-message" }, meta: { at }, type: "session.waiting" },
   ];
   return `${events.map((event) => JSON.stringify(event)).join("\n")}\n`;
 }

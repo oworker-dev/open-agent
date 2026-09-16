@@ -964,9 +964,25 @@ export function reconcileHydratedPendingTurn(
 export function projectThreadEditBranches(
   events: readonly MessageStreamEvent[],
 ): readonly MessageStreamEvent[] {
-  if (!events.some((event) => event.type === "context.cleared")) return events;
+  const rejectedEditTurnIds = new Set(events.flatMap((event) =>
+    event.type === "turn.failed" && event.data.code === "turn_revert_conflict"
+      ? [event.data.turnId]
+      : [],
+  ));
+  // Eve emits a normal turn preamble before it can discover that an edit's
+  // checkpoint is stale. That rejected transaction never changed model
+  // context, so its turn-scoped audit events must not become a second chat
+  // branch. Keep the raw event log intact and omit it only from this display
+  // projection; the following session.waiting boundary remains authoritative.
+  const acceptedEvents = rejectedEditTurnIds.size === 0
+    ? events
+    : events.filter((event) => {
+        const turnId = eventTurnId(event);
+        return turnId === undefined || !rejectedEditTurnIds.has(turnId);
+      });
+  if (!acceptedEvents.some((event) => event.type === "context.cleared")) return acceptedEvents;
   const projected: MessageStreamEvent[] = [];
-  for (const event of events) {
+  for (const event of acceptedEvents) {
     if (event.type === "context.cleared") {
       const targetTurnId = event.data.turnId;
       // A retried edit can emit another clear marker for the same durable

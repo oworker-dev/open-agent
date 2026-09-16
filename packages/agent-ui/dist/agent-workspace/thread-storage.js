@@ -713,10 +713,19 @@ export function reconcileHydratedPendingTurn(pendingTurn, events) {
     return { ...reconciled, state: "delivery-failed" };
 }
 export function projectThreadEditBranches(events) {
-    if (!events.some((event) => event.type === "context.cleared"))
-        return events;
+    const rejectedEditTurnIds = new Set(events.flatMap((event) => event.type === "turn.failed" && event.data.code === "turn_revert_conflict"
+        ? [event.data.turnId]
+        : []));
+    const acceptedEvents = rejectedEditTurnIds.size === 0
+        ? events
+        : events.filter((event) => {
+            const turnId = eventTurnId(event);
+            return turnId === undefined || !rejectedEditTurnIds.has(turnId);
+        });
+    if (!acceptedEvents.some((event) => event.type === "context.cleared"))
+        return acceptedEvents;
     const projected = [];
-    for (const event of events) {
+    for (const event of acceptedEvents) {
         if (event.type === "context.cleared") {
             const targetTurnId = event.data.turnId;
             const previousClearIndex = projected.findLastIndex((candidate) => candidate.type === "context.cleared" && candidate.data.turnId === targetTurnId);

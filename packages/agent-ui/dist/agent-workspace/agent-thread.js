@@ -748,14 +748,15 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             });
         }
     }, [agent.events, agent.session, agent.status, awaitingInput, effectiveTurnError, isRecovering, liveTurnOpen, localInterruption, onChange, pendingTurnInFlight, recoveryContextWindowTokens]);
-    const hasTurnFailure = Boolean(latestTurnFailure(authoritativeEvents));
+    const hasInlineTurnFailure = Boolean(latestTurnFailure(projectionEvents)) ||
+        latestTurnHasStepFailure(projectionEvents);
     const transportError = agent.error?.message;
-    const errorMessage = !hasTurnFailure
+    const errorMessage = !hasInlineTurnFailure
         ? cancellationError ?? (transportError && !isRecoverableStreamError(agent.error) ? transportError : undefined)
         : undefined;
     const runtimeError = recoveryError
         ? sanitizeAgentError(recoveryError)
-        : !hasTurnFailure && (providerRetry || effectiveTurnError || errorMessage)
+        : !hasInlineTurnFailure && (providerRetry || effectiveTurnError || errorMessage)
             ? sanitizeAgentError(providerRetry?.error.message ?? effectiveTurnError ?? errorMessage ?? "The Agent request failed.")
             : undefined;
     const runtimeFailure = recoveryError
@@ -2379,5 +2380,13 @@ function latestTurnFailure(events) {
             (candidate.type === "turn.failed" || candidate.type === "step.failed") &&
             candidate.data.turnId === turnId));
     return event?.type === "turn.failed" || event?.type === "step.failed" || event?.type === "session.failed" ? event.data.message : undefined;
+}
+function latestTurnHasStepFailure(events) {
+    const startedIndex = events.findLastIndex((event) => event.type === "turn.started");
+    const started = startedIndex >= 0 ? events[startedIndex] : undefined;
+    if (started?.type !== "turn.started")
+        return false;
+    const turnId = started.data.turnId;
+    return events.slice(startedIndex + 1).some((event) => event.type === "step.failed" && event.data.turnId === turnId);
 }
 //# sourceMappingURL=agent-thread.js.map

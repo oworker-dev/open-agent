@@ -1126,7 +1126,8 @@ function eventsForRootTurn(events, turnId) {
     const start = events.findIndex((event) => event.type === "turn.started" && event.data.turnId === turnId);
     if (start < 0)
         return events.filter((event) => eventTurnId(event) === turnId);
-    const next = events.findIndex((event, index) => index > start && event.type === "message.received" && event.data.turnId !== turnId);
+    const next = events.findIndex((event, index) => index > start && ((event.type === "turn.started" && event.data.turnId !== turnId) ||
+        (event.type === "message.received" && event.data.turnId !== turnId)));
     return events.slice(start, next < 0 ? undefined : next);
 }
 function eventsForAssistantSegment(message, events) {
