@@ -4,7 +4,7 @@ import test from "node:test";
 import { emitStreamContent } from "../../node_modules/eve/dist/src/harness/emission.js";
 import { createOrderedStreamEmitter } from "../../node_modules/eve/dist/src/harness/ordered-stream-emitter.js";
 import type { MessageStreamEvent } from "eve/client";
-import type { TextStreamPart, ToolSet } from "ai";
+import { jsonSchema, type TextStreamPart, type ToolSet } from "ai";
 
 test("Eve persists provider tool input deltas before the complete tool call", async () => {
   const events: MessageStreamEvent[] = [];
@@ -23,16 +23,18 @@ test("Eve persists provider tool input deltas before the complete tool call", as
       { delta: '{"patch":"*** Begin Patch\\n', id: "call-patch", type: "tool-input-delta" },
       { delta: '*** End Patch"}', id: "call-patch", type: "tool-input-delta" },
       { id: "call-patch", type: "tool-input-end" },
+      { toolCallId: "call-patch", toolName: "apply_patch", input: { patch: "*** Begin Patch\n*** End Patch" }, type: "tool-call" },
       { finishReason: "tool-calls", type: "finish-step", usage: { inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 }, outputTokens: { total: 1, text: 1, reasoning: 0 } } },
     ] as TextStreamPart<ToolSet>[]),
+    { excludedActionToolNames: new Set(), tools: new Map([["apply_patch", {
+      name: "apply_patch", description: "Edit files", inputSchema: jsonSchema({ type: "object" }),
+    }]]) },
   );
 
-  const inputEvents = events.filter((event) => event.type === "action.input.partial");
-  assert.equal(inputEvents.length, 1);
-  assert.equal(inputEvents[0]?.data.inputTextDelta, '{"patch":"*** Begin Patch\\n*** End Patch"}');
-  assert.deepEqual(inputEvents[0]?.data.input, {
-    patch: "*** Begin Patch\n*** End Patch",
-  });
+  const inputEvents = events.filter((event) => event.type === "action.input.appended");
+  assert.ok(inputEvents.length > 0);
+  assert.equal(events.at(-1)?.type, "actions.requested");
+  assert.equal(inputEvents.map((event) => event.data.inputTextDelta).join(""), JSON.stringify({ patch: "*** Begin Patch\n*** End Patch" }));
   assert.equal(inputEvents[0]?.data.toolName, "apply_patch");
 });
 
@@ -54,9 +56,8 @@ test("adjacent provider input snapshots coalesce behind a slow durable writer", 
   await emitter.closeAndDrain();
 
   assert.equal(events.length, 2);
-  assert.equal(events[1]?.type, "action.input.partial");
+  assert.equal(events[1]?.type, "action.input.appended");
   assert.equal(events[1]?.data.inputTextDelta, "ab");
-  assert.equal(events[1]?.data.inputTextSoFar, "ab");
 });
 
 test("character-granular tool input stays near-linear with a fast durable writer", async () => {
@@ -72,9 +73,8 @@ test("character-granular tool input stays near-linear with a fast durable writer
   }
   await emitter.closeAndDrain();
 
-  const inputEvents = events.filter((event) => event.type === "action.input.partial");
+  const inputEvents = events.filter((event) => event.type === "action.input.appended");
   assert.ok(inputEvents.length < 80, `expected fewer than 80 snapshots, received ${inputEvents.length}`);
-  assert.equal(inputEvents.at(-1)?.data.inputTextSoFar, input);
   assert.equal(inputEvents.map((event) => event.data.inputTextDelta).join(""), input);
   assert.ok(
     Buffer.byteLength(JSON.stringify(inputEvents)) < input.length * 20,
@@ -92,9 +92,9 @@ test("an ordering barrier flushes the latest partial input before the next event
   await emitter.emit(messageEvent("After input"));
   await emitter.closeAndDrain();
 
-  assert.deepEqual(events.map((event) => event.type), ["action.input.partial", "message.appended"]);
-  assert.equal(events[0]?.type, "action.input.partial");
-  assert.equal(events[0]?.data.inputTextSoFar, "a");
+  assert.deepEqual(events.map((event) => event.type), ["action.input.appended", "message.appended"]);
+  assert.equal(events[0]?.type, "action.input.appended");
+  assert.equal(events[0]?.data.inputTextDelta, "a");
 });
 
 async function* stream(
@@ -108,14 +108,13 @@ function inputEvent(inputTextDelta: string, inputTextSoFar: string): MessageStre
     data: {
       callId: "call-patch",
       inputTextDelta,
-      inputTextSoFar,
       sequence: 0,
       stepIndex: 0,
       toolName: "apply_patch",
       turnId: "turn-tool-input",
     },
     meta: { at: "2026-08-17T00:00:00.000Z", id: `event-${inputTextSoFar.length}` },
-    type: "action.input.partial",
+    type: "action.input.appended",
   };
 }
 
@@ -123,7 +122,6 @@ function messageEvent(message: string): MessageStreamEvent {
   return {
     data: {
       messageDelta: message,
-      messageSoFar: message,
       sequence: 0,
       stepIndex: 0,
       turnId: "turn-tool-input",

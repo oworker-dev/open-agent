@@ -81,6 +81,6 @@ test("Eve session adapter rejects invalid public cursors before transport", () =
 
 function ndjsonResponse(events: readonly unknown[]) {
   return new Response(`${events.map((event) => JSON.stringify(event)).join("\n")}\n`, {
-    headers: { "content-type": "application/x-ndjson" },
+    headers: { "content-type": "application/x-ndjson", "x-eve-stream-version": "25" },
   });
 }

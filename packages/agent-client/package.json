@@ -36,7 +36,7 @@
   },
   "peerDependencies": {
     "@oworker/open-agent-contracts": "0.1.0-alpha.9",
-    "eve": ">=0.31.1 <0.32.0"
+    "eve": ">=0.56.0 <0.57.0"
   },
   "peerDependenciesMeta": {
     "eve": {

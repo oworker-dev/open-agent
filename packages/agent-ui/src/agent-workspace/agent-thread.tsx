@@ -230,10 +230,8 @@ export function AgentThreadView({
     // Flush the append-only buffer before teardown so the last observed events
     // are not stranded in this component's refs.
     flushCheckpointRef.current();
-    // A component switch must release the Eve transport as well. Eve's store
-    // does not automatically abort an in-flight send when its React consumer
-    // unmounts; without this, every visited running thread can keep a live
-    // stream and stale callbacks in the background.
+    // Abort preparation owned by this component as well as Eve's automatic
+    // transport detach. Neither operation cancels the durable server task.
     stopAgentRef.current();
   }, []);
 
@@ -504,6 +502,11 @@ export function AgentThreadView({
     [onChange, onEvent, requestDurableCancellation, settleCancellationUi],
   );
 
+  const transportAbortRef = useRef(new AbortController());
+  const stopAgent = useCallback(() => {
+    transportAbortRef.current.abort();
+    transportAbortRef.current = new AbortController();
+  }, []);
   const agent = useEveAgent({
     auth: connection.auth,
     headers: connection.headers,
@@ -552,10 +555,13 @@ export function AgentThreadView({
         requestDurableCancellation(sessionRef.current, cancellationRef.current.turnId);
       }
     },
-    prepareSend: client?.prepareSend,
+    prepareSend: async (input) => {
+      const signal = transportAbortRef.current.signal;
+      const prepared = await client?.prepareSend?.(input) ?? input;
+      return { ...prepared, signal: prepared.signal ? AbortSignal.any([prepared.signal, signal]) : signal };
+    },
     ...(sessionRef.current ? { session: sessionRef.current } : {}),
   });
-  const stopAgent = agent.stop;
   stopAgentRef.current = stopAgent;
 
   // An initial ClientSession is attached before useEveAgent installs its
@@ -1172,7 +1178,8 @@ export function AgentThreadView({
       ? "cancelling"
       : effectiveTurnError ? "error" : awaitingInput ? "waiting"
         : pendingTurnInFlight ? "submitted"
-          : liveTurnOpen && agent.status === "ready" ? "streaming" : agent.status;
+          : liveTurnOpen && agent.status === "ready" ? "streaming"
+            : agent.status === "resuming" ? "submitted" : agent.status;
     const metadataChanged = acceptedPendingTurn || acceptedQueuedTurn ||
       cancelledTurn !== undefined || nextStatus !== persistedThreadStatusRef.current;
     if (metadataChanged) {
@@ -3060,7 +3067,7 @@ function recoverySnapshotContainsLiveStructure(
     if (
       event.type === "message.appended" ||
       event.type === "reasoning.appended" ||
-      event.type === "action.input.partial"
+      event.type === "action.input.partial" || event.type === "action.input.appended"
     ) continue;
     if (!recoveryIds.has(eventIdentity(event))) return false;
   }

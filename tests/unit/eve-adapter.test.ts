@@ -57,7 +57,7 @@ test("resets an Eve session by stable ID", async (t) => {
     "token",
   );
   assert.equal(status, "reset");
-  assert.equal(body, undefined);
+  assert.deepEqual(JSON.parse(String(body)), {});
 });
 
 test("uses the stable session ID as the reset handle", async (t) => {

@@ -31,8 +31,9 @@ test("creates only a validated, compiled MCP connection surface", () => {
 
   assert.equal(connection.url, "https://mcp.example/mcp");
   assert.deepEqual(connection.tools, { allow: ["read_record", "write_record"] });
-  assert.equal(connection.approval?.({ toolName: "gateway__read_record" } as never), "not-applicable");
-  assert.equal(connection.approval?.({ toolName: "gateway__write_record" } as never), "user-approval");
+  assert.ok(typeof connection.approval === "function");
+  assert.equal(connection.approval({ toolName: "gateway__read_record" } as never), "not-applicable");
+  assert.equal(connection.approval({ toolName: "gateway__write_record" } as never), "user-approval");
   assert.throws(
     () => createBrokeredMcpConnection({
       adapter,

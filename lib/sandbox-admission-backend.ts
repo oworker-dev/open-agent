@@ -160,12 +160,26 @@ export function withSandboxAdmission<BO, SO>(
     session: ActiveSession,
   ): SandboxBackendHandle<SO> {
     let shutdown: Promise<void> | undefined;
+    let released = false;
+    const releaseOnce = () => {
+      if (released) return;
+      released = true;
+      release(sessionKey, session);
+    };
     return {
       ...handle,
+      async stop() {
+        await handle.stop();
+        releaseOnce();
+      },
+      async delete(options) {
+        await handle.delete(options);
+        releaseOnce();
+      },
       shutdown() {
         if (shutdown) return shutdown;
         shutdown = handle.shutdown().then(
-          () => release(sessionKey, session),
+          releaseOnce,
           (error) => {
             // A failed stop can leave compute running. Keep its permit held and
             // allow a later lifecycle pass to retry instead of admitting more

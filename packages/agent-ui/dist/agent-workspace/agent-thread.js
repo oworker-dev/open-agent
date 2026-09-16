@@ -302,6 +302,11 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         }
         onEvent?.(event);
     }, [onChange, onEvent, requestDurableCancellation, settleCancellationUi]);
+    const transportAbortRef = useRef(new AbortController());
+    const stopAgent = useCallback(() => {
+        transportAbortRef.current.abort();
+        transportAbortRef.current = new AbortController();
+    }, []);
     const agent = useEveAgent({
         auth: connection.auth,
         headers: connection.headers,
@@ -337,10 +342,13 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
                 requestDurableCancellation(sessionRef.current, cancellationRef.current.turnId);
             }
         },
-        prepareSend: client?.prepareSend,
+        prepareSend: async (input) => {
+            const signal = transportAbortRef.current.signal;
+            const prepared = await client?.prepareSend?.(input) ?? input;
+            return { ...prepared, signal: prepared.signal ? AbortSignal.any([prepared.signal, signal]) : signal };
+        },
         ...(sessionRef.current ? { session: sessionRef.current } : {}),
     });
-    const stopAgent = agent.stop;
     stopAgentRef.current = stopAgent;
     useEffect(() => {
         const attachedSession = sessionRef.current;
@@ -726,7 +734,8 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             ? "cancelling"
             : effectiveTurnError ? "error" : awaitingInput ? "waiting"
                 : pendingTurnInFlight ? "submitted"
-                    : liveTurnOpen && agent.status === "ready" ? "streaming" : agent.status;
+                    : liveTurnOpen && agent.status === "ready" ? "streaming"
+                        : agent.status === "resuming" ? "submitted" : agent.status;
         const metadataChanged = acceptedPendingTurn || acceptedQueuedTurn ||
             cancelledTurn !== undefined || nextStatus !== persistedThreadStatusRef.current;
         if (metadataChanged) {
@@ -2036,7 +2045,7 @@ function recoverySnapshotContainsLiveStructure(liveEvents, recoveryEvents) {
     for (const event of liveEvents) {
         if (event.type === "message.appended" ||
             event.type === "reasoning.appended" ||
-            event.type === "action.input.partial")
+            event.type === "action.input.partial" || event.type === "action.input.appended")
             continue;
         if (!recoveryIds.has(eventIdentity(event)))
             return false;

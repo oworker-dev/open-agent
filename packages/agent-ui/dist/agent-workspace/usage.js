@@ -40,10 +40,12 @@ function estimatePendingTokens(events) {
     let actionCharacters = 0;
     for (const event of events) {
         if (event.type === "message.appended") {
-            cumulativeText.set(`message:${event.data.turnId}:${event.data.stepIndex}`, event.data.messageSoFar);
+            const key = `message:${event.data.turnId}:${event.data.stepIndex}`;
+            cumulativeText.set(key, event.data.messageSoFar ?? (cumulativeText.get(key) ?? "") + event.data.messageDelta);
         }
         else if (event.type === "reasoning.appended") {
-            cumulativeText.set(`reasoning:${event.data.turnId}:${event.data.stepIndex}`, event.data.reasoningSoFar);
+            const key = `reasoning:${event.data.turnId}:${event.data.stepIndex}`;
+            cumulativeText.set(key, event.data.reasoningSoFar ?? (cumulativeText.get(key) ?? "") + event.data.reasoningDelta);
         }
         else if (event.type === "message.completed") {
             cumulativeText.set(`message:${event.data.turnId}:${event.data.stepIndex}`, event.data.message ?? "");

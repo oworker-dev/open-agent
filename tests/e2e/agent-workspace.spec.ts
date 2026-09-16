@@ -5943,7 +5943,7 @@ function mockSuccessfulTurn(message: string, reply: string, sequence = 0): strin
 function mockHistoryTurns(count: number): readonly MessageStreamEvent[] {
   const base = Date.now();
   const events: MessageStreamEvent[] = [{
-    data: { runtime: { agentId: "open-agent", agentName: "open-agent", eveVersion: "test", modelId: "mock/model" } },
+    data: { runtime: { agentId: "open-agent", agentName: "open-agent", eveVersion: "test" } },
     meta: { at: new Date(base).toISOString(), id: "history-session-started" },
     type: "session.started",
   }];

@@ -611,7 +611,7 @@ function ReasoningPart({ events, locale, part, turnId, }) {
     const eventText = hasTurnId ? reasoningContentForStep(events, turnId, part.stepIndex) : "";
     const responseStarted = Boolean(turnId) && !eventText && events.some((event) => (event.type === "message.appended" || event.type === "message.completed") &&
         eventTurnMatches(event, turnId, stepIndex) &&
-        (event.type !== "message.appended" || event.data.messageSoFar.trim().length > 0) &&
+        (event.type !== "message.appended" || (event.data.messageSoFar ?? event.data.messageDelta).trim().length > 0) &&
         (event.type !== "message.completed" || Boolean(event.data.message?.trim())));
     const streaming = (part.state === "streaming" || retryInFlight) && !responseStarted;
     const text = hasTurnId ? (retryInFlight ? eventText : eventText || part.text.trim()) : "";

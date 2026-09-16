@@ -105,6 +105,8 @@ function fakeBackend(overrides: { shutdown?: () => Promise<void> } = {}): {
           await overrides.shutdown?.();
           shutdowns.set(input.sessionKey, (shutdowns.get(input.sessionKey) ?? 0) + 1);
         },
+        async stop() { await this.shutdown(); },
+        async delete() { await this.shutdown(); },
       };
       return handle;
     },

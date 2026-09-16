@@ -75,11 +75,6 @@ export default defineAgent({
   build: { externalDependencies: ["sharp"] },
   description: "A general-purpose autonomous agent for research, software, and knowledge work.",
   model: defineDynamic({
-    fallback: evalFixtureModel ?? createAgentModel(
-      deploymentDefaultModel.providerModelId,
-      deploymentDefaultModel.defaultReasoning,
-      deploymentDefaultModel.maxOutputTokens,
-    ),
     events: {
       "step.started": (_event, ctx) => {
         if (evalFixtureModel) {
@@ -118,12 +113,6 @@ export default defineAgent({
       },
     },
   }),
-  modelContextWindowTokens: evalContextWindowTokens,
-  modelOptions: {
-    providerOptions: {
-      openai: { store: false },
-    },
-  },
   reasoning: "provider-default",
   compaction: {
     thresholdPercent: deploymentConfig.compaction.thresholdPercent,
@@ -132,7 +121,6 @@ export default defineAgent({
     ...definitionLimits,
   },
   experimental: {
-    subagentPersistentSessions: true,
     ...(workflowWorld ? { workflow: { world: workflowWorld } } : {}),
   },
 });

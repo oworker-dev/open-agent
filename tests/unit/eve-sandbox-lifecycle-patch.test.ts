@@ -9,6 +9,7 @@ import {
 import {
   DynamicSkillManifestKey,
   SandboxKey,
+  StaticModelReferenceKey,
 } from "../../node_modules/eve/dist/src/context/keys.js";
 import {
   countActiveSandboxHandles,
@@ -243,6 +244,7 @@ function dynamicSkillResolver(handler) {
 }
 
 function fakeContext(values, getSandbox) {
+  values.set(StaticModelReferenceKey, null);
   return {
     get(key) {
       return values.get(key);

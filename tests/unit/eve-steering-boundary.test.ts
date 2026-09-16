@@ -15,6 +15,8 @@ const modules: Record<string, string> = {
   "#execution/hook-ownership.js": "export const claimHookOwnership = async () => {}; export const disposeHook = async () => {}; export const closeHookIterator = async () => {};",
   "#execution/forward-turn-delivery-step.js": "export const forwardTurnDeliveryStep = async (input) => globalThis.__eveSteeringFixture().forward(input);",
   "#execution/forward-turn-cancellation-step.js": "export const forwardTurnCancellationStep = async (input) => globalThis.__eveSteeringFixture().cancellations.push(input);",
+  "#execution/cancel-indexed-session-tasks-step.js": "export const cancelAllIndexedSessionTasksStep = async () => {};",
+  "#execution/report-dropped-wire-payload-step.js": "export const reportDroppedWirePayloadStep = async (input) => { throw new Error(input.detail); };",
 };
 const hooks = registerHooks({
   resolve(specifier, context, next) {
@@ -35,12 +37,12 @@ test("a replay-ready steer is consumed at the first safe boundary, without inter
   fixture.push("session", steer("first"));
   fixture.push("control", boundary("boundary-1"));
   const buffered: ConstructorParameters<typeof TurnControlReceiver>[0]["bufferedDeliveries"] = [];
-  const receiver = new TurnControlReceiver({ bufferedDeliveries: buffered, bufferedSessionControls: [], commandInbox: inbox, token: "control" });
-  const done = receiver.waitForAction(true);
+  const receiver = new TurnControlReceiver({ bufferedDeliveries: buffered, bufferedSessionControls: [], commandInbox: inbox, token: "control", expectedTurnId: "turn-0", stateCursor: {} as never });
+  const done = receiver.waitForAction();
   try {
     await fixture.forwarded;
     assert.equal(fixture.deliveries[0]?.payload.kind, "driver-delivery");
-    assert.equal(fixture.deliveries[0]?.payload.delivery.steer.clientMessageId, "first");
+    assert.equal(fixture.deliveries[0]?.payload.delivery.payloads[0].steer.clientMessageId, "first");
     assert.equal(fixture.cancellations.length, 0);
   } finally {
     fixture.push("control", { kind: "turn-result", action: { kind: "park" } });
@@ -55,8 +57,8 @@ test("an empty steering boundary does not wait for a future user message", async
   const inbox = createSessionCommandInbox();
   await inbox.claimStable("session");
   fixture.push("control", boundary("boundary-empty"));
-  const receiver = new TurnControlReceiver({ bufferedDeliveries: [], bufferedSessionControls: [], commandInbox: inbox, token: "control" });
-  const done = receiver.waitForAction(true);
+  const receiver = new TurnControlReceiver({ bufferedDeliveries: [], bufferedSessionControls: [], commandInbox: inbox, token: "control", expectedTurnId: "turn-0", stateCursor: {} as never });
+  const done = receiver.waitForAction();
   try {
     await fixture.forwarded;
     assert.equal(fixture.deliveries[0]?.payload.kind, "driver-delivery-empty");
@@ -71,7 +73,6 @@ test("an empty steering boundary does not wait for a future user message", async
 for (const scenario of [
   { name: "a stale turn target", command: { ...steer("stale"), steer: { expectedTurnId: "older-turn", clientMessageId: "stale" } }, readySteering: true },
   { name: "a normal next-turn message", command: { kind: "deliver", payload: { message: "later" }, payloads: [{ message: "later" }] }, readySteering: true },
-  { name: "an existing dispatch recorded before the ready-steering protocol", command: steer("legacy"), readySteering: false },
 ]) {
   test(`does not retarget or consume ${scenario.name}`, async () => {
     fixture = createFixture();
@@ -79,8 +80,8 @@ for (const scenario of [
     await inbox.claimStable("session");
     fixture.push("session", scenario.command);
     fixture.push("control", boundary("boundary-guard"));
-    const receiver = new TurnControlReceiver({ bufferedDeliveries: [], bufferedSessionControls: [], commandInbox: inbox, token: "control" });
-    const done = receiver.waitForAction(scenario.readySteering);
+    const receiver = new TurnControlReceiver({ bufferedDeliveries: [], bufferedSessionControls: [], commandInbox: inbox, token: "control", expectedTurnId: "turn-0", stateCursor: {} as never });
+    const done = receiver.waitForAction();
     try {
       await fixture.forwarded;
       assert.equal(fixture.deliveries[0]?.payload.kind, "driver-delivery-empty");
@@ -101,15 +102,15 @@ test("ready steering consumes each message once in FIFO order across safe bounda
   fixture.push("session", steer("first"));
   fixture.push("session", steer("second"));
   fixture.push("control", boundary("first-boundary"));
-  const receiver = new TurnControlReceiver({ bufferedDeliveries: [], bufferedSessionControls: [], commandInbox: inbox, token: "control" });
-  const done = receiver.waitForAction(true);
+  const receiver = new TurnControlReceiver({ bufferedDeliveries: [], bufferedSessionControls: [], commandInbox: inbox, token: "control", expectedTurnId: "turn-0", stateCursor: {} as never });
+  const done = receiver.waitForAction();
   try {
     await fixture.forwarded;
-    assert.equal(fixture.deliveries[0]?.payload.delivery.steer.clientMessageId, "first");
+    assert.equal(fixture.deliveries[0]?.payload.delivery.payloads[0].steer.clientMessageId, "first");
     fixture.push("control", boundary("second-boundary"));
     const deadline = Date.now() + 1_000;
     while (fixture.deliveries.length < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 1));
-    assert.deepEqual(fixture.deliveries.map((input) => input.payload.delivery?.steer.clientMessageId), ["first", "second"]);
+    assert.deepEqual(fixture.deliveries.map((input) => input.payload.delivery?.payloads[0].steer.clientMessageId), ["first", "second"]);
     assert.equal(fixture.cancellations.length, 0);
   } finally {
     fixture.push("control", { kind: "turn-result", action: { kind: "park" } });

@@ -1,5 +1,5 @@
 import { defineTool } from "eve/tools";
-import { bash } from "eve/tools/defaults";
+import { bash } from "eve/tools/bash";
 
 import {
   bashApprovalDecision,
@@ -13,7 +13,16 @@ export default defineTool({
   ...bash,
   execute(input, ctx) {
     return withSandboxCommandTimeout({
-      execute: async (signal) => await bash.execute(input, { ...ctx, abortSignal: signal }),
+      execute: async (signal) => {
+        const result = await bash.execute(input, { ...ctx, abortSignal: signal });
+        if (Symbol.asyncIterator in result) {
+          let final: { exitCode: number; stderr: string; stdout: string; truncated: boolean } | undefined;
+          for await (const value of result) final = value;
+          if (!final) throw new Error("The terminal command produced no result.");
+          return final;
+        }
+        return result;
+      },
       parentSignal: ctx.abortSignal,
       timeoutMs: readAgentSandboxCommandTimeoutMs(),
     });

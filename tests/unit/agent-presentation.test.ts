@@ -986,6 +986,13 @@ test("subagent lifecycle stays distinct from generic provider waiting", () => {
     status: "completed",
   });
   assert.deepEqual(presentSubagentCall([], "call-pending"), { status: "starting" });
+  assert.equal(presentSubagentCall([
+    ...running,
+    event("subagent.completed", endedAt, {
+      callId: "call-agent", output: "working", subagentName: "agent",
+      backgroundTask: { status: "working", taskId: "task" },
+    }),
+  ], "call-agent").status, "running");
 });
 
 test("a cancelled parent turn waits for the child cancellation boundary", () => {

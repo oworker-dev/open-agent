@@ -148,6 +148,11 @@ export function withIdleSandboxShutdown<BO, SO>(
         return state;
       },
       shutdown: stop,
+      stop,
+      async delete(options) {
+        await stop();
+        await entry.handle.delete(options);
+      },
     };
     return handle;
   }

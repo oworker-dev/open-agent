@@ -27,7 +27,7 @@
     "@oworker/open-agent-contracts": "0.1.0-alpha.9"
   },
   "peerDependencies": {
-    "eve": ">=0.31.1 <0.32.0",
+    "eve": ">=0.56.0 <0.57.0",
     "react": ">=19.2.0 <20.0.0",
     "react-dom": ">=19.2.0 <20.0.0"
   },

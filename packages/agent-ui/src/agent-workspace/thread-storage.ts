@@ -564,9 +564,9 @@ export function appendThreadEvent(
   if (cumulativeKey) {
     const existingIndex = findLastCumulativeEventIndex(events, cumulativeKey);
     if (existingIndex !== undefined && canReplaceCumulativeEvent(events, existingIndex, event)) {
-      return [...events.slice(0, existingIndex), event, ...events.slice(existingIndex + 1)];
+      return [...events.slice(0, existingIndex), projectAppendEvent(event, events[existingIndex]), ...events.slice(existingIndex + 1)];
     }
-    return [...events, event];
+    return [...events, projectAppendEvent(event)];
   }
   if (event.type === "message.completed" || event.type === "reasoning.completed") {
     // Keep the incremental event as the visual anchor. Eve may emit the
@@ -597,7 +597,7 @@ export function appendThreadEventIndexed(
     const cumulativeIndexes = cumulativeIndexFor(events);
     const existingIndex = cumulativeIndexes.get(cumulativeKey);
     if (existingIndex !== undefined && canReplaceCumulativeEvent(events, existingIndex, event)) {
-      events[existingIndex] = event;
+      events[existingIndex] = projectAppendEvent(event, events[existingIndex]);
       return true;
     }
     cumulativeIndexes.set(cumulativeKey, events.length);
@@ -605,7 +605,7 @@ export function appendThreadEventIndexed(
   // Completion is a separate lifecycle boundary. Retain it after the
   // cumulative incremental anchor so the reducer can render the final state
   // while the presenter can still recover the original visual position.
-  events.push(event);
+  events.push(projectAppendEvent(event));
   return true;
 }
 
@@ -738,6 +738,7 @@ function eventLifecycleRank(event: MessageStreamEvent): number {
     case "message.appended":
     case "message.completed":
     case "action.input.partial":
+    case "action.input.appended":
     case "actions.requested":
     case "input.requested":
     case "authorization.required":
@@ -828,14 +829,14 @@ export function compactThreadEvents(
     if (cumulativeKey) {
       const existingIndex = cumulativeIndexes.get(cumulativeKey);
       if (existingIndex !== undefined && canReplaceCumulativeEvent(compacted, existingIndex, event)) {
-        compacted[existingIndex] = event;
+        compacted[existingIndex] = projectAppendEvent(event, compacted[existingIndex]);
         continue;
       }
       cumulativeIndexes.set(cumulativeKey, compacted.length);
     }
     // Completion is a separate lifecycle boundary. Keep it after the
     // cumulative incremental anchor instead of moving the visual anchor.
-    compacted.push(event);
+    compacted.push(projectAppendEvent(event));
   }
   return compacted;
 }
@@ -846,8 +847,8 @@ function cumulativeEventKey(event: MessageStreamEvent): CumulativeEventKey | und
   if (event.type === "message.appended" || event.type === "reasoning.appended") {
     return `${event.type}:${event.data.turnId}:${event.data.stepIndex}`;
   }
-  if (event.type === "action.input.partial") {
-    return `${event.type}:${event.data.turnId}:${event.data.stepIndex}:${event.data.callId}`;
+  if (event.type === "action.input.partial" || event.type === "action.input.appended") {
+    return `action.input:${event.data.turnId}:${event.data.stepIndex}:${event.data.callId}`;
   }
   return undefined;
 }
@@ -876,12 +877,17 @@ function canReplaceCumulativeEvent(
     if (candidate.type === "step.started" && stepScope(candidate) === scope) {
       return false;
     }
+    if ((candidate.type === "message.completed" || candidate.type === "reasoning.completed") &&
+        candidate.data.turnId === (next as { data: { turnId: string } }).data.turnId &&
+        candidate.data.stepIndex === (next as { data: { stepIndex: number } }).data.stepIndex) return false;
   }
 
   const previousSnapshot = cumulativeSnapshot(existing);
   const nextSnapshot = cumulativeSnapshot(next);
-  // Eve's cumulative fields are present for all current event versions. If a
-  // legacy adapter omits one, retain both events rather than risk data loss.
+  // Native v25 appends extend the existing projection; legacy snapshots
+  // retain their existing monotonic replacement rule.
+  if (nextSnapshot === undefined && (next.type === "message.appended" ||
+      next.type === "reasoning.appended" || next.type === "action.input.appended")) return true;
   if (previousSnapshot === undefined || nextSnapshot === undefined) return false;
   // Provider snapshots are usually textual prefixes. Some adapters serialize
   // a growing JSON value, however, so the newly appended bytes can appear
@@ -895,7 +901,7 @@ function stepScope(event: MessageStreamEvent): string | undefined {
   if (event.type === "step.started" ||
       event.type === "message.appended" ||
       event.type === "reasoning.appended" ||
-      event.type === "action.input.partial") {
+      event.type === "action.input.partial" || event.type === "action.input.appended") {
     return `${event.data.turnId}:${event.data.stepIndex}`;
   }
   return undefined;
@@ -906,6 +912,24 @@ function cumulativeSnapshot(event: MessageStreamEvent): string | undefined {
   if (event.type === "reasoning.appended") return event.data.reasoningSoFar;
   if (event.type === "action.input.partial") return event.data.inputTextSoFar;
   return undefined;
+}
+
+/** Build a bounded UI checkpoint from v25 deltas. The durable wire stays delta-only. */
+function projectAppendEvent(event: MessageStreamEvent, previous?: MessageStreamEvent): MessageStreamEvent {
+  let projected = event;
+  const prefix = previous ? cumulativeSnapshot(previous) ?? "" : "";
+  if (event.type === "message.appended" && event.data.messageSoFar === undefined) {
+    projected = { ...event, data: { ...event.data, messageSoFar: prefix + event.data.messageDelta } };
+  } else if (event.type === "reasoning.appended" && event.data.reasoningSoFar === undefined) {
+    projected = { ...event, data: { ...event.data, reasoningSoFar: prefix + event.data.reasoningDelta } };
+  } else if (event.type === "action.input.appended") {
+    projected = { ...event, type: "action.input.partial", data: {
+      ...event.data, inputTextSoFar: prefix + event.data.inputTextDelta,
+    } };
+  }
+  const cursor = eventCursors.get(event);
+  if (cursor !== undefined && projected !== event) eventCursors.set(projected, cursor);
+  return projected;
 }
 
 /** Return a pending browser turn only while the authoritative transcript has

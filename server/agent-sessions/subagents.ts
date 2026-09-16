@@ -208,6 +208,8 @@ export async function syncAgentSubagentsFromEvents(options: AgentSubagentSupervi
       children.set(childSessionId, created);
       if (created.callId) byCall.set(created.callId, created);
     } else if (event.type === "subagent.completed") {
+      // Eve 0.56 emits this event on background admission, not child completion.
+      if (isRecord(data.backgroundTask) && data.backgroundTask.status === "working") continue;
       const callId = typeof data.callId === "string" ? data.callId : undefined;
       const child = (callId ? byCall.get(callId) : undefined) ?? (typeof data.childSessionId === "string" ? children.get(data.childSessionId) : undefined);
       if (!child) continue;

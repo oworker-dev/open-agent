@@ -204,6 +204,8 @@ function fakeBackend(failures = new Set<string>()): {
           return { backendName: "fake", metadata: {}, sessionKey: input.sessionKey };
         },
         async shutdown() {},
+        async stop(this: SandboxBackendHandle) { await this.shutdown(); },
+        async delete(this: SandboxBackendHandle) { await this.shutdown(); },
       };
       return handle;
     },
@@ -233,6 +235,8 @@ function intermittentlyFailingBackend(sessionKey: string): {
             return { backendName: "intermittent", metadata: {}, sessionKey: input.sessionKey };
           },
           async shutdown() {},
+          async stop() {},
+          async delete() {},
         };
       },
       async prewarm() {
@@ -261,6 +265,8 @@ function shutdownFailsOnceBackend(): {
             attempts += 1;
             if (attempts === 1) throw new Error("stop failed");
           },
+          async stop() {},
+          async delete() {},
         };
       },
       async prewarm() { return { reused: true }; },

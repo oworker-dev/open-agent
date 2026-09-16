@@ -452,9 +452,9 @@ export function appendThreadEvent(events, event) {
     if (cumulativeKey) {
         const existingIndex = findLastCumulativeEventIndex(events, cumulativeKey);
         if (existingIndex !== undefined && canReplaceCumulativeEvent(events, existingIndex, event)) {
-            return [...events.slice(0, existingIndex), event, ...events.slice(existingIndex + 1)];
+            return [...events.slice(0, existingIndex), projectAppendEvent(event, events[existingIndex]), ...events.slice(existingIndex + 1)];
         }
-        return [...events, event];
+        return [...events, projectAppendEvent(event)];
     }
     if (event.type === "message.completed" || event.type === "reasoning.completed") {
         return [...events, event];
@@ -471,12 +471,12 @@ export function appendThreadEventIndexed(events, eventIds, event) {
         const cumulativeIndexes = cumulativeIndexFor(events);
         const existingIndex = cumulativeIndexes.get(cumulativeKey);
         if (existingIndex !== undefined && canReplaceCumulativeEvent(events, existingIndex, event)) {
-            events[existingIndex] = event;
+            events[existingIndex] = projectAppendEvent(event, events[existingIndex]);
             return true;
         }
         cumulativeIndexes.set(cumulativeKey, events.length);
     }
-    events.push(event);
+    events.push(projectAppendEvent(event));
     return true;
 }
 export function mergeThreadEventSnapshots(left, right) {
@@ -566,6 +566,7 @@ function eventLifecycleRank(event) {
         case "message.appended":
         case "message.completed":
         case "action.input.partial":
+        case "action.input.appended":
         case "actions.requested":
         case "input.requested":
         case "authorization.required":
@@ -630,12 +631,12 @@ export function compactThreadEvents(events) {
         if (cumulativeKey) {
             const existingIndex = cumulativeIndexes.get(cumulativeKey);
             if (existingIndex !== undefined && canReplaceCumulativeEvent(compacted, existingIndex, event)) {
-                compacted[existingIndex] = event;
+                compacted[existingIndex] = projectAppendEvent(event, compacted[existingIndex]);
                 continue;
             }
             cumulativeIndexes.set(cumulativeKey, compacted.length);
         }
-        compacted.push(event);
+        compacted.push(projectAppendEvent(event));
     }
     return compacted;
 }
@@ -643,8 +644,8 @@ function cumulativeEventKey(event) {
     if (event.type === "message.appended" || event.type === "reasoning.appended") {
         return `${event.type}:${event.data.turnId}:${event.data.stepIndex}`;
     }
-    if (event.type === "action.input.partial") {
-        return `${event.type}:${event.data.turnId}:${event.data.stepIndex}:${event.data.callId}`;
+    if (event.type === "action.input.partial" || event.type === "action.input.appended") {
+        return `action.input:${event.data.turnId}:${event.data.stepIndex}:${event.data.callId}`;
     }
     return undefined;
 }
@@ -659,9 +660,16 @@ function canReplaceCumulativeEvent(events, existingIndex, next) {
         if (candidate.type === "step.started" && stepScope(candidate) === scope) {
             return false;
         }
+        if ((candidate.type === "message.completed" || candidate.type === "reasoning.completed") &&
+            candidate.data.turnId === next.data.turnId &&
+            candidate.data.stepIndex === next.data.stepIndex)
+            return false;
     }
     const previousSnapshot = cumulativeSnapshot(existing);
     const nextSnapshot = cumulativeSnapshot(next);
+    if (nextSnapshot === undefined && (next.type === "message.appended" ||
+        next.type === "reasoning.appended" || next.type === "action.input.appended"))
+        return true;
     if (previousSnapshot === undefined || nextSnapshot === undefined)
         return false;
     return nextSnapshot.length >= previousSnapshot.length;
@@ -670,7 +678,7 @@ function stepScope(event) {
     if (event.type === "step.started" ||
         event.type === "message.appended" ||
         event.type === "reasoning.appended" ||
-        event.type === "action.input.partial") {
+        event.type === "action.input.partial" || event.type === "action.input.appended") {
         return `${event.data.turnId}:${event.data.stepIndex}`;
     }
     return undefined;
@@ -683,6 +691,25 @@ function cumulativeSnapshot(event) {
     if (event.type === "action.input.partial")
         return event.data.inputTextSoFar;
     return undefined;
+}
+function projectAppendEvent(event, previous) {
+    let projected = event;
+    const prefix = previous ? cumulativeSnapshot(previous) ?? "" : "";
+    if (event.type === "message.appended" && event.data.messageSoFar === undefined) {
+        projected = { ...event, data: { ...event.data, messageSoFar: prefix + event.data.messageDelta } };
+    }
+    else if (event.type === "reasoning.appended" && event.data.reasoningSoFar === undefined) {
+        projected = { ...event, data: { ...event.data, reasoningSoFar: prefix + event.data.reasoningDelta } };
+    }
+    else if (event.type === "action.input.appended") {
+        projected = { ...event, type: "action.input.partial", data: {
+                ...event.data, inputTextSoFar: prefix + event.data.inputTextDelta,
+            } };
+    }
+    const cursor = eventCursors.get(event);
+    if (cursor !== undefined && projected !== event)
+        eventCursors.set(projected, cursor);
+    return projected;
 }
 export function reconcilePendingTurnWithEvents(pendingTurn, events) {
     if (!pendingTurn)

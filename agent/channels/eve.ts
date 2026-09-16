@@ -33,7 +33,7 @@ import {
   MailboxBoundaryInspectionTimeoutError,
   type MailboxBoundary,
 } from "../lib/mailbox-boundary.ts";
-import type { MessageStreamEvent } from "eve/client";
+import { parseInputResponses, type MessageStreamEvent } from "eve/client";
 import { withMailboxEditAdmission } from "../lib/mailbox-edit-admission.ts";
 
 const MODEL_HEADER = "x-agent-model";
@@ -281,12 +281,13 @@ const mailboxRoute = POST(MAILBOX_ROUTE, async (request, {
     }
     const turnOptions = {
       auth: mailboxSessionAuth(input),
+      turnPolicy: "queue" as const,
       ...(input.clientContext ? { clientContext: input.clientContext } : {}),
       ...(revert ? { revert } : {}),
       ...(steer ? { steer } : {}),
     };
     const accepted = input.operationKind === "respond"
-      ? await session.respond(input.inputResponses!, turnOptions)
+      ? await session.respond(parseInputResponses(input.inputResponses!), turnOptions)
       : await session.send(input.message!, turnOptions);
     if (accepted.status === "session_not_active") {
       return mailboxProblem(

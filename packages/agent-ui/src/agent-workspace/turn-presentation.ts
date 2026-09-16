@@ -1096,7 +1096,7 @@ export function reasoningContentForStep(
       content = "";
       completedBlock = false;
     }
-    if (event.data.reasoningSoFar.trim()) {
+    if (event.data.reasoningSoFar?.trim()) {
       content = event.data.reasoningSoFar;
     } else if (event.data.reasoningDelta.trim()) {
       content += event.data.reasoningDelta;
@@ -1579,11 +1579,12 @@ export function presentSubagentCall(
     event.type === "subagent.called" && event.data.callId === callId,
   );
   const completed = [...events].reverse().find((event) =>
-    event.type === "subagent.completed" && event.data.callId === callId,
+    event.type === "subagent.completed" && event.data.callId === callId && !event.data.backgroundTask,
   );
   const result = [...events].reverse().find((event) =>
     event.type === "action.result" &&
     event.data.result.kind === "subagent-result" &&
+    !("backgroundTask" in event.data.result && event.data.result.backgroundTask) &&
     event.data.result.callId === callId,
   );
   const owningTurnId = started?.type === "subagent.called" ? started.data.turnId : undefined;

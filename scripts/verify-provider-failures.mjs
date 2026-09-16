@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 import { Client } from "eve/client";
 
 const projectRoot = process.cwd();
+const builtRuntime = process.env.VERIFY_EVE_BUILT_RUNTIME === "1";
 const isolatedAppRoot = await createIsolatedAppRoot(projectRoot);
 const providerPort = await freePort();
 const evePort = await freePort();
@@ -26,7 +27,7 @@ try {
   }));
   await waitFor(`${providerUrl}/v1/models`);
 
-  children.push(spawnLogged("eve", process.execPath, [
+  children.push(spawnLogged("eve", process.execPath, builtRuntime ? [resolve(".output/server/index.mjs")] : [
     resolve("node_modules/eve/bin/eve.js"), "dev", "--no-ui", "--port", String(evePort),
   ], {
     ...process.env,
@@ -44,11 +45,14 @@ try {
     AGENT_SANDBOX_MAX_QUEUED: "1024",
     AGENT_SANDBOX_BACKEND: "docker",
     NODE_ENV: "development",
+    EVE_DEV: "1",
+    HOST: "127.0.0.1",
+    PORT: String(evePort),
     OPENAI_API_KEY: "mock-provider-key",
     OPENAI_BASE_URL: `${providerUrl}/v1`,
-    WORKFLOW_TARGET_WORLD: "",
+    WORKFLOW_TARGET_WORLD: builtRuntime ? "@workflow/world-postgres" : "",
   }, isolatedAppRoot));
-  await waitFor(`${eveUrl}/eve/v1/health`, 60_000);
+  await waitFor(`${eveUrl}/eve/v1/health`, 180_000);
 
   const rateLimit = await completedTurn(eveUrl,
     "PROVIDER_429_RECOVER. Do not use tools. Reply exactly: RATE_LIMIT_RECOVERED");

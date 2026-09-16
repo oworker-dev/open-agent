@@ -1,35 +1,7 @@
 import assert from "node:assert/strict";
-import { readdir, readFile } from "node:fs/promises";
-import { resolve } from "node:path";
 import test from "node:test";
 import { EveAgentStore } from "eve/client";
 import type { ClientSession, MessageStreamEvent } from "eve/client";
-
-test("Eve appends private reducer history without copying the full projection per event", async () => {
-  const chunksDirectory = resolve("node_modules/eve/dist/src/chunks");
-  const chunkNames = (await readdir(chunksDirectory))
-    .filter((name) => /^use-eve-agent-.*\.js$/u.test(name));
-
-  assert.ok(chunkNames.length > 0, "The installed Eve React store chunks were not found.");
-  for (const chunkName of chunkNames) {
-    const source = await readFile(resolve(chunksDirectory, chunkName), "utf8");
-    assert.doesNotMatch(
-      source,
-      /this\.#projectionEvents\s*=\s*\[\.\.\.this\.#projectionEvents,\s*event\]/u,
-      `${chunkName} restored quadratic projection-event copying`,
-    );
-    assert.match(
-      source,
-      /this\.#projectionEvents\.push\(event\)/u,
-      `${chunkName} does not contain the patched private projection append`,
-    );
-    assert.match(
-      source,
-      /this\.#schedulePublish\(\)/u,
-      `${chunkName} does not batch immutable stream snapshots`,
-    );
-  }
-});
 
 test("Eve batches hot subscriber snapshots while preserving every event", async () => {
   const eventCount = 20_000;

@@ -49,6 +49,19 @@ test("sync derives idempotent child metadata and stable nickname from Eve events
   assert.equal(snapshot?.activeCount, 0);
 });
 
+test("background admission is not mistaken for a child completion", async () => {
+  const store = createMemoryAgentSubagentStore();
+  const children = await syncAgentSubagentsFromEvents({
+    accessToken: "token", identity: owner, ownershipStore, parentSessionId: "parent", store,
+    runtime: { async inspect() { throw new Error("Admission must not inspect a terminal outcome"); } } as never,
+    events: [
+      { type: "subagent.called", data: { childSessionId: "child", callId: "call", name: "agent" } },
+      { type: "subagent.completed", data: { callId: "call", backgroundTask: { status: "working", taskId: "task" } } },
+    ],
+  });
+  assert.equal(children[0]?.status, "running");
+});
+
 test("persistent subagent completion parks at a waiting boundary and remains resumable", async () => {
   const store = createMemoryAgentSubagentStore();
   const events = [
