@@ -290,7 +290,7 @@ The model adapter must declare `vision` capability. If the selected model is
 text-only, the runtime must report that limitation instead of silently sending
 an unusable image part. Multiple images are bounded by turn and tenant quota.
 
-Eve 0.31 persists model-facing tool history as well as public tool events and
+Eve persists model-facing tool history as well as public tool events and
 uses a JSON-length estimate for text context budgeting. Returning image Base64
 from `toModelOutput` therefore makes a small image look like enormous text.
 Open Agent keeps Eve's native estimator unchanged and adds no tokenizer.

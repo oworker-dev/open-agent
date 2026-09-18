@@ -220,7 +220,7 @@ environment is too late. Use `npm run build:eve:local` only for an explicit
 local-disk development build.
 
 This Docker topology is for a trusted single-tenant operator or staging
-baseline. Eve 0.31.1 does not expose Docker CPU, memory, PID, Linux capability,
+baseline. Eve 0.56.0 does not expose Docker CPU, memory, PID, Linux capability,
 or non-root controls through its backend. `doctor:production` therefore rejects
 Docker when `AGENT_DEPLOYMENT_TENANCY=multi-tenant`; use a reviewed microVM
 backend such as microsandbox or Vercel Sandbox before admitting mutually
@@ -560,7 +560,7 @@ denied instead of approving themselves. Production rejects `never`.
 Each Eve sub-agent has an independent durable session and stream. The Web UI
 can inspect, reconnect to, and cancel that session. Eve's built-in `agent` copy
 shares the root sandbox; a declared specialist uses its own sandbox unless
-configured otherwise. Open Agent enables Eve 0.31.1 persistent subagent
+configured otherwise. Open Agent enables Eve 0.56.0 persistent subagent
 sessions: a completed child parks, receives a stable `agentId`, and can be
 continued by the parent on a later model step. Open Agent patches the Eve turn
 driver with Codex-style root-session steering at safe model boundaries; it still

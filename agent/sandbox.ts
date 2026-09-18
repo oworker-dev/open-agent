@@ -117,7 +117,7 @@ function withManagedSandboxCapacity<BO, SO>(
 }
 
 /**
- * Eve 0.31's Docker backend intentionally exposes only image/network options.
+ * Eve 0.56's Docker backend intentionally exposes only image/network options.
  * Apply host resource limits immediately after a session container is created
  * or reattached, then verify Docker accepted the values before returning a
  * usable sandbox handle. This keeps untrusted commands from running in an

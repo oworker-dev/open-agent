@@ -189,7 +189,7 @@ history. This prevents an older React snapshot from erasing persisted steps.
 
 Eve accepts ID-addressed follow-ups but does not provide the product-level FIFO,
 client idempotency, and delivery audit required by a multi-client Web product.
-The published Eve 0.31.1 API also does not expose Open Agent's same-turn Web
+The published Eve 0.56.0 API also does not expose Open Agent's same-turn Web
 steering contract. Open Agent therefore carries a reproducible `patch-package`
 patch and uses an application-owned `agent_mailbox_items` table when a host
 provides `AgentWorkspaceMailbox`. A follow-up is accepted by the Web API with a
@@ -368,7 +368,7 @@ explicit allow-all for a trusted single-tenant deployment. Docker enforces only
 the coarse allow-all/deny-all forms; Vercel and microsandbox receive the
 fine-grained policy through Eve's network-policy API.
 
-`AGENT_DEPLOYMENT_TENANCY` makes the trust model explicit. Eve 0.31.1's Docker
+`AGENT_DEPLOYMENT_TENANCY` makes the trust model explicit. Eve 0.56.0's Docker
 backend does not expose CPU, memory, PID, Linux capability, or non-root controls
 and is accepted only for a trusted single-tenant alpha/staging deployment. The
 production doctor rejects Docker for mutually untrusted multi-tenant traffic;
@@ -657,7 +657,7 @@ pretending that unavailable child events were observed.
 
 ### Supervisor boundary
 
-Eve 0.31.1 owns parent waiting, recursive cancellation, child task results, and
+Eve 0.56.0 owns parent waiting, recursive cancellation, child task results, and
 durable child sessions. Open Agent enables its persistent-subagent option, so a
 parked child keeps a stable `agentId` and the parent can continue it on a later
 model step. Open Agent's patched root-session protocol now provides the useful
@@ -716,7 +716,7 @@ The project must not be called production-complete until all of these are done:
 
 The headless AgentRun API has deterministic coverage for PostgreSQL World, Host
 JWT authentication, structured output, event cursors, idempotency, isolation,
-and bounded cancellation reconciliation. The Eve 0.31.1 migration requires a
+and bounded cancellation reconciliation. The Eve 0.56.0 release requires a
 fresh deployed production conformance run and real-Provider sandbox/preview
 evidence before release; unit and local build evidence do not waive the
 remaining gates above.
