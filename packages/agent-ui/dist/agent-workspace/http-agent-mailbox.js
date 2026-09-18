@@ -1,3 +1,4 @@
+const pendingEnqueues = new Map();
 export class AgentMailboxHttpError extends Error {
     code;
     status;
@@ -14,11 +15,23 @@ export function createHttpAgentMailbox(options) {
     const fetchImplementation = options.fetch ?? globalThis.fetch;
     return {
         async enqueue(input) {
-            return await mutate(fetchImplementation, options, endpoint, {
+            const operationKey = `${input.sessionId}:${input.operationId ?? input.clientMessageId}`;
+            const pending = pendingEnqueues.get(operationKey);
+            if (pending)
+                return await pending;
+            const request = mutate(fetchImplementation, options, endpoint, {
                 body: JSON.stringify(input),
                 headers: { "content-type": "application/json" },
                 method: "POST",
             });
+            pendingEnqueues.set(operationKey, request);
+            try {
+                return await request;
+            }
+            finally {
+                if (pendingEnqueues.get(operationKey) === request)
+                    pendingEnqueues.delete(operationKey);
+            }
         },
         async inspect(itemId) {
             return await mutate(fetchImplementation, options, itemUrl(endpoint, itemId));

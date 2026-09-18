@@ -380,7 +380,7 @@ function KnownToolContent({ assetUrl, events, locale, onOpenSubagent, part, }) {
 }
 function FileMutationToolContent({ events, locale, part, }) {
     const previewPart = usePreviewFileMutationPart(part);
-    const patch = toolPatch(previewPart);
+    const patch = toolPatch(previewPart, events);
     const fileChange = toolFileChange(previewPart, events);
     if (patch) {
         return _jsx("div", { "data-tool-view": "diff", children: _jsx(DiffViewer, { contentClassName: "max-h-72 overflow-auto", patch: patch, showIcon: true, size: "sm", variant: "muted" }) });
@@ -493,7 +493,7 @@ function isTodoTool(part) {
     return ["todo", "todo_write", "update_plan"].includes(normalizeToolName(part.toolName));
 }
 function fileMutationSummary(part, events = []) {
-    const patch = toolPatch(part);
+    const patch = toolPatch(part, events);
     const change = toolFileChange(part, events);
     const patchPath = patch ? patchFilePath(patch) : undefined;
     const path = change?.path ?? patchPath;
@@ -953,13 +953,20 @@ function todoArray(value) {
     const candidate = record.todos ?? record.items ?? record.tasks ?? record.plan;
     return Array.isArray(candidate) ? candidate : undefined;
 }
-function toolPatch(part) {
+function toolPatch(part, events = []) {
     const toolName = part.toolName.toLocaleLowerCase().replaceAll("-", "_");
     if (!["apply_patch", "patch_file"].includes(toolName))
         return undefined;
+    const streamedInput = events.findLast((event) => (event.type === "action.input.partial" || event.type === "action.input.appended") &&
+        event.data.callId === part.toolCallId);
     return patchFromValue(part.input) ??
         patchFromValue(part.output) ??
-        partialPatchFromText(part.inputText);
+        partialPatchFromText(part.inputText) ??
+        (streamedInput?.type === "action.input.partial"
+            ? patchFromValue(streamedInput.data.input) ?? partialPatchFromText(streamedInput.data.inputTextSoFar)
+            : streamedInput?.type === "action.input.appended"
+                ? partialPatchFromText(streamedInput.data.inputTextDelta)
+                : undefined);
 }
 function patchFromValue(value) {
     if (typeof value === "string")
@@ -1324,7 +1331,7 @@ function ApprovalActionPreview({ events, locale, part, }) {
         return (_jsx("div", { className: "mt-3", children: _jsx(ShellToolContent, { command: firstString(input, ["command", "cmd"]), locale: locale, output: undefined, running: false }) }));
     }
     if (isFileMutationTool(part)) {
-        const patch = toolPatch(part);
+        const patch = toolPatch(part, events);
         const change = toolFileChange(part, events);
         if (patch) {
             return _jsx("div", { className: "mt-3", "data-tool-view": "approval-diff", children: _jsx(DiffViewer, { contentClassName: "max-h-56 overflow-auto", patch: patch, showIcon: true, size: "sm", variant: "muted" }) });

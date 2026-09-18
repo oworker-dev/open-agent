@@ -1006,7 +1006,7 @@ function FileMutationToolContent({
   // the browser. Publish an in-progress snapshot at a bounded cadence, while
   // showing terminal tool input immediately.
   const previewPart = usePreviewFileMutationPart(part);
-  const patch = toolPatch(previewPart);
+  const patch = toolPatch(previewPart, events);
   const fileChange = toolFileChange(previewPart, events);
 
   if (patch) {
@@ -1210,7 +1210,7 @@ function fileMutationSummary(
   part: EveDynamicToolPart,
   events: readonly MessageStreamEvent[] = [],
 ): FileMutationSummary {
-  const patch = toolPatch(part);
+  const patch = toolPatch(part, events);
   const change = toolFileChange(part, events);
   const patchPath = patch ? patchFilePath(patch) : undefined;
   const path = change?.path ?? patchPath;
@@ -1960,12 +1960,21 @@ function todoArray(value: unknown): readonly unknown[] | undefined {
   return Array.isArray(candidate) ? candidate : undefined;
 }
 
-function toolPatch(part: EveDynamicToolPart): string | undefined {
+function toolPatch(part: EveDynamicToolPart, events: readonly MessageStreamEvent[] = []): string | undefined {
   const toolName = part.toolName.toLocaleLowerCase().replaceAll("-", "_");
   if (!["apply_patch", "patch_file"].includes(toolName)) return undefined;
+  const streamedInput = events.findLast((event) =>
+    (event.type === "action.input.partial" || event.type === "action.input.appended") &&
+    event.data.callId === part.toolCallId,
+  );
   return patchFromValue(part.input) ??
     patchFromValue(part.output) ??
-    partialPatchFromText(part.inputText);
+    partialPatchFromText(part.inputText) ??
+    (streamedInput?.type === "action.input.partial"
+      ? patchFromValue(streamedInput.data.input) ?? partialPatchFromText(streamedInput.data.inputTextSoFar)
+      : streamedInput?.type === "action.input.appended"
+        ? partialPatchFromText(streamedInput.data.inputTextDelta)
+        : undefined);
 }
 
 function patchFromValue(value: unknown): string | undefined {
@@ -2612,7 +2621,7 @@ function ApprovalActionPreview({
     );
   }
   if (isFileMutationTool(part)) {
-    const patch = toolPatch(part);
+    const patch = toolPatch(part, events);
     const change = toolFileChange(part, events);
     if (patch) {
       return <div className="mt-3" data-tool-view="approval-diff"><DiffViewer contentClassName="max-h-56 overflow-auto" patch={patch} showIcon size="sm" variant="muted" /></div>;

@@ -23,6 +23,7 @@ import { summarizeUsage } from "./usage.js";
 const CANCELLATION_STREAM_REATTACH_AFTER_MS = 5_000;
 const MAX_PROVIDER_SUBMISSION_RETRIES = 3;
 const LIVE_CHECKPOINT_INTERVAL_MS = 250;
+const activeMailboxEnqueues = new Set();
 const LONG_RUNNING_STREAM_RECONNECT_POLICY = {
     retryableErrorStatuses: [408, 409, 425, 429, 500, 502, 503, 504],
     streamIdleReconnectPolicy: {
@@ -118,7 +119,17 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
         preferencesRef.current = thread.preferences;
     }, [thread.preferences]);
     useEffect(() => {
-        queuedTurnsRef.current = thread.queuedTurns;
+        if (mailboxEnqueueIdsRef.current.size === 0) {
+            queuedTurnsRef.current = thread.queuedTurns;
+            return;
+        }
+        const localById = new Map(queuedTurnsRef.current.map((turn) => [turn.id, turn]));
+        queuedTurnsRef.current = thread.queuedTurns.map((turn) => {
+            const local = localById.get(turn.id);
+            return mailboxEnqueueIdsRef.current.has(turn.id) && local?.state === "delivering" && !turn.mailboxItemId
+                ? local
+                : turn;
+        });
     }, [thread.queuedTurns]);
     useEffect(() => {
         pendingTurnRef.current = thread.pendingTurn;
@@ -299,6 +310,9 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             cancellationRef.current.requested &&
             hasCancellationBoundary(compactedEventsRef.current, cancellationRef.current.turnId)) {
             settleCancellationUi();
+        }
+        if (event.type === "session.waiting" || event.type === "session.completed" || event.type === "session.failed") {
+            flushCheckpointRef.current();
         }
         onEvent?.(event);
     }, [onChange, onEvent, requestDurableCancellation, settleCancellationUi]);
@@ -1441,6 +1455,14 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
     useEffect(() => {
         if (!mailbox || !agent.session?.sessionId)
             return;
+        for (const operationId of mailboxEnqueueIdsRef.current) {
+            const queued = queuedTurnsRef.current.find((turn) => turn.id === operationId);
+            if (!queued || queued.mailboxItemId || queued.state === "delivery-failed") {
+                mailboxEnqueueIdsRef.current.delete(operationId);
+                if (agent.session?.sessionId)
+                    activeMailboxEnqueues.delete(`${agent.session.sessionId}:${operationId}`);
+            }
+        }
         const next = queuedTurnsRef.current.find((turn) => turn.delivery === "server" &&
             turn.intent !== "post-cancellation" &&
             turn.state === "queued" &&
@@ -1459,7 +1481,12 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
             if (originalTurnStillSettling)
                 return;
         }
+        const mailboxDispatchKey = `${agent.session.sessionId}:${next.id}`;
+        if (activeMailboxEnqueues.has(mailboxDispatchKey))
+            return;
+        activeMailboxEnqueues.add(mailboxDispatchKey);
         mailboxEnqueueIdsRef.current.add(next.id);
+        updateQueuedTurns(queuedTurnsRef.current.map((turn) => turn.id === next.id ? { ...turn, state: "delivering" } : turn));
         void mailbox.enqueue({
             clientMessageId: next.id,
             ...(thread.retainedContext ? { clientContext: thread.retainedContext } : {}),
@@ -1491,10 +1518,9 @@ export function AgentThreadView({ client, commands, draftStorageKey, historyHasM
                 ? { ...turn, mailboxItemId: receipt.itemId, state }
                 : turn));
         }).catch((error) => {
+            activeMailboxEnqueues.delete(mailboxDispatchKey);
             setQueueError(error instanceof Error ? error.message : messages.queueDeliveryFailed);
             updateQueuedTurns(queuedTurnsRef.current.map((turn) => turn.id === next.id ? { ...turn, state: "delivery-failed" } : turn));
-        }).finally(() => {
-            mailboxEnqueueIdsRef.current.delete(next.id);
         });
     }, [authoritativeEvents, agent.session?.sessionId, cancellationSettling, durableTurnOpen, isRecovering, liveTurnOpen, mailbox, messages.queueDeliveryFailed, pendingTurnInFlight, runtimeIsBusy, thread.queuedTurns]);
     useEffect(() => {

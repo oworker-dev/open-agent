@@ -4,6 +4,112 @@ import { compactThreadEvents, editOperationId } from "@oworker/open-agent-ui/age
 const threadStores = new WeakMap<Page, FakeThreadStore>();
 
 test.beforeEach(async ({ page }, testInfo) => {
+  // Eve 0.56 requires the v25 stream header and a delivery id on accepted
+  // message responses. Deterministic browser fixtures intentionally omit
+  // those transport details; normalize only this test boundary so production
+  // client validation remains strict.
+  await page.addInitScript(() => {
+    const deliveryIds = new Map<string, string>();
+    const deliveryCounters = new Map<string, number>();
+    const normalizedResponses = new WeakSet<Response>();
+    const initialFetch = window.fetch.bind(window);
+
+    const normalizeFetchResponse = async (input: RequestInfo | URL, init: RequestInit | undefined, response: Response) => {
+      if (normalizedResponses.has(response)) return response;
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (!url.includes("/eve/v1/")) return response;
+      const parsed = new URL(url, window.location.href);
+      const pathname = parsed.pathname;
+      const headers = new Headers(response.headers);
+      const contentType = headers.get("content-type") ?? "";
+      if (contentType.includes("application/x-ndjson")) {
+        if (!headers.has("x-eve-stream-version")) headers.set("x-eve-stream-version", "25");
+        const sessionId = pathname.match(/^\/eve\/v1\/session\/([^/]+)\/stream$/)?.[1];
+        const deliveryId = sessionId
+          ? deliveryIds.get(decodeURIComponent(sessionId)) ?? `e2e-${decodeURIComponent(sessionId)}`
+          : undefined;
+        const normalized = new Response(deliveryId && response.body
+          ? response.body.pipeThrough(stampFixtureDeliveryId(deliveryId))
+          : response.body, {
+          headers,
+          status: response.status,
+          statusText: response.statusText,
+        });
+        normalizedResponses.add(normalized);
+        return normalized;
+      }
+      if (init?.method?.toUpperCase() !== "POST") return response;
+      const body = await response.clone().json().catch(() => undefined);
+      if (!body || typeof body !== "object" || typeof body.sessionId !== "string") return response;
+      const sessionId = body.sessionId;
+      const count = (deliveryCounters.get(sessionId) ?? 0) + 1;
+      deliveryCounters.set(sessionId, count);
+      const deliveryId = typeof body.deliveryId === "string" ? body.deliveryId : `e2e-${sessionId}-${count}`;
+      deliveryIds.set(sessionId, deliveryId);
+      if (typeof body.deliveryId === "string") return response;
+      const normalized = new Response(JSON.stringify({ ...body, deliveryId }), {
+        headers: new Headers([...headers.entries(), ["content-type", "application/json"]]),
+        status: response.status,
+        statusText: response.statusText,
+      });
+      normalizedResponses.add(normalized);
+      return normalized;
+    };
+
+    const wrapFetch = (next: typeof window.fetch): typeof window.fetch => {
+      const wrapped = async (input: RequestInfo | URL, init?: RequestInit) =>
+        normalizeFetchResponse(input, init, await next(input, init));
+      return wrapped as typeof window.fetch;
+    };
+
+    let fetchImplementation = wrapFetch(initialFetch);
+    Object.defineProperty(window, "fetch", {
+      configurable: true,
+      enumerable: true,
+      get: () => fetchImplementation,
+      // Test cases may install a custom stream fetch after this hook. Keep
+      // that stream inside the same protocol boundary instead of letting it
+      // bypass Eve v25 validation and delivery metadata.
+      set: (next: typeof window.fetch) => {
+        fetchImplementation = wrapFetch(next);
+      },
+    });
+
+    function stampFixtureDeliveryId(deliveryId: string): TransformStream<Uint8Array, Uint8Array> {
+      const decoder = new TextDecoder();
+      const encoder = new TextEncoder();
+      let buffered = "";
+      const stamp = (line: string) => {
+        if (!line.trim()) return line;
+        const event = JSON.parse(line) as {
+          data?: Record<string, unknown>;
+          meta?: { deliveryIds?: string[] };
+          type?: string;
+        };
+        // A number of deterministic fixtures predate Eve's v25 delta-only
+        // append protocol. The test transport advertises v25, so normalize
+        // those legacy cumulative fields at this boundary instead of
+        // weakening the production client's strict version validation.
+        if (event.data && event.type === "message.appended") delete event.data.messageSoFar;
+        if (event.data && event.type === "reasoning.appended") delete event.data.reasoningSoFar;
+        if (event.data && event.type === "action.input.appended") delete event.data.inputTextOffset;
+        event.meta = { ...event.meta, deliveryIds: event.meta?.deliveryIds ?? [deliveryId] };
+        return JSON.stringify(event);
+      };
+      return new TransformStream({
+        transform(chunk, controller) {
+          buffered += decoder.decode(chunk, { stream: true });
+          const lines = buffered.split("\n");
+          buffered = lines.pop() ?? "";
+          for (const line of lines) controller.enqueue(encoder.encode(`${stamp(line)}\n`));
+        },
+        flush(controller) {
+          buffered += decoder.decode();
+          if (buffered) controller.enqueue(encoder.encode(stamp(buffered)));
+        },
+      });
+    }
+  });
   // The live provider test must exercise the real standalone auth and
   // PostgreSQL-backed thread storage. The in-memory route below intentionally
   // omits Set-Cookie, which would make Eve's browser request look unauthenticated
@@ -511,17 +617,32 @@ test("an interleaved Provider failure never duplicates the inline failure alert"
       const encoder = new TextEncoder();
       return new Response(new ReadableStream<Uint8Array>({
         start(controller) {
-          controller.enqueue(encoder.encode(`${initialEvents.map((event) => JSON.stringify(event)).join("\n")}\n`));
+          const deliveryId = `e2e-${targetSessionId}`;
+          const stamp = (event: unknown) => {
+            if (typeof event !== "object" || event === null || Array.isArray(event)) return event;
+            const record = event as { readonly meta?: unknown };
+            const existingMeta = typeof record.meta === "object" && record.meta !== null && !Array.isArray(record.meta)
+              ? record.meta as Record<string, unknown>
+              : {};
+            return {
+              ...event,
+              meta: {
+                ...existingMeta,
+                deliveryIds: [deliveryId],
+              },
+            };
+          };
+          controller.enqueue(encoder.encode(`${initialEvents.map((event) => JSON.stringify(stamp(event))).join("\n")}\n`));
           Reflect.set(window, "__openAgentEmitTerminalFailure", () => {
-            controller.enqueue(encoder.encode(`${JSON.stringify(terminalEvent)}\n`));
+            controller.enqueue(encoder.encode(`${JSON.stringify(stamp(terminalEvent))}\n`));
           });
           Reflect.set(window, "__openAgentFinishFailureStream", () => {
-            controller.enqueue(encoder.encode(`${JSON.stringify(waitingEvent)}\n`));
+            controller.enqueue(encoder.encode(`${JSON.stringify(stamp(waitingEvent))}\n`));
             controller.close();
           });
         },
       }), {
-        headers: { "content-type": "application/x-ndjson" },
+        headers: { "content-type": "application/x-ndjson", "x-eve-stream-version": "25" },
         status: 200,
       });
     };
@@ -2816,9 +2937,18 @@ test("a queued follow-up does not replace a healthy stream during prolonged Prov
               type: "turn.started",
             },
           ].map((event) => JSON.stringify(event)).join("\n")}\n`));
+          // Eve 0.56 applies a 15s read-idle guard even while the durable
+          // stream is intentionally kept alive. A blank NDJSON line is a
+          // transport heartbeat (not an event) and keeps this healthy mock
+          // connection open without changing the transcript.
+          const heartbeat = window.setInterval(() => controller.enqueue(new TextEncoder().encode("\n")), 1_000);
+          const clearHeartbeat = () => window.clearInterval(heartbeat);
           signal?.addEventListener(
             "abort",
-            () => controller.error(new DOMException("Aborted", "AbortError")),
+            () => {
+              clearHeartbeat();
+              controller.error(new DOMException("Aborted", "AbortError"));
+            },
             { once: true },
           );
         },
@@ -5060,17 +5190,17 @@ test("an in-flight turn reconnects after a hard refresh", async ({ page }) => {
   const at = new Date().toISOString();
   const turnId = "turn_0";
   const acceptedEvents = [
-    { data: { runtime: { agentId: "open-agent", agentName: "open-agent", eveVersion: "test", modelId: "mock/model" } }, meta: { at }, type: "session.started" },
-    { data: { sequence: 0, turnId }, meta: { at }, type: "turn.started" },
-    { data: { message: "Run through refresh", parts: [{ text: "Run through refresh", type: "text" }], sequence: 0, turnId }, meta: { at }, type: "message.received" },
-    { data: { sequence: 0, stepIndex: 0, turnId }, meta: { at }, type: "step.started" },
+    { data: { runtime: { agentId: "open-agent", agentName: "open-agent", eveVersion: "test", modelId: "mock/model" } }, meta: { at, id: "refresh-session-started" }, type: "session.started" },
+    { data: { sequence: 0, turnId }, meta: { at, id: "refresh-turn-started" }, type: "turn.started" },
+    { data: { message: "Run through refresh", parts: [{ text: "Run through refresh", type: "text" }], sequence: 0, turnId }, meta: { at, id: "refresh-message-received" }, type: "message.received" },
+    { data: { sequence: 0, stepIndex: 0, turnId }, meta: { at, id: "refresh-step-started" }, type: "step.started" },
   ];
   const completedEvents = [
     ...acceptedEvents,
-    { data: { finishReason: "stop", message: "Refresh recovery ready.", sequence: 0, stepIndex: 0, turnId }, meta: { at }, type: "message.completed" },
-    { data: { finishReason: "stop", sequence: 0, stepIndex: 0, turnId, usage: { inputTokens: 1, outputTokens: 1 } }, meta: { at }, type: "step.completed" },
-    { data: { sequence: 0, turnId }, meta: { at }, type: "turn.completed" },
-    { data: { wait: "next-user-message" }, meta: { at }, type: "session.waiting" },
+    { data: { finishReason: "stop", message: "Refresh recovery ready.", sequence: 0, stepIndex: 0, turnId }, meta: { at, id: "refresh-message-completed" }, type: "message.completed" },
+    { data: { finishReason: "stop", sequence: 0, stepIndex: 0, turnId, usage: { inputTokens: 1, outputTokens: 1 } }, meta: { at, id: "refresh-step-completed" }, type: "step.completed" },
+    { data: { sequence: 0, turnId }, meta: { at, id: "refresh-turn-completed" }, type: "turn.completed" },
+    { data: { wait: "next-user-message" }, meta: { at, id: "refresh-session-waiting" }, type: "session.waiting" },
   ];
 
   await page.route("**/eve/v1/session", async (route) => {
@@ -5107,7 +5237,11 @@ test("an in-flight turn reconnects after a hard refresh", async ({ page }) => {
   const composer = page.getByRole("textbox", { name: "Do anything" });
   await composer.fill("Run through refresh");
   await composer.press("Enter");
-  await expect.poll(() => threadEvents(page).some((event) => isEventType(event, "step.started"))).toBeTruthy();
+  // The v25 message response may publish the admission prefix before the
+  // first step boundary is exposed by the browser reducer. The durable user
+  // receipt is the correct refresh handoff point; recovery must then replay
+  // the remaining step and terminal events from its absolute cursor.
+  await expect.poll(() => threadEvents(page).some((event) => isEventType(event, "message.received"))).toBeTruthy();
   await page.reload();
   await expect(page.getByRole("textbox", { name: "Do anything" })).toBeEnabled();
   await expect(page.getByRole("button", { name: "Stop" })).toBeVisible();

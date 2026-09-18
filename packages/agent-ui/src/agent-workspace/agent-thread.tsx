@@ -59,6 +59,10 @@ const MAX_PROVIDER_SUBMISSION_RETRIES = 3;
 // already publishes the live reducer at frame cadence; checkpoint less often
 // so the parent workspace is not rebuilt for every provider fragment.
 const LIVE_CHECKPOINT_INTERVAL_MS = 250;
+// A thread can briefly have two React owners during a recovery/navigation
+// handoff. Keep mailbox admission single-flight across those owners; the
+// operation id is also the server-side idempotency key.
+const activeMailboxEnqueues = new Set<string>();
 
 type ProviderRetryState = {
   readonly attempt: number;
@@ -240,7 +244,21 @@ export function AgentThreadView({
   }, [thread.preferences]);
 
   useEffect(() => {
-    queuedTurnsRef.current = thread.queuedTurns;
+    if (mailboxEnqueueIdsRef.current.size === 0) {
+      queuedTurnsRef.current = thread.queuedTurns;
+      return;
+    }
+    // A parent checkpoint can briefly render the pre-receipt queue snapshot
+    // while an enqueue response is already being applied locally. Do not
+    // overwrite the in-flight `delivering` marker with that stale snapshot;
+    // doing so reopens the admission effect and submits a duplicate request.
+    const localById = new Map(queuedTurnsRef.current.map((turn) => [turn.id, turn]));
+    queuedTurnsRef.current = thread.queuedTurns.map((turn) => {
+      const local = localById.get(turn.id);
+      return mailboxEnqueueIdsRef.current.has(turn.id) && local?.state === "delivering" && !turn.mailboxItemId
+        ? local
+        : turn;
+    });
   }, [thread.queuedTurns]);
 
   useEffect(() => {
@@ -496,6 +514,13 @@ export function AgentThreadView({
         hasCancellationBoundary(compactedEventsRef.current, cancellationRef.current.turnId)
       ) {
         settleCancellationUi();
+      }
+      // Session boundaries are the durable handoff used by refresh and edit
+      // recovery. Do not leave the final failure/waiting event in the 15s
+      // coalescing window: a hard refresh in that interval would restore the
+      // preceding running snapshot and hide the edit affordance.
+      if (event.type === "session.waiting" || event.type === "session.completed" || event.type === "session.failed") {
+        flushCheckpointRef.current();
       }
       onEvent?.(event);
     },
@@ -2110,6 +2135,18 @@ export function AgentThreadView({
 
   useEffect(() => {
     if (!mailbox || !agent.session?.sessionId) return;
+    // Keep the operation idempotent until the mailbox receipt is reflected in
+    // the durable queue row. React may run this effect once more between the
+    // enqueue response and the `onChange` snapshot; clearing the guard in a
+    // promise `finally` allowed that narrow window to submit the same follow-
+    // up twice.
+    for (const operationId of mailboxEnqueueIdsRef.current) {
+      const queued = queuedTurnsRef.current.find((turn) => turn.id === operationId);
+      if (!queued || queued.mailboxItemId || queued.state === "delivery-failed") {
+        mailboxEnqueueIdsRef.current.delete(operationId);
+        if (agent.session?.sessionId) activeMailboxEnqueues.delete(`${agent.session.sessionId}:${operationId}`);
+      }
+    }
     const next = queuedTurnsRef.current.find((turn) =>
       turn.delivery === "server" &&
       turn.intent !== "post-cancellation" &&
@@ -2142,7 +2179,17 @@ export function AgentThreadView({
       if (originalTurnStillSettling) return;
     }
 
+    const mailboxDispatchKey = `${agent.session.sessionId}:${next.id}`;
+    if (activeMailboxEnqueues.has(mailboxDispatchKey)) return;
+    activeMailboxEnqueues.add(mailboxDispatchKey);
     mailboxEnqueueIdsRef.current.add(next.id);
+    // Publish the dispatch phase before awaiting the mailbox response. This
+    // durable marker also protects against a StrictMode/effect remount, where
+    // a fresh ref could otherwise enqueue the same operation a second time
+    // before the first receipt has been written back.
+    updateQueuedTurns(queuedTurnsRef.current.map((turn) =>
+      turn.id === next.id ? { ...turn, state: "delivering" as const } : turn,
+    ));
     void mailbox.enqueue({
       clientMessageId: next.id,
       ...(thread.retainedContext ? { clientContext: thread.retainedContext } : {}),
@@ -2186,12 +2233,11 @@ export function AgentThreadView({
           : turn,
       ));
     }).catch((error: unknown) => {
+      activeMailboxEnqueues.delete(mailboxDispatchKey);
       setQueueError(error instanceof Error ? error.message : messages.queueDeliveryFailed);
       updateQueuedTurns(queuedTurnsRef.current.map((turn) =>
         turn.id === next.id ? { ...turn, state: "delivery-failed" } : turn,
       ));
-    }).finally(() => {
-      mailboxEnqueueIdsRef.current.delete(next.id);
     });
   }, [authoritativeEvents, agent.session?.sessionId, cancellationSettling, durableTurnOpen, isRecovering, liveTurnOpen, mailbox, messages.queueDeliveryFailed, pendingTurnInFlight, runtimeIsBusy, thread.queuedTurns]);
 

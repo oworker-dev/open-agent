@@ -411,7 +411,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
             for (const event of eventsToMerge)
                 appendThreadEventIndexed(events, eventIds, event);
             const nextSettledEvents = compactThreadEvents(events);
-            updateThread(thread.id, {
+            const tailPatch = {
                 events: nextSettledEvents,
                 ...(settledCoverage
                     ? { transcriptCoverage: settledCoverage }
@@ -420,7 +420,23 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                 revision: (thread.revision ?? 0) + 1,
                 session: settledSession,
                 status: settledStatus,
-            }, { preserveUpdatedAt: true });
+            };
+            if (activeThreadIdRef.current === thread.id && !preserveRuntimeIdentity) {
+                flushSync(() => {
+                    setThreadRuntimeSeeds((current) => {
+                        const seed = `settled-tail:${thread.session.sessionId}:${settledCursor}`;
+                        if (current.get(thread.id) === seed)
+                            return current;
+                        const next = new Map(current);
+                        next.set(thread.id, seed);
+                        return next;
+                    });
+                    updateThread(thread.id, tailPatch, { preserveUpdatedAt: true });
+                });
+            }
+            else {
+                updateThread(thread.id, tailPatch, { preserveUpdatedAt: true });
+            }
         }
         catch {
         }
@@ -1453,6 +1469,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
             const handoffEvents = compactThreadEvents(mergeThreadEventSnapshots(latestEventsAtHandoff, events));
             const transcriptChangedAtHandoff = handoffEvents.length !== latestEventsAtHandoff.length ||
                 handoffEvents.some((event, index) => eventIdentity(event) !== eventIdentity(latestEventsAtHandoff[index]));
+            const recoveryAdvanced = cursor > recoveryStartCursor;
             const recoveryPatch = {
                 events: handoffEvents,
                 interruptedTurns,
@@ -1470,7 +1487,7 @@ export function AgentWorkspace({ assetEndpoint, client, commands = [], defaultPr
                 ...(recoveryCursorReconciled ? { allowCursorRewind: true } : {}),
                 preserveUpdatedAt: true,
             };
-            if (activeThreadIdRef.current === thread.id && transcriptChangedAtHandoff && !editRecovery) {
+            if (activeThreadIdRef.current === thread.id && (transcriptChangedAtHandoff || recoveryAdvanced) && !editRecovery) {
                 flushSync(() => {
                     setThreadRuntimeSeeds((current) => {
                         const seed = `recovery:${thread.session.sessionId}:${cursor}`;
@@ -2087,7 +2104,19 @@ function sameThreadCollection(left, right) {
         left.threads.length === right.threads.length &&
         left.threads.every((thread, index) => {
             const candidate = right.threads[index];
-            return candidate?.id === thread.id && candidate.updatedAt === thread.updatedAt;
+            if (!candidate || candidate.id !== thread.id || candidate.updatedAt !== thread.updatedAt)
+                return false;
+            return candidate.status === thread.status &&
+                candidate.session.sessionId === thread.session.sessionId &&
+                candidate.session.streamIndex === thread.session.streamIndex &&
+                candidate.events.length === thread.events.length &&
+                (candidate.events.length === 0 || eventIdentity(candidate.events.at(-1)) === eventIdentity(thread.events.at(-1))) &&
+                samePendingTurn(candidate.pendingTurn, thread.pendingTurn) &&
+                sameQueuedTurns(candidate.queuedTurns, thread.queuedTurns) &&
+                sameInterruptedTurns(candidate.interruptedTurns ?? [], thread.interruptedTurns ?? []) &&
+                JSON.stringify(candidate.inputResponseSubmissions ?? []) === JSON.stringify(thread.inputResponseSubmissions ?? []) &&
+                sameStringList(candidate.closedInputRequestIds, thread.closedInputRequestIds) &&
+                sameStringList(candidate.retainedContext ?? [], thread.retainedContext ?? []);
         });
 }
 function isUrgentPersistenceChange(previous, next) {

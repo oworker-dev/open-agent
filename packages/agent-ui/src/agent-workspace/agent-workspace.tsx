@@ -595,7 +595,7 @@ export function AgentWorkspace({
       const eventIds = new Set(events.map(eventIdentity));
       for (const event of eventsToMerge) appendThreadEventIndexed(events, eventIds, event);
       const nextSettledEvents = compactThreadEvents(events);
-      updateThread(thread.id, {
+      const tailPatch: AgentThreadPatch = {
         events: nextSettledEvents,
         ...(settledCoverage
           ? { transcriptCoverage: settledCoverage }
@@ -604,7 +604,21 @@ export function AgentWorkspace({
         revision: (thread.revision ?? 0) + 1,
         session: settledSession,
         status: settledStatus,
-      }, { preserveUpdatedAt: true });
+      };
+      if (activeThreadIdRef.current === thread.id && !preserveRuntimeIdentity) {
+        flushSync(() => {
+          setThreadRuntimeSeeds((current) => {
+            const seed = `settled-tail:${thread.session.sessionId}:${settledCursor}`;
+            if (current.get(thread.id) === seed) return current;
+            const next = new Map(current);
+            next.set(thread.id, seed);
+            return next;
+          });
+          updateThread(thread.id, tailPatch, { preserveUpdatedAt: true });
+        });
+      } else {
+        updateThread(thread.id, tailPatch, { preserveUpdatedAt: true });
+      }
     } catch {
       // The runtime lifecycle is already settled. A transient tail read must
       // not reopen a live stream or put the completed thread back in recovery.
@@ -1830,6 +1844,13 @@ export function AgentWorkspace({
       );
       const transcriptChangedAtHandoff = handoffEvents.length !== latestEventsAtHandoff.length ||
         handoffEvents.some((event, index) => eventIdentity(event) !== eventIdentity(latestEventsAtHandoff[index]!));
+      // The recovery worker may have already checkpointed the complete tail
+      // before this final handoff. In that case the parent snapshot is equal
+      // to `events`, but the mounted Eve reducer can still be on the old
+      // branch (notably after an input-response/sub-agent continuation).
+      // Reseed whenever the worker actually consumed new stream positions,
+      // not only when the storage array changed at this exact line.
+      const recoveryAdvanced = cursor > recoveryStartCursor;
       const recoveryPatch: AgentThreadPatch = {
         events: handoffEvents,
         interruptedTurns,
@@ -1853,7 +1874,7 @@ export function AgentWorkspace({
       // would replace the freshly recovered transcript. Reseed exactly once
       // at the durable handoff so edited replies remain visible after the
       // recovery worker releases its stream.
-      if (activeThreadIdRef.current === thread.id && transcriptChangedAtHandoff && !editRecovery) {
+      if (activeThreadIdRef.current === thread.id && (transcriptChangedAtHandoff || recoveryAdvanced) && !editRecovery) {
         flushSync(() => {
           setThreadRuntimeSeeds((current) => {
             const seed = `recovery:${thread.session.sessionId}:${cursor}`;
@@ -3000,7 +3021,21 @@ function sameThreadCollection(
     left.threads.length === right.threads.length &&
     left.threads.every((thread, index) => {
       const candidate = right.threads[index];
-      return candidate?.id === thread.id && candidate.updatedAt === thread.updatedAt;
+      if (!candidate || candidate.id !== thread.id || candidate.updatedAt !== thread.updatedAt) return false;
+      // Recovery handoffs intentionally preserve `updatedAt` so opening a
+      // session does not reorder recents. That must not make the persistence
+      // layer mistake a durable cursor/pending/status change for a no-op.
+      return candidate.status === thread.status &&
+        candidate.session.sessionId === thread.session.sessionId &&
+        candidate.session.streamIndex === thread.session.streamIndex &&
+        candidate.events.length === thread.events.length &&
+        (candidate.events.length === 0 || eventIdentity(candidate.events.at(-1)!) === eventIdentity(thread.events.at(-1)!)) &&
+        samePendingTurn(candidate.pendingTurn, thread.pendingTurn) &&
+        sameQueuedTurns(candidate.queuedTurns, thread.queuedTurns) &&
+        sameInterruptedTurns(candidate.interruptedTurns ?? [], thread.interruptedTurns ?? []) &&
+        JSON.stringify(candidate.inputResponseSubmissions ?? []) === JSON.stringify(thread.inputResponseSubmissions ?? []) &&
+        sameStringList(candidate.closedInputRequestIds, thread.closedInputRequestIds) &&
+        sameStringList(candidate.retainedContext ?? [], thread.retainedContext ?? []);
     });
 }
 
