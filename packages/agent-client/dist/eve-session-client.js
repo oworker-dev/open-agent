@@ -2,7 +2,7 @@ import { Client, } from "eve/client";
 import { AGENT_SESSION_CONTRACT_VERSION, } from "@oworker/open-agent-contracts/agent-session";
 export const EVE_AGENT_SESSION_ADAPTER_VERSION = "0.1.0-alpha.9";
 /**
- * Default interactive-session adapter for Eve 0.31.x.
+ * Default interactive-session adapter for Eve 0.56.x.
  *
  * The returned surface contains no Eve classes or event types. Hosts persist
  * the AgentSession cursor and can replace this adapter without changing UI

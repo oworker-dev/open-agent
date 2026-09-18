@@ -53,7 +53,7 @@ try {
     "--ignore-scripts",
     "--no-audit",
     "--no-fund",
-    "eve@0.31.1",
+    "eve@0.56.0",
     ...archives,
   ], {
     cwd: consumerDirectory,
@@ -128,7 +128,7 @@ try {
     JSON.stringify({
       dependencies: {
         ...localPackageSpecs,
-        eve: "0.31.1",
+        eve: "0.56.0",
       },
       name: "agent-sdk-pnpm-conformance-consumer",
       pnpm: {

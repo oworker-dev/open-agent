@@ -33,7 +33,7 @@ export interface AgentSessionClient {
     session(cursor?: AgentSessionCursor): AgentSession;
 }
 /**
- * Default interactive-session adapter for Eve 0.31.x.
+ * Default interactive-session adapter for Eve 0.56.x.
  *
  * The returned surface contains no Eve classes or event types. Hosts persist
  * the AgentSession cursor and can replace this adapter without changing UI

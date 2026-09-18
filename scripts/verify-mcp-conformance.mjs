@@ -257,7 +257,7 @@ async function scaffoldFixtureAgent({ agentRoot, brokerPort, mcpPort }) {
     type: "module",
     dependencies: {
       "@oworker/open-agent-mcp-adapter": "0.1.0-alpha.9",
-      eve: "0.31.1",
+      eve: "0.56.0",
     },
   }, null, 2));
   await writeFile(join(tempRoot, "tsconfig.json"), JSON.stringify({
