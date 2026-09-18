@@ -368,7 +368,7 @@ function isApprovalRequest(candidate) {
     candidate.action?.kind === "tool-call" &&
     Array.isArray(candidate.options) &&
     candidate.options.some((option) => option?.id === "approve") &&
-    candidate.options.some((option) => option?.id === "deny"),
+    candidate.options.some((option) => option?.id === "deny" || option?.id === "cancel"),
   );
 }
 
