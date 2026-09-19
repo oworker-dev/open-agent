@@ -4,7 +4,6 @@ import { createPostgresThreadCollectionStoreFromEnvironment, UnsafeThreadTranscr
 import { authenticateStandaloneRequest } from "@/server/http/standalone-request-auth";
 import {
   applyThreadCollectionPatch,
-  parseStrictThreadCollection,
   parseThreadCollectionPatch,
   summarizeThreadCollection,
 } from "@/server/http/thread-collection-contract";
@@ -15,9 +14,6 @@ import {
 
 export const runtime = "nodejs";
 
-// PUT is retained only for legacy full-snapshot clients. Normal Agent
-// checkpoints use PATCH event deltas and never scale with transcript size.
-const MAX_LEGACY_SNAPSHOT_BYTES = 64 * 1024 * 1024;
 const MAX_PATCH_BYTES = 64 * 1024 * 1024;
 const DEFAULT_EVENT_WINDOW = 256;
 const MAX_EVENT_WINDOW = 1_000;
@@ -114,72 +110,6 @@ function parseEventWindow(url: URL): { before?: number; limit: number } | undefi
   const before = Number(rawBefore);
   if (!Number.isSafeInteger(before) || before < 0) return undefined;
   return { before, limit };
-}
-
-export async function PUT(request: Request, context: RouteContext): Promise<Response> {
-  const authenticated = authenticateStandaloneRequest(request);
-  if (!store) return databaseUnavailable(authenticated.setCookie);
-
-  const expectedRevision = parseExpectedRevision(request.headers.get("if-match"));
-  if (expectedRevision === undefined) {
-    return problem(428, "revision_required", "If-Match must contain the loaded collection revision.", authenticated.setCookie);
-  }
-
-  const contentLength = Number(request.headers.get("content-length") ?? "0");
-  if (Number.isFinite(contentLength) && contentLength > MAX_LEGACY_SNAPSHOT_BYTES) {
-    return problem(413, "collection_too_large", "The legacy thread snapshot exceeds 64 MiB.", authenticated.setCookie);
-  }
-
-  let input: unknown;
-  try {
-    input = JSON.parse(await readRequestTextWithinLimit(request, MAX_LEGACY_SNAPSHOT_BYTES)) as unknown;
-  } catch (error) {
-    if (error instanceof RequestBodyTooLargeError) {
-      return problem(413, "collection_too_large", "The legacy thread snapshot exceeds 64 MiB.", authenticated.setCookie);
-    }
-    return problem(400, "invalid_json", "The request body must be valid JSON.", authenticated.setCookie);
-  }
-  if (!isRecord(input) || !("collection" in input)) {
-    return problem(400, "invalid_collection", "The request must contain a thread collection.", authenticated.setCookie);
-  }
-  const serialized = JSON.stringify(input.collection);
-  if (Buffer.byteLength(serialized) > MAX_LEGACY_SNAPSHOT_BYTES) {
-    return problem(413, "collection_too_large", "The legacy thread snapshot exceeds 64 MiB.", authenticated.setCookie);
-  }
-  const collection = parseStrictThreadCollection(input.collection);
-  if (!collection) {
-    return problem(400, "invalid_collection", "The thread collection does not match a supported storage version.", authenticated.setCookie);
-  }
-
-  const { storageKey } = await context.params;
-  let result;
-  try {
-    result = await store.save(
-      authenticated.identity.tenantId,
-      authenticated.identity.principalId,
-      storageKey,
-      expectedRevision,
-      collection,
-    );
-  } catch (error) {
-    if (error instanceof UnsafeThreadTranscriptReplacementError) {
-      return problem(422, "incomplete_thread_transcript", error.message, authenticated.setCookie);
-    }
-    throw error;
-  }
-  if (result.status === "conflict") {
-    return problem(
-      409,
-      "thread_collection_conflict",
-      "The thread collection changed in another client.",
-      authenticated.setCookie,
-      responseHeaders(result.currentRevision),
-    );
-  }
-  return Response.json(
-    { revision: result.record.revision },
-    { headers: responseHeaders(result.record.revision, authenticated.setCookie) },
-  );
 }
 
 export async function PATCH(request: Request, context: RouteContext): Promise<Response> {
@@ -312,8 +242,4 @@ function problem(
       },
     },
   );
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
