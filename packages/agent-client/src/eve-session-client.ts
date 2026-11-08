@@ -19,7 +19,7 @@ import {
 } from "@oworker/open-agent-contracts/agent-session";
 import type { AgentClientHeaders } from "./agent-run-client.js";
 
-export const EVE_AGENT_SESSION_ADAPTER_VERSION = "0.1.0-alpha.10" as const;
+export const EVE_AGENT_SESSION_ADAPTER_VERSION = "0.1.0-alpha.11" as const;
 
 export type AgentSessionClientOptions = {
   readonly baseUrl: string;

@@ -31,7 +31,7 @@ product-owner decisions; do not infer them from this automation.
    all five SDKs, emits `SHA256SUMS`, uploads artifacts, and requests GitHub
    build-provenance attestations.
 6. A separate release job builds `sandbox/Dockerfile`, publishes version and
-   `v`-prefixed tags to `ghcr.io/<owner>/open-agent-sandbox`, runs the runtime
+   `v`-prefixed tags to `ghcr.io/<owner>/open-agent-sandbox-runtime`, runs the runtime
    probe against the returned immutable digest, emits an SBOM, and requests a
    registry provenance attestation.
 7. Verify the release assets, image digest, SBOM, and attestations, then update
@@ -46,14 +46,12 @@ bypasses the server persistence, steering, and cancellation behavior under test.
 Keep Strict Mode enabled: scope initialization may load twice in development,
 while same-scope token renewal must not add collection loads in either mode.
 
-Before publishing a sandbox image, confirm that the GHCR package is connected
-to `oworker-dev/open-agent` and inherits repository permissions, or explicitly
-grants this repository Actions write access. A pre-existing package published
-with a personal token does not automatically grant `GITHUB_TOKEN` access.
-The Dockerfile's `org.opencontainers.image.source` label identifies the source
-repository; when bootstrapping an unlinked package, publish this metadata with
-an owner credential under a separate tag, without moving release tags. Keep
-the workflow using `GITHUB_TOKEN`; do not store the owner token in the repo.
+The release workflow publishes the sandbox image with `GITHUB_TOKEN`, which
+links the new package to `oworker-dev/open-agent` and gives the workflow package
+access. A package first published with a personal token may remain inaccessible
+to Actions even after its OCI source metadata is linked. If a package is ever
+recreated manually, grant this repository Actions write access before release.
+Keep the workflow using `GITHUB_TOKEN`; do not store an owner token in the repo.
 
 Do not treat tag push or workflow startup as a successful release. Wait for
 both main CI jobs, the image runtime probe, and the prerelease job to succeed,

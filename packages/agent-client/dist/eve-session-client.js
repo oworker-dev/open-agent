@@ -1,6 +1,6 @@
 import { Client, } from "eve/client";
 import { AGENT_SESSION_CONTRACT_VERSION, } from "@oworker/open-agent-contracts/agent-session";
-export const EVE_AGENT_SESSION_ADAPTER_VERSION = "0.1.0-alpha.10";
+export const EVE_AGENT_SESSION_ADAPTER_VERSION = "0.1.0-alpha.11";
 /** Host-neutral adapter over Eve's ID-addressed v27 session and delivery API. */
 export function createEveAgentSessionClient(options) {
     const client = new Client({

@@ -1,6 +1,6 @@
 {
   "name": "@oworker/open-agent-example-custom-host-react",
-  "version": "0.1.0-alpha.10",
+  "version": "0.1.0-alpha.11",
   "private": true,
   "description": "A non-iframe React host that owns its UI and consumes the Open AgentSession SDK.",
   "type": "module",
@@ -23,8 +23,8 @@
     "check": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
-    "@oworker/open-agent-client": "0.1.0-alpha.10",
-    "@oworker/open-agent-contracts": "0.1.0-alpha.10"
+    "@oworker/open-agent-client": "0.1.0-alpha.11",
+    "@oworker/open-agent-contracts": "0.1.0-alpha.11"
   },
   "peerDependencies": {
     "eve": ">=0.85.0 <0.86.0",

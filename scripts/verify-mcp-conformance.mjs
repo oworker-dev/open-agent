@@ -257,7 +257,7 @@ async function scaffoldFixtureAgent({ agentRoot, brokerPort, mcpPort }) {
     private: true,
     type: "module",
     dependencies: {
-      "@oworker/open-agent-mcp-adapter": "0.1.0-alpha.10",
+      "@oworker/open-agent-mcp-adapter": "0.1.0-alpha.11",
       eve: eveVersion,
     },
   }, null, 2));

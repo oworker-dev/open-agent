@@ -70,7 +70,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      SANDBOX_IMAGE: ghcr.io/${{ github.repository_owner }}/open-agent-sandbox
+      SANDBOX_IMAGE: ghcr.io/${{ github.repository_owner }}/open-agent-sandbox-runtime
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -102,8 +102,8 @@ jobs:
           tags: |
             ${{ env.SANDBOX_IMAGE }}:${{ steps.version.outputs.version }}
             ${{ env.SANDBOX_IMAGE }}:${{ github.ref_name }}
-          cache-from: type=gha,scope=open-agent-sandbox
-          cache-to: type=gha,mode=max,scope=open-agent-sandbox
+          cache-from: type=gha,scope=open-agent-sandbox-runtime
+          cache-to: type=gha,mode=max,scope=open-agent-sandbox-runtime
       - name: Verify the published runtime by digest
         env:
           AGENT_SANDBOX_IMAGE: ${{ env.SANDBOX_IMAGE }}@${{ steps.sandbox.outputs.digest }}

@@ -1,6 +1,6 @@
 {
   "name": "@oworker/open-agent-host",
-  "version": "0.1.0-alpha.10",
+  "version": "0.1.0-alpha.11",
   "private": true,
   "description": "Server-side Host Capability SDK for Open Agent integrations.",
   "type": "module",
@@ -35,7 +35,7 @@
     "check": "tsc --noEmit -p tsconfig.build.json"
   },
   "peerDependencies": {
-    "@oworker/open-agent-contracts": "0.1.0-alpha.10"
+    "@oworker/open-agent-contracts": "0.1.0-alpha.11"
   },
   "engines": {
     "node": ">=20"
