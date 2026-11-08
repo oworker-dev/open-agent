@@ -572,6 +572,11 @@ for (const scrolled of [false, true]) test(`new turn anchors its user and adjace
   const thinking = page.getByRole("log").getByText("Thinking", { exact: true }).last();
   await expect(thinking).toBeVisible();
   await expect.poll(async () => (await user.boundingBox())!.y - (await viewport.boundingBox())!.y).toBeLessThan(100);
+  await expect.poll(async () => {
+    const before = (await user.boundingBox())!.y;
+    await page.waitForTimeout(100);
+    return Math.abs((await user.boundingBox())!.y - before);
+  }).toBeLessThan(1);
   const initial = await user.boundingBox();
   const placeholder = await thinking.boundingBox();
   const viewportBox = await viewport.boundingBox();
