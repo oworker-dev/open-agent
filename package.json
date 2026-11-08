@@ -1,6 +1,6 @@
 {
   "name": "open-agent",
-  "version": "0.1.0-alpha.9",
+  "version": "0.1.0-alpha.10",
   "private": true,
   "type": "module",
   "workspaces": [
@@ -77,10 +77,10 @@
     "@aws-sdk/client-s3": "^3.1111.0",
     "@aws-sdk/s3-request-presigner": "^3.1111.0",
     "@opentelemetry/api": "1.9.1",
-    "@oworker/open-agent-client": "0.1.0-alpha.9",
-    "@oworker/open-agent-contracts": "0.1.0-alpha.9",
-    "@oworker/open-agent-host": "0.1.0-alpha.9",
-    "@oworker/open-agent-ui": "0.1.0-alpha.9",
+    "@oworker/open-agent-client": "0.1.0-alpha.10",
+    "@oworker/open-agent-contracts": "0.1.0-alpha.10",
+    "@oworker/open-agent-host": "0.1.0-alpha.10",
+    "@oworker/open-agent-ui": "0.1.0-alpha.10",
     "@radix-ui/react-use-controllable-state": "1.2.2",
     "@shikijs/core": "4.1.0",
     "@shikijs/engine-javascript": "4.1.0",

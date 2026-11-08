@@ -48,7 +48,7 @@ async function openEmbed(page: Page, config = configuration) {
   await expect(frame.getByRole("textbox", { name: "Do anything" })).toBeVisible();
   return {
     frame, requests, navigations: () => navigations,
-    indexLoads: () => requests.filter(request => request.method === "GET" && request.url.includes("/thread-collections/") && new URL(request.url).searchParams.get("view") === "index").length,
+    indexLoads: (storageKey?: string) => requests.filter(request => request.method === "GET" && request.url.includes("/thread-collections/") && new URL(request.url).searchParams.get("view") === "index" && (!storageKey || decodeURIComponent(new URL(request.url).pathname).endsWith(`/${storageKey}`))).length,
     async configure(patch: Partial<AgentEmbedConfigureMessage> = {}) {
       const next = { ...config, requestId: `rotation-${Date.now()}`, accessToken: "synthetic-renewed-token", expiresAt: new Date(Date.now() + 600_000).toISOString(), ...patch };
       await page.evaluate(value => (window as Host).configure(JSON.parse(value)), JSON.stringify(next));
@@ -156,9 +156,11 @@ test("a missing persisted active ID selects an existing thread, while a new scop
   await expect(h.frame.getByText("History reply 0", { exact: true })).toBeVisible();
   await h.frame.getByRole("textbox", { name: "Do anything" }).fill("Project A private draft");
   f.collection = { threads: [], version: 2 }; f.revision = 0;
-  const loads = h.indexLoads();
+  const initialLoads = h.indexLoads(configuration.storageKey);
   await h.configure({ storageKey: "embed-test:project-b", accessToken: "synthetic-project-b-token" });
-  await expect.poll(() => h.indexLoads()).toBe(loads + 1);
+  // Development Strict Mode replays mount effects. A new scope should perform
+  // the same initialization as the first scope in either dev or production.
+  await expect.poll(() => h.indexLoads("embed-test:project-b")).toBe(initialLoads);
   await expect(h.frame.getByRole("heading", { name: "What should we work on?" })).toBeVisible();
   await expect(h.frame.getByRole("textbox", { name: "Do anything" })).toHaveText("");
   await expect(h.frame.getByText("History reply 0", { exact: true })).toHaveCount(0);

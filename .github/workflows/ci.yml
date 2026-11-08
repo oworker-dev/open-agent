@@ -37,6 +37,9 @@ jobs:
       AGENT_EVAL_FIXTURE_MODEL: autonomy-v1
       AGENT_SANDBOX_BACKEND: docker
       AGENT_WEB_URL: http://127.0.0.1:3000
+      # NativeFixture intercepts storage/mailbox HTTP. Select that path instead
+      # of the development-only localStorage fallback; no database is contacted.
+      AGENT_DATABASE_URL: postgresql://fixture:fixture@127.0.0.1:1/browser_fixture
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -58,6 +61,12 @@ jobs:
           tail -200 /tmp/open-agent-ci.log
           exit 1
       - run: npm run test:e2e
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: browser-failure-evidence
+          path: test-results/
+          retention-days: 7
       - name: Print server log on failure
         if: failure()
         run: tail -300 /tmp/open-agent-ci.log || true

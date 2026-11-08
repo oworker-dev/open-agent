@@ -1,6 +1,6 @@
 import { type AgentSessionCancellation, type AgentSessionCursor, type AgentSessionEvent, type AgentSessionReset, type AgentSessionSendPayload, type AgentSessionTurnResult } from "@oworker/open-agent-contracts/agent-session";
 import type { AgentClientHeaders } from "./agent-run-client.js";
-export declare const EVE_AGENT_SESSION_ADAPTER_VERSION: "0.1.0-alpha.9";
+export declare const EVE_AGENT_SESSION_ADAPTER_VERSION: "0.1.0-alpha.10";
 export type AgentSessionClientOptions = {
     readonly baseUrl: string;
     readonly getAccessToken: () => string | Promise<string>;

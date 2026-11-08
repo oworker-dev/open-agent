@@ -74,9 +74,9 @@ try {
     assert.equal(AGENT_RUN_CONTRACT_VERSION, "0.1.0-draft");
     assert.equal(AGENT_SESSION_CONTRACT_VERSION, "0.1.0-draft");
     assert.equal(AGENT_EMBED_CONTRACT_VERSION, "0.1.0");
-    assert.equal(AGENT_CLIENT_VERSION, "0.1.0-alpha.9");
+    assert.equal(AGENT_CLIENT_VERSION, "0.1.0-alpha.10");
     assert.equal(AGENT_HOST_SIGNATURE_VERSION, "0.2.0");
-    assert.equal(AGENT_UI_VERSION, "0.1.0-alpha.9");
+    assert.equal(AGENT_UI_VERSION, "0.1.0-alpha.10");
     assert.equal(typeof createAgentRunClient, "function");
     assert.equal(typeof signAgentHostCapabilityRequest, "function");
     assert.equal(typeof AgentWorkspace, "function");

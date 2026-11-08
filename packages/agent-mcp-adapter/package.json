@@ -1,6 +1,6 @@
 {
   "name": "@oworker/open-agent-mcp-adapter",
-  "version": "0.1.0-alpha.9",
+  "version": "0.1.0-alpha.10",
   "private": true,
   "description": "Host-neutral, tenant-scoped Eve MCP connection factory for Open Agent deployments.",
   "type": "module",

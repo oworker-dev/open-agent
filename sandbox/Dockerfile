@@ -1,6 +1,8 @@
 ARG EVE_SANDBOX_BASE_IMAGE=ghcr.io/vercel/eve@sha256:18fb75032908d231b65e269fa46034ddcea3d90524d795d2f7e77c4fd4edbe48
 FROM ${EVE_SANDBOX_BASE_IMAGE}
 
+LABEL org.opencontainers.image.source="https://github.com/oworker-dev/open-agent"
+
 ARG PLAYWRIGHT_VERSION=1.62.1
 
 ENV DEBIAN_FRONTEND=noninteractive
