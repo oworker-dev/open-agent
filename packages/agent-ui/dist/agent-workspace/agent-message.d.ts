@@ -1,16 +1,16 @@
 import type { EveMessage } from "eve/react";
-import type { InputResponse, MessageStreamEvent } from "eve/client";
+import type { SessionStreamEvent } from "eve/client";
+import { type Answer } from "eve/events";
 import type { AgentLocale } from "./i18n.js";
 import type { AgentSessionDeliverable } from "./contracts.js";
-export type AgentInputResponse = InputResponse;
-export declare function AgentMessage({ assetUrl, canRespond, closedInputRequestIds, events, fallbackStartedAt, isStreaming, isTurnContinuation, locale, message, onOpenDeliverable, onOpenSubagent, onInputResponses, onCloseInputRequest, showCopyAction, }: {
+export type AgentInputResponse = Answer;
+export declare function AgentMessage({ assetUrl, canRespond, closedInputRequestIds, events: sourceEvents, fallbackStartedAt, isStreaming: sourceStreaming, locale, message, onOpenDeliverable, onOpenSubagent, onInputResponses, onCloseInputRequest, showCopyAction, }: {
     readonly assetUrl?: (assetId: string) => string;
     readonly canRespond: boolean;
     readonly closedInputRequestIds?: ReadonlySet<string>;
-    readonly events: readonly MessageStreamEvent[];
+    readonly events: readonly SessionStreamEvent[];
     readonly fallbackStartedAt?: number;
     readonly isStreaming: boolean;
-    readonly isTurnContinuation?: boolean;
     readonly locale: AgentLocale;
     readonly message: EveMessage;
     readonly onOpenDeliverable?: (deliverable: AgentSessionDeliverable) => void;

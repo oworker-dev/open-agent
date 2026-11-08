@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { isBoundedAgentClientContext } from "@oworker/open-agent-contracts/client-context";
 import type { Pool, PoolClient } from "pg";
-import type { InputResponse } from "eve/client";
+import type { Answer } from "eve/events";
+import type { SessionAuthContext } from "eve/context";
 import {
   getAgentDatabasePool,
   quoteIdentifier,
@@ -10,8 +11,12 @@ import {
 } from "./agent-database.ts";
 import type { AgentSessionOwner } from "./session-ownership-store.ts";
 
-export const EDIT_ADMISSION_TIMEOUT_MS = 120_000;
-export const EDIT_ADMISSION_EXPIRED = "edit_admission_expired";
+export type AgentMailboxEditPlan = {
+  readonly phase: "prepared" | "clearing" | "cleared";
+  readonly history: readonly { readonly id: string; readonly role: "user" | "assistant"; readonly text: string }[];
+  readonly startIndex: number;
+  readonly clearDeliveryId?: string;
+};
 
 export type AgentMailboxStatus =
   | "accepted"
@@ -23,6 +28,8 @@ export type AgentMailboxStatus =
   | "submission-ambiguous";
 
 type AgentMailboxPayloadBase = {
+  /** Server-verified principal metadata, never supplied by the browser body. */
+  readonly callerAuth?: SessionAuthContext;
   readonly clientContext?: readonly string[];
   /** Stable product operation metadata. Eve treats the content as opaque input. */
   readonly operation?: {
@@ -30,8 +37,6 @@ type AgentMailboxPayloadBase = {
     readonly expectedTurnId?: string;
     readonly kind: "send" | "steer" | "edit" | "respond";
     readonly operationId: string;
-    /** Set only after the runtime advertises a pre-revert consumption guard. */
-    readonly consumptionGuard?: "edit-v1";
   };
   readonly preferences?: {
     readonly executionMode: "automation" | "cautious" | "standard";
@@ -41,11 +46,13 @@ type AgentMailboxPayloadBase = {
 };
 
 export type AgentMailboxPayload = AgentMailboxPayloadBase & (
-  | { readonly inputResponses: readonly InputResponse[]; readonly message?: never }
+  | { readonly inputResponses: readonly Answer[]; readonly message?: never }
   | { readonly inputResponses?: never; readonly message: string }
 );
 
 export type AgentMailboxItem = {
+  readonly cancellationRequestedAt?: string;
+  readonly editPlan?: AgentMailboxEditPlan;
   readonly admissionStartedAt?: string;
   readonly acceptedAt?: string;
   readonly acceptedSessionId?: string;
@@ -76,14 +83,11 @@ export type EnqueueAgentMailboxResult =
 
 export interface AgentMailboxStore {
   accept(itemId: string, claimToken: string, acceptedSessionId: string): Promise<AgentMailboxItem>;
-  beginAdmission(itemId: string, claimToken: string, options?: { readonly guardEdit?: boolean }): Promise<AgentMailboxItem>;
-  consumeEdit(input: {
-    readonly beforeTurnId: string;
-    readonly clientMessageId: string;
-    readonly itemId: string;
-    readonly owner: AgentSessionOwner;
-    readonly sessionId: string;
-  }): Promise<boolean>;
+  beginAdmission(itemId: string, claimToken: string): Promise<AgentMailboxItem>;
+  prepareEdit(itemId: string, plan: AgentMailboxEditPlan): Promise<AgentMailboxItem>;
+  claimEditClear(itemId: string): Promise<boolean>;
+  recordEditClear(itemId: string, deliveryId: string): Promise<void>;
+  completeEditClear(itemId: string): Promise<void>;
   cancelOwned(owner: AgentSessionOwner, itemId: string): Promise<AgentMailboxItem | undefined>;
   claimNext(options?: { readonly leaseMs?: number }): Promise<AgentMailboxItem | undefined>;
   commit(itemId: string, acceptedSessionId: string): Promise<AgentMailboxItem>;
@@ -210,17 +214,15 @@ function postgresAgentMailboxStore(
     async claimNext(options) {
       const leaseMs = options?.leaseMs ?? 60_000;
       assertLease(leaseMs);
-      // Consumption and expiry compete on this same row. A late delivery must
-      // pass consumeEdit before it can rewind context, so expiry cannot race
-      // into a second edit after the browser has released its pending state.
+      // Only an edit with a durable plan can safely resume an expired attempt.
+      // Its clear claim is never repeated; all later sends use native dedup.
       await pool.query(
-        `update ${mailboxTable}
-            set status = 'cancelled', claim_token = null, claim_expires_at = null,
-                last_error = $1, updated_at = now()
-          where status in ('delivering', 'accepted', 'submission-ambiguous')
-            and payload->'operation'->>'consumptionGuard' = 'edit-v1'
-            and admission_started_at < now() - ($2::bigint * interval '1 millisecond')`,
-        [EDIT_ADMISSION_EXPIRED, EDIT_ADMISSION_TIMEOUT_MS],
+        `update ${mailboxTable} set status = 'queued', claim_token = null,
+             claim_expires_at = null, admission_started_at = null, updated_at = now()
+           where edit_plan is not null and (
+             status = 'submission-ambiguous' or
+             (status = 'delivering' and claim_expires_at < now())
+           )`,
       );
       await pool.query(
         `update ${mailboxTable}
@@ -269,52 +271,49 @@ function postgresAgentMailboxStore(
       );
       return result.rows[0] ? toRecord(result.rows[0]) : undefined;
     },
-    async beginAdmission(itemId, claimToken, options) {
+    async beginAdmission(itemId, claimToken) {
       assertText(itemId, "itemId", 512);
       assertText(claimToken, "claimToken", 512);
       const result = await pool.query<AgentMailboxRow>(
-        `update ${mailboxTable}
-            set admission_started_at = now(), updated_at = now(),
-                payload = case when $3 and payload->'operation'->>'kind' = 'edit'
-                  then jsonb_set(payload, '{operation,consumptionGuard}', '"edit-v1"'::jsonb)
-                  else payload end
+        `update ${mailboxTable} set admission_started_at = now(), updated_at = now()
           where item_id = $1 and status = 'delivering' and claim_token = $2
             and admission_started_at is null and claim_expires_at >= now()
-         returning ${selectColumns()}`,
-        [itemId, claimToken, options?.guardEdit === true],
+         returning ${selectColumns()}`, [itemId, claimToken],
       );
       return toRecord(requireRow(result.rows[0]));
     },
-    async consumeEdit(input) {
-      assertOwner(input.owner);
-      return await inTransaction(pool, async (client) => {
-        const result = await client.query<AgentMailboxRow>(
-          `select ${selectColumns()} from ${mailboxTable}
-            where item_id = $1 and session_id = $2 and client_message_id = $3
-              and tenant_id = $4 and principal_id = $5
-              and payload->'operation'->>'kind' = 'edit'
-              and payload->'operation'->>'beforeTurnId' = $6
-            for update`,
-          [input.itemId, input.sessionId, input.clientMessageId,
-            input.owner.tenantId, input.owner.principalId, input.beforeTurnId],
-        );
-        if (!result.rows[0]) return false;
-        const item = toRecord(result.rows[0]);
-        // Old durable deliveries keep their recorded protocol. They are never
-        // expired by the guarded-edit reaper above.
-        if (item.payload.operation?.consumptionGuard !== "edit-v1") return true;
-        if (!["delivering", "accepted", "submission-ambiguous", "committed"].includes(item.status)) return false;
-        await client.query(
-          `update ${mailboxTable}
-              set status = 'committed', accepted_session_id = $2,
-                  accepted_at = coalesce(accepted_at, now()),
-                  committed_at = coalesce(committed_at, now()),
-                  claim_token = null, claim_expires_at = null, updated_at = now()
-            where item_id = $1`,
-          [input.itemId, input.sessionId],
-        );
-        return true;
-      });
+    async prepareEdit(itemId, plan) {
+      const result = await pool.query<AgentMailboxRow>(
+        `update ${mailboxTable} set edit_plan = coalesce(edit_plan, $2::jsonb), updated_at = now()
+          where item_id = $1 and payload->'operation'->>'kind' = 'edit'
+            and status in ('delivering', 'accepted', 'submission-ambiguous')
+         returning ${selectColumns()}`, [itemId, JSON.stringify(plan)],
+      );
+      return toRecord(requireRow(result.rows[0]));
+    },
+    async claimEditClear(itemId) {
+      const result = await pool.query(
+        `update ${mailboxTable} set edit_plan = jsonb_set(edit_plan, '{phase}', '"clearing"'::jsonb), updated_at = now()
+          where item_id = $1 and edit_plan->>'phase' = 'prepared'
+            and status in ('delivering', 'accepted', 'submission-ambiguous') returning item_id`, [itemId],
+      );
+      return result.rows.length === 1;
+    },
+    async recordEditClear(itemId, deliveryId) {
+      const result = await pool.query(
+        `update ${mailboxTable} set edit_plan = jsonb_set(edit_plan, '{clearDeliveryId}', to_jsonb($2::text)), updated_at = now()
+          where item_id = $1 and edit_plan->>'phase' = 'clearing'
+            and (edit_plan->>'clearDeliveryId' is null or edit_plan->>'clearDeliveryId' = $2)
+         returning item_id`, [itemId, deliveryId],
+      );
+      requireRow(result.rows[0]);
+    },
+    async completeEditClear(itemId) {
+      const result = await pool.query(
+        `update ${mailboxTable} set edit_plan = jsonb_set(edit_plan, '{phase}', '"cleared"'::jsonb), updated_at = now()
+          where item_id = $1 and edit_plan->>'phase' in ('clearing', 'cleared') returning item_id`, [itemId],
+      );
+      requireRow(result.rows[0]);
     },
     async defer(itemId, claimToken, availableAt, reason) {
       assertText(itemId, "itemId", 512);
@@ -407,15 +406,15 @@ function postgresAgentMailboxStore(
       assertText(itemId, "itemId", 512);
       const result = await pool.query<AgentMailboxRow>(
         `update ${mailboxTable}
-            set status = 'cancelled', claim_token = null, claim_expires_at = null,
-                admission_started_at = null, last_error = null, updated_at = now()
+            set status = case when status in ('queued', 'failed') and edit_plan is null
+                or status = 'delivering' and admission_started_at is null and edit_plan is null
+              then 'cancelled' else status end,
+                cancellation_requested_at = coalesce(cancellation_requested_at, now()), updated_at = now()
           where item_id = $1 and tenant_id = $2 and principal_id = $3
-            and (
-              status in ('queued', 'failed')
-              or (status = 'delivering' and admission_started_at is null)
-            )
-         returning ${selectColumns()}`,
-        [itemId, owner.tenantId, owner.principalId],
+            and (status in ('queued', 'failed', 'cancelled')
+              or status = 'delivering' and admission_started_at is null
+              or payload->'operation'->>'kind' = 'edit')
+         returning ${selectColumns()}`, [itemId, owner.tenantId, owner.principalId],
       );
       return result.rows[0] ? toRecord(result.rows[0]) : undefined;
     },
@@ -493,6 +492,8 @@ async function claimedTransition(
 }
 
 type AgentMailboxRow = {
+  editPlan: AgentMailboxEditPlan | null;
+  cancellationRequestedAt: Date | string | null;
   admissionStartedAt: Date | string | null;
   acceptedAt: Date | string | null;
   acceptedSessionId: string | null;
@@ -523,6 +524,7 @@ function selectColumns(alias?: string): string {
     ${prefix}client_message_id as "clientMessageId",
     ${prefix}principal_type as "principalType", ${prefix}issuer,
     ${prefix}payload_fingerprint as "payloadFingerprint", ${prefix}payload,
+    ${prefix}edit_plan as "editPlan", ${prefix}cancellation_requested_at as "cancellationRequestedAt",
     ${prefix}status, ${prefix}attempt_count as "attemptCount",
     ${prefix}available_at as "availableAt", ${prefix}claim_token as "claimToken",
     ${prefix}claim_expires_at as "claimExpiresAt",
@@ -534,6 +536,8 @@ function selectColumns(alias?: string): string {
 
 function toRecord(row: AgentMailboxRow): AgentMailboxItem {
   return {
+    ...(row.editPlan ? { editPlan: row.editPlan } : {}),
+    ...(row.cancellationRequestedAt ? { cancellationRequestedAt: toIso(row.cancellationRequestedAt) } : {}),
     ...(row.admissionStartedAt ? { admissionStartedAt: toIso(row.admissionStartedAt) } : {}),
     ...(row.acceptedAt ? { acceptedAt: toIso(row.acceptedAt) } : {}),
     ...(row.acceptedSessionId ? { acceptedSessionId: row.acceptedSessionId } : {}),
@@ -618,13 +622,13 @@ function assertPayload(payload: AgentMailboxPayload): void {
   }
 }
 
-function assertInputResponses(value: readonly InputResponse[]): void {
+function assertInputResponses(value: readonly Answer[]): void {
   if (value.length < 1 || value.length > 16) {
     throw new Error("payload.inputResponses must contain between 1 and 16 responses.");
   }
   for (const response of value) {
     if (!response || typeof response !== "object") throw new Error("payload.inputResponses is invalid.");
-    assertText(response.requestId, "payload.inputResponses.requestId", 512);
+    assertText(response.interactionId, "payload.inputResponses.interactionId", 512);
     const hasOption = typeof response.optionId === "string" && response.optionId.trim().length > 0;
     const hasText = typeof response.text === "string" && response.text.trim().length > 0;
     if (!hasOption && !hasText) throw new Error("An input response requires optionId or text.");

@@ -1,4 +1,5 @@
 import type { Pool, PoolClient } from "pg";
+import { eventIdentity, isThreadEvent } from "@oworker/open-agent-ui/agent-workspace";
 import {
   getAgentDatabasePool,
   quoteIdentifier,
@@ -665,10 +666,9 @@ function threadEvents(thread: Record<string, unknown>): readonly Record<string, 
 }
 
 function isExplicitTranscriptReplacement(thread: Record<string, unknown>): boolean {
+  if (thread.hydration === "summary") return false;
   const pending = isRecordValue(thread.pendingTurn) ? thread.pendingTurn : undefined;
-  if (!pending) return false;
-  return pending.state === "clearing" ||
-    pending.state === "resubmitting";
+  return pending?.operation === "edit";
 }
 
 /** Keep summary metadata authoritative, including explicit clearing of
@@ -700,11 +700,7 @@ function mergeSummaryThread(
   const currentCoverage = isRecordValue(current.transcriptCoverage)
     ? current.transcriptCoverage
     : undefined;
-  const replacingEditedTurn = isRecordValue(replacement.pendingTurn) &&
-    (replacement.pendingTurn.state === "clearing" || replacement.pendingTurn.state === "resubmitting");
-  if (replacingEditedTurn) {
-    delete next.transcriptCoverage;
-  } else if (replacementCoverage?.authoritative === true) {
+  if (replacementCoverage?.authoritative === true) {
     next.transcriptCoverage = replacementCoverage;
   } else if (Object.prototype.hasOwnProperty.call(replacement, "transcriptCoverage") && replacementCoverage) {
     if (currentCoverage?.authoritative === true) {
@@ -796,21 +792,10 @@ async function assertReplacementPrefix(
     throw new UnsafeThreadTranscriptReplacementError();
   }
   for (let index = 0; index < events.length; index += 1) {
-    const rawMeta = events[index]?.meta;
-    // Migrations used `legacy:<index>` for events that predated Eve event
-    // ids, while newer append checkpoints include the thread id in their
-    // fallback key. Accept either deterministic legacy form; neither can
-    // match a different event at the same absolute index.
-    const eventId = isRecordValue(rawMeta) && typeof rawMeta.id === "string"
-      ? rawMeta.id
-      : undefined;
+    const eventId = threadEventIdentity(events[index]);
     const stored = prefixResult.rows[index];
-    const legacyIds = eventId
-      ? []
-      : [`legacy:${index}`, `legacy:${threadId}:${index}`];
     if (!stored || parseRevision(stored.event_index) !== index ||
-      (!eventId && !legacyIds.includes(stored.event_id)) ||
-      (eventId && stored.event_id !== eventId)) {
+      stored.event_id !== eventId) {
       throw new UnsafeThreadTranscriptReplacementError();
     }
   }
@@ -829,14 +814,19 @@ async function appendThreadEvents(
   if (validEvents.length === 0 && replaceFrom === undefined) return;
 
   let nextIndex = replaceFrom;
+  let tailPosition: { line: number; index: number } | undefined;
   if (nextIndex === undefined) {
-    const countResult = await connection.query<{ next_index: string }>(
-      `select coalesce(max(event_index) + 1, 0)::text as next_index
+    const tail = await connection.query<{ next_index: string; tail_position: typeof tailPosition }>(
+      `select (event_index + 1)::text as next_index, event #> '{meta,position}' as tail_position
          from ${eventTable}
-        where tenant_id = $1 and principal_id = $2 and storage_key = $3 and thread_id = $4`,
+        where tenant_id = $1 and principal_id = $2 and storage_key = $3 and thread_id = $4
+        order by event_index desc limit 1`,
       [tenantId, principalId, storageKey, append.threadId],
     );
-    nextIndex = parseRevision(countResult.rows[0]?.next_index ?? "0");
+    nextIndex = parseRevision(tail.rows[0]?.next_index ?? "0");
+    tailPosition = tail.rows[0]?.tail_position;
+    // An old cache must be rebuilt from Eve before current facts are added.
+    if (nextIndex > 0 && !tailPosition) throw new UnsafeThreadTranscriptReplacementError();
   }
   if (replaceFrom !== undefined) {
     await connection.query(
@@ -845,13 +835,11 @@ async function appendThreadEvents(
       [tenantId, principalId, storageKey, append.threadId, replaceFrom],
     );
   }
-  const candidates = validEvents.map((rawEvent, offset) => {
-    const meta = isRecordValue(rawEvent.meta) ? rawEvent.meta : {};
-    const eventId = typeof meta.id === "string" && meta.id
-      ? meta.id
-      : `legacy:${append.threadId}:${nextIndex + offset}`;
-    return { event: rawEvent, eventId };
-  });
+  const candidates = validEvents.map((rawEvent) => {
+    if (!isThreadEvent(rawEvent)) throw new TypeError("Thread events must carry a v27 source position.");
+    const eventId = eventIdentity(rawEvent);
+    return { event: rawEvent, eventId, position: rawEvent.meta.position };
+  }).sort((a, b) => a.position.line - b.position.line || a.position.index - b.position.index);
   if (candidates.length === 0) return;
 
   // Reconnects can resend a suffix that is already durable. Filter those
@@ -883,6 +871,34 @@ async function appendThreadEvents(
     append.threadId,
     fresh.map(({ event }, offset) => ({ event, eventIndex: nextIndex + offset })),
   );
+  const first = fresh[0]!.position;
+  if (tailPosition && (first.line < tailPosition.line ||
+    (first.line === tailPosition.line && first.index < tailPosition.index))) {
+    // A bounded recovery page can arrive after newer live facts. Array offsets
+    // must follow source order too, or pagination persists the interleaving.
+    // Move above the occupied range before assigning contiguous offsets so
+    // the immediate primary-key constraint cannot collide during the update.
+    const scope = [tenantId, principalId, storageKey, append.threadId];
+    await connection.query(
+      `update ${eventTable} set event_index = event_index + $5
+        where tenant_id = $1 and principal_id = $2 and storage_key = $3 and thread_id = $4`,
+      [...scope, nextIndex + fresh.length],
+    );
+    await connection.query(
+      `with ranked as (
+         select event_id, row_number() over (
+           order by (event #>> '{meta,position,line}')::bigint,
+                    (event #>> '{meta,position,index}')::bigint
+         ) - 1 as source_index
+         from ${eventTable}
+         where tenant_id = $1 and principal_id = $2 and storage_key = $3 and thread_id = $4
+       )
+       update ${eventTable} e set event_index = ranked.source_index from ranked
+        where e.tenant_id = $1 and e.principal_id = $2 and e.storage_key = $3
+          and e.thread_id = $4 and e.event_id = ranked.event_id`,
+      scope,
+    );
+  }
 }
 
 async function insertThreadEvents(
@@ -896,10 +912,7 @@ async function insertThreadEvents(
 ): Promise<void> {
   if (entries.length === 0) return;
   const records = entries.map(({ event, eventIndex }) => {
-    const meta = isRecordValue(event.meta) ? event.meta : {};
-    const eventId = typeof meta.id === "string" && meta.id
-      ? meta.id
-      : `legacy:${threadId}:${eventIndex}`;
+    const eventId = threadEventIdentity(event);
     return {
       event: normalizeJsonbValue(event),
       eventId,
@@ -927,4 +940,9 @@ async function insertThreadEvents(
       event_index: record.eventIndex,
     })))],
   );
+}
+
+function threadEventIdentity(event: unknown): string {
+  if (!isThreadEvent(event)) throw new TypeError("Thread events must carry a v27 source position.");
+  return eventIdentity(event);
 }

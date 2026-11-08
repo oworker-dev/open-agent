@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const workspaceRoot = new URL("../", import.meta.url).pathname;
+const eveVersion = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")).dependencies.eve;
 const temporaryRoot = await mkdtemp(join(tmpdir(), "open-agent-sdk-"));
 const packageDirectory = join(temporaryRoot, "packages");
 const consumerDirectory = join(temporaryRoot, "consumer");
@@ -53,7 +54,7 @@ try {
     "--ignore-scripts",
     "--no-audit",
     "--no-fund",
-    "eve@0.56.0",
+    `eve@${eveVersion}`,
     ...archives,
   ], {
     cwd: consumerDirectory,
@@ -87,6 +88,7 @@ try {
     cwd: consumerDirectory,
     stdio: "pipe",
   });
+  await rm(consumerDirectory, { recursive: true, force: true });
 
   await writeFile(
     join(headlessConsumerDirectory, "package.json"),
@@ -122,13 +124,14 @@ try {
     cwd: headlessConsumerDirectory,
     stdio: "pipe",
   });
+  await rm(headlessConsumerDirectory, { recursive: true, force: true });
 
   await writeFile(
     join(pnpmConsumerDirectory, "package.json"),
     JSON.stringify({
       dependencies: {
         ...localPackageSpecs,
-        eve: "0.56.0",
+        eve: eveVersion,
       },
       name: "agent-sdk-pnpm-conformance-consumer",
       pnpm: {

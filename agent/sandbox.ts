@@ -1,13 +1,4 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-import {
-  defaultBackend,
-  defineSandbox,
-  type SandboxBackend,
-} from "eve/sandbox";
-import { docker } from "eve/sandbox/docker";
-import { microsandbox } from "eve/sandbox/microsandbox";
-import { vercel } from "eve/sandbox/vercel";
+import { defineSandbox } from "eve/sandbox";
 import {
   readAgentDockerResourceLimits,
   readAgentSandboxAdmissionConfig,
@@ -21,177 +12,35 @@ import {
   resolveAgentDockerNetworkPolicy,
   resolveAgentSandboxNetworkPolicy,
 } from "../lib/sandbox-network-policy.ts";
-import { withIdleSandboxShutdown } from "../lib/idle-sandbox-backend.ts";
-import { withSandboxAdmission } from "../lib/sandbox-admission-backend.ts";
+import { ManagedDockerSandbox, DEFAULT_AGENT_SANDBOX_IMAGE } from "./lib/docker-sandbox-provider.ts";
+import { ManagedVercelSandbox } from "./lib/vercel-sandbox-provider.ts";
 
-const execFileAsync = promisify(execFile);
+const configured = readAgentSandboxBackend();
+// Local auto selection stays isolated. There is deliberately no in-process
+// shell fallback when a Docker daemon is unavailable.
+const selected = configured === "auto" ? (process.env.VERCEL?.trim() ? "vercel" : "docker") : configured;
+const shared = {
+  admission: readAgentSandboxAdmissionConfig(),
+  idleTimeoutMs: readAgentSandboxIdleTimeoutMs(),
+};
+const image = readAgentSandboxImage();
+const networkMode = readAgentSandboxNetworkMode();
+const networkAllowlist = readAgentSandboxNetworkAllowlist();
 
-/**
- * The sandbox is an Agent capability boundary, not a convenience default.
- * Keep the backend selectable for local development and hosted deployment,
- * while applying an explicit deployment-selected network policy to every backend.
- */
-export default defineSandbox({
-  description:
-    "One isolated workspace per durable Agent session with policy-controlled egress.",
-  backend: selectBackend(),
+const provider = selected === "vercel"
+  ? { kind: "vercel" as const, environment: ManagedVercelSandbox.environment({ ...shared, ...(image ? { image } : {}) }) }
+  : { kind: "docker" as const, environment: ManagedDockerSandbox.environment({ ...shared,
+      image: image ?? (process.env.EVE_SANDBOX_IMAGE_TAG?.trim()
+        ? `ghcr.io/vercel/eve:${process.env.EVE_SANDBOX_IMAGE_TAG.trim()}` : DEFAULT_AGENT_SANDBOX_IMAGE),
+      limits: readAgentDockerResourceLimits(),
+    }) };
+export const environment = provider.environment;
+
+export default defineSandbox(() => {
+  if (provider.kind === "vercel") return provider.environment.open({
+    networkPolicy: resolveAgentSandboxNetworkPolicy(networkMode, "vercel", networkAllowlist),
+  });
+  return provider.environment.open({
+    networkPolicy: resolveAgentDockerNetworkPolicy(configured === "auto" && networkMode === "standard" ? "isolated" : networkMode),
+  });
 });
-
-function selectBackend() {
-  const selected = readAgentSandboxBackend();
-  const image = readAgentSandboxImage();
-  const admission = readAgentSandboxAdmissionConfig();
-  const idleTimeoutMs = readAgentSandboxIdleTimeoutMs();
-  const networkMode = readAgentSandboxNetworkMode();
-  const networkAllowlist = readAgentSandboxNetworkAllowlist();
-  if (selected === "docker") {
-    return withManagedSandboxCapacity(
-      withDockerResourceLimits(docker({
-        ...(image ? { image } : {}),
-        networkPolicy: resolveAgentDockerNetworkPolicy(networkMode),
-        pullPolicy: "if-not-present",
-      }), readAgentDockerResourceLimits()),
-      admission,
-      idleTimeoutMs,
-    );
-  }
-  if (selected === "microsandbox") {
-    return withManagedSandboxCapacity(microsandbox({
-      ...(image ? { image } : {}),
-      cpus: 2,
-      memoryMiB: 2048,
-      networkPolicy: resolveAgentSandboxNetworkPolicy(networkMode, "microsandbox", networkAllowlist),
-      pullPolicy: "if-missing",
-    }), admission, idleTimeoutMs);
-  }
-  if (selected === "vercel") {
-    return withManagedSandboxCapacity(vercel({
-      ...(image ? { image } : {}),
-      networkPolicy: resolveAgentSandboxNetworkPolicy(networkMode, "vercel", networkAllowlist),
-      resources: { vcpus: 2 },
-    }), admission, idleTimeoutMs);
-  }
-  return withManagedSandboxCapacity(defaultBackend({
-    docker: {
-      ...(image ? { image } : {}),
-      // `auto` may select Docker on a local host. Keep that fallback isolated
-      // when the requested standard policy needs domain-level firewall rules;
-      // production requires an explicit microVM-capable backend for standard.
-      networkPolicy: networkMode === "standard"
-        ? "deny-all"
-        : resolveAgentDockerNetworkPolicy(networkMode),
-      pullPolicy: "if-not-present",
-    },
-    microsandbox: {
-      ...(image ? { image } : {}),
-      cpus: 2,
-      memoryMiB: 2048,
-      networkPolicy: resolveAgentSandboxNetworkPolicy(networkMode, "microsandbox", networkAllowlist),
-      pullPolicy: "if-missing",
-    },
-    vercel: {
-      ...(image ? { image } : {}),
-      networkPolicy: resolveAgentSandboxNetworkPolicy(networkMode, "vercel", networkAllowlist),
-      resources: { vcpus: 2 },
-    },
-  }), admission, idleTimeoutMs);
-}
-
-function withManagedSandboxCapacity<BO, SO>(
-  backend: SandboxBackend<BO, SO>,
-  admission: ReturnType<typeof readAgentSandboxAdmissionConfig>,
-  idleTimeoutMs: number,
-): SandboxBackend<BO, SO> {
-  return withIdleSandboxShutdown(
-    withSandboxAdmission(backend, admission.maxActive, admission.timeoutMs, { maxQueued: admission.maxQueued }),
-    idleTimeoutMs,
-    {
-      onIdleShutdownError(error, sessionKey) {
-        console.warn("Sandbox idle shutdown failed", {
-          message: error instanceof Error ? error.message : String(error),
-          sessionKey,
-        });
-      },
-    },
-  );
-}
-
-/**
- * Eve 0.56's Docker backend intentionally exposes only image/network options.
- * Apply host resource limits immediately after a session container is created
- * or reattached, then verify Docker accepted the values before returning a
- * usable sandbox handle. This keeps untrusted commands from running in an
- * unlimited container without forking or patching Eve itself.
- */
-function withDockerResourceLimits(
-  backend: SandboxBackend,
-  limits: ReturnType<typeof readAgentDockerResourceLimits>,
-): SandboxBackend {
-  return {
-    ...backend,
-    async create(input) {
-      const handle = await backend.create(input);
-      const configuredName = input.existingMetadata?.containerName;
-      const containerName = typeof configuredName === "string" && configuredName.length > 0
-        ? configuredName
-        : input.sessionKey;
-      try {
-        await applyDockerResourceLimits(containerName, limits);
-        return handle;
-      } catch (error) {
-        await handle.shutdown().catch(() => undefined);
-        throw new Error(
-          `Docker sandbox resource limits could not be applied to ${containerName}.`,
-          { cause: error },
-        );
-      }
-    },
-  };
-}
-
-async function applyDockerResourceLimits(
-  containerName: string,
-  limits: ReturnType<typeof readAgentDockerResourceLimits>,
-): Promise<void> {
-  const dockerBinary = process.env.EVE_DOCKER_PATH?.trim() || "docker";
-  const memory = `${limits.memoryBytes}b`;
-  await execFileAsync(
-    dockerBinary,
-    [
-      "update",
-      "--memory", memory,
-      "--memory-swap", memory,
-      "--cpus", String(limits.cpus),
-      "--pids-limit", String(limits.pidsLimit),
-      containerName,
-    ],
-    { timeout: 10_000, maxBuffer: 2 * 1024 * 1024 },
-  );
-
-  const { stdout } = await execFileAsync(
-    dockerBinary,
-    ["inspect", "--format", "{{json .HostConfig}}", containerName],
-    { timeout: 10_000, maxBuffer: 2 * 1024 * 1024 },
-  );
-  const hostConfig = JSON.parse(stdout.trim()) as {
-    readonly Memory?: unknown;
-    readonly MemorySwap?: unknown;
-    readonly NanoCpus?: unknown;
-    readonly PidsLimit?: unknown;
-  };
-  const memoryBytes = Number(hostConfig.Memory ?? 0);
-  const memorySwapBytes = Number(hostConfig.MemorySwap ?? 0);
-  const nanoCpus = Number(hostConfig.NanoCpus ?? 0);
-  const pidsLimit = Number(hostConfig.PidsLimit ?? 0);
-  const expectedNanoCpus = Math.round(limits.cpus * 1_000_000_000);
-  if (
-    memoryBytes !== limits.memoryBytes
-    || memorySwapBytes !== limits.memoryBytes
-    || nanoCpus !== expectedNanoCpus
-    || pidsLimit !== limits.pidsLimit
-  ) {
-    throw new Error(
-      `Docker returned unexpected limits (memory=${memoryBytes}, swap=${memorySwapBytes}, cpus=${nanoCpus}, pids=${pidsLimit}).`,
-    );
-  }
-}

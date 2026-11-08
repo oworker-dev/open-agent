@@ -1,7 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { MessageStreamEvent } from "eve/client";
+import { conversationOf, type SessionStreamEvent } from "eve/client";
+import { activeTurn, session as sessionState, waiting } from "eve/events";
 import { AgentThreadView } from "./agent-thread.js";
 import { attachAgentSession, createAgentSession } from "./agent-client.js";
 import type {
@@ -15,7 +16,7 @@ import type {
   AgentWorkspaceMailbox,
 } from "./contracts.js";
 import type { AgentLocale } from "./i18n.js";
-import { AGENT_THREAD_STORAGE_VERSION, appendThreadEventIndexed, eventIdentity, rememberThreadEventCursor, compactThreadEvents, type AgentThreadCollection, type AgentThreadStorage } from "./thread-storage.js";
+import { AGENT_THREAD_STORAGE_VERSION, appendThreadEventIndexed, eventIdentity, threadEventCursor, compactThreadEvents, type AgentThreadCollection, type AgentThreadStorage } from "./thread-storage.js";
 
 /**
  * Child sessions intentionally use the same thread controller and assistant-ui
@@ -46,7 +47,7 @@ export function AgentChildSessionView({
   readonly mailbox?: AgentWorkspaceMailbox;
   readonly mentions: readonly AgentPromptMenuItem[];
   readonly models: readonly AgentModelOption[];
-  readonly onEvent?: (event: MessageStreamEvent) => void;
+  readonly onEvent?: (event: SessionStreamEvent) => void;
   readonly onOpenDeliverable?: (deliverable: AgentSessionDeliverable) => void;
   readonly onOpenSubagent?: (sessionId: string) => void;
   readonly onStorageError?: (error: unknown) => void;
@@ -158,7 +159,8 @@ export function AgentChildSessionView({
         const read = async (follow: boolean) => {
           for await (const event of session.stream({ follow, startIndex: cursor, signal: controller.signal })) {
             if (controller.signal.aborted) return;
-            rememberThreadEventCursor(event, cursor++);
+            const eventCursor = threadEventCursor(event);
+            if (eventCursor !== undefined) cursor = Math.max(cursor, eventCursor);
             appendThreadEventIndexed(events, ids, event);
             onEvent?.(event);
             if (follow && isChildSnapshotBoundary(event)) break;
@@ -386,59 +388,12 @@ function persistedChildControls(thread: AgentThread): Pick<AgentThread,
 async function readChildSnapshot(
   session: NonNullable<ReturnType<typeof attachAgentSession>>,
   signal: AbortSignal,
-): Promise<{ readonly events: readonly MessageStreamEvent[]; readonly session: { readonly sessionId: string; readonly streamIndex: number } }> {
-  try {
-    return await session.snapshot({ signal });
-  } catch (error: unknown) {
-    if (signal.aborted || !isMissingTailBoundaryError(error)) throw error;
-  }
-
-  // Older Eve versions and transparent proxies may not expose the tail
-  // header required by `snapshot()`. Keep this compatibility path bounded:
-  // an unbounded follow stream here makes a child page wait forever whenever
-  // the child is still running or the upstream connection is half-open. The
-  // cursor recovery starts after this snapshot and remains responsible for
-  // following future events. `follow:true` is intentional:
-  // older clients reject bounded streams when the proxy cannot provide the
-  // tail header, so the timeout is the compatibility boundary.
-  const events: MessageStreamEvent[] = [];
-  const controller = new AbortController();
-  const abort = () => controller.abort();
-  const timeout = window.setTimeout(abort, CHILD_SNAPSHOT_FALLBACK_TIMEOUT_MS);
-  signal.addEventListener("abort", abort, { once: true });
-  try {
-    for await (const event of session.stream({
-      follow: true,
-      signal: controller.signal,
-      startIndex: 0,
-      streamReconnectPolicy: { reconnect: false },
-    })) {
-      events.push(event);
-      if (isChildSnapshotBoundary(event)) break;
-    }
-  } catch (error: unknown) {
-    // A timeout is an expected outcome for a running child on a legacy
-    // transport. Return the durable prefix collected so far and let the live
-    // stream reconcile the remainder; surface all other failures normally.
-    if (!controller.signal.aborted || signal.aborted) throw error;
-  } finally {
-    window.clearTimeout(timeout);
-    signal.removeEventListener("abort", abort);
-  }
-  return {
-    events,
-    session: { sessionId: session.state.sessionId, streamIndex: events.length },
-  };
+): Promise<{ readonly events: readonly SessionStreamEvent[]; readonly session: { readonly sessionId: string; readonly streamIndex: number } }> {
+  return await session.snapshot({ signal });
 }
 
-const CHILD_SNAPSHOT_FALLBACK_TIMEOUT_MS = 5_000;
-
-function isMissingTailBoundaryError(error: unknown): boolean {
-  return error instanceof Error && error.message.includes("x-eve-stream-tail-index");
-}
-
-function isChildSnapshotBoundary(event: MessageStreamEvent): boolean {
-  return event.type === "session.waiting" || event.type === "session.completed" || event.type === "session.failed";
+function isChildSnapshotBoundary(event: SessionStreamEvent): boolean {
+  return event.type === "turn.settled" || event.type === "session.ended" || event.type === "delivery.settled";
 }
 
 function createChildThread(sessionId: string, preferences: AgentThreadPreferences): AgentThread {
@@ -457,11 +412,12 @@ function createChildThread(sessionId: string, preferences: AgentThreadPreference
   };
 }
 
-function statusFromEvents(events: readonly MessageStreamEvent[]): AgentThread["status"] {
-  const last = events.at(-1);
-  if (!last) return "ready";
-  if (last.type === "session.failed" || last.type === "turn.failed") return "error";
-  if (last.type === "session.completed") return "ready";
-  if (last.type === "session.waiting" || last.type === "turn.completed" || last.type === "turn.cancelled") return "waiting";
+function statusFromEvents(events: readonly SessionStreamEvent[]): AgentThread["status"] {
+  const view = conversationOf(events).view;
+  const currentSession = sessionState(view);
+  if (currentSession.status === "ended") return currentSession.outcome === "failed" ? "error" : "ready";
+  const turn = activeTurn(view);
+  if (!turn) return "ready";
+  if (waiting(view, turn.turnId)) return "waiting";
   return "streaming";
 }

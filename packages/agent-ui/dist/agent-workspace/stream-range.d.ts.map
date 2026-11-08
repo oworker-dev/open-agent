@@ -1,0 +1,1 @@
+{"version":3,"file":"stream-range.d.ts","sourceRoot":"","sources":["../../src/agent-workspace/stream-range.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,EAAE,aAAa,EAAE,kBAAkB,EAAE,MAAM,YAAY,CAAC;AAGpE,wBAAsB,kBAAkB,CACtC,OAAO,EAAE,IAAI,CAAC,aAAa,EAAE,QAAQ,CAAC,EACtC,UAAU,EAAE,MAAM,EAClB,QAAQ,EAAE,MAAM,EAChB,MAAM,EAAE,WAAW,GAClB,OAAO,CAAC,SAAS,kBAAkB,EAAE,CAAC,CAiBxC"}

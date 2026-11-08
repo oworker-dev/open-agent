@@ -179,6 +179,13 @@ keyed compactor is used by live checkpoints, recovery, settled repair, and
 hydration so a reconnect cannot create false consecutive thinking rows or
 reorder narration around tools.
 
+The durable approval projection consumes authoritative `approval.settled` and
+`input.resolved` outcomes, including when an approved Host tool fails before
+emitting a terminal action result. An observed response submission or rejected
+responder candidate does not settle the shared request. Projection updates are
+session-bound and monotonic: replaying `input.requested` cannot turn an approved
+or rejected request back into a pending one.
+
 Storage conflicts are resolved against hydrated remote transcripts. An index
 summary with `events: []` is metadata only and can never replace a local or
 remote complete event log. Normal append races retain the remote order and
@@ -189,21 +196,19 @@ history. This prevents an older React snapshot from erasing persisted steps.
 
 Eve accepts ID-addressed follow-ups but does not provide the product-level FIFO,
 client idempotency, and delivery audit required by a multi-client Web product.
-The published Eve 0.56.0 API also does not expose Open Agent's same-turn Web
-steering contract. Open Agent therefore carries a reproducible `patch-package`
-patch and uses an application-owned `agent_mailbox_items` table when a host
-provides `AgentWorkspaceMailbox`. A follow-up is accepted by the Web API with a
+Eve 0.85.0 supplies native steering through `turnPolicy: "steer"`. Open Agent
+uses an application-owned `agent_mailbox_items` table when a host provides
+`AgentWorkspaceMailbox`. A follow-up is accepted by the Web API with a
 stable `clientMessageId`, then a separate mailbox worker leases one item and
 inspects the current durable session boundary.
 
-When the session is running and has published a `turnId`, delivery includes
-`expectedTurnId`. The Eve driver performs a non-blocking steering poll after a
-completed model step and before the next one, emits the accepted input as a
-durable `message.received` inside the same turn, and continues with the updated
-history. A waiting session receives an ordinary next-turn delivery. If the
-expected turn settles in the admission race, the driver strips the stale
-steering precondition and queues the payload as a normal next turn, so user
-input is never discarded merely because a boundary moved.
+When the session is running, only a steer addressed to its exact active turn
+or a structured interaction response can pass the dispatcher. Ordinary sends
+and edits wait. HITL keeps its turn active while parked, so responses must not
+wait for an idle boundary; Eve still validates the interaction and responder.
+A waiting session receives `turnPolicy: "queue"`. `delivery.consumed` identifies the
+durable turn that received the input. The official HTTP handler owns admission
+and turn-scoped client context. No Eve runtime patch is required.
 
 The mailbox is strictly ordered per session. A later item cannot be leased while
 an earlier item is queued, delivering, accepted, failed, or
@@ -214,8 +219,17 @@ crashes recoverable before admission begins. Once admission begins, a lost
 response is recorded as `submission-ambiguous` and is never blindly replayed.
 
 The internal Eve route authenticates the worker request with a separate HMAC
-secret. The mailbox item id is carried in the internal session auth context. Eve
-records `message.received` durably before running `agent/hooks/mailbox-commit.ts`,
+secret and verifies the session's tenant, principal, principal type, and issuer.
+Host enqueue routes persist a bounded snapshot of verified caller metadata in
+the mailbox payload: the raw JWT subject, opaque Host scope, gateway identity,
+runtime config, and run policy. Browser body fields cannot supply this snapshot;
+bearer credentials and arbitrary JWT attributes are excluded. Dispatch restores
+the snapshot as `auth.current` for both approval responses and ordinary
+follow-ups, preserving the caller's authenticator, issuer, principal type, and
+principal id. Eve compares these fields before accepting an approval. Internal
+mailbox bookkeeping uses `agentMailboxDispatch` and `agentMailboxItemId`
+attributes without replacing that identity. Eve
+records `delivery.consumed` durably before running `agent/hooks/mailbox-commit.ts`,
 which marks the item `committed`; the dispatcher tolerates this hook winning the
 race with its HTTP response. The hook retries transient product-database
 failures with bounded exponential backoff. Because the durable event is the
@@ -225,7 +239,13 @@ persistent database failure still fails closed and leaves the item blocking
 FIFO instead of guessing. The hook is bookkeeping for delivery certainty, not a
 replacement for Eve's model loop.
 
-The browser removes one queued item only when `message.received` carries its
+A structured response commits at durable HTTP admission because it resumes a
+parked turn without a new `delivery.consumed` hook. This proves delivery, not
+approval: `response.settled` can still refuse the answer. The UI uses those
+authoritative facts to display the reason and restore controls for the still
+open interaction; only `interaction.settled` confirms its decision.
+
+The browser removes one queued item only when `delivery.consumed` carries its
 exact `clientMessageId`. This keeps multiple steered messages distinct and
 preserves strict FIFO across refreshes. A closed tab or a second browser observes
 the same server queue and cannot submit another Eve message directly. Without a
@@ -368,9 +388,8 @@ explicit allow-all for a trusted single-tenant deployment. Docker enforces only
 the coarse allow-all/deny-all forms; Vercel and microsandbox receive the
 fine-grained policy through Eve's network-policy API.
 
-`AGENT_DEPLOYMENT_TENANCY` makes the trust model explicit. Eve 0.56.0's Docker
-backend does not expose CPU, memory, PID, Linux capability, or non-root controls
-and is accepted only for a trusted single-tenant alpha/staging deployment. The
+`AGENT_DEPLOYMENT_TENANCY` makes the trust model explicit. The managed Docker
+provider is accepted only for a trusted single-tenant alpha/staging deployment. The
 production doctor rejects Docker for mutually untrusted multi-tenant traffic;
 that topology must select a reviewed microVM backend and pass physical
 isolation tests there. Single-tenant Docker deployments also require
@@ -378,9 +397,8 @@ isolation tests there. Single-tenant Docker deployments also require
 `EVE_SANDBOX_REAPER_MAX_REMOVALS`, plus explicit finite
 `AGENT_DOCKER_MEMORY_LIMIT_BYTES`, `AGENT_DOCKER_CPU_LIMIT`, and
 `AGENT_DOCKER_PIDS_LIMIT` values and a finite
-`AGENT_SANDBOX_IDLE_TIMEOUT_MS`. Eve does not expose the Docker resource flags directly;
-Open Agent applies them with `docker update` immediately after each session is
-created or reattached and fails closed if Docker reports different values.
+`AGENT_SANDBOX_IDLE_TIMEOUT_MS`. The provider configures resource limits when
+creating Docker compute and verifies them when reconnecting.
 Every backend also uses `AGENT_SANDBOX_MAX_ACTIVE` and
 `AGENT_SANDBOX_ADMISSION_TIMEOUT_MS` to bound live handles in one Eve process,
 plus `AGENT_SANDBOX_MAX_QUEUED` to bound waiting sessions and memory during a
@@ -657,16 +675,12 @@ pretending that unavailable child events were observed.
 
 ### Supervisor boundary
 
-Eve 0.56.0 owns parent waiting, recursive cancellation, child task results, and
-durable child sessions. Open Agent enables its persistent-subagent option, so a
-parked child keeps a stable `agentId` and the parent can continue it on a later
-model step. Open Agent's patched root-session protocol now provides the useful
-Codex `turn/steer` equivalent without cancelling the current model step: Web
-messages enter at the next safe model boundary. It does not yet expose general
-`thread/inject_items`, detached/no-wait child execution, injection into a busy
-child, or a public close/archive lifecycle. Those remain supervisor protocol
-capabilities, not presentation controls, and must not be simulated with browser
-state.
+Eve 0.85.0 owns parent waiting, recursive cancellation, child task results, and
+durable child sessions. A subagent call returns a `taskId` receipt immediately;
+the parent can continue working and receives the child's reply as a task result.
+Later calls continue the child through that same `taskId`. Web messages use
+Eve's native steering policy. The UI projects the official task and child
+events and leaves execution ownership with Eve.
 
 Browser recovery is evidence-driven. A live stream with no new events may mean
 either a slow Provider or a stale transport. The UI supervises its observed-event
@@ -716,7 +730,7 @@ The project must not be called production-complete until all of these are done:
 
 The headless AgentRun API has deterministic coverage for PostgreSQL World, Host
 JWT authentication, structured output, event cursors, idempotency, isolation,
-and bounded cancellation reconciliation. The Eve 0.56.0 release requires a
+and bounded cancellation reconciliation. The Eve 0.85.0 release requires a
 fresh deployed production conformance run and real-Provider sandbox/preview
 evidence before release; unit and local build evidence do not waive the
 remaining gates above.

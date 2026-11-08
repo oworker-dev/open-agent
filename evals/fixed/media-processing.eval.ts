@@ -19,6 +19,6 @@ export default defineEval({
       count: 1,
     });
     t.messageIncludes("MEDIA_PROCESSING_PUBLISHED");
-    t.noFailedActions();
+    t.noFailedCalls();
   },
 });

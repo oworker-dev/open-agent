@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import type { MessageStreamEvent } from "eve/client";
+import { line, startTurn } from "../helpers/session-events.ts";
 import {
   approximateTokenCount,
   interruptedTurnContextFromEvents,
@@ -29,42 +29,12 @@ test("token truncation preserves the beginning and end of a large observation", 
 });
 
 test("an interrupted bash checkpoint keeps exact intent, command, exit status, and output tail", () => {
-  const events = [
-    event("message.received", {
-      message: "Build and verify the company website",
-      parts: [{ text: "Build and verify the company website", type: "text" }],
-      sequence: 0,
-      turnId: "turn-0",
-    }),
-    event("actions.requested", {
-      actions: [{
-        callId: "call-bash",
-        input: { command: "npm run build" },
-        kind: "tool-call",
-        toolName: "bash",
-      }],
-      sequence: 0,
-      stepIndex: 0,
-      turnId: "turn-0",
-    }),
-    event("action.result", {
-      result: {
-        callId: "call-bash",
-        kind: "tool-result",
-        output: {
-          exitCode: 1,
-          stderr: `provider log\n${"noise\n".repeat(10_000)}FINAL_ERROR_TAIL`,
-          stdout: `BUILD_START\n${"asset\n".repeat(10_000)}BUILD_OUTPUT_TAIL`,
-          truncated: true,
-        },
-        toolName: "bash",
-      },
-      sequence: 0,
-      status: "completed",
-      stepIndex: 0,
-      turnId: "turn-0",
-    }),
-  ];
+  const events = [...line(0, { type: "session.started", data: {} }), ...startTurn(1, "turn-0", "delivery", "Build and verify the company website"),
+    ...line(4, { type: "call.requested", scope: { turnId: "turn-0" }, data: { callId: "call-bash", owner: { runId: "turn-0:run" }, capability: { kind: "tool", name: "bash" }, input: { command: "npm run build" } } }),
+    ...line(5, { type: "call.settled", scope: { turnId: "turn-0" }, data: { callId: "call-bash", outcome: "completed", output: {
+      exitCode: 1, stderr: `provider log\n${"noise\n".repeat(10_000)}FINAL_ERROR_TAIL`,
+      stdout: `BUILD_START\n${"asset\n".repeat(10_000)}BUILD_OUTPUT_TAIL`, truncated: true,
+    } } })];
 
   const context = interruptedTurnContextFromEvents(
     events,
@@ -82,31 +52,9 @@ test("an interrupted bash checkpoint keeps exact intent, command, exit status, a
 
 test("a write checkpoint keeps the file reference instead of duplicating its payload", () => {
   const content = `SENSITIVE_FILE_BODY\n${"body\n".repeat(20_000)}`;
-  const events = [
-    event("actions.requested", {
-      actions: [{
-        callId: "call-write",
-        input: { content, filePath: "/workspace/site/index.html" },
-        kind: "tool-call",
-        toolName: "write_file",
-      }],
-      sequence: 0,
-      stepIndex: 0,
-      turnId: "turn-write",
-    }),
-    event("action.result", {
-      result: {
-        callId: "call-write",
-        kind: "tool-result",
-        output: { path: "/workspace/site/index.html", written: true },
-        toolName: "write_file",
-      },
-      sequence: 0,
-      status: "completed",
-      stepIndex: 0,
-      turnId: "turn-write",
-    }),
-  ];
+  const events = [...line(0, { type: "session.started", data: {} }), ...startTurn(1, "turn-write", "delivery", "Write the file"),
+    ...line(4, { type: "call.requested", scope: { turnId: "turn-write" }, data: { callId: "call-write", owner: { runId: "turn-write:run" }, capability: { kind: "tool", name: "write_file" }, input: { content, filePath: "/workspace/site/index.html" } } }),
+    ...line(5, { type: "call.settled", scope: { turnId: "turn-write" }, data: { callId: "call-write", outcome: "completed", output: { path: "/workspace/site/index.html", written: true } } })];
 
   const context = interruptedTurnContextFromEvents(
     events,
@@ -127,14 +75,3 @@ test("storage hydration uses the shared token budget rather than a 32k character
   assert.equal(hydrated, entry);
   assert.match(hydrated, /-TAIL$/);
 });
-
-function event(
-  type: MessageStreamEvent["type"],
-  data: Record<string, unknown>,
-): MessageStreamEvent {
-  return {
-    data,
-    meta: { at: "2026-08-09T00:00:00.000Z", id: `evt-${type}` },
-    type,
-  } as MessageStreamEvent;
-}

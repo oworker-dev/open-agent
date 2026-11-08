@@ -19,6 +19,7 @@ declare const translations: {
         readonly deleteUnavailable: "This session could not be retired. It was left intact.";
         readonly deletingThread: "Deleting thread";
         readonly dismiss: "Dismiss";
+        readonly downloadCompleteFile: "Download complete file";
         readonly elapsed: "Elapsed";
         readonly emptyTitle: "What should we work on?";
         readonly emptyDescription: "Describe the outcome and let the Agent work through the details.";
@@ -39,6 +40,8 @@ declare const translations: {
         readonly providerUnconfigured: "No LLM Provider is configured. Add a valid capability-scoped credential before starting Agent turns.";
         readonly providerTakingLonger: "The model Provider is taking longer than usual";
         readonly providerStillWaiting: "Still waiting. The run remains active and transient failures retry automatically.";
+        readonly previewFile: "Preview file";
+        readonly previewTruncated: "Showing the first 512 KiB. Download to view the complete file.";
         readonly queuedFollowUps: "Queued follow-ups";
         readonly queueDeliveryFailed: "Delivery failed";
         readonly queueDelivering: "Sending";
@@ -139,6 +142,7 @@ declare const translations: {
         readonly deleteUnavailable: "当前会话未能安全终止，已保留原状态。";
         readonly deletingThread: "正在删除会话";
         readonly dismiss: "关闭";
+        readonly downloadCompleteFile: "下载完整文件";
         readonly elapsed: "已运行";
         readonly emptyTitle: "我们要完成什么？";
         readonly emptyDescription: "描述你想得到的结果，Agent 会处理具体执行细节。";
@@ -159,6 +163,8 @@ declare const translations: {
         readonly providerUnconfigured: "尚未配置 LLM Provider。请先添加有效的能力范围凭证，再启动 Agent 任务。";
         readonly providerTakingLonger: "模型 Provider 的响应时间比平常更长";
         readonly providerStillWaiting: "仍在等待。任务保持运行，短暂故障会自动重试。";
+        readonly previewFile: "预览文件";
+        readonly previewTruncated: "当前显示前 512 KiB。下载后可查看完整文件。";
         readonly queuedFollowUps: "待发送的后续消息";
         readonly queueDeliveryFailed: "投递失败";
         readonly queueDelivering: "正在发送";

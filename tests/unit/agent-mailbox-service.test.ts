@@ -122,7 +122,7 @@ test("a structured input response commits at durable admission without a message
   const store = new MemoryMailboxStore();
   await enqueueAgentMailboxMessage({
     clientMessageId: "response-request-1",
-    inputResponses: [{ optionId: "approve", requestId: "request-approval-1" }],
+    inputResponses: [{ optionId: "approve", interactionId: "request-approval-1" }],
     operationId: "response-request-1",
     operationKind: "respond",
     owner,
@@ -136,7 +136,7 @@ test("a structured input response commits at durable admission without a message
   assert.equal(result.status, "accepted");
   assert.equal(store.items[0]?.status, "committed");
   assert.deepEqual(runtime.deliveries[0]?.inputResponses, [
-    { optionId: "approve", requestId: "request-approval-1" },
+    { optionId: "approve", interactionId: "request-approval-1" },
   ]);
   assert.equal(runtime.deliveries[0]?.message, undefined);
 });
@@ -146,7 +146,7 @@ test("structured input responses reject mixed message payloads", async () => {
   await assert.rejects(
     enqueueAgentMailboxMessage({
       clientMessageId: "response-request-2",
-      inputResponses: [{ optionId: "approve", requestId: "request-approval-2" }],
+      inputResponses: [{ optionId: "approve", interactionId: "request-approval-2" }],
       message: "approve",
       operationId: "response-request-2",
       operationKind: "respond",
@@ -156,6 +156,70 @@ test("structured input responses reject mixed message payloads", async () => {
     }),
     /cannot contain a message/i,
   );
+});
+
+for (const answer of [
+  { interactionId: "active-approval", optionId: "approve" },
+  { interactionId: "active-approval", optionId: "deny" },
+  { interactionId: "active-question", text: "Use the first option" },
+]) {
+  test(`a structured ${"optionId" in answer ? answer.optionId : "text"} answer resumes an active turn once`, async () => {
+    const store = new MemoryMailboxStore();
+    const input = {
+      clientMessageId: "response-active-1",
+      inputResponses: [answer],
+      operationId: "response-active-1",
+      operationKind: "respond" as const,
+      owner,
+      sessionId: "session-1",
+      store,
+    };
+    await enqueueAgentMailboxMessage(input);
+    const runtime = new FakeMailboxRuntime({ state: "running", turnId: "turn-paused" });
+
+    assert.equal((await dispatchNextAgentMailboxMessage({ runtime, store })).status, "accepted");
+    assert.equal(store.items[0]?.status, "committed");
+    assert.deepEqual(runtime.deliveries[0]?.inputResponses, [answer]);
+    assert.equal((await enqueueAgentMailboxMessage(input)).status, "replay");
+    assert.equal((await dispatchNextAgentMailboxMessage({ runtime, store })).status, "idle");
+    assert.equal(runtime.deliveries.length, 1);
+  });
+}
+
+test("an active turn answer rejected by Eve fails without retrying", async () => {
+  const store = new MemoryMailboxStore();
+  await enqueueAgentMailboxMessage({
+    clientMessageId: "response-rejected-1",
+    inputResponses: [{ interactionId: "stale-approval", optionId: "approve" }],
+    operationId: "response-rejected-1",
+    operationKind: "respond",
+    owner,
+    sessionId: "session-1",
+    store,
+  });
+  const runtime = new FakeMailboxRuntime({ state: "running", turnId: "turn-paused" });
+  runtime.deliveryError = new AgentMailboxAdmissionError("rejected", "The interaction is no longer open.");
+
+  assert.equal((await dispatchNextAgentMailboxMessage({ runtime, store })).status, "failed");
+  assert.equal(store.items[0]?.status, "failed");
+  assert.equal((await dispatchNextAgentMailboxMessage({ runtime, store })).status, "idle");
+});
+
+test("an answer cannot revive a terminal session", async () => {
+  const store = new MemoryMailboxStore();
+  await enqueueAgentMailboxMessage({
+    clientMessageId: "response-terminal-1",
+    inputResponses: [{ interactionId: "old-approval", optionId: "approve" }],
+    operationId: "response-terminal-1",
+    operationKind: "respond",
+    owner,
+    sessionId: "session-1",
+    store,
+  });
+  const runtime = new FakeMailboxRuntime({ state: "terminal", terminalStatus: "completed" });
+
+  assert.equal((await dispatchNextAgentMailboxMessage({ runtime, store })).status, "failed");
+  assert.equal(runtime.deliveries.length, 0);
 });
 
 test("a stale steer remains queued and is admitted only at the waiting boundary", async () => {
@@ -400,9 +464,10 @@ class MemoryMailboxStore implements AgentMailboxStore {
   items: AgentMailboxItem[] = [];
   private sequence = 0;
 
-  async consumeEdit(): Promise<boolean> {
-    throw new Error("Consumption is exercised by the PostgreSQL and Eve adapter tests.");
-  }
+  async prepareEdit(): Promise<AgentMailboxItem> { throw new Error("Edit plans use PostgreSQL integration coverage."); }
+  async claimEditClear(): Promise<boolean> { throw new Error("Edit plans use PostgreSQL integration coverage."); }
+  async recordEditClear(): Promise<void> { throw new Error("Edit plans use PostgreSQL integration coverage."); }
+  async completeEditClear(): Promise<void> { throw new Error("Edit plans use PostgreSQL integration coverage."); }
 
   async enqueue(input: Parameters<AgentMailboxStore["enqueue"]>[0]): Promise<EnqueueAgentMailboxResult> {
     const existing = this.items.find((item) =>

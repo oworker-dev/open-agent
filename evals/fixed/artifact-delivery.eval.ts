@@ -19,6 +19,6 @@ export default defineEval({
       count: 1,
     });
     t.messageIncludes("ARTIFACT_DELIVERY_PUBLISHED");
-    t.noFailedActions();
+    t.noFailedCalls();
   },
 });

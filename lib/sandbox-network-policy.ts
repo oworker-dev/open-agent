@@ -99,14 +99,14 @@ function isValidNetworkDomain(domain: string): boolean {
 
 export function resolveAgentSandboxNetworkPolicy(
   mode: AgentSandboxNetworkMode,
-  backend: "docker" | "microsandbox" | "vercel",
+  backend: "docker" | "vercel",
   allowlist: readonly string[] = [],
 ): SandboxNetworkPolicy {
   if (mode === "isolated") return "deny-all";
   if (mode === "trusted") return "allow-all";
   if (backend === "docker") {
     throw new Error(
-      "AGENT_SANDBOX_NETWORK_MODE=standard requires microsandbox or vercel; Docker only supports allow-all or deny-all.",
+      "AGENT_SANDBOX_NETWORK_MODE=standard requires vercel; Docker only supports allow-all or deny-all.",
     );
   }
   return {

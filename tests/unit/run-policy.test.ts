@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   enforceAgentRunPolicy,
   parseAgentRunPolicy,
+  updateRunPolicyClock,
   type RunPolicyState,
 } from "../../agent/lib/run-policy.ts";
 
@@ -86,4 +87,36 @@ test("enforces token, call, turn, tool, and duration limits", () => {
     () => enforceAgentRunPolicy(limits, emptyState, 1_501),
     /maxDurationMs/,
   );
+});
+
+test("approval waits and idle follow-up gaps do not spend the active execution budget", () => {
+  const limits = { maxDurationMs: 500, maxToolCalls: 2 };
+  let state = updateRunPolicyClock({ ...emptyState, toolCalls: 2 }, true, 1_000);
+  state = updateRunPolicyClock(state, false, 1_200);
+  assert.equal(state.elapsedActiveMs, 200);
+  // Repeated pause publications must not count the same execution twice.
+  state = updateRunPolicyClock(state, false, 5_000);
+  assert.equal(state.elapsedActiveMs, 200);
+  const nextDay = 86_400_000;
+  assert.doesNotThrow(() => enforceAgentRunPolicy(limits, state, nextDay));
+  state = updateRunPolicyClock(state, true, nextDay);
+  state = updateRunPolicyClock(state, true, nextDay + 100);
+  assert.equal(state.activeSinceMs, nextDay);
+  assert.doesNotThrow(() => enforceAgentRunPolicy(limits, state, nextDay + 300));
+  assert.throws(() => enforceAgentRunPolicy(limits, state, nextDay + 301), /maxDurationMs/);
+  state = updateRunPolicyClock(state, false, nextDay + 300);
+  assert.equal(state.elapsedActiveMs, 500);
+  assert.doesNotThrow(() => enforceAgentRunPolicy(limits, state, nextDay * 2));
+  state = updateRunPolicyClock(state, true, nextDay * 2);
+  assert.throws(() => enforceAgentRunPolicy(limits, state, nextDay * 2 + 1), /maxDurationMs/);
+  assert.throws(() => enforceAgentRunPolicy(limits, { ...state, toolCalls: 3 }, nextDay * 2), /maxToolCalls/);
+});
+
+test("legacy policy checkpoints retain all metering when adopting the active clock", () => {
+  const legacy = { ...emptyState, inputTokens: 10, outputTokens: 5, modelCalls: 2, toolCalls: 3, turns: 1 };
+  const resumed = updateRunPolicyClock(legacy, true, 86_400_000);
+  assert.equal(resumed.elapsedActiveMs, 0);
+  assert.deepEqual({ ...resumed, activeSinceMs: undefined, elapsedActiveMs: undefined },
+    { ...legacy, activeSinceMs: undefined, elapsedActiveMs: undefined });
+  assert.doesNotThrow(() => enforceAgentRunPolicy({ maxDurationMs: 500 }, resumed, 86_400_100));
 });

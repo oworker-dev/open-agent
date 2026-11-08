@@ -2,6 +2,7 @@ import type { AgentThreadCollection } from "@oworker/open-agent-ui/agent-workspa
 import {
   AGENT_THREAD_STORAGE_VERSION,
   compactThreadEvents,
+  isThreadEvent,
   parseThreadCollection,
 } from "@oworker/open-agent-ui/agent-workspace";
 
@@ -20,7 +21,8 @@ export function parseStrictThreadCollection(value: unknown): AgentThreadCollecti
   if (
     !isRecord(value) ||
     (value.version !== 1 && value.version !== AGENT_THREAD_STORAGE_VERSION) ||
-    !Array.isArray(value.threads)
+    !Array.isArray(value.threads) || value.threads.some((thread) =>
+      isRecord(thread) && Array.isArray(thread.events) && !thread.events.every(isThreadEvent))
   ) return undefined;
   const parsed = parseThreadCollection(value);
   return parsed.threads.length === value.threads.length ? parsed : undefined;
@@ -48,7 +50,7 @@ export function parseThreadCollectionPatch(value: unknown): ThreadCollectionPatc
     if (!isRecord(candidate) || typeof candidate.threadId !== "string" || !Array.isArray(candidate.events)) return undefined;
     if (!candidate.threadId || candidate.threadId.length > 200) return undefined;
     const events = candidate.events as AgentThreadCollection["threads"][number]["events"];
-    if (events.some((event) => !isRecord(event) || !isRecord(event.meta) || typeof event.meta.id !== "string")) return undefined;
+    if (!events.every(isThreadEvent)) return undefined;
     const replaceFrom = candidate.replaceFrom === undefined
       ? undefined
       : typeof candidate.replaceFrom === "number"
@@ -144,13 +146,8 @@ function mergeSummaryThread(
   delete next.transcriptWindow;
   // A server repair establishes a monotonic, authoritative coverage marker.
   // Stale browser summaries must not erase it and force a completed session
-  // through transcript repair on every open. An explicit edit checkpoint is
-  // the one normal operation that invalidates coverage before resubmission.
-  const replacingEditedTurn = replacement.pendingTurn?.state === "clearing" ||
-    replacement.pendingTurn?.state === "resubmitting";
-  if (replacingEditedTurn) {
-    delete next.transcriptCoverage;
-  } else if (replacement.transcriptCoverage?.authoritative === true) {
+  // through transcript repair on every open.
+  if (replacement.transcriptCoverage?.authoritative === true) {
     next.transcriptCoverage = replacement.transcriptCoverage;
   } else if (Object.prototype.hasOwnProperty.call(replacement, "transcriptCoverage") && replacement.transcriptCoverage) {
     // Browser checkpoints are observations, not proof that the finite Eve

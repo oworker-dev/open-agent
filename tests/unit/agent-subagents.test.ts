@@ -27,8 +27,8 @@ const ownershipStore: AgentSessionOwnershipStore = {
 test("sync derives idempotent child metadata and stable nickname from Eve events", async () => {
   const store = createMemoryAgentSubagentStore();
   const events = [
-    { type: "subagent.called", data: { childSessionId: "ses_child_1", callId: "call_1", name: "researcher", input: { message: "Investigate" } } },
-    { type: "subagent.completed", data: { childSessionId: "ses_child_1", callId: "call_1", result: { output: "done" } } },
+    { type: "child.opened", data: { sessionId: "ses_child_1", owner: { callId: "call_1" }, name: "researcher", stream: "/sessions/ses_child_1/stream" } },
+    { type: "call.settled", data: { callId: "call_1", outcome: "completed", output: "done" } },
   ] as const;
   // Keep this projection test hermetic. When the full CI gate inherits an
   // AGENT_RUNTIME_URL, the supervisor would otherwise probe a real Eve
@@ -55,8 +55,8 @@ test("background admission is not mistaken for a child completion", async () => 
     accessToken: "token", identity: owner, ownershipStore, parentSessionId: "parent", store,
     runtime: { async inspect() { throw new Error("Admission must not inspect a terminal outcome"); } } as never,
     events: [
-      { type: "subagent.called", data: { childSessionId: "child", callId: "call", name: "agent" } },
-      { type: "subagent.completed", data: { callId: "call", backgroundTask: { status: "working", taskId: "task" } } },
+      { type: "child.opened", data: { sessionId: "child", owner: { callId: "call" }, name: "agent", stream: "/sessions/child/stream" } },
+      { type: "task.started", data: { taskId: "task", startedBy: { callId: "call" }, kind: "agent", name: "agent" } },
     ],
   });
   assert.equal(children[0]?.status, "running");
@@ -66,13 +66,11 @@ test("persistent subagent completion parks at a waiting boundary and remains res
   const store = createMemoryAgentSubagentStore();
   const events = [
     {
-      type: "actions.requested",
-      data: {
-        actions: [{ callId: "call_persistent", input: { agentId: "agent-child-1", message: "Investigate" }, kind: "subagent-call" }],
-      },
+      type: "call.requested",
+      data: { callId: "call_persistent", owner: { runId: "run" }, capability: { kind: "agent", name: "agent" }, input: { agentId: "agent-child-1", message: "Investigate" } },
     },
-    { type: "subagent.called", data: { childSessionId: "ses_child_persistent", callId: "call_persistent", name: "agent" } },
-    { type: "subagent.completed", data: { childSessionId: "ses_child_persistent", callId: "call_persistent", output: "parked" } },
+    { type: "child.opened", data: { sessionId: "ses_child_persistent", owner: { callId: "call_persistent" }, name: "agent", stream: "/sessions/ses_child_persistent/stream" } },
+    { type: "call.settled", data: { callId: "call_persistent", outcome: "completed", output: "parked" } },
   ] as const;
   const runtime = {
     async inspect() { return { status: "waiting" as const }; },
@@ -293,7 +291,7 @@ test("parent cancellation closes active child projections instead of leaving the
   await store.create({ owner, parentSessionId: "parent", childSessionId: "child", status: "running" });
   const result = await syncAgentSubagentsFromEvents({
     accessToken: "token",
-    events: [{ type: "turn.cancelled", data: {} }],
+    events: [{ type: "turn.settled", data: { turnId: "parent-turn", outcome: "cancelled" } }],
     identity: owner,
     ownershipStore,
     parentSessionId: "parent",
@@ -317,7 +315,7 @@ test("normal parent completion does not terminate a detached no-wait child", asy
   });
   const result = await syncAgentSubagentsFromEvents({
     accessToken: "token",
-    events: [{ type: "session.completed", data: {} }],
+    events: [{ type: "session.ended", data: { outcome: "completed" } }],
     identity: owner,
     ownershipStore,
     parentSessionId: "parent",

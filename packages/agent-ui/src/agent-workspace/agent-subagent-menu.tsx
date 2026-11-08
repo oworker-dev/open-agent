@@ -1,6 +1,6 @@
 "use client";
 
-import type { MessageStreamEvent } from "eve/client";
+import type { SessionStreamEvent } from "eve/client";
 import { useState, type Dispatch, type SetStateAction } from "react";
 import {
   CheckCircle2Icon,
@@ -37,7 +37,7 @@ export function AgentSubagentMenu({
   onOpen,
 }: {
   readonly activeSessionId?: string;
-  readonly events: readonly MessageStreamEvent[];
+  readonly events: readonly SessionStreamEvent[];
   readonly durableSessions?: readonly AgentSubagentSummary[];
   readonly locale: AgentLocale;
   readonly onControl?: AgentSubagentController;

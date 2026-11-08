@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { MessageStreamEvent } from "eve/client";
+import { line } from "../helpers/session-events.ts";
 import {
   cancelAgentSession,
   parseSessionCursor,
@@ -27,8 +27,8 @@ test("session hydration projects a bounded absolute cursor and latest runtime st
         sessionId: "session-1",
       });
       return [
-        event("turn.started", { sequence: 5, turnId: "turn-2" }),
-        event("session.waiting", { wait: "next-user-message" }),
+        ...line(4, { type: "turn.started", data: { cause: { deliveryId: "delivery-test" }, follows: null, turnId: "turn-2" } }),
+        ...line(5, { type: "turn.settled", data: { outcome: "completed", turnId: "turn-2" } }),
       ];
     },
     async cancel() {
@@ -77,7 +77,7 @@ test("session hydration uses the authoritative runtime boundary for an empty mid
 
 test("session hydration keeps the durable page when authority is temporarily unavailable", async () => {
   const runtime: AgentSessionRuntime = {
-    async readEvents() { return [event("message.appended", { text: "still here" })]; },
+    async readEvents() { return [...line(0, { type: "content.delta", scope: { turnId: "turn-1", runId: "run-1" }, data: { partId: "text", kind: "text", delta: "still here" } })]; },
     async inspect() { throw new Error("runtime restarting"); },
     async cancel() { return "no_active_turn"; },
   };
@@ -96,7 +96,7 @@ test("session hydration does not inspect Eve for every full history page", async
   let inspected = 0;
   const runtime: AgentSessionRuntime = {
     async readEvents() {
-      return [event("message.appended", { text: "page event" }), event("message.appended", { text: "page event 2" })];
+      return [...line(0, { type: "content.delta", scope: { turnId: "turn-1", runId: "run-1" }, data: { partId: "text", kind: "text", delta: "page event" } }), ...line(1, { type: "content.delta", scope: { turnId: "turn-1", runId: "run-1" }, data: { partId: "text", delta: "page event 2" } })];
     },
     async inspect() {
       inspected += 1;
@@ -163,9 +163,6 @@ test("session cursor rejects negative and fractional values", () => {
   assert.throws(() => parseSessionCursor(1.5), /cursor is invalid/);
 });
 
-function event(type: string, data: Record<string, unknown>): MessageStreamEvent {
-  return { data, meta: { at: "2030-01-01T00:00:00.000Z", id: `${type}-1` }, type } as MessageStreamEvent;
-}
 
 function ownershipStore(result: "owned" | "missing" | "forbidden"): AgentSessionOwnershipStore {
   return {

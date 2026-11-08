@@ -1,9 +1,9 @@
-import type { MessageStreamEvent } from "eve/client";
+import type { SessionStreamEvent } from "eve/client";
 import type { AgentLocale } from "./i18n.js";
 import type { AgentSubagentController, AgentSubagentSummary } from "./contracts.js";
 export declare function AgentSubagentMenu({ activeSessionId, events, durableSessions, locale, onControl, onOpen, }: {
     readonly activeSessionId?: string;
-    readonly events: readonly MessageStreamEvent[];
+    readonly events: readonly SessionStreamEvent[];
     readonly durableSessions?: readonly AgentSubagentSummary[];
     readonly locale: AgentLocale;
     readonly onControl?: AgentSubagentController;

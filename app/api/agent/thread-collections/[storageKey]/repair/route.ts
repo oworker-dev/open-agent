@@ -1,9 +1,8 @@
 import type { AgentThread, AgentThreadCollection } from "@oworker/open-agent-ui/agent-workspace";
-import { AGENT_THREAD_STORAGE_VERSION } from "@oworker/open-agent-ui/agent-workspace";
+import { AGENT_THREAD_STORAGE_VERSION, parseThreadCollection } from "@oworker/open-agent-ui/agent-workspace";
 import { createEveAgentMailboxRuntime } from "@/server/agent-mailbox/eve-runtime";
 import { createPostgresThreadCollectionStoreFromEnvironment, type ThreadCollectionPatchRecord } from "@/server/data/thread-collection-store";
 import { authenticateHostRequest, HOST_AGENT_SCOPE, requireHostScope } from "@/server/http/host-request-auth";
-import { parseStrictThreadCollection } from "@/server/http/thread-collection-contract";
 import { rebuildSettledThreadTranscript } from "@/server/thread-transcript-repair";
 
 export const runtime = "nodejs";
@@ -39,7 +38,7 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
     { limit: 1 },
   );
   if (!record) return problem(404, "thread_not_found", "The Agent thread was not found.");
-  const parsed = parseStrictThreadCollection({
+  const parsed = parseThreadCollection({
     threads: [record.thread],
     version: AGENT_THREAD_STORAGE_VERSION,
   })?.threads[0];
@@ -49,7 +48,7 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
   // deliberately not considered complete and must not bypass this check.
   if (parsed.transcriptCoverage?.authoritative === true &&
       parsed.transcriptCoverage.complete &&
-      parsed.transcriptCoverage.projection === "logical-edits-v1" &&
+      parsed.transcriptCoverage.projection === "v27-source-lines" &&
       parsed.transcriptCoverage.endIndex >= parsed.session.streamIndex) {
     return Response.json({ revision: record.revision, thread: null }, { headers: responseHeaders(record.revision) });
   }
@@ -101,7 +100,7 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
       authoritative: true,
       complete: true,
       endIndex: rebuilt.endIndex,
-      projection: "logical-edits-v1",
+      projection: "v27-source-lines",
       startIndex: 0,
       version: 1,
     },

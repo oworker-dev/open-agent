@@ -11,10 +11,12 @@ import type {
 } from "../data/session-ownership-store.ts";
 import { enqueueAgentMailboxMessage } from "./service.ts";
 import type { AgentMailboxStore } from "../data/agent-mailbox-store.ts";
+import type { SessionAuthContext } from "eve/context";
 
 const MAX_REQUEST_BYTES = 128 * 1024;
 
 export async function enqueueAgentMailboxHttpRequest(options: {
+  readonly callerAuth?: SessionAuthContext;
   readonly owner: AgentSessionOwner;
   readonly ownershipStore?: AgentSessionOwnershipStore;
   readonly request: Request;
@@ -40,6 +42,7 @@ export async function enqueueAgentMailboxHttpRequest(options: {
   try {
     let result = await enqueueAgentMailboxMessage({
       ...parsed.value,
+      ...(options.callerAuth ? { callerAuth: options.callerAuth } : {}),
       owner: options.owner,
       store: options.store,
     });
@@ -51,6 +54,7 @@ export async function enqueueAgentMailboxHttpRequest(options: {
       if (ownership === "owned") {
         result = await enqueueAgentMailboxMessage({
           ...parsed.value,
+          ...(options.callerAuth ? { callerAuth: options.callerAuth } : {}),
           owner: options.owner,
           store: options.store,
         });
@@ -167,17 +171,17 @@ function parseEnqueueRequest(
   };
 }
 
-function parseInputResponses(value: unknown): readonly import("eve/client").InputResponse[] | undefined {
+function parseInputResponses(value: unknown): readonly import("eve/events").Answer[] | undefined {
   if (!Array.isArray(value) || value.length < 1 || value.length > 16) return undefined;
-  const responses: import("eve/client").InputResponse[] = [];
+  const responses: import("eve/events").Answer[] = [];
   for (const entry of value) {
-    if (!isRecord(entry) || !validText(entry.requestId)) return undefined;
+    if (!isRecord(entry) || !validText(entry.interactionId)) return undefined;
     const optionId = validText(entry.optionId) ? entry.optionId : undefined;
     const text = validText(entry.text) ? entry.text : undefined;
     if (!optionId && !text) return undefined;
     responses.push({
       ...(optionId ? { optionId } : {}),
-      requestId: entry.requestId,
+      interactionId: entry.interactionId,
       ...(text ? { text } : {}),
     });
   }

@@ -9,7 +9,11 @@ if (!configured) {
 }
 
 const expected = normalizedOrigins(configured);
-const manifestPath = resolve(".next/routes-manifest.json");
+const distDir = process.env.OPEN_AGENT_NEXT_DIST_DIR?.trim() || ".next";
+if (!/^\.next(?:-[A-Za-z0-9][A-Za-z0-9._-]*)?$/u.test(distDir)) {
+  throw new Error("OPEN_AGENT_NEXT_DIST_DIR must be .next or a dedicated .next-* directory.");
+}
+const manifestPath = resolve(distDir, "routes-manifest.json");
 const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
 const embedRule = manifest.headers?.find((rule) => rule.source === "/embed");
 const csp = embedRule?.headers?.find(

@@ -8,6 +8,8 @@ import type {
 } from "@oworker/open-agent-contracts/agent-run";
 
 export type RunPolicyState = {
+  readonly activeSinceMs?: number;
+  readonly elapsedActiveMs?: number;
   readonly inputTokens: number;
   readonly modelCalls: number;
   readonly outputTokens: number;
@@ -43,6 +45,7 @@ const LIMIT_MAXIMUMS: Readonly<Record<keyof AgentRunLimits, number>> = {
 export const runPolicyState = defineState<RunPolicyState>(
   "open-agent.run-policy.v1",
   () => ({
+    elapsedActiveMs: 0,
     inputTokens: 0,
     modelCalls: 0,
     outputTokens: 0,
@@ -203,13 +206,36 @@ export function initializeRunPolicy(now = Date.now()): void {
   }));
 }
 
+/** Track execution segments; human waits and idle conversations spend no time. */
+export function updateRunPolicyClock(
+  state: RunPolicyState,
+  active: boolean,
+  now: number,
+): RunPolicyState {
+  // Old checkpoints recorded only session wall time. Start the new clock at
+  // the next observed boundary, retaining every token/call/turn counter.
+  const elapsed = state.elapsedActiveMs ?? 0;
+  if (active) return state.activeSinceMs !== undefined ? state : {
+    ...state, elapsedActiveMs: elapsed, activeSinceMs: now,
+  };
+  return {
+    ...state,
+    elapsedActiveMs: elapsed + (state.activeSinceMs === undefined ? 0 : Math.max(0, now - state.activeSinceMs)),
+    activeSinceMs: undefined,
+  };
+}
+
+export function recordRunPolicyActivity(active: boolean, now = Date.now()): void {
+  runPolicyState.update((state) => updateRunPolicyClock(state, active, now));
+}
+
 export function recordRunPolicyBoundary(
   policy: AgentRunPolicy,
   boundary: "model" | "tool" | "turn",
   increment = 1,
   now = Date.now(),
 ): void {
-  const current = runPolicyState.get();
+  const current = updateRunPolicyClock(runPolicyState.get(), true, now);
   const next = {
     ...current,
     modelCalls: current.modelCalls + (boundary === "model" ? increment : 0),
@@ -249,7 +275,9 @@ export function enforceAgentRunPolicy(
     [limits.maxOutputTokens, state.outputTokens, "maxOutputTokens"],
     [
       limits.maxDurationMs,
-      state.startedAtMs > 0 ? Math.max(0, now - state.startedAtMs) : 0,
+      state.elapsedActiveMs !== undefined
+        ? state.elapsedActiveMs + (state.activeSinceMs === undefined ? 0 : Math.max(0, now - state.activeSinceMs))
+        : state.startedAtMs > 0 ? Math.max(0, now - state.startedAtMs) : 0,
       "maxDurationMs",
     ],
   ];

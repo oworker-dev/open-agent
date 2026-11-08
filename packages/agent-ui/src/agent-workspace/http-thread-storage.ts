@@ -333,20 +333,12 @@ function baselineAfterPatch(
       .map((thread) => {
         const prior = previousThreads.get(thread.id);
         if (!prior) return thread;
-        if (isExplicitTranscriptReplacement(thread)) return thread;
         const append = appends.get(thread.id);
         if (!append || append.events.length === 0) {
           return { ...thread, events: [...prior.events] };
         }
         if (append.replaceFrom === undefined) {
-          const seen = new Set(prior.events.map(eventIdentity));
-          const merged = [...prior.events];
-          for (const event of append.events) {
-            if (seen.has(eventIdentity(event))) continue;
-            seen.add(eventIdentity(event));
-            merged.push(event);
-          }
-          return { ...thread, events: merged };
+          return { ...thread, events: mergeThreadEventSnapshots(prior.events, append.events) };
         }
         // A replacement checkpoint carried the complete local transcript (or
         // a bounded window with an absolute cursor). The browser snapshot is
@@ -387,49 +379,14 @@ function createCollectionPatch(
   const upsertThreads = collection.threads.flatMap((thread) => {
     const previous = previousThreads.get(thread.id);
     if (!previous) return [withoutTranscriptWindow(thread)];
-    const delta = appendOnlyEventDelta(previous.events, thread.events);
-    if (delta) {
-      if (delta.events.length > 0) eventAppends.push({
-        events: delta.events,
-        // A bounded transcript starts at an absolute event-log offset. The
-        // local array index is only suitable for the in-memory diff; translate
-        // replacement checkpoints back to the server's absolute index so a
-        // cumulative tool-input update cannot overwrite older turns.
-        ...(delta.replaceFrom === previous.events.length ? {} : {
-          replaceFrom: (previous.transcriptWindow?.startIndex ?? 0) + delta.replaceFrom,
-        }),
-        threadId: thread.id,
-      });
-      return [withoutTranscriptWindow({ ...thread, events: [], hydration: "summary" as const })];
-    }
-    if (sameEventIds(previous.events, thread.events)) {
-      return [withoutTranscriptWindow({ ...thread, events: [], hydration: "summary" as const })];
-    }
-    // A reconnect/remount can temporarily expose a shorter in-memory snapshot
-    // than the server's append-only transcript. Never let that stale view
-    // replace durable history. Only the explicit edit/resubmit transaction is
-    // allowed to truncate the event log.
-    if (!isExplicitTranscriptReplacement(thread)) {
-      // A reconnect can expose a snapshot whose ordering/length no longer
-      // matches the last local baseline. Do not silently turn that change into
-      // a metadata-only checkpoint: retain every event identity that is new to
-      // the baseline and append it in stream order. Existing durable events
-      // remain untouched, so this path is lossless even when the snapshot is
-      // only a partial tail.
-      // A reconnect snapshot can contain the same events in a different order
-      // (for example a live page interleaved with a bounded recovery page).
-      // Derive the append set from the canonical merge instead of the raw
-      // array so the server's append-only event log never receives a reordered
-      // suffix.
-      const merged = mergeThreadEventSnapshots(previous.events, thread.events);
-      const previousIds = new Set(previous.events.map(eventIdentity));
-      const unseen = merged.filter((event) => !previousIds.has(eventIdentity(event)));
-      if (unseen.length > 0) {
-        eventAppends.push({ events: unseen, threadId: thread.id });
-      }
-      return [withoutTranscriptWindow({ ...thread, events: [], hydration: "summary" as const })];
-    }
-    return [withoutTranscriptWindow(thread)];
+    // v27 facts are immutable. Checkpoint only unseen source positions;
+    // reconnects and edits preserve the complete audit log. The store places
+    // late recovery facts in source order inside its collection transaction.
+    const previousIds = new Set(previous.events.map(eventIdentity));
+    const unseen = mergeThreadEventSnapshots(previous.events, thread.events)
+      .filter((event) => !previousIds.has(eventIdentity(event)));
+    if (unseen.length > 0) eventAppends.push({ events: unseen, threadId: thread.id });
+    return [withoutTranscriptWindow({ ...thread, events: [], hydration: "summary" as const })];
   });
   return {
     activeThreadId: collection.activeThreadId ?? null,
@@ -446,48 +403,6 @@ function createCollectionPatch(
 function withoutTranscriptWindow(thread: AgentThread): AgentThread {
   const { transcriptWindow: _derivedWindow, ...persisted } = thread;
   return persisted;
-}
-
-function isExplicitTranscriptReplacement(thread: AgentThread): boolean {
-  const pending = thread.pendingTurn;
-  if (!pending) return false;
-  // Only legacy browser clear/resubmit snapshots may carry a shortened event
-  // array. Server-owned edits keep Eve's append-only audit stream intact.
-  return pending.state === "clearing" ||
-    pending.state === "resubmitting";
-}
-
-function appendOnlyEventDelta(
-  previous: AgentThreadCollection["threads"][number]["events"],
-  next: AgentThreadCollection["threads"][number]["events"],
-): { readonly events: AgentThreadCollection["threads"][number]["events"]; readonly replaceFrom: number } | undefined {
-  if (next.length < previous.length) return undefined;
-  let firstDifference = -1;
-  for (let index = 0; index < previous.length; index += 1) {
-    if (eventIdentity(previous[index]!) !== eventIdentity(next[index]!)) {
-      firstDifference = index;
-      break;
-    }
-  }
-  if (firstDifference < 0) firstDifference = previous.length;
-  // A normal checkpoint may replace one cumulative snapshot in place, but it
-  // must leave every later event at the same position. If the suffix shifted,
-  // this is a reordered/recovered snapshot rather than an append delta; let
-  // the conflict path or authoritative repair handle it instead of replacing
-  // durable history with an ambiguous array.
-  for (let index = firstDifference + 1; index < previous.length; index += 1) {
-    if (eventIdentity(previous[index]!) !== eventIdentity(next[index]!)) return undefined;
-  }
-  return { events: next.slice(firstDifference), replaceFrom: firstDifference };
-}
-
-function sameEventIds(
-  left: AgentThread["events"],
-  right: AgentThread["events"],
-): boolean {
-  return left.length === right.length && left.every((event, index) =>
-    right[index] !== undefined && eventIdentity(event) === eventIdentity(right[index]),
-  );
 }
 
 async function request<T = never>(

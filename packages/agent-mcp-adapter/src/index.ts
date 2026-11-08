@@ -1,5 +1,5 @@
 import { ConnectionAuthorizationFailedError, defineMcpClientConnection } from "eve/connections";
-import type { SessionContext } from "eve/tools";
+import type { SessionContext } from "eve/context";
 import { z } from "zod";
 
 const MAX_RESPONSE_BYTES = 16 * 1024;

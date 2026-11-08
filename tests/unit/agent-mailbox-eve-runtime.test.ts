@@ -8,15 +8,6 @@ const environment = {
   AGENT_RUNTIME_URL: "https://runtime.test",
 };
 
-test("edit admission expiry requires an explicit runtime capability", async () => {
-  for (const capability of [undefined, false, "true", true]) {
-    const runtime = createEveAgentMailboxRuntime(environment, async () =>
-      Response.json({ ok: true, state: "waiting", editAdmissionGuard: capability }));
-    const result = await runtime.inspect({ owner: owner(), sessionId: "session-1" });
-    assert.equal(result.editAdmissionGuard, capability === true ? true : undefined);
-  }
-});
-
 test("Eve mailbox runtime reads waiting boundaries and admits messages", async () => {
   const requests: unknown[] = [];
   const runtime = createEveAgentMailboxRuntime(environment, async (_input, init) => {
@@ -131,7 +122,7 @@ test("Eve mailbox runtime forwards structured input responses without synthesizi
     itemId: "mail-response-1",
     owner: owner(),
     payload: {
-      inputResponses: [{ optionId: "approve", requestId: "request-approval-1" }],
+      inputResponses: [{ optionId: "approve", interactionId: "request-approval-1" }],
       operation: { kind: "respond", operationId: "response-request-1" },
     },
     sessionId: "session-1",
@@ -140,7 +131,7 @@ test("Eve mailbox runtime forwards structured input responses without synthesizi
   assert.deepEqual(requestBody, {
     action: "deliver",
     clientMessageId: "response-request-1",
-    inputResponses: [{ optionId: "approve", requestId: "request-approval-1" }],
+    inputResponses: [{ optionId: "approve", interactionId: "request-approval-1" }],
     itemId: "mail-response-1",
     operationId: "response-request-1",
     operationKind: "respond",

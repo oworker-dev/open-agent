@@ -6,6 +6,7 @@ const workflowInputId = process.env.MOCK_MUSES_WORKFLOW_INPUT_ID || "prompt";
 let responseSequence = 0;
 let requestCount = 0;
 const scenarioAttempts = new Map();
+const cancellations = [];
 
 const server = http.createServer(async (request, response) => {
   if (request.method === "GET" && request.url === "/v1/models") {
@@ -18,6 +19,7 @@ const server = http.createServer(async (request, response) => {
     return sendJson(response, {
       requestCount,
       scenarioAttempts: Object.fromEntries(scenarioAttempts),
+      cancellations,
     });
   }
   if (request.method !== "POST" || request.url !== "/v1/responses") {
@@ -27,6 +29,27 @@ const server = http.createServer(async (request, response) => {
 
   requestCount += 1;
   const body = await readJson(request);
+  const userInput = (body.input ?? []).filter((item) => item.role === "user").at(-1);
+  const cancellation = JSON.stringify(userInput ?? "").match(/CANCELLATION_(WAIT_HEADERS|STREAM|COMMAND|CONTINUE)/u)?.[0];
+  if (cancellation) {
+    const record = { scenario: cancellation, startedAt: Date.now(), input: body.input };
+    cancellations.push(record);
+    response.once("close", () => { record.closedAt = Date.now(); });
+    if (cancellation === "CANCELLATION_WAIT_HEADERS") {
+      await waitForCloseOrDelay(response, 60_000);
+      if (!response.destroyed) sendStream(response, { kind: "text", text: "CANCELLATION_TOO_LATE" });
+      return;
+    }
+    if (cancellation === "CANCELLATION_STREAM") {
+      return sendStream(response, { kind: "text", text: "CANCELLATION_STREAM_STARTED", hold: true });
+    }
+    if (cancellation === "CANCELLATION_COMMAND" && !(body.input ?? []).some((item) => item.type === "function_call_output")) {
+      return sendStream(response, toolCall("bash", {
+        command: "printf ready > /workspace/cancellation-ready; sleep 60; printf late > /workspace/cancellation-late",
+      }));
+    }
+    return sendStream(response, { kind: "text", text: "CANCELLATION_CONTINUED" });
+  }
   if (injectFailure(response, body)) return;
   const planned = await planResponse(body);
   if (body.stream === true) return sendStream(response, planned);
@@ -376,7 +399,7 @@ function deepFind(value, predicate) {
   return undefined;
 }
 
-function sendStream(response, planned) {
+async function sendStream(response, planned) {
   response.writeHead(200, {
     "content-type": "text/event-stream",
     "cache-control": "no-cache",
@@ -427,6 +450,10 @@ function sendStream(response, planned) {
       content_index: 0,
       delta: planned.text,
     });
+    if (planned.hold) {
+      await waitForCloseOrDelay(response, 60_000);
+      if (response.destroyed) return;
+    }
     emit(response, "response.output_text.done", {
       type: "response.output_text.done",
       item_id: itemId,
@@ -445,6 +472,15 @@ function sendStream(response, planned) {
     response: responseResult(planned, id, createdAt),
   });
   response.end();
+}
+
+function waitForCloseOrDelay(response, delayMs) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(done, delayMs);
+    function done() { clearTimeout(timer); response.removeListener("close", done); resolve(); }
+    response.once("close", done);
+    if (response.destroyed) done();
+  });
 }
 
 function responseResult(planned, id = `resp_mock_${++responseSequence}`, createdAt = Math.floor(Date.now() / 1000)) {

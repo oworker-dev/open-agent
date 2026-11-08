@@ -1,6 +1,6 @@
 import { AssetStoreError, createAssetStoreFromEnvironment } from "@/server/data/asset-store";
 import { authResponseHeaders, authenticateAssetRequest, requireAssetScope } from "@/server/http/asset-request-auth";
-import { problem, storeProblem } from "../route";
+import { problem, storeProblem } from "@/server/http/asset-upload-response";
 
 export const runtime = "nodejs";
 type RouteContext = { readonly params: Promise<{ readonly uploadId: string }> };

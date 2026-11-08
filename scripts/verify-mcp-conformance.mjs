@@ -18,6 +18,7 @@ assert.equal(
 );
 
 const root = resolve(import.meta.dirname, "..");
+const eveVersion = JSON.parse(await readFile(resolve(root, "node_modules/eve/package.json"), "utf8")).version;
 const tempRoot = await mkdtemp(join(root, "examples/.mcp-conformance-"));
 const agentRoot = join(tempRoot, "agent");
 const serviceToken = "mcp-broker-service-token-never-exported";
@@ -112,35 +113,35 @@ try {
       "x-fixture-agent-run-policy": JSON.stringify({ mcpConnections: [adapter] }),
       "x-fixture-tenant-id": tenantId,
     },
-    host: eveUrl,
+    baseUrl: eveUrl,
   });
 
-  const { session, response: readResponse } = await client.sessions.create({
+  const { session, delivery: readDelivery } = await client.sessions.create({
     message: "EVAL_MCP_READ",
   });
-  const readTurn = await readResponse.result();
-  assert.equal(readTurn.message, "MCP_READ_COMPLETED");
+  const readTurn = await consumeDelivery(readDelivery);
+  assert.equal(readTurn.reply, "MCP_READ_COMPLETED");
   assert.equal(effects.read, 1);
   assert.equal(effects.hiddenDelete, 0);
   assert.ok(requests.mcp.some((request) => request.authorization === `Bearer ${credential}`));
 
-  const writePending = await (await session.send("EVAL_MCP_WRITE")).result();
-  assert.equal(writePending.status, "waiting");
+  const writePending = await consumeDelivery(await session.send("EVAL_MCP_WRITE"));
+  assert.equal(writePending.status, "awaiting-input");
   const approvalRequest = findApprovalRequest(writePending);
   assert.ok(approvalRequest, "write MCP tool did not park for durable approval");
   assert.equal(effects.write, 0);
-  const writeComplete = await (await session.respond([
-    { optionId: "approve", requestId: approvalRequest.requestId },
-  ])).result();
-  assert.equal(writeComplete.message, "MCP_WRITE_COMPLETED");
+  const writeComplete = await consumeDelivery(await session.respond([
+    { optionId: "approve", interactionId: approvalRequest.interactionId },
+  ]));
+  assert.equal(writeComplete.reply, "MCP_WRITE_COMPLETED");
   assert.equal(effects.write, 1);
 
   installation = "revoked";
   const brokerRequestsBeforeRevocation = requests.broker.length;
   const mcpRequestsBeforeRevocation = requests.mcp.length;
-  const revokedTurn = await (await session.send("EVAL_MCP_READ")).result();
-  assert.notEqual(revokedTurn.message, "MCP_READ_COMPLETED");
-  assert.notEqual(revokedTurn.message, "MCP_CREDENTIAL_LEAK_DETECTED");
+  const revokedTurn = await consumeDelivery(await session.send("EVAL_MCP_READ"));
+  assert.notEqual(revokedTurn.reply, "MCP_READ_COMPLETED");
+  assert.notEqual(revokedTurn.reply, "MCP_CREDENTIAL_LEAK_DETECTED");
   assert.ok(requests.broker.length > brokerRequestsBeforeRevocation);
   assert.equal(requests.mcp.length, mcpRequestsBeforeRevocation);
 
@@ -154,14 +155,14 @@ try {
       "x-fixture-agent-run-policy": JSON.stringify({ mcpConnections: [] }),
       "x-fixture-tenant-id": tenantId,
     },
-    host: eveUrl,
+    baseUrl: eveUrl,
   });
   const brokerRequestsBeforeDeniedPolicy = requests.broker.length;
-  const { response: deniedPolicyResponse } = await deniedPolicyClient.sessions.create({
+  const { delivery: deniedPolicyDelivery } = await deniedPolicyClient.sessions.create({
     message: "EVAL_MCP_READ",
   });
-  const deniedPolicyTurn = await deniedPolicyResponse.result();
-  assert.notEqual(deniedPolicyTurn.message, "MCP_READ_COMPLETED");
+  const deniedPolicyTurn = await consumeDelivery(deniedPolicyDelivery);
+  assert.notEqual(deniedPolicyTurn.reply, "MCP_READ_COMPLETED");
   assert.equal(requests.broker.length, brokerRequestsBeforeDeniedPolicy);
 
   const crossTenantClient = new Client({
@@ -173,14 +174,14 @@ try {
       "x-fixture-agent-run-policy": JSON.stringify({ mcpConnections: [adapter] }),
       "x-fixture-tenant-id": "tenant-mcp-conformance-other",
     },
-    host: eveUrl,
+    baseUrl: eveUrl,
   });
   const brokerRequestsBeforeCrossTenant = requests.broker.length;
   const crossTenantSession = crossTenantClient.sessions.attach(session.state.sessionId, {
     streamIndex: session.state.streamIndex,
   });
-  const crossTenantTurn = await (await crossTenantSession.send("EVAL_MCP_READ")).result();
-  assert.notEqual(crossTenantTurn.message, "MCP_READ_COMPLETED");
+  const crossTenantTurn = await consumeDelivery(await crossTenantSession.send("EVAL_MCP_READ"));
+  assert.notEqual(crossTenantTurn.reply, "MCP_READ_COMPLETED");
   assert.equal(requests.broker.length, brokerRequestsBeforeCrossTenant);
   assert.equal(effects.hiddenDelete, 0);
 
@@ -193,12 +194,12 @@ try {
 
   const serializedEvidence = JSON.stringify({
     brokerRequests: requests.broker.length,
-    crossTenant: crossTenantTurn.message,
-    deniedPolicy: deniedPolicyTurn.message,
+    crossTenant: crossTenantTurn.reply,
+    deniedPolicy: deniedPolicyTurn.reply,
     mcpRequests: requests.mcp.length,
-    read: readTurn.message,
-    revoked: revokedTurn.message,
-    write: writeComplete.message,
+    read: readTurn.reply,
+    revoked: revokedTurn.reply,
+    write: writeComplete.reply,
   });
   assert.doesNotMatch(serializedEvidence, new RegExp(escapeRegExp(credential)));
   assert.doesNotMatch(serializedEvidence, new RegExp(escapeRegExp(serviceToken)));
@@ -257,7 +258,7 @@ async function scaffoldFixtureAgent({ agentRoot, brokerPort, mcpPort }) {
     type: "module",
     dependencies: {
       "@oworker/open-agent-mcp-adapter": "0.1.0-alpha.9",
-      eve: "0.56.0",
+      eve: eveVersion,
     },
   }, null, 2));
   await writeFile(join(tempRoot, "tsconfig.json"), JSON.stringify({
@@ -349,27 +350,32 @@ async function runNode(args, options) {
 }
 
 function findApprovalRequest(result) {
-  for (const request of result.inputRequests ?? []) {
-    if (isApprovalRequest(request)) return request;
-  }
-  for (const event of result.events) {
-    if (event.type !== "input.requested") continue;
-    const requests = event.data?.requests;
-    if (!Array.isArray(requests)) continue;
-    const request = requests.find(isApprovalRequest);
-    if (request) return request;
-  }
+  return result.interactions.find(isApprovalInteraction);
 }
 
-function isApprovalRequest(candidate) {
+function isApprovalInteraction(candidate) {
   return Boolean(
     candidate &&
-    typeof candidate.requestId === "string" &&
-    candidate.action?.kind === "tool-call" &&
-    Array.isArray(candidate.options) &&
-    candidate.options.some((option) => option?.id === "approve") &&
-    candidate.options.some((option) => option?.id === "deny" || option?.id === "cancel"),
+    typeof candidate.interactionId === "string" &&
+    candidate.request?.kind === "approval" &&
+    Array.isArray(candidate.request.options) &&
+    candidate.request.options.some((option) => option?.id === "approve") &&
+    candidate.request.options.some((option) => option?.id === "deny"),
   );
+}
+
+async function consumeDelivery(delivery) {
+  const [events, result] = await Promise.all([
+    collect(delivery.stream()),
+    delivery.result(),
+  ]);
+  return { ...result, events };
+}
+
+async function collect(stream) {
+  const events = [];
+  for await (const event of stream) events.push(event);
+  return events;
 }
 
 async function readBody(request) {

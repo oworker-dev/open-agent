@@ -7,7 +7,7 @@ import {
   createBrokeredMcpConnection,
   resolveBrokeredCredential,
 } from "@oworker/open-agent-mcp-adapter";
-import type { SessionContext } from "eve/tools";
+import type { SessionContext } from "eve/context";
 
 const adapter = { id: "records", version: "1.0.0" } as const;
 

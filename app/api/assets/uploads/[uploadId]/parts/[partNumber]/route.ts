@@ -1,6 +1,6 @@
 import { AssetStoreError, MAX_ASSET_PART_BYTES, createAssetStoreFromEnvironment } from "@/server/data/asset-store";
 import { authResponseHeaders, authenticateAssetRequest, requireAssetScope } from "@/server/http/asset-request-auth";
-import { problem, readBoundedRequestBody, storeProblem } from "../../../route";
+import { problem, readBoundedRequestBody, storeProblem } from "@/server/http/asset-upload-response";
 import { z } from "zod";
 
 export const runtime = "nodejs";

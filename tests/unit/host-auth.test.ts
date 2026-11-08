@@ -107,6 +107,12 @@ test("requires the declared endpoint scope after Host JWT authentication", async
     ok: true as const,
     runtimeConfig: (await import("../../lib/agent-runtime-config.ts")).DEFAULT_AGENT_RUNTIME_CONFIG,
     scopes: new Set<string>(),
+    sessionAuth: {
+      attributes: { tenantId: "tenant-1" },
+      authenticator: "host-jwt",
+      principalId: "issuer:user-1",
+      principalType: "user",
+    },
   };
   const denied = requireHostScope(authenticated, "agent:runs");
   assert.equal(denied.ok, false);

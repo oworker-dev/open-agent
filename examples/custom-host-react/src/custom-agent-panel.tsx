@@ -10,6 +10,8 @@ import type {
   AgentSessionInputRequest,
 } from "@oworker/open-agent-contracts/agent-session";
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { conversationOf, type SessionStreamEvent } from "eve/client";
+import { activeTurn, idle, openInteractions } from "eve/events";
 
 export type CustomAgentPanelProps = {
   readonly baseUrl: string;
@@ -49,7 +51,10 @@ export function CustomAgentPanel({
   const resumeStarted = useRef(false);
 
   const appendEvent = useCallback((event: AgentSessionEvent) => {
-    setEvents((current) => [...current, event]);
+    setEvents((current) => {
+      if (current.some((item) => item.position.line === event.position.line && item.position.index === event.position.index)) return current;
+      return [...current, event].sort((a, b) => a.position.line - b.position.line || a.position.index - b.position.index);
+    });
   }, []);
 
   const consume = useCallback(async (stream: AsyncIterable<AgentSessionEvent>) => {
@@ -93,15 +98,15 @@ export function CustomAgentPanel({
 
   const approve = async (request: AgentSessionInputRequest, optionId: string) => {
     if (isBusy) return;
-    setRespondedRequestIds((current) => new Set(current).add(request.requestId));
+    setRespondedRequestIds((current) => new Set(current).add(request.interactionId));
     setIsBusy(true);
     try {
       const turn = await session.send({
-        inputResponses: [{ optionId, requestId: request.requestId }],
+        inputResponses: [{ optionId, interactionId: request.interactionId }],
       });
       await consume(turn);
     } catch (cause) {
-      setRespondedRequestIds((current) => withoutValue(current, request.requestId));
+      setRespondedRequestIds((current) => withoutValue(current, request.interactionId));
       setError(cause instanceof Error ? cause.message : "The approval response failed.");
       setIsBusy(false);
     }
@@ -116,7 +121,7 @@ export function CustomAgentPanel({
   };
 
   const pendingRequests = latestInputRequests(events).filter(
-    (request) => !respondedRequestIds.has(request.requestId),
+    (request) => !respondedRequestIds.has(request.interactionId),
   );
   return (
     <section className="custom-agent" aria-label={title}>
@@ -128,7 +133,7 @@ export function CustomAgentPanel({
       <div className="custom-agent__events" aria-live="polite">
         {events.length === 0 ? <p>Start a task with the independent Agent service.</p> : null}
         {events.map((event) => (
-          <article className="custom-agent__event" key={`${event.cursor}:${event.type}`}>
+          <article className="custom-agent__event" key={`${event.position.line}:${event.position.index}`}>
             <small>{event.type}</small>
             <p>{eventText(event)}</p>
           </article>
@@ -136,10 +141,10 @@ export function CustomAgentPanel({
       </div>
 
       {pendingRequests.map((request) => (
-        <aside className="custom-agent__approval" key={request.requestId}>
-          <p>{request.prompt}</p>
+        <aside className="custom-agent__approval" key={request.interactionId}>
+          <p>{request.request.prompt}</p>
           <div>
-            {request.options?.map((option) => (
+            {request.request.options?.map((option) => (
               <button disabled={isBusy} key={option.id} onClick={() => void approve(request, option.id)} type="button">
                 {option.label}
               </button>
@@ -170,43 +175,28 @@ export function CustomAgentPanel({
 
 function needsResume(session: PersistedSession): boolean {
   if (!session.cursor?.sessionId || session.events.length === 0) return false;
-  const last = session.events.at(-1)?.type;
-  return last !== "session.waiting" && last !== "session.completed" && last !== "session.failed";
+  return !idle(sessionView(session.events));
 }
 
 function latestTurnId(events: readonly AgentSessionEvent[]): string | undefined {
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index];
-    const data = asRecord(event?.data);
-    if (event?.type === "turn.started" && typeof data?.turnId === "string") return data.turnId;
-  }
-  return undefined;
+  return activeTurn(sessionView(events))?.turnId;
 }
 
 function latestInputRequests(events: readonly AgentSessionEvent[]): readonly AgentSessionInputRequest[] {
-  const latest = [...events].reverse().find((event) => event.type === "input.requested");
-  const requests = asRecord(latest?.data)?.requests;
-  if (!Array.isArray(requests)) return [];
-  return requests.filter(isInputRequest);
+  return openInteractions(sessionView(events));
 }
 
-function isInputRequest(value: unknown): value is AgentSessionInputRequest {
-  const request = asRecord(value);
-  const action = asRecord(request?.action);
-  return typeof request?.requestId === "string" &&
-    typeof request.prompt === "string" &&
-    action?.kind === "tool-call" &&
-    typeof action.callId === "string" &&
-    typeof action.toolName === "string";
+function sessionView(events: readonly AgentSessionEvent[]) {
+  // The Eve session adapter preserves the native data, scope and reader meta.
+  return conversationOf(events as unknown as readonly SessionStreamEvent[]).view;
 }
 
 function eventText(event: AgentSessionEvent): string {
   const data = asRecord(event.data);
-  if (typeof data?.messageDelta === "string") return data.messageDelta;
-  if (typeof data?.message === "string") return data.message;
-  if (typeof data?.reasoningDelta === "string") return data.reasoningDelta;
-  if (typeof data?.message === "string") return data.message;
-  if (typeof data?.toolName === "string") return data.toolName;
+  if (typeof data?.delta === "string") return data.delta;
+  if (typeof data?.value === "string") return data.value;
+  const capability = asRecord(data?.capability);
+  if (typeof capability?.name === "string") return capability.name;
   return event.type.replaceAll(".", " ");
 }
 

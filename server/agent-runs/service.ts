@@ -1,4 +1,5 @@
-import { ClientError } from "eve/client";
+import { eveEventsCursor } from "../../lib/eve-stream.ts";
+import { ClientError, type SessionStreamEvent } from "eve/client";
 import {
   AGENT_RUN_CONTRACT_VERSION,
   type AgentEvent,
@@ -380,10 +381,10 @@ export async function readAgentRunEvents(options: {
   // page size and absolute cursor contract. A caller reading older history
   // still takes the dedicated read path below.
   if (options.after === record.eventCount) {
-    const events = synchronized.events.slice(0, AGENT_EVENT_PAGE_SIZE);
+    const events = synchronized.events;
     return {
       events,
-      nextCursor: options.after + events.length,
+      nextCursor: events.at(-1)?.cursor ?? options.after,
       record: synchronized.record,
     };
   }
@@ -397,7 +398,7 @@ export async function readAgentRunEvents(options: {
   );
   return {
     events: projectAgentEvents(record.runId, events, options.after),
-    nextCursor: options.after + events.length,
+    nextCursor: eveEventsCursor(events, options.after),
     record: synchronized.record,
   };
 }
@@ -531,7 +532,7 @@ export async function respondAgentRun(options: {
   // while the database projection is still several bounded pages behind.
   // Catch up deterministically before deciding whether the run is parked.
   const syncPageSize = synchronizationPageSize(runtime);
-  for (let page = 1; page < 50 && synchronized.events.length === syncPageSize; page += 1) {
+  for (let page = 1; page < 50 && synchronized.events.length >= syncPageSize; page += 1) {
     if (synchronized.record.status === "waiting-input" || isTerminal(synchronized.record.status)) break;
     synchronized = await synchronizeAgentRun(
       options.store,
@@ -784,25 +785,19 @@ function isTerminal(status: AgentRunRecord["status"]): boolean {
 }
 
 function latestPendingInputRequestIds(
-  events: readonly { readonly type: string; readonly data?: unknown }[],
+  events: readonly SessionStreamEvent[],
 ): ReadonlySet<string> {
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index];
-    if (!event) continue;
-    if (event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled") {
-      return new Set();
+  const pending = new Set<string>();
+  for (const event of events) {
+    if (event.type === "turn.started" || event.type === "turn.settled" || event.type === "session.ended") pending.clear();
+    if (event.type === "interaction.opened" && event.data.request.kind !== "sign-in") pending.add(event.data.interactionId);
+    if (event.type === "interaction.settled") pending.delete(event.data.interactionId);
+    // A bounded tail may begin after the question was opened. The pause's
+    // explicit waiting set remains authoritative in that case.
+    if (event.type === "turn.paused") {
+      pending.clear();
+      for (const item of event.data.awaiting) if ("interactionId" in item) pending.add(item.interactionId);
     }
-    if (event.type !== "input.requested" || !isRecord(event.data) || !Array.isArray(event.data.requests)) {
-      continue;
-    }
-    return new Set(
-      event.data.requests.flatMap((request) =>
-        isRecord(request) && typeof request.requestId === "string" ? [request.requestId] : []),
-    );
   }
-  return new Set();
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  return pending;
 }

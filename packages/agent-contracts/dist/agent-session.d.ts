@@ -18,7 +18,10 @@ export type AgentSessionOperation = {
 /** Serializable position used to resume one durable interactive conversation. */
 export type AgentSessionCursor = {
     readonly sessionId?: string;
-    readonly eventCursor: number;
+    /** Exclusive durable source-line cursor, as Eve v27 defines it. */
+    readonly streamIndex: number;
+    /** Opaque Eve delivery routing hint; preserve it when restoring a session. */
+    readonly inbox?: string;
 };
 export type AgentSessionTextPart = {
     readonly type: "text";
@@ -32,7 +35,7 @@ export type AgentSessionFilePart = {
 };
 export type AgentSessionUserContent = readonly (AgentSessionTextPart | AgentSessionFilePart)[];
 export type AgentSessionInputResponse = {
-    readonly requestId: string;
+    readonly interactionId: string;
     readonly optionId?: string;
     readonly text?: string;
 };
@@ -43,17 +46,22 @@ export type AgentSessionInputOption = {
     readonly style?: "danger" | "default" | "primary";
 };
 export type AgentSessionInputRequest = {
-    readonly requestId: string;
-    readonly prompt: string;
-    readonly allowFreeform?: boolean;
-    readonly display?: "confirmation" | "select" | "text";
-    readonly options?: readonly AgentSessionInputOption[];
-    readonly action: {
-        readonly callId: string;
-        readonly input: Readonly<Record<string, JsonValue>>;
-        readonly kind: "tool-call";
-        readonly toolName: string;
+    readonly interactionId: string;
+    readonly turnId: string;
+    readonly request: {
+        readonly kind: string;
+        readonly prompt: string;
+        readonly allowFreeform?: boolean;
+        readonly display?: string;
+        readonly options?: readonly AgentSessionInputOption[];
     };
+    readonly call?: {
+        readonly callId: string;
+        readonly name: string;
+        readonly input?: JsonValue;
+    };
+    readonly status: "open" | "settled";
+    readonly outcome?: string;
 };
 export type AgentSessionSendPayload = {
     readonly clientContext?: string | readonly string[] | Readonly<Record<string, JsonValue>>;
@@ -63,10 +71,20 @@ export type AgentSessionSendPayload = {
 };
 export type AgentSessionEvent = {
     readonly contractVersion: typeof AGENT_SESSION_CONTRACT_VERSION;
-    /** Number of durable events consumed after this event. */
+    /** Exclusive source-line cursor after this event's complete line. */
     readonly cursor: number;
     readonly data?: JsonValue;
     readonly meta?: JsonValue;
+    readonly position: {
+        readonly line: number;
+        readonly index: number;
+    };
+    readonly scope?: {
+        readonly turnId?: string;
+        readonly runId?: string;
+        readonly taskId?: string;
+        readonly changeId?: string;
+    };
     readonly type: string;
 };
 /** A bounded server-authoritative history page used after a refresh/reconnect. */
@@ -119,7 +137,7 @@ export type AgentSessionTurnResult<TOutput = unknown> = {
     readonly inputRequests: readonly AgentSessionInputRequest[];
     readonly message: string | undefined;
     readonly sessionId: string;
-    readonly status: "completed" | "failed" | "waiting";
+    readonly status: "completed" | "failed" | "waiting" | "cancelled";
 };
 export type AgentSessionCancellation = {
     readonly sessionId: string;

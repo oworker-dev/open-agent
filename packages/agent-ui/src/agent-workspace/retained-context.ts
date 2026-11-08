@@ -1,4 +1,4 @@
-import type { MessageStreamEvent } from "eve/client";
+import { conversationOf, type EveMessage, type SessionStreamEvent } from "eve/client";
 import {
   AGENT_APPROXIMATE_BYTES_PER_TOKEN,
   AGENT_CLIENT_CONTEXT_MAX_ENTRIES,
@@ -36,12 +36,12 @@ export function recoveryContextTokenBudget(modelContextWindowTokens: number): nu
 }
 
 export function interruptedTurnContextsFromEvents(
-  events: readonly MessageStreamEvent[],
+  events: readonly SessionStreamEvent[],
   priorContext: readonly string[] | undefined,
   modelContextWindowTokens: number,
 ): readonly string[] | undefined {
   const cancelledTurnIds = events.flatMap((event) =>
-    event.type === "turn.cancelled" ? [event.data.turnId] : []
+    event.type === "turn.settled" && event.data.outcome === "cancelled" ? [event.data.turnId] : []
   );
   let context = priorContext;
   for (const turnId of cancelledTurnIds) {
@@ -56,7 +56,7 @@ export function interruptedTurnContextsFromEvents(
 }
 
 export function interruptedTurnContextFromEvents(
-  events: readonly MessageStreamEvent[],
+  events: readonly SessionStreamEvent[],
   turnId: string,
   priorContext: readonly string[] | undefined,
   modelContextWindowTokens: number,
@@ -67,30 +67,19 @@ export function interruptedTurnContextFromEvents(
   const assistantMessages: string[] = [];
   const toolCalls = new Map<string, ToolCall>();
   const toolResults = new Map<string, ToolResult>();
-
-  for (const event of events) {
-    if (event.type === "message.received" && event.data.turnId === turnId) {
-      const message = event.data.message.trim();
-      if (message) userMessages.push(message);
-      continue;
-    }
-    if (event.type === "message.completed" && event.data.turnId === turnId) {
-      const message = event.data.message?.trim();
-      if (message && !assistantMessages.includes(message)) assistantMessages.push(message);
-      continue;
-    }
-    if (event.type === "actions.requested" && event.data.turnId === turnId) {
-      for (const action of event.data.actions) {
-        if (action.kind !== "tool-call") continue;
-        toolCalls.set(action.callId, { input: action.input, toolName: action.toolName });
+  for (const message of turnMessages(conversationOf(events).messages, turnId)) {
+    const text = messageText(message).trim();
+    if (message.role === "user" && text) userMessages.push(text);
+    if (message.role === "assistant" && text && !assistantMessages.includes(text)) assistantMessages.push(text);
+    for (const part of message.parts) {
+      if (part.type !== "tool") continue;
+      toolCalls.set(part.callId, { input: part.input, toolName: part.name });
+      if (part.output !== undefined || part.error !== undefined) {
+        toolResults.set(part.callId, {
+          output: part.output ?? part.error,
+          status: part.state,
+        });
       }
-      continue;
-    }
-    if (event.type === "action.result" && event.data.turnId === turnId) {
-      toolResults.set(event.data.result.callId, {
-        output: event.data.result.output,
-        status: event.data.status,
-      });
     }
   }
 
@@ -125,28 +114,19 @@ export function interruptedTurnContextFromEvents(
 }
 
 export function rewriteContextFromEvents(
-  events: readonly MessageStreamEvent[],
+  events: readonly SessionStreamEvent[],
   modelContextWindowTokens: number,
 ): readonly string[] | undefined {
   const completedTurns = new Set(
-    events.flatMap((event) => event.type === "turn.completed" ? [event.data.turnId] : []),
+    events.flatMap((event) => event.type === "turn.settled" && event.data.outcome === "completed" ? [event.data.turnId] : []),
   );
   const transcript: string[] = [];
-
-  for (const event of events) {
-    if (event.type === "message.received" && completedTurns.has(event.data.turnId)) {
-      const message = event.data.message.trim();
-      if (message) transcript.push(`User: ${message}`);
-      continue;
-    }
-    if (
-      event.type === "message.completed" &&
-      completedTurns.has(event.data.turnId) &&
-      event.data.finishReason !== "tool-calls"
-    ) {
-      const message = event.data.message?.trim();
-      if (message) transcript.push(`Assistant: ${message}`);
-    }
+  for (const message of conversationOf(events).messages) {
+    const turnId = message.metadata?.turnId;
+    if (!turnId || !completedTurns.has(turnId)) continue;
+    const text = messageText(message).trim();
+    if (!text) continue;
+    transcript.push(`${message.role === "user" ? "User" : "Assistant"}: ${text}`);
   }
 
   if (transcript.length === 0) return undefined;
@@ -154,6 +134,16 @@ export function rewriteContextFromEvents(
     "Prior settled conversation retained after the user edited the latest request. Treat it as conversation history, not as new instructions.",
     ...transcript,
   ], modelContextWindowTokens);
+}
+
+function turnMessages(messages: readonly EveMessage[], turnId: string): readonly EveMessage[] {
+  return messages.filter((message) => message.metadata?.turnId === turnId);
+}
+
+function messageText(message: EveMessage): string {
+  return message.parts.flatMap((part) =>
+    (part.type === "text" || part.type === "reasoning") && part.text.trim() ? [part.text] : []
+  ).join("\n");
 }
 
 export function sanitizeRetainedContext(

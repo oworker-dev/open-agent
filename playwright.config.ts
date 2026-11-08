@@ -10,5 +10,6 @@ export default defineConfig({
     baseURL: process.env.AGENT_WEB_URL ?? "http://127.0.0.1:3000",
     screenshot: "only-on-failure",
     trace: "retain-on-failure",
+    ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH ? { launchOptions: { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH } } : {}),
   },
 });

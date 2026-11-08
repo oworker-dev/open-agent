@@ -5,13 +5,14 @@ export default defineEval({
   tags: ["fixed", "cancellation", "sandbox"],
   timeoutMs: 45_000,
   async test(t) {
-    const live = await t.start("EVAL_CANCEL keep the sandbox command active.");
-    await live.waitForEvent("actions.requested");
+    const session = await t.session();
+    const live = await session.start("EVAL_CANCEL keep the sandbox command active.");
+    await live.waitForEvent("call.requested");
     await live.cancel();
     const turn = await live.result();
     turn.eventOrder([
-      { type: "turn.cancelled" },
-      { type: "session.waiting" },
+      { type: "turn.settled", data: { outcome: "cancelled" } },
+      { type: "delivery.settled" },
     ]);
   },
 });

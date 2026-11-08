@@ -5,6 +5,7 @@ import { configureEveNextProductionPort } from "./scripts/production-preview-top
 configureEveNextProductionPort();
 
 const nextConfig: NextConfig = {
+  distDir: nextBuildDirectory(),
   allowedDevOrigins: allowedDevelopmentOrigins(),
   async headers() {
     return [{
@@ -16,6 +17,14 @@ const nextConfig: NextConfig = {
     }];
   },
 };
+
+function nextBuildDirectory(): string {
+  const configured = process.env.OPEN_AGENT_NEXT_DIST_DIR?.trim() || ".next";
+  if (!/^\.next(?:-[A-Za-z0-9][A-Za-z0-9._-]*)?$/u.test(configured)) {
+    throw new Error("OPEN_AGENT_NEXT_DIST_DIR must be .next or a dedicated .next-* directory.");
+  }
+  return configured;
+}
 
 function allowedDevelopmentOrigins(): string[] {
   const configured = process.env.AGENT_DEV_ALLOWED_ORIGINS?.trim();

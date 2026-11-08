@@ -1,6 +1,6 @@
 "use client";
 
-import type { MessageStreamEvent } from "eve/client";
+import type { SessionStreamEvent } from "eve/client";
 import { useRef } from "react";
 import {
   ReasoningRoot,
@@ -14,14 +14,14 @@ export function AgentActivity({
   messages,
   mode = "live",
 }: {
-  readonly events: readonly MessageStreamEvent[];
+  readonly events: readonly SessionStreamEvent[];
   readonly messages: AgentMessages;
   readonly mode?: "live" | "recovery";
 }) {
   const mountedAt = useRef(Date.now());
   const label = activityLabel(events, messages, { mode, mountedAt: mountedAt.current, now: Date.now() });
   const hasReasoning = events.some((event) =>
-    event.type === "reasoning.appended" || event.type === "reasoning.completed",
+    (event.type === "content.delta" || event.type === "content.completed") && event.data.kind === "reasoning",
   );
   // Keep one calm reasoning disclosure visible from admission onward. The
   // label intentionally stays provider-neutral; transport retries belong in

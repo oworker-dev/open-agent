@@ -1,82 +1,44 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { EveAgentStore } from "eve/client";
-import type { ClientSession, MessageStreamEvent } from "eve/client";
+import { Client, SessionStore, type SessionStreamEvent } from "eve/client";
+import { line, startTurn, reply, streamResponse } from "../helpers/session-events.ts";
 
-test("Eve batches hot subscriber snapshots while preserving every event", async () => {
-  const eventCount = 20_000;
-  let observedEvents = 0;
-  let publications = 0;
-  const store = new EveAgentStore({
-    optimistic: false,
-    reducer: { initial: () => 0, reduce: (count) => count + 1 },
-    session: sessionFrom(async function* () {
-      for (let index = 0; index < eventCount; index += 1) yield event(index);
-    }),
-  });
-  store.setCallbacks({ onEvent: () => { observedEvents += 1; } });
-  store.subscribe(() => { publications += 1; });
+const running = () => [...line(0, { type: "session.started", data: {} }), ...startTurn(1, "turn", "delivery", "Run")];
 
-  await store.send({ message: "run" });
-
-  assert.equal(observedEvents, eventCount);
-  assert.equal(store.snapshot.events.length, eventCount);
-  assert.equal(store.snapshot.data, eventCount);
-  assert.ok(publications < 100, `expected frame-batched snapshots, received ${publications}`);
+test("SessionStore preserves every native hot-stream event", async (t) => {
+  const events = running();
+  for (let index = 0; index < 20_000; index++) events.push(...line(index + 4, { type: "content.delta", scope: { turnId: "turn", runId: "turn:run" }, data: { partId: "reply", kind: "text", delta: "x" } }));
+  events.push(...reply(20_004, "turn", "delivery", "x".repeat(20_000)));
+  const original = globalThis.fetch;
+  t.after(() => { globalThis.fetch = original; });
+  globalThis.fetch = async () => streamResponse(events);
+  const session = new Client({ baseUrl: "https://agent.example" }).sessions.attach("session");
+  const store = new SessionStore({ session, optimistic: false });
+  let observed = 0;
+  store.setCallbacks({ onEvent: () => { observed++; } });
+  await store.resume();
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(observed, events.length);
+  assert.equal(store.snapshot.events.length, events.length);
+  assert.equal(store.snapshot.messages.at(-1)?.parts.find((part) => part.type === "text")?.text, "x".repeat(20_000));
 });
 
-test("Eve does not mutate a previously published event snapshot", async () => {
-  let releaseSecondEvent!: () => void;
-  const secondEvent = new Promise<void>((resolveSecondEvent) => {
-    releaseSecondEvent = resolveSecondEvent;
-  });
-  let observedFirstEvent!: () => void;
-  const firstEvent = new Promise<void>((resolveFirstEvent) => {
-    observedFirstEvent = resolveFirstEvent;
-  });
-  const store = new EveAgentStore({
-    optimistic: false,
-    reducer: { initial: () => 0, reduce: (count) => count + 1 },
-    session: sessionFrom(async function* () {
-      yield event(0);
-      await secondEvent;
-      yield event(1);
-    }),
-  });
-  store.setCallbacks({ onEvent: () => { observedFirstEvent(); } });
-
-  const sending = store.send({ message: "run" });
-  await firstEvent;
-  await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
-  const firstSnapshot = store.snapshot;
-  assert.equal(firstSnapshot.events.length, 1);
-
-  releaseSecondEvent();
-  await sending;
-
-  assert.equal(firstSnapshot.events.length, 1);
-  assert.equal(store.snapshot.events.length, 2);
-  assert.notEqual(firstSnapshot.events, store.snapshot.events);
+test("SessionStore keeps published snapshots immutable during catch-up", async (t) => {
+  const original = globalThis.fetch;
+  t.after(() => { globalThis.fetch = original; });
+  const events = running();
+  globalThis.fetch = async () => streamResponse(events);
+  const session = new Client({ baseUrl: "https://agent.example" }).sessions.attach("session");
+  const store = new SessionStore({ session, optimistic: false });
+  await store.resume();
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  const before = store.snapshot;
+  const beforeEvents = [...before.events];
+  const appended = reply(4, "turn", "delivery", "Done");
+  globalThis.fetch = async () => streamResponse(appended);
+  await store.resume();
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.deepEqual(before.events, beforeEvents);
+  assert.equal(store.snapshot.events.length, events.length + appended.length);
+  assert.notEqual(before.events, store.snapshot.events);
 });
-
-function sessionFrom(events: () => AsyncGenerator<MessageStreamEvent>): ClientSession {
-  return {
-    respond: async () => { throw new Error("not used"); },
-    send: async () => ({ [Symbol.asyncIterator]: events }),
-    state: { sessionId: "session", streamIndex: 0 },
-  } as unknown as ClientSession;
-}
-
-function event(index: number): MessageStreamEvent {
-  return {
-    data: {
-      messageDelta: "x",
-      messageSoFar: "x",
-      sequence: index,
-      stepIndex: index,
-      turnId: "turn",
-    },
-    meta: { at: new Date(0).toISOString(), id: `event-${index}` },
-    type: "message.appended",
-  };
-}

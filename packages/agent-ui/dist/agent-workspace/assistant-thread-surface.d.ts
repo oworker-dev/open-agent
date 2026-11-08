@@ -1,4 +1,4 @@
-import type { MessageStreamEvent } from "eve/client";
+import type { SessionStreamEvent } from "eve/client";
 import type { EveMessage } from "eve/react";
 import { type ReactNode } from "react";
 import { type AgentInputResponse } from "./agent-message.js";
@@ -22,7 +22,7 @@ export declare function AssistantThreadSurface({ assetUrl, approvalTakeover, can
     readonly composerTop?: ReactNode;
     readonly draftStorageKey: string;
     readonly draftRestore?: AgentComposerDraftRestore;
-    readonly events: readonly MessageStreamEvent[];
+    readonly events: readonly SessionStreamEvent[];
     readonly eveMessages: readonly EveMessage[];
     readonly fallbackStartedAt?: number;
     readonly historyHasMore?: boolean;

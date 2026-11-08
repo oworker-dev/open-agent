@@ -53,7 +53,6 @@ export {
   replacePromptTrigger,
   type PromptTrigger,
 } from "./prompt-menu.js";
-export { sanitizeSettledThreadEvents } from "./turn-presentation.js";
 export {
   AGENT_THREAD_STORAGE_VERSION,
   appendThreadEvent,
@@ -64,6 +63,7 @@ export {
   dedupeThreadEvents,
   editOperationId,
   eventIdentity,
+  isThreadEvent,
   hasUnsettledInputResponseSubmission,
   inputResponseSubmissionProjectsAnswer,
   latestEditableTurnId,
@@ -71,8 +71,6 @@ export {
   mergeThreadCollectionsForConflict,
   mergeInputResponseSubmissions,
   parseThreadCollection,
-  projectPendingThreadEdit,
-  projectThreadEditBranches,
   reconcileHydratedPendingTurn,
   reconcilePendingTurnWithEvents,
   settleInputResponseSubmissions,
@@ -81,3 +79,5 @@ export type {
   AgentThreadCollection,
   AgentThreadStorage,
 } from "./thread-storage.js";
+
+export { projectConversationMessages } from "./conversation-messages.js";

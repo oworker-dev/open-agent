@@ -1,11 +1,11 @@
 import type {
   ClientAuth,
   ClientRedirectPolicy,
-  InputResponse,
-  MessageStreamEvent,
+  SessionStreamEvent,
   HeadersValue,
   PrepareSend,
 } from "eve/client";
+import type { Answer } from "eve/events";
 import type { ReactNode } from "react";
 import type { AgentThreadStorage } from "./thread-storage.js";
 
@@ -30,7 +30,7 @@ export type AgentPendingTurn = {
   readonly mailboxItemId?: string;
   /** Distinguishes an explicit last-message edit from a normal admission. */
   readonly operation?: "edit" | "send";
-  readonly state: "clearing" | "delivery-failed" | "interrupted" | "resubmitting" | "submitting";
+  readonly state: "delivery-failed" | "interrupted" | "submitting";
   readonly submittedAt: number;
   readonly text: string;
 };
@@ -41,6 +41,10 @@ export type AgentComposerDraftRestore = {
 };
 
 export type AgentInterruptedTurn = {
+  /** Kept only until an unacknowledged stopped send appears in the transcript. */
+  readonly pendingMessage?: AgentPendingTurn;
+  /** Identifies the stopped send until delivery.consumed assigns its turn. */
+  readonly pendingClientMessageId?: string;
   /** Persisted presentation-event count observed at cancellation. */
   readonly eventCount: number;
   /** Absolute Eve stream cursor observed at cancellation. */
@@ -58,8 +62,7 @@ export type AgentQueuedTurn = {
   /** Exact Eve turn that may accept this message at its next model boundary. */
   readonly expectedTurnId?: string;
   readonly id: string;
-  /** A post-cancellation message is a normal next turn staged until Eve parks. */
-  readonly intent?: "active-turn" | "post-cancellation";
+  readonly intent?: "active-turn";
   readonly mailboxItemId?: string;
   readonly state:
     | "accepted"
@@ -88,7 +91,7 @@ export type AgentMailboxReceipt = {
   readonly status: AgentMailboxItemStatus;
 };
 
-export type AgentInputResponse = InputResponse;
+export type AgentInputResponse = Answer;
 
 export type AgentInputResponseSubmission = {
   readonly id: string;
@@ -210,7 +213,7 @@ export type AgentTranscriptCoverage = {
   readonly complete: boolean;
   readonly endIndex: number;
   /** Identifies server transcripts that already applied edit/clear branches. */
-  readonly projection?: "logical-edits-v1";
+  readonly projection?: "v27-source-lines";
   readonly startIndex: number;
   readonly version: 1;
 };
@@ -236,7 +239,7 @@ export type AgentThreadSessionState = {
 export type AgentThread = {
   readonly createdAt: number;
   readonly closedInputRequestIds: readonly string[];
-  readonly events: readonly MessageStreamEvent[];
+  readonly events: readonly SessionStreamEvent[];
   readonly draftRestore?: AgentComposerDraftRestore;
   /** Server-backed indexes omit the event transcript until the thread is opened. */
   readonly hydration?: "summary";
@@ -344,7 +347,7 @@ export type AgentWorkspaceConfig = {
   readonly mailbox?: AgentWorkspaceMailbox;
   readonly models: readonly AgentModelOption[];
   readonly mentions?: readonly AgentPromptMenuItem[];
-  readonly onEvent?: (event: MessageStreamEvent) => void;
+  readonly onEvent?: (event: SessionStreamEvent) => void;
   readonly onActiveThreadChange?: (threadId?: string) => void;
   readonly onActiveSubagentChange?: (threadId: string, sessionId?: string) => void;
   readonly onDeleteThread?: (thread: AgentThread) => void | Promise<void>;

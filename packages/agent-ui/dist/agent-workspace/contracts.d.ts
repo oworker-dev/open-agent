@@ -1,4 +1,5 @@
-import type { ClientAuth, ClientRedirectPolicy, InputResponse, MessageStreamEvent, HeadersValue, PrepareSend } from "eve/client";
+import type { ClientAuth, ClientRedirectPolicy, SessionStreamEvent, HeadersValue, PrepareSend } from "eve/client";
+import type { Answer } from "eve/events";
 import type { ReactNode } from "react";
 import type { AgentThreadStorage } from "./thread-storage.js";
 export type AgentThreadStatus = "cancelling" | "error" | "ready" | "streaming" | "submitted" | "waiting";
@@ -16,7 +17,7 @@ export type AgentPendingTurn = {
     readonly id: string;
     readonly mailboxItemId?: string;
     readonly operation?: "edit" | "send";
-    readonly state: "clearing" | "delivery-failed" | "interrupted" | "resubmitting" | "submitting";
+    readonly state: "delivery-failed" | "interrupted" | "submitting";
     readonly submittedAt: number;
     readonly text: string;
 };
@@ -25,6 +26,8 @@ export type AgentComposerDraftRestore = {
     readonly text: string;
 };
 export type AgentInterruptedTurn = {
+    readonly pendingMessage?: AgentPendingTurn;
+    readonly pendingClientMessageId?: string;
     readonly eventCount: number;
     readonly streamIndex: number;
     readonly turnId: string;
@@ -34,7 +37,7 @@ export type AgentQueuedTurn = {
     readonly delivery?: "browser" | "server";
     readonly expectedTurnId?: string;
     readonly id: string;
-    readonly intent?: "active-turn" | "post-cancellation";
+    readonly intent?: "active-turn";
     readonly mailboxItemId?: string;
     readonly state: "accepted" | "admission-ambiguous" | "committed" | "delivering" | "delivery-failed" | "queued";
     readonly submittedAt: number;
@@ -47,7 +50,7 @@ export type AgentMailboxReceipt = {
     readonly lastError?: string;
     readonly status: AgentMailboxItemStatus;
 };
-export type AgentInputResponse = InputResponse;
+export type AgentInputResponse = Answer;
 export type AgentInputResponseSubmission = {
     readonly id: string;
     readonly mailboxItemId?: string;
@@ -141,7 +144,7 @@ export type AgentTranscriptCoverage = {
     readonly authoritative?: boolean;
     readonly complete: boolean;
     readonly endIndex: number;
-    readonly projection?: "logical-edits-v1";
+    readonly projection?: "v27-source-lines";
     readonly startIndex: number;
     readonly version: 1;
 };
@@ -161,7 +164,7 @@ export type AgentThreadSessionState = {
 export type AgentThread = {
     readonly createdAt: number;
     readonly closedInputRequestIds: readonly string[];
-    readonly events: readonly MessageStreamEvent[];
+    readonly events: readonly SessionStreamEvent[];
     readonly draftRestore?: AgentComposerDraftRestore;
     readonly hydration?: "summary";
     readonly id: string;
@@ -253,7 +256,7 @@ export type AgentWorkspaceConfig = {
     readonly mailbox?: AgentWorkspaceMailbox;
     readonly models: readonly AgentModelOption[];
     readonly mentions?: readonly AgentPromptMenuItem[];
-    readonly onEvent?: (event: MessageStreamEvent) => void;
+    readonly onEvent?: (event: SessionStreamEvent) => void;
     readonly onActiveThreadChange?: (threadId?: string) => void;
     readonly onActiveSubagentChange?: (threadId: string, sessionId?: string) => void;
     readonly onDeleteThread?: (thread: AgentThread) => void | Promise<void>;

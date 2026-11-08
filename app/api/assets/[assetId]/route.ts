@@ -1,14 +1,26 @@
 import { AssetStoreError, createAssetStoreFromEnvironment } from "@/server/data/asset-store";
 import { authResponseHeaders, authenticateAssetRequest, requireAssetScope } from "@/server/http/asset-request-auth";
 import { assetContentDisposition, safeAssetContentType } from "@/server/http/asset-content";
+import { verifyAssetDownloadToken } from "@/lib/asset-download-token";
+import { readPreviewSigningSecret } from "@/lib/preview-token";
+import type { AssetRequestAuthentication } from "@/server/http/asset-request-auth";
 
 export const runtime = "nodejs";
 type RouteContext = { readonly params: Promise<{ readonly assetId: string }> };
 
 export async function GET(request: Request, context: RouteContext): Promise<Response> {
-  const authenticated = requireAssetScope(await authenticateAssetRequest(request), "asset:read");
-  if (!authenticated.ok) return authenticated.response;
   const { assetId } = await context.params;
+  const grant = new URL(request.url).searchParams.get("downloadGrant");
+  let authenticated: AssetRequestAuthentication;
+  if (grant !== null && !request.headers.has("authorization")) {
+    // Missing signing configuration must fail closed without leaking details.
+    let claims;
+    try { claims = verifyAssetDownloadToken(grant, assetId, readPreviewSigningSecret()); }
+    catch { return response(503, "Asset downloads are temporarily unavailable."); }
+    if (!claims) return response(401, "The asset download link has expired or is invalid.");
+    authenticated = { ok: true, identity: claims.owner };
+  } else authenticated = requireAssetScope(await authenticateAssetRequest(request), "asset:read");
+  if (!authenticated.ok) return authenticated.response;
   const rangeHeader = request.headers.get("range");
   const range = parseRange(rangeHeader);
   if (rangeHeader && !range) return response(416, "The requested asset byte range is invalid.");
@@ -20,15 +32,16 @@ export async function GET(request: Request, context: RouteContext): Promise<Resp
     if (!download) return response(404, "Asset not found.");
     const status = range ? 206 : 200;
     const headers = new Headers({
-      "cache-control": "private, max-age=60",
-      "content-disposition": assetContentDisposition(download.contentType, download.filename),
+      "cache-control": grant !== null ? "private, no-store" : "private, max-age=60",
+      "content-disposition": assetContentDisposition(download.contentType, download.filename, grant !== null),
       "content-length": String(download.contentLength),
       "content-type": safeAssetContentType(download.contentType),
       "cross-origin-resource-policy": "same-site",
       "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer",
     });
     for (const [key, value] of Object.entries(authResponseHeaders(authenticated))) headers.set(key, String(value));
-    if (range) headers.set("content-range", `bytes ${range.start}-${range.end ?? range.start + download.contentLength - 1}/${asset.sizeBytes}`);
+    if (range) headers.set("content-range", `bytes ${range.start}-${range.start + download.contentLength - 1}/${asset.sizeBytes}`);
     headers.set("accept-ranges", "bytes");
     return new Response(download.stream, { headers, status });
   } catch (error) {
@@ -62,7 +75,7 @@ function parseRange(value: string | null): { end?: number; start: number } | nul
   if (!match) return null;
   const start = Number(match[1]);
   const end = match[2] ? Number(match[2]) : undefined;
-  return Number.isSafeInteger(start) && (end === undefined || Number.isSafeInteger(end)) ? { start, ...(end === undefined ? {} : { end }) } : null;
+  return Number.isSafeInteger(start) && (end === undefined || (Number.isSafeInteger(end) && end >= start)) ? { start, ...(end === undefined ? {} : { end }) } : null;
 }
 
 function response(status: number, message: string): Response {

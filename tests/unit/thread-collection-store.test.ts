@@ -79,7 +79,7 @@ test("full snapshot save replaces transcript inside the collection transaction",
     threads: [{
       events: [{
         data: { sequence: 0 },
-        meta: { id: "event-1" },
+        meta: { at: new Date(0).toISOString(), position: { line: 0, index: 0 } },
         type: "step.started",
       }],
       id: "thread-1",
@@ -135,7 +135,7 @@ test("append-only thread patches do not load the existing transcript", async () 
       if (sql.includes("set collection = $4::jsonb")) {
         updatedCollection = JSON.parse(String(parameters?.[3])) as Record<string, unknown>;
       }
-      if (sql.includes("max(event_index)")) return { rows: [{ next_index: "2" }] };
+      if (sql.includes("as next_index")) return { rows: [{ next_index: "2", tail_position: { line: 1, index: 0 } }] };
       return { rows: [] };
     },
     release() {},
@@ -147,7 +147,7 @@ test("append-only thread patches do not load the existing transcript", async () 
   const patch: ThreadCollectionPatchRecord = {
     deletedThreadIds: [],
     eventAppends: [{
-      events: [{ data: { sequence: 2 }, meta: { at: new Date(0).toISOString(), id: "evt-3" }, type: "step.started" }],
+      events: [{ data: { sequence: 2 }, meta: { at: new Date(0).toISOString(), position: { line: 2, index: 0 } }, type: "step.started" }],
       threadId: "thread-1",
     }],
     upsertThreads: [{ events: [], id: "thread-1", status: "streaming", title: "Long task" }],
@@ -207,8 +207,8 @@ test("append-only thread patches keep event indexes contiguous after replay dedu
           }],
         };
       }
-      if (sql.includes("max(event_index)")) return { rows: [{ next_index: "4" }] };
-      if (sql.includes("select event_id")) return { rows: [{ event_id: "evt-duplicate" }] };
+      if (sql.includes("as next_index")) return { rows: [{ next_index: "4", tail_position: { line: 3, index: 0 } }] };
+      if (sql.includes("select event_id")) return { rows: [{ event_id: "position:3:0" }] };
       if (sql.includes("insert into") && sql.includes("jsonb_to_recordset")) {
         insertedParameters = parameters;
       }
@@ -223,9 +223,9 @@ test("append-only thread patches keep event indexes contiguous after replay dedu
     deletedThreadIds: [],
     eventAppends: [{
       events: [
-        { type: "duplicate", meta: { id: "evt-duplicate" } },
-        { type: "fresh-a", meta: { id: "evt-a" } },
-        { type: "fresh-b", meta: { id: "evt-b" } },
+        { type: "duplicate", data: {}, meta: { at: new Date(0).toISOString(), position: { line: 3, index: 0 } } },
+        { type: "fresh-a", data: {}, meta: { at: new Date(0).toISOString(), position: { line: 4, index: 0 } } },
+        { type: "fresh-b", data: {}, meta: { at: new Date(0).toISOString(), position: { line: 5, index: 0 } } },
       ],
       threadId: "thread-1",
     }],
@@ -235,8 +235,8 @@ test("append-only thread patches keep event indexes contiguous after replay dedu
   assert.equal(result?.status, "saved");
   const records = JSON.parse(String(insertedParameters?.[4])) as Array<{ event_index: number; event_id: string }>;
   assert.deepEqual(records.map((record) => [record.event_index, record.event_id]), [
-    [4, "evt-a"],
-    [5, "evt-b"],
+    [4, "position:4:0"],
+    [5, "position:5:0"],
   ]);
 });
 
@@ -265,7 +265,7 @@ test("replacement appends truncate from their cursor without reading the current
   const result = await store.patch?.("tenant-1", "principal-1", "workspace-1", 3, {
     deletedThreadIds: [],
     eventAppends: [{
-      events: [{ meta: { id: "evt-replacement" }, type: "message.completed" }],
+      events: [{ data: {}, meta: { at: new Date(0).toISOString(), position: { line: 4, index: 0 } }, type: "message.completed" }],
       replaceFrom: 12,
       threadId: "thread-1",
     }],
@@ -296,7 +296,7 @@ test("rejects an edit replacement whose events are not the durable prefix", asyn
       }
       if (sql.includes("max(event_index)")) return { rows: [{ total: "4" }] };
       if (sql.includes("event_index <")) {
-        return { rows: [{ event_index: "0", event_id: "evt-original" }] };
+        return { rows: [{ event_index: "0", event_id: "position:0:0" }] };
       }
       return { rows: [] };
     },
@@ -312,9 +312,9 @@ test("rejects an edit replacement whose events are not the durable prefix", asyn
         deletedThreadIds: [],
         eventAppends: [],
         upsertThreads: [{
-          events: [{ meta: { id: "evt-tail-only" }, type: "message.completed" }],
+          events: [{ data: {}, meta: { at: new Date(0).toISOString(), position: { line: 9, index: 0 } }, type: "message.completed" }],
           id: "thread-1",
-          pendingTurn: { id: "edit-1", state: "clearing", submittedAt: 1, text: "edited" },
+          pendingTurn: { id: "edit-1", state: "submitting", submittedAt: 1, text: "edited" },
           status: "ready",
         }],
       });
@@ -346,8 +346,8 @@ test("allows an explicit edit to retain a verified event prefix", async () => {
       if (sql.includes("event_index <")) {
         return {
           rows: [
-            { event_index: "0", event_id: "evt-first" },
-            { event_index: "1", event_id: "evt-second" },
+            { event_index: "0", event_id: "position:0:0" },
+            { event_index: "1", event_id: "position:1:0" },
           ],
         };
       }
@@ -363,11 +363,11 @@ test("allows an explicit edit to retain a verified event prefix", async () => {
     eventAppends: [],
     upsertThreads: [{
       events: [
-        { meta: { id: "evt-first" }, type: "message.received" },
-        { meta: { id: "evt-second" }, type: "message.completed" },
+        { data: {}, meta: { at: new Date(0).toISOString(), position: { line: 0, index: 0 } }, type: "message.received" },
+        { data: {}, meta: { at: new Date(0).toISOString(), position: { line: 1, index: 0 } }, type: "message.completed" },
       ],
       id: "thread-1",
-      pendingTurn: { id: "edit-1", state: "clearing", submittedAt: 1, text: "edited" },
+      pendingTurn: { id: "edit-1", state: "submitting", submittedAt: 1, text: "edited" },
       status: "ready",
     }],
   });
@@ -407,7 +407,7 @@ test("rejects an explicit empty edit snapshot when durable history exists", asyn
       upsertThreads: [{
         events: [],
         id: "thread-1",
-        pendingTurn: { id: "edit-1", state: "resubmitting", submittedAt: 1, text: "edited" },
+        pendingTurn: { id: "edit-1", operation: "edit", state: "submitting", submittedAt: 1, text: "edited" },
         status: "ready",
       }],
     }),
@@ -496,7 +496,7 @@ test("legacy thread hydration returns a bounded tail instead of aggregating full
         rows: [{
           thread: {
             id: "thread-1",
-            events: [{ type: "session.waiting", data: {}, meta: { id: "evt-1" } }],
+            events: [{ type: "session.waiting", data: {}, meta: { at: new Date(0).toISOString(), position: { line: 0, index: 0 } } }],
             status: "ready",
           },
           revision: "9",

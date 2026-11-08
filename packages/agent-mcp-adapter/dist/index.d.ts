@@ -1,4 +1,4 @@
-import type { SessionContext } from "eve/tools";
+import type { SessionContext } from "eve/context";
 import { z } from "zod";
 export type ServiceTokenResolver = () => string | Promise<string>;
 declare const adapterConfigSchema: z.ZodObject<{

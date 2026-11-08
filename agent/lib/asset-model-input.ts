@@ -1,14 +1,19 @@
 import type { LanguageModelMiddleware } from "ai";
 import { parseAssetPrompt } from "@oworker/open-agent-contracts/asset";
-import { MAX_IMAGES_PER_REQUEST, readAssetImage, type ImageContext, type ImagePreview } from "./image-input.ts";
+import { bindBrowserAssetSession, MAX_IMAGES_PER_REQUEST, readAssetImage, type ImageContext, type ImagePreview } from "./image-input.ts";
 
 type ModelParams = Parameters<NonNullable<LanguageModelMiddleware["transformParams"]>>[0]["params"];
 type ImageReader = (assetId: string, ctx: ImageContext, signal?: AbortSignal) => Promise<ImagePreview>;
+type AssetSessionBinder = (assetId: string, ctx: ImageContext) => Promise<unknown>;
 
 /** Like Eve's sandbox attachment hydration, this changes only the model call.
  * Durable history and Eve's native token estimator continue to see small refs.
  */
-export function assetModelInputMiddleware(ctx: ImageContext, readImage: ImageReader = readAssetImage): LanguageModelMiddleware {
+export function assetModelInputMiddleware(
+  ctx: ImageContext,
+  readImage: ImageReader = readAssetImage,
+  bindAsset: AssetSessionBinder = bindBrowserAssetSession,
+): LanguageModelMiddleware {
   return {
     specificationVersion: "v4",
     async transformParams({ params }) {
@@ -16,10 +21,14 @@ export function assetModelInputMiddleware(ctx: ImageContext, readImage: ImageRea
       const positions = new Map<string, number>();
       const latestUser = params.prompt.findLastIndex((message) => message.role === "user");
       const required = new Set<string>();
+      const latestMessageAssets = new Map<string, { readonly mediaType: string; readonly id: string }>();
       for (const [index, message] of params.prompt.entries()) {
         if (message.role === "user") {
-          const attached = message.content.flatMap((part) => part.type === "text"
-            ? parseAssetPrompt(part.text).assets.filter((asset) => asset.mediaType.startsWith("image/")).map((asset) => asset.id) : []);
+          const messageAssets = message.content.flatMap((part) => part.type === "text" ? parseAssetPrompt(part.text).assets : []);
+          const attached = messageAssets.filter((asset) => asset.mediaType.startsWith("image/")).map((asset) => asset.id);
+          if (index === latestUser) {
+            for (const asset of messageAssets) latestMessageAssets.set(asset.id, asset);
+          }
           if (attached.length > MAX_IMAGES_PER_REQUEST) throw new Error(`A message supports up to ${MAX_IMAGES_PER_REQUEST} images. Send fewer images.`);
           ids.push(...attached);
           for (const id of attached) {
@@ -37,6 +46,9 @@ export function assetModelInputMiddleware(ctx: ImageContext, readImage: ImageRea
           }
         }
       }
+      await Promise.all([...latestMessageAssets.values()]
+        .filter((asset) => !asset.mediaType.startsWith("image/"))
+        .map((asset) => bindAsset(asset.id, ctx)));
       // Bound historical visual context. References remain available to the
       // model so it can explicitly re-open an older image with view_image.
       const selected = new Set([...new Set(ids.toReversed())].slice(0, MAX_IMAGES_PER_REQUEST));
@@ -97,6 +109,6 @@ export function assetModelInputMiddleware(ctx: ImageContext, readImage: ImageRea
 function toolImageAssetId(part: Extract<ModelParams["prompt"][number], { role: "tool" }>["content"][number]): string | undefined {
   if (part.type !== "tool-result" || part.toolName !== "view_image" || part.output.type !== "json") return undefined;
   const value = part.output.value;
-  return value && typeof value === "object" && !Array.isArray(value) && typeof value.assetId === "string"
+  return value && typeof value === "object" && !Array.isArray(value) && "assetId" in value && typeof value.assetId === "string"
     ? value.assetId : undefined;
 }

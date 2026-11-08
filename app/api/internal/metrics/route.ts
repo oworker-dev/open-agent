@@ -10,7 +10,7 @@ import {
   getWorkflowRuntimeStats,
   readWorkflowDatabaseConfig,
 } from "@/server/data/workflow-database";
-import { getSandboxAdmissionStats } from "@/lib/sandbox-admission-backend";
+import { getSandboxAdmissionStats } from "@/lib/sandbox-compute-pool";
 
 export const runtime = "nodejs";
 

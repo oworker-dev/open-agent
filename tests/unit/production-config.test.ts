@@ -38,7 +38,7 @@ const validEnvironment = {
   AGENT_PUBLIC_BASE_URL: "https://agent.example.com",
   AGENT_PROVIDER_HTTP_TIMEOUT_MS: "120000",
   AGENT_RUNTIME_URL: "https://agent-runtime.example.com",
-  AGENT_SANDBOX_BACKEND: "microsandbox",
+  AGENT_SANDBOX_BACKEND: "vercel",
   AGENT_SANDBOX_MAX_ACTIVE: "16",
   AGENT_SANDBOX_MAX_QUEUED: "1024",
   AGENT_SANDBOX_ADMISSION_TIMEOUT_MS: "30000",

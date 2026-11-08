@@ -1,18 +1,12 @@
 import { Client, } from "eve/client";
 import { AGENT_SESSION_CONTRACT_VERSION, } from "@oworker/open-agent-contracts/agent-session";
 export const EVE_AGENT_SESSION_ADAPTER_VERSION = "0.1.0-alpha.9";
-/**
- * Default interactive-session adapter for Eve 0.56.x.
- *
- * The returned surface contains no Eve classes or event types. Hosts persist
- * the AgentSession cursor and can replace this adapter without changing UI
- * ownership or thread storage.
- */
+/** Host-neutral adapter over Eve's ID-addressed v27 session and delivery API. */
 export function createEveAgentSessionClient(options) {
     const client = new Client({
         auth: { bearer: options.getAccessToken },
         headers: options.headers,
-        host: normalizeBaseUrl(options.baseUrl),
+        baseUrl: normalizeBaseUrl(options.baseUrl),
         redirect: options.redirect ?? "error",
     });
     return {
@@ -29,114 +23,110 @@ class EveAgentSession {
         validateCursor(cursor);
         if (cursor?.sessionId) {
             this.sessionHandle = client.sessions.attach(cursor.sessionId, {
-                streamIndex: cursor.eventCursor,
+                ...(cursor.inbox ? { inbox: cursor.inbox } : {}),
+                streamIndex: cursor.streamIndex,
             });
         }
     }
     get cursor() {
-        return this.sessionHandle
-            ? fromEveCursor(this.sessionHandle.state)
-            : { eventCursor: 0 };
+        return this.sessionHandle ? fromEveCursor(this.sessionHandle.state) : { streamIndex: 0 };
     }
     async send(input) {
-        const startCursor = this.cursor.eventCursor;
         const payload = toEveSendInput(input);
-        let response;
+        let delivery;
         if (!this.sessionHandle) {
-            if ("inputResponses" in payload) {
-                throw new Error("An active Agent session is required to answer an input request.");
+            if ("answers" in payload) {
+                throw new Error("An active Agent session is required to answer an interaction.");
             }
             const created = await this.client.sessions.create({
-                message: toEveMessage(payload.message),
+                message: payload.message,
                 ...payload.options,
             });
             this.sessionHandle = created.session;
-            response = created.response;
+            delivery = created.delivery;
         }
-        else if ("inputResponses" in payload) {
-            response = await this.sessionHandle.respond(payload.inputResponses, payload.options);
+        else if ("answers" in payload) {
+            delivery = await this.sessionHandle.respond(payload.answers, payload.options);
         }
         else {
-            response = await this.sessionHandle.send(toEveMessage(payload.message), payload.options);
+            delivery = await this.sessionHandle.send(payload.message, payload.options);
         }
-        return new EveAgentSessionTurn(response, startCursor);
+        return new EveAgentSessionTurn(delivery);
     }
     async *stream(options) {
         if (!this.sessionHandle)
             return;
-        let cursor = options?.after ?? this.cursor.eventCursor;
-        if (!Number.isSafeInteger(cursor) || cursor < 0) {
-            throw new RangeError("Agent session event cursor must be a non-negative safe integer.");
-        }
+        const startIndex = options?.after ?? this.cursor.streamIndex;
+        validateLineCursor(startIndex);
         for await (const event of this.sessionHandle.stream({
             follow: options?.follow,
             signal: options?.signal,
-            startIndex: cursor,
+            startIndex,
         })) {
-            cursor += 1;
-            yield projectSessionEvent(event, cursor);
+            yield projectSessionEvent(event);
         }
     }
     async cancel(options) {
-        return this.sessionHandle?.cancel(options) ?? { status: "no_active_turn" };
+        if (!this.sessionHandle)
+            return { status: "no_active_turn" };
+        const delivery = await this.sessionHandle.cancel(options);
+        return { sessionId: delivery.sessionId, status: "accepted" };
     }
     async reset() {
         if (!this.sessionHandle)
             return { status: "no_active_session" };
-        const result = await this.sessionHandle.reset();
-        if (result.status === "reset")
-            this.sessionHandle = undefined;
-        return result;
+        const sessionId = this.sessionHandle.id;
+        const delivery = await this.sessionHandle.reset();
+        const result = await delivery.result();
+        this.sessionHandle = undefined;
+        return result.outcome === "applied"
+            ? { previousSessionId: sessionId, status: "reset" }
+            : { status: "no_active_session" };
     }
 }
 class EveAgentSessionTurn {
-    response;
-    startCursor;
+    delivery;
     sessionId;
-    consumed = false;
-    constructor(response, startCursor) {
-        this.response = response;
-        this.startCursor = startCursor;
-        this.sessionId = response.sessionId;
+    constructor(delivery) {
+        this.delivery = delivery;
+        this.sessionId = delivery.sessionId;
     }
     async result() {
-        this.assertUnconsumed();
-        this.consumed = true;
-        const result = await this.response.result();
+        const events = [];
+        for await (const event of this.delivery.stream())
+            events.push(projectSessionEvent(event));
+        const result = await this.delivery.result();
         return {
             data: result.data,
-            events: result.events.map((event, index) => projectSessionEvent(event, this.startCursor + index + 1)),
-            inputRequests: result.inputRequests,
-            message: result.message,
+            events,
+            inputRequests: result.interactions,
+            message: result.reply,
             sessionId: result.sessionId,
-            status: result.status,
+            status: result.status === "cancelled" ? "cancelled" :
+                result.status === "failed" ? "failed" :
+                    result.status === "awaiting-input" ? "waiting" : "completed",
         };
     }
     async *[Symbol.asyncIterator]() {
-        this.assertUnconsumed();
-        this.consumed = true;
-        let cursor = this.startCursor;
-        for await (const event of this.response) {
-            cursor += 1;
-            yield projectSessionEvent(event, cursor);
-        }
-    }
-    assertUnconsumed() {
-        if (this.consumed)
-            throw new Error("AgentSessionTurn has already been consumed.");
+        for await (const event of this.delivery.stream())
+            yield projectSessionEvent(event);
     }
 }
 function validateCursor(cursor) {
     if (!cursor)
-        return undefined;
-    if (!Number.isSafeInteger(cursor.eventCursor) || cursor.eventCursor < 0) {
-        throw new RangeError("Agent session event cursor must be a non-negative safe integer.");
+        return;
+    validateLineCursor(cursor.streamIndex);
+}
+function validateLineCursor(cursor) {
+    if (!Number.isSafeInteger(cursor) || cursor < 0) {
+        throw new RangeError("Agent session stream cursor must be a non-negative safe integer.");
     }
 }
 function fromEveCursor(cursor) {
     return {
+        ...(cursor.inbox ? { inbox: cursor.inbox } : {}),
         sessionId: cursor.sessionId,
-        eventCursor: cursor.streamIndex,
+        streamIndex: cursor.streamIndex,
     };
 }
 function toEveSendInput(input) {
@@ -148,25 +138,37 @@ function toEveSendInput(input) {
         ...(input.outputSchema === undefined ? {} : { outputSchema: input.outputSchema }),
         ...(input.signal === undefined ? {} : { signal: input.signal }),
     };
-    if (input.inputResponses)
-        return { inputResponses: input.inputResponses, options };
+    if (input.inputResponses) {
+        return {
+            answers: input.inputResponses.map((response) => ({
+                interactionId: response.interactionId,
+                ...(response.optionId === undefined ? {} : { optionId: response.optionId }),
+                ...(response.text === undefined ? {} : { text: response.text }),
+            })),
+            options,
+        };
+    }
     if (input.message === undefined)
         throw new Error("Agent session input requires a message or input response.");
-    return { message: input.message, options };
+    return {
+        message: toEveMessage(input.message),
+        options,
+    };
 }
 function toEveMessage(message) {
-    return typeof message === "string"
-        ? message
-        : [...message];
+    return typeof message === "string" ? message : message.map((part) => ({ ...part }));
 }
-function projectSessionEvent(event, cursor) {
-    const candidate = event;
+function projectSessionEvent(event) {
+    const { position } = event.meta;
+    const cursor = event.meta.next ?? (event.meta.endOfLine === false ? position.line : position.line + 1);
     return {
         contractVersion: AGENT_SESSION_CONTRACT_VERSION,
         cursor,
-        ...(candidate.data === undefined ? {} : { data: candidate.data }),
-        ...(candidate.meta === undefined ? {} : { meta: candidate.meta }),
-        type: candidate.type,
+        data: event.data,
+        meta: event.meta,
+        position,
+        ...(event.scope ? { scope: event.scope } : {}),
+        type: event.type,
     };
 }
 function normalizeBaseUrl(value) {

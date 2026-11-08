@@ -1,706 +1,129 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { MessageStreamEvent } from "eve/client";
+import { conversationOf, type SessionStreamEvent } from "eve/client";
+import { position } from "eve/events";
+import { serializeAssetPrompt } from "../../packages/agent-contracts/src/asset.ts";
+import { appendThreadEvent, appendThreadEventIndexed, compactThreadEvents, createAgentThread, dedupeThreadEvents, editOperationId, eventIdentity, inputResponseSubmissionFailure, inputResponseSubmissionProjectsAnswer, latestEditableTurnId, mergeThreadEventSnapshots, mergeThreadCollectionsForConflict, parseThreadCollection, reconcileHydratedPendingTurn, reconcilePendingTurnWithEvents, threadEventCursor } from "../../packages/agent-ui/dist/agent-workspace/thread-storage.js";
+import { line, reply, startTurn } from "../helpers/session-events.ts";
 
-import {
-  appendThreadEventIndexed,
-  compactThreadEvents,
-  dedupeThreadEvents,
-  editOperationId,
-  eventIdentity,
-  latestEditableTurnId,
-  mergeThreadEventSnapshots,
-  mergeThreadCollectionsForConflict,
-  parseThreadCollection,
-  projectPendingThreadEdit,
-  projectThreadEditBranches,
-  reconcileHydratedPendingTurn,
-  reconcilePendingTurnWithEvents,
-} from "@oworker/open-agent-ui/agent-workspace";
+const prompt = (id: string, text = "same prompt") => serializeAssetPrompt(text, [], id);
+const pending = { id: "pending-message", text: "same prompt", state: "submitting" as const, submittedAt: 100 };
+const source = () => [...line(0, { type: "session.started", data: {} }), ...startTurn(1, "first", "d1", prompt("original")), ...reply(4, "first", "d1", "Done")];
 
-test("edit operation ids are stable for replay and scoped to the edit tuple", () => {
-  const first = editOperationId("session-1", "turn-1", "Edited request");
-  assert.equal(first, editOperationId("session-1", "turn-1", "Edited request"));
-  assert.notEqual(first, editOperationId("session-1", "turn-1", "Edited request 2"));
-  assert.notEqual(first, editOperationId("session-1", "turn-2", "Edited request"));
-  assert.notEqual(first, editOperationId("session-2", "turn-1", "Edited request"));
-  assert.match(first, /^edit-[0-9a-f]{16}$/u);
+test("an incompatible history cache preserves its session for authoritative repair", () => {
+  const thread = createAgentThread(100, "Preserved conversation");
+  const collection = parseThreadCollection({ version: 2, threads: [{ ...thread,
+    events: [{ type: "session.started", data: {}, meta: { id: "old-event", timestamp: 100 } }],
+    session: { sessionId: "old-session", streamIndex: 434 },
+    transcriptCoverage: { version: 1, complete: true, authoritative: true,
+      projection: "logical-edits-v1", startIndex: 0, endIndex: 434 },
+  }] });
+  assert.equal(collection.threads.length, 1);
+  assert.equal(collection.threads[0]?.title, "Preserved conversation");
+  assert.deepEqual(collection.threads[0]?.session, { sessionId: "old-session", streamIndex: 434 });
+  assert.deepEqual(collection.threads[0]?.events, []);
+  assert.equal(collection.threads[0]?.transcriptCoverage, undefined);
 });
 
-test("recovery snapshot merge never drops live events", () => {
-  const live = [
-    editEvent("turn.started", { sequence: 0, turnId: "turn-1" }),
-    editEvent("message.received", { message: "hello", sequence: 0, turnId: "turn-1" }),
-  ];
-  const recovery = [live[0]!];
-  const merged = mergeThreadEventSnapshots(live, recovery);
-  assert.deepEqual(merged.map(eventIdentity), live.map(eventIdentity));
+test("edit operation identities are deterministic and include session, target and content", () => {
+  const id = editOperationId("session", "turn", "message");
+  assert.equal(id, editOperationId("session", "turn", "message"));
+  assert.notEqual(id, editOperationId("other", "turn", "message"));
+  assert.notEqual(id, editOperationId("session", "other", "message"));
+  assert.notEqual(id, editOperationId("session", "turn", "other"));
+  assert.match(id, /^edit-[0-9a-f]{16}$/);
 });
 
-test("recovery snapshot merge retains events unique to either snapshot", () => {
-  const live = [
-    editEvent("turn.started", { sequence: 0, turnId: "turn-merge-live" }),
-    editEvent("step.started", { sequence: 0, stepIndex: 0, turnId: "turn-merge-live" }),
-  ];
-  const recovery = [
-    live[0]!,
-    editEvent("message.received", {
-      message: "Continue",
-      sequence: 0,
-      turnId: "turn-merge-live",
-    }),
-  ];
-  const merged = mergeThreadEventSnapshots(live, recovery);
-  assert.deepEqual(merged.map(eventIdentity), [
-    eventIdentity(live[0]!),
-    eventIdentity(recovery[1]!),
-    eventIdentity(live[1]!),
-  ]);
+test("recovery merges by durable position despite reversed timestamps and reset turn ids", () => {
+  const events = source();
+  const middle = Math.floor(events.length / 2);
+  const merged = mergeThreadEventSnapshots(events.slice(middle), events.slice(0, middle).map((event) => ({ ...event, meta: { ...event.meta, at: "2099-01-01T00:00:00Z" } })));
+  assert.deepEqual(merged.map(eventIdentity), events.map(eventIdentity));
+  assert.equal(mergeThreadEventSnapshots(events, []).length, events.length);
+  assert.deepEqual(mergeThreadEventSnapshots(events, events.slice(0, 2)), events);
 });
 
-test("recovery merge never orders different turns by their reset sequence", () => {
-  const first = editEvent("message.received", {
-    message: "first",
-    sequence: 0,
-    turnId: "turn-first",
-  });
-  const second = editEvent("message.received", {
-    message: "second",
-    sequence: 0,
-    turnId: "turn-second",
-  });
-  // Equal timestamps model the common same-tick recovery merge. The existing
-  // live order must remain stable because sequence is scoped to each turn.
-  const merged = mergeThreadEventSnapshots([first], [second]);
-  assert.deepEqual(merged.map((event) => eventIdentity(event)), [
-    eventIdentity(first),
-    eventIdentity(second),
-  ]);
+test("facts sharing a source line remain distinct and exact replay is idempotent", () => {
+  const atomic = line(0, { type: "session.started", data: {} }, { type: "turn.started", data: { turnId: "first", cause: { deliveryId: "first-delivery" }, follows: null } });
+  assert.notEqual(eventIdentity(atomic[0]!), eventIdentity(atomic[1]!));
+  assert.equal(dedupeThreadEvents([...atomic, ...atomic]).length, 2);
+  assert.equal(threadEventCursor(atomic[0]!), undefined);
+  assert.equal(threadEventCursor(atomic[1]!), 1);
 });
 
-function editEvent(type: string, data: Record<string, unknown>): MessageStreamEvent {
-  return {
-    data,
-    meta: { at: new Date().toISOString(), id: `evt-${type}-${String(data.turnId ?? data.sequence ?? "event")}` },
-    type,
-  } as unknown as MessageStreamEvent;
-}
-
-test("recovery merge does not put newly loaded earlier history after the live turn", () => {
-  const older = editEvent("message.received", { message: "older", sequence: 0, turnId: "turn-old" });
-  const newer = editEvent("message.received", { message: "newer", sequence: 1, turnId: "turn-new" });
-  const left = [{ ...newer, meta: { ...newer.meta, at: "2026-09-11T00:00:01.000Z" } }];
-  const right = [{ ...older, meta: { ...older.meta, at: "2026-09-11T00:00:00.000Z" } }];
-  assert.deepEqual(mergeThreadEventSnapshots(left, right).map(eventIdentity), [eventIdentity(older), eventIdentity(newer)]);
+test("readonly append preserves the published snapshot and inserts in source order", () => {
+  const [first] = line(0, { type: "session.started", data: {} });
+  const [last] = line(2, { type: "delivery.admitted", data: { deliveryId: "later", source: { channel: "eve" } } });
+  const [middle] = line(1, { type: "delivery.admitted", data: { deliveryId: "first", source: { channel: "eve" } } });
+  const original = Object.freeze([first!, last!]);
+  const next = appendThreadEvent(original, middle!);
+  assert.deepEqual(original, [first, last]);
+  assert.deepEqual(next, [first, middle, last]);
+  assert.equal(appendThreadEvent(next, middle!), next);
 });
 
-function editTurnEvents(turnId: string, message: string, reply: string): readonly MessageStreamEvent[] {
-  const sequence = Number.parseInt(turnId.replace(/\D/gu, ""), 10) || 0;
-  return [
-    editEvent("turn.started", { sequence, turnId }),
-    editEvent("message.received", { message, parts: [{ text: message, type: "text" }], sequence, turnId }),
-    editEvent("step.started", { sequence, stepIndex: 0, turnId }),
-    editEvent("message.completed", { finishReason: "stop", message: reply, sequence, stepIndex: 0, turnId }),
-    editEvent("step.completed", { finishReason: "stop", sequence, stepIndex: 0, turnId }),
-    editEvent("turn.completed", { sequence, turnId }),
-  ];
-}
-
-test("deduplicates exact replayed events without collapsing distinct lifecycle events", () => {
-  const at = new Date().toISOString();
-  const event = {
-    data: { sequence: 0, stepIndex: 0, turnId: "turn-0" },
-    meta: { at },
-    type: "step.started" as const,
-  } as unknown as MessageStreamEvent;
-  const distinct = { ...event, meta: { at: new Date(Date.parse(at) + 1).toISOString() } } as unknown as MessageStreamEvent;
-  assert.deepEqual(dedupeThreadEvents([event, event, distinct]).map((candidate) => candidate.meta.at), [
-    at,
-    distinct.meta.at,
-  ]);
-});
-
-test("uses Eve's durable event id even when a replay payload is normalized", () => {
-  const first = {
-    data: { message: "before normalization", sequence: 0 },
-    meta: { at: new Date().toISOString(), id: "durable-event-1" },
-    type: "message.received" as const,
-  } as unknown as MessageStreamEvent;
-  const replay = {
-    ...first,
-    data: { message: "after normalization", sequence: 0 },
-    meta: { ...first.meta, at: new Date(Date.now() + 1_000).toISOString() },
-  } as unknown as MessageStreamEvent;
-
-  assert.equal(eventIdentity(first), eventIdentity(replay));
-  assert.equal(dedupeThreadEvents([first, replay]).length, 1);
-});
-
-test("legacy id-less lifecycle events remain distinct while exact replays deduplicate", () => {
-  const at = new Date(0).toISOString();
-  const source = [
-    { data: { runtime: { agentId: "open-agent" } }, meta: { at }, type: "session.started" },
-    { data: { sequence: 0, turnId: "turn-legacy" }, meta: { at }, type: "turn.started" },
-    { data: { message: "Run", parts: [], sequence: 0, turnId: "turn-legacy" }, meta: { at }, type: "message.received" },
-    { data: { sequence: 0, stepIndex: 0, turnId: "turn-legacy" }, meta: { at }, type: "step.started" },
-  ] as unknown as MessageStreamEvent[];
-  const events: MessageStreamEvent[] = [];
+test("indexed replay keeps every delta and does not collapse a commit", () => {
+  const sourceEvents = source();
+  const events: SessionStreamEvent[] = [];
   const ids = new Set<string>();
-
-  for (const event of source) assert.equal(appendThreadEventIndexed(events, ids, event), true);
-  for (const event of source) assert.equal(appendThreadEventIndexed(events, ids, event), false);
-
-  assert.deepEqual(events.map((event) => event.type), source.map((event) => event.type));
+  for (const event of sourceEvents.toReversed()) assert.equal(appendThreadEventIndexed(events, ids, event), true);
+  for (const event of sourceEvents) assert.equal(appendThreadEventIndexed(events, ids, event), false);
+  assert.deepEqual(events, sourceEvents);
+  assert.equal(position(conversationOf(events).view), 5);
 });
 
-test("pending edit reconciliation is anchored to the latest accepted message", () => {
-  const pending = {
-    id: "pending-edit",
-    state: "clearing" as const,
-    submittedAt: 10_000,
-    text: "same prompt",
-  };
-  const received = (message: string, id: string) => ({
-    data: { clientMessageId: id, message, parts: [], sequence: 0, turnId: id },
-    meta: { at: new Date(20_000).toISOString(), id: `evt-${id}` },
-    type: "message.received" as const,
-  });
-  const oldReceived = { ...received("same prompt", "old"), meta: { at: new Date(0).toISOString(), id: "evt-old" } };
-  assert.deepEqual(reconcilePendingTurnWithEvents(pending, [oldReceived]), pending);
-  assert.equal(reconcilePendingTurnWithEvents(pending, [received("same prompt", "old"), received("same prompt", "pending-edit")]), undefined);
-  assert.equal(reconcileHydratedPendingTurn(pending, [received("different", "other")])?.state, "delivery-failed");
+test("large tool input recovery preserves source coverage and linear serialized size", () => {
+  const events: SessionStreamEvent[] = []; const ids = new Set<string>();
+  const count = 16_384;
+  for (let index = 0; index < count; index++) {
+    appendThreadEventIndexed(events, ids, line(index, { type: "call.input", scope: { turnId: "first", runId: "run" }, data: { callId: "patch", ...(index === 0 ? { name: "apply_patch", kind: "tool" as const } : {}), delta: "x" } })[0]!);
+  }
+  const compacted = compactThreadEvents([...events, ...events]);
+  assert.equal(compacted.length, count);
+  assert.equal(threadEventCursor(compacted.at(-1)!), count);
+  assert.ok(JSON.stringify(compacted).length < count * 300);
 });
 
-test("does not acknowledge a same-text pending turn with another client message id", () => {
-  const pending = {
-    id: "pending-new",
-    state: "submitting" as const,
-    submittedAt: 10_000,
-    text: "same prompt",
-  };
-  const received = {
-    data: { clientMessageId: "pending-old", message: "same prompt", parts: [], sequence: 0, turnId: "turn-old" },
-    meta: { at: new Date(10_100).toISOString(), id: "evt-old" },
-    type: "message.received" as const,
-  } as unknown as MessageStreamEvent;
-
-  assert.deepEqual(reconcilePendingTurnWithEvents(pending, [received]), pending);
+test("a pending message is acknowledged only by its own envelope", () => {
+  assert.equal(reconcilePendingTurnWithEvents(pending, startTurn(1, "first", "d1", prompt("pending-message"))), undefined);
+  assert.equal(reconcilePendingTurnWithEvents(pending, startTurn(1, "first", "d1", prompt("other-message"))), pending);
+  const events = [...startTurn(1, "first", "d1", prompt("pending-message")), ...startTurn(5, "second", "d2", prompt("other-message"), "first")];
+  assert.equal(reconcilePendingTurnWithEvents(pending, events), undefined);
 });
 
-test("hydration never silently resends an unacknowledged submitting turn", () => {
-  const pending = {
-    id: "pending-refresh",
-    state: "submitting" as const,
-    submittedAt: 10_000,
-    text: "品牌名称改成妙思",
-  };
-  const history = [{
-    data: { message: "上一条消息", parts: [], sequence: 0, turnId: "turn-old" },
-    meta: { at: new Date(9_000).toISOString(), id: "evt-old" },
-    type: "message.received" as const,
-  }] as unknown as MessageStreamEvent[];
-  assert.equal(reconcileHydratedPendingTurn(pending, history)?.state, "delivery-failed");
+test("hydration never resubmits unacknowledged browser work", () => {
+  assert.equal(reconcileHydratedPendingTurn({ ...pending, state: "submitting" }, [])?.state, "delivery-failed");
+  const obsolete = parseThreadCollection({ version: 2, threads: [{
+    ...createAgentThread(1, "Obsolete edit state"),
+    pendingTurn: { ...pending, state: "resubmitting" },
+  }] });
+  assert.equal(obsolete.threads[0]?.pendingTurn, undefined);
+  const edit = { ...pending, beforeTurnId: "first", operation: "edit" as const, delivery: "server" as const, mailboxItemId: "mail-1" };
+  assert.equal(reconcileHydratedPendingTurn(edit, []), edit);
 });
 
-test("hydration preserves a server-owned edit operation for idempotent recovery", () => {
-  const pending = {
-    beforeTurnId: "turn-1",
-    delivery: "server" as const,
-    id: "pending-edit-1",
-    mailboxItemId: "mail-edit-1",
-    operation: "edit" as const,
-    state: "submitting" as const,
-    submittedAt: Date.now(),
-    text: "Edited request",
-  };
-  assert.equal(reconcileHydratedPendingTurn(pending, []), pending);
-});
-
-test("edit projection uses exact targets and keeps unaffected event arrays stable", () => {
-  const turn0 = editTurnEvents("turn-0", "First", "First reply");
-  const turn1 = editTurnEvents("turn-1", "Original latest", "Original reply");
-  const clear = editEvent("context.cleared", { sequence: 2, sessionId: "session-1", turnId: "turn-1" });
-  const turn2 = editTurnEvents("turn-2", "Edited latest", "Edited reply");
-  const untouched = [...turn0, ...turn1];
-
-  assert.equal(projectThreadEditBranches(untouched), untouched);
-  const projected = projectThreadEditBranches([...turn0, ...turn1, clear, ...turn2]);
-  assert.deepEqual(projected.filter((event) => event.type === "message.received").map((event) => event.data.message), [
-    "First",
-    "Edited latest",
-  ]);
-});
-
-test("edit projection keeps only the newest replacement for a repeated target", () => {
-  const turn0 = editTurnEvents("turn-0", "First", "First reply");
-  const turn1 = editTurnEvents("turn-1", "Original latest", "Original reply");
-  const firstClear = editEvent("context.cleared", { sequence: 2, sessionId: "session-1", turnId: "turn-1" });
-  const firstReplacement = editTurnEvents("turn-2", "Edited once", "First edit reply");
-  const secondClear = editEvent("context.cleared", { sequence: 3, sessionId: "session-1", turnId: "turn-1" });
-  const secondReplacement = editTurnEvents("turn-3", "Edited twice", "Final edit reply");
-
-  const projected = projectThreadEditBranches([
-    ...turn0,
-    ...turn1,
-    firstClear,
-    ...firstReplacement,
-    secondClear,
-    ...secondReplacement,
-  ]);
-
-  assert.deepEqual(projected.filter((event) => event.type === "message.received").map((event) => event.data.message), [
-    "First",
-    "Edited twice",
-  ]);
-});
-
-test("latest editable turn follows a chain of edits instead of a display alias", () => {
-  const turn0 = editTurnEvents("turn-0", "First", "First reply");
-  const turn1 = editTurnEvents("turn-1", "Original latest", "Original reply");
-  const turn2 = editTurnEvents("turn-2", "Edited once", "First edit reply");
-  const turn3 = editTurnEvents("turn-3", "Edited twice", "Second edit reply");
-  const projected = projectThreadEditBranches([
-    ...turn0,
-    ...turn1,
-    editEvent("context.cleared", { sequence: 2, sessionId: "session-1", turnId: "turn-1" }),
-    ...turn2,
-    editEvent("context.cleared", { sequence: 3, sessionId: "session-1", turnId: "turn-2" }),
-    ...turn3,
-  ]);
-
-  assert.equal(latestEditableTurnId(projected), "turn-3");
-});
-
-test("latest editable turn skips an Eve revert-conflict turn", () => {
-  const turn0 = editTurnEvents("turn-0", "First", "First reply");
-  const failed = [
-    editEvent("turn.started", { sequence: 1, turnId: "turn-1" }),
-    editEvent("message.received", { message: "Stale edit", parts: [{ text: "Stale edit", type: "text" }], sequence: 1, turnId: "turn-1" }),
-    editEvent("turn.failed", { code: "turn_revert_conflict", message: "Conflict", sequence: 1, turnId: "turn-1" }),
-  ];
-
-  assert.equal(latestEditableTurnId([...turn0, ...failed]), "turn-0");
-});
-
-test("edit projection keeps the original branch when Eve rejects a stale edit", () => {
-  const original = editTurnEvents("turn-0", "Original", "Original reply");
-  const rejected = [
-    editEvent("turn.started", { sequence: 1, turnId: "turn-1" }),
-    editEvent("message.received", {
-      clientMessageId: "edit-stale",
-      message: "Rejected edit",
-      parts: [{ text: "Rejected edit", type: "text" }],
-      sequence: 1,
-      turnId: "turn-1",
-    }),
-    editEvent("step.started", { sequence: 1, stepIndex: 0, turnId: "turn-1" }),
-    editEvent("step.failed", {
-      code: "turn_revert_conflict",
-      message: "The edited turn is no longer the latest reversible turn.",
-      sequence: 1,
-      stepIndex: 0,
-      turnId: "turn-1",
-    }),
-    editEvent("turn.failed", {
-      code: "turn_revert_conflict",
-      message: "The edited turn is no longer the latest reversible turn.",
-      sequence: 1,
-      turnId: "turn-1",
-    }),
-    editEvent("session.waiting", { wait: "next-user-message" }),
-  ];
-
-  const auditEvents = [...original, ...rejected];
-  const projected = projectThreadEditBranches(auditEvents);
-
-  assert.equal(auditEvents.some((event) => event.type === "turn.failed"), true);
-  assert.deepEqual(
-    projected.filter((event) => event.type === "message.received").map((event) => event.data.message),
-    ["Original"],
-  );
-  assert.equal(projected.some((event) => {
-    if (!("data" in event)) return false;
-    const data = event.data as { readonly turnId?: unknown };
-    return data.turnId === "turn-1";
-  }), false);
-  assert.equal(projected.at(-1)?.type, "session.waiting");
-  assert.equal(latestEditableTurnId(projected), "turn-0");
-});
-
-test("a consumed steer is not an independent edit checkpoint and never hides the original turn", () => {
-  const original = editTurnEvents("turn-0", "Original task", "Original work");
-  const steer = editEvent("message.received", {
-    turnId: "turn-0", sequence: 0, clientMessageId: "follow-up-1", message: "Additional request",
-  });
-  const events = [...original.slice(0, -1), steer, original.at(-1)!];
+test("edit eligibility follows the selected branch and excludes consumed steering", () => {
+  const events = source();
+  assert.equal(latestEditableTurnId(events), "first");
+  events.push(...line(5, { type: "delivery.consumed", scope: { turnId: "first" }, data: { turnId: "first", deliveryId: "steer", parts: [{ kind: "text", text: "Follow-up" }] } }));
   assert.equal(latestEditableTurnId(events), undefined);
-  assert.equal(projectPendingThreadEdit(events, "turn-0"), events);
-  const nextTurn = editTurnEvents("turn-1", "Next ordinary request", "Next reply");
-  assert.equal(latestEditableTurnId([...events, ...nextTurn]), "turn-1");
 });
 
-test("a partial history window cannot mistake its first visible steer for a turn root", () => {
-  const receipt = editEvent("message.received", {
-    turnId: "turn-0", sequence: 0, clientMessageId: "follow-up-window", message: "Additional request",
-  });
-  assert.equal(latestEditableTurnId([receipt]), undefined);
+test("a context clear is retained as facts and changes edit selection", () => {
+  const events = source();
+  events.push(...line(5, { type: "context.started", data: { changeId: "clear", kind: "clear" } }, { type: "context.settled", data: { changeId: "clear", kind: "clear", outcome: "completed", selects: null } }));
+  assert.equal(latestEditableTurnId(events), undefined);
+  assert.deepEqual(compactThreadEvents(events), events);
+  events.push(...startTurn(6, "edited", "d2", prompt("edit")), ...reply(9, "edited", "d2", "Edited reply"));
+  assert.equal(latestEditableTurnId(events), "edited");
 });
 
-test("unknown clear markers never guess and remove a preceding turn", () => {
-  const turn0 = editTurnEvents("turn-0", "Original", "Original reply");
-  const clear = editEvent("context.cleared", { sequence: 1, sessionId: "session-1", turnId: "clear-1" });
-  const turn1 = editTurnEvents("turn-1", "Edited", "Edited reply");
-  const projected = projectThreadEditBranches([...turn0, clear, ...turn1]);
-
-  assert.equal(projected.some((event) => {
-    if (!("data" in event)) return false;
-    const data = event.data as { readonly turnId?: unknown };
-    return data.turnId === "turn-0";
-  }), true);
-  assert.deepEqual(projected.filter((event) => event.type === "message.received").map((event) => event.data.message), ["Original", "Edited"]);
-});
-
-test("pending edit hides only its addressed branch until Eve commits the revert", () => {
-  const turn0 = editTurnEvents("turn-0", "First", "First reply");
-  const turn1 = editTurnEvents("turn-1", "Original latest", "Original reply");
-  const pending = projectPendingThreadEdit([...turn0, ...turn1], "turn-1");
-  assert.deepEqual(pending.filter((event) => event.type === "message.received").map((event) => event.data.message), ["First"]);
-});
-
-test("compacts legacy cumulative deltas without changing the absolute stream cursor", () => {
-  const at = new Date().toISOString();
-  const events = Array.from({ length: 1_000 }, (_, index) => ({
-    data: {
-      messageDelta: "x",
-      messageSoFar: "x".repeat(index + 1),
-      sequence: 0,
-      stepIndex: 0,
-      turnId: "turn_0",
-    },
-    meta: { at, id: `evt_${index}` },
-    type: "message.appended",
-  }));
-  const collection = parseThreadCollection({
-    activeThreadId: "thread-0",
-    threads: [{
-      createdAt: 1,
-      events,
-      id: "thread-0",
-      preferences: { modelId: "model", reasoning: "medium" },
-      session: { sessionId: "session-0", streamIndex: events.length },
-      status: "streaming",
-      title: "Thread",
-      updatedAt: 1,
-    }],
-    version: 1,
-  });
-
-  assert.equal(collection.threads[0]?.events.length, 1);
-  assert.equal(collection.threads[0]?.session.streamIndex, 1_000);
-});
-
-test("keeps the first visual anchor when cumulative deltas arrive after an interleaved event", () => {
-  const at = new Date().toISOString();
-  let sequence = 0;
-  const appended = (messageSoFar: string) => ({
-    data: { messageDelta: "x", messageSoFar, sequence: 0, stepIndex: 0, turnId: "turn_0" },
-    meta: { at, id: `evt_append_${sequence++}` },
-    type: "message.appended",
-  }) as const;
-  const barrier = {
-    data: { sequence: 0, stepIndex: 1, turnId: "turn_0" },
-    meta: { at, id: "evt_barrier" },
-    type: "step.started",
-  } as const;
-
-  const compacted = compactThreadEvents([
-    appended("one"),
-    appended("one two"),
-    barrier,
-    appended("one two three"),
-  ]);
-
-  assert.deepEqual(compacted.map((event) => event.type), [
-    "message.appended",
-    "step.started",
-  ]);
-  assert.equal(compacted[0]?.type, "message.appended");
-  if (compacted[0]?.type === "message.appended") {
-    assert.equal(compacted[0].data.messageSoFar, "one two three");
-  }
-});
-
-test("indexed recovery keeps reasoning anchored before tools across interleaved deltas", () => {
-  const events: Parameters<typeof appendThreadEventIndexed>[0] = [];
-  const ids = new Set<string>();
-  const append = (id: string, type: "reasoning.appended" | "actions.requested", data: Record<string, unknown>) => {
-    appendThreadEventIndexed(events, ids, {
-      data,
-      meta: { at: new Date(0).toISOString(), id },
-      type,
-    } as MessageStreamEvent);
-  };
-  append("reasoning-1", "reasoning.appended", {
-    reasoningDelta: "Planning",
-    reasoningSoFar: "Planning",
-    sequence: 0,
-    stepIndex: 0,
-    turnId: "turn-order",
-  });
-  append("tool-request", "actions.requested", {
-    actions: [{ callId: "call-1", input: {}, kind: "tool-call", toolName: "bash" }],
-    sequence: 0,
-    stepIndex: 0,
-    turnId: "turn-order",
-  });
-  append("reasoning-2", "reasoning.appended", {
-    reasoningDelta: " verification",
-    reasoningSoFar: "Planning verification",
-    sequence: 0,
-    stepIndex: 0,
-    turnId: "turn-order",
-  });
-  assert.deepEqual(events.map((event) => event.type), ["reasoning.appended", "actions.requested"]);
-  assert.equal(events[0]?.type, "reasoning.appended");
-  if (events[0]?.type === "reasoning.appended") {
-    assert.equal(events[0].data.reasoningSoFar, "Planning verification");
-  }
-});
-
-test("keeps reasoning and message anchors when completion follows tool events", () => {
-  const at = new Date().toISOString();
-  const reasoning = {
-    data: {
-      reasoningDelta: "Planning the verification",
-      reasoningSoFar: "Planning the verification",
-      sequence: 0,
-      stepIndex: 0,
-      turnId: "turn-boundary-order",
-    },
-    meta: { at, id: "reasoning-anchor" },
-    type: "reasoning.appended" as const,
-  };
-  const tool = {
-    data: {
-      actions: [{ callId: "call-check", input: { command: "pwd" }, kind: "tool-call", toolName: "bash" }],
-      sequence: 0,
-      stepIndex: 0,
-      turnId: "turn-boundary-order",
-    },
-    meta: { at, id: "tool-request" },
-    type: "actions.requested" as const,
-  };
-  const completed = {
-    data: {
-      reasoning: "Planning the verification",
-      sequence: 0,
-      stepIndex: 0,
-      turnId: "turn-boundary-order",
-    },
-    meta: { at, id: "reasoning-completed" },
-    type: "reasoning.completed" as const,
-  };
-  const source = [reasoning, tool, completed] as unknown as MessageStreamEvent[];
-  const compacted = compactThreadEvents(source);
-  assert.deepEqual(compacted.map((event) => event.type), [
-    "reasoning.appended",
-    "actions.requested",
-    "reasoning.completed",
-  ]);
-
-  const indexed: Parameters<typeof appendThreadEventIndexed>[0] = [];
-  const ids = new Set<string>();
-  for (const event of source) appendThreadEventIndexed(indexed, ids, event);
-  assert.deepEqual(indexed.map((event) => event.type), compacted.map((event) => event.type));
-});
-
-test("compacts cumulative tool input snapshots without losing the final argument", () => {
-  const at = new Date().toISOString();
-  const events = Array.from({ length: 2_000 }, (_, index) => ({
-    data: {
-      callId: "call-write",
-      inputTextSoFar: JSON.stringify({ path: "index.html", content: "x".repeat(index + 1) }),
-      sequence: 0,
-      stepIndex: 0,
-      toolName: "write_file",
-      turnId: "turn-tool",
-    },
-    meta: { at, id: `tool-input-${index}` },
-    type: "action.input.partial" as const,
-  }));
-
-  const collection = parseThreadCollection({
-    threads: [{
-      createdAt: 1,
-      events,
-      id: "thread-tool",
-      preferences: { modelId: "model", reasoning: "medium" },
-      session: { streamIndex: events.length },
-      status: "streaming",
-      title: "Tool",
-      updatedAt: 1,
-    }],
-    version: 2,
-  });
-
-  assert.equal(collection.threads[0]?.events.length, 1);
-  const compactedToolEvent = collection.threads[0]?.events[0];
-  assert.equal(compactedToolEvent?.type, "action.input.partial");
-  if (compactedToolEvent?.type === "action.input.partial") {
-    assert.equal(compactedToolEvent.data.inputTextSoFar, events.at(-1)?.data.inputTextSoFar);
-  }
-  assert.equal(collection.threads[0]?.session.streamIndex, events.length);
-});
-
-test("indexed recovery append deduplicates and replaces cumulative tool snapshots in linear time", () => {
-  const events: Parameters<typeof appendThreadEventIndexed>[0] = [];
-  const ids = new Set<string>();
-  for (let index = 0; index < 1_000; index += 1) {
-    appendThreadEventIndexed(events, ids, {
-      data: {
-        callId: "call-1",
-        inputTextDelta: String(index),
-        inputTextSoFar: String(index),
-        sequence: 0,
-        stepIndex: 0,
-        toolName: "write_file",
-        turnId: "turn-1",
-      },
-      meta: { at: new Date(0).toISOString(), id: `event-${index}` },
-      type: "action.input.partial",
-    } as Extract<import("eve/client").MessageStreamEvent, { type: "action.input.partial" }>);
-  }
-  assert.equal(events.length, 1);
-  const last = events[0];
-  assert.equal(last?.type, "action.input.partial");
-  if (last?.type === "action.input.partial") assert.equal(last.data.inputTextSoFar, "999");
-  assert.equal(appendThreadEventIndexed(events, ids, events[0]!), false);
-});
-
-test("preserves cumulative reasoning from a failed attempt when Eve retries the same step", () => {
-  const event = (
-    id: string,
-    type: "step.started" | "reasoning.appended" | "step.failed",
-    data: Record<string, unknown>,
-  ) => ({
-    data,
-    meta: { at: new Date(0).toISOString(), id },
-    type,
-  }) as unknown as MessageStreamEvent;
-  const compacted = compactThreadEvents([
-    event("start-1", "step.started", { sequence: 0, stepIndex: 0, turnId: "turn-retry" }),
-    event("reasoning-1", "reasoning.appended", {
-      reasoningDelta: "Planning",
-      reasoningSoFar: "Planning",
-      sequence: 0,
-      stepIndex: 0,
-      turnId: "turn-retry",
-    }),
-    event("failed-1", "step.failed", {
-      code: "UPSTREAM_ERROR",
-      message: "temporary provider failure",
-      sequence: 0,
-      stepIndex: 0,
-      turnId: "turn-retry",
-    }),
-    event("start-2", "step.started", { sequence: 0, stepIndex: 0, turnId: "turn-retry" }),
-    event("reasoning-2", "reasoning.appended", {
-      reasoningDelta: "Inspecting",
-      reasoningSoFar: "Inspecting",
-      sequence: 0,
-      stepIndex: 0,
-      turnId: "turn-retry",
-    }),
-    event("reasoning-3", "reasoning.appended", {
-      reasoningDelta: " the workspace",
-      reasoningSoFar: "Inspecting the workspace",
-      sequence: 0,
-      stepIndex: 0,
-      turnId: "turn-retry",
-    }),
-  ]);
-
-  assert.deepEqual(compacted.map((candidate) => candidate.meta.id), [
-    "start-1",
-    "reasoning-1",
-    "failed-1",
-    "start-2",
-    "reasoning-3",
-  ]);
-  assert.equal(compacted[1]?.type, "reasoning.appended");
-  assert.equal(compacted[4]?.type, "reasoning.appended");
-  if (compacted[4]?.type === "reasoning.appended") {
-    assert.equal(compacted[4].data.reasoningSoFar, "Inspecting the workspace");
-  }
-});
-
-test("preserves a reset tool-input snapshot even when the retry boundary is missing", () => {
-  const event = (id: string, inputTextSoFar: string) => ({
-    data: {
-      callId: "call-patch",
-      inputTextDelta: inputTextSoFar,
-      inputTextSoFar,
-      sequence: 0,
-      stepIndex: 0,
-      toolName: "apply_patch",
-      turnId: "turn-tool-retry",
-    },
-    meta: { at: new Date(0).toISOString(), id },
-    type: "action.input.partial" as const,
-  }) as unknown as MessageStreamEvent;
-  const source = [
-    event("input-1", "{\"patch\":\"*** Begin Patch"),
-    event("input-2", "{\"patch\":\"rewrite\"}"),
-  ];
-  const compacted = compactThreadEvents(source);
-
-  assert.equal(compacted.length, 2);
-  assert.deepEqual(compacted.map((candidate) => candidate.meta.id), ["input-1", "input-2"]);
-
-  const indexed: MessageStreamEvent[] = [];
-  const ids = new Set<string>();
-  for (const item of source) appendThreadEventIndexed(indexed, ids, item);
-  assert.equal(indexed.length, 2);
-});
-
-test("conflict merge never replaces a complete remote transcript with a compact local prefix", () => {
-  const event = (id: string, type: "step.started" | "reasoning.appended", stepIndex: number) => ({
-    data: type === "step.started"
-      ? { sequence: stepIndex, stepIndex, turnId: "turn-merge" }
-      : {
-          reasoningDelta: "x",
-          reasoningSoFar: "x",
-          sequence: stepIndex,
-          stepIndex,
-          turnId: "turn-merge",
-        },
-    meta: { at: new Date(0).toISOString(), id },
-    type,
-  }) as unknown as MessageStreamEvent;
-  const remoteEvents = [event("step-0", "step.started", 0), event("reasoning-0", "reasoning.appended", 0), event("step-1", "step.started", 1)];
-  const localEvents = [event("step-0", "step.started", 0)];
-  const base = {
-    closedInputRequestIds: [],
-    createdAt: 1,
-    id: "thread-merge",
-    preferences: { executionMode: "standard" as const, modelId: "model", reasoning: "medium" },
-    queuedTurns: [],
-    revision: 1,
-    session: { sessionId: "session", streamIndex: 3 },
-    status: "ready" as const,
-    title: "Merge",
-    updatedAt: 2,
-  };
-  const merged = mergeThreadCollectionsForConflict(
-    { threads: [{ ...base, events: localEvents }], version: 2 },
-    { threads: [{ ...base, events: remoteEvents, updatedAt: 3 }], version: 2 },
-  );
-  assert.deepEqual(merged.threads[0]?.events.map((candidate) => candidate.meta.id), [
-    "step-0",
-    "reasoning-0",
-    "step-1",
-  ]);
-  assert.equal(merged.threads[0]?.session.streamIndex, 3);
+test("conflict resolution retains complete remote facts and the highest line cursor", () => {
+  const events = source(); const thread = { ...createAgentThread(1), id: "thread", events, session: { sessionId: "session", streamIndex: 5 } };
+  const local = { ...thread, events: events.slice(0, 2), updatedAt: 3, session: { sessionId: "session", streamIndex: 1 } };
+  const merged = mergeThreadCollectionsForConflict({ threads: [local], version: 2 }, { threads: [thread], version: 2 });
+  assert.deepEqual(merged.threads[0]?.events, events);
+  assert.equal(merged.threads[0]?.session.streamIndex, 5);
 });
 
 test("hydrates queued follow-ups from the v2 collection without accepting malformed entries", () => {
@@ -714,7 +137,6 @@ test("hydrates queued follow-ups from the v2 collection without accepting malfor
         { id: "queued-1", state: "queued", submittedAt: 2, text: "Continue" },
         { id: "invalid", state: "delivering", submittedAt: 3, text: "Do not send" },
         { delivery: "server", expectedTurnId: "turn-1", id: "committed-1", intent: "active-turn", mailboxItemId: "mail-1", state: "committed", submittedAt: 4, text: "Durably admitted" },
-        { delivery: "browser", id: "post-cancel-1", intent: "post-cancellation", state: "queued", submittedAt: 5, text: "Continue after stop" },
       ],
       session: { streamIndex: 0 },
       status: "ready",
@@ -727,7 +149,6 @@ test("hydrates queued follow-ups from the v2 collection without accepting malfor
   assert.deepEqual(collection.threads[0]?.queuedTurns, [
     { id: "queued-1", state: "queued", submittedAt: 2, text: "Continue" },
     { delivery: "server", expectedTurnId: "turn-1", id: "committed-1", intent: "active-turn", mailboxItemId: "mail-1", state: "committed", submittedAt: 4, text: "Durably admitted" },
-    { delivery: "browser", id: "post-cancel-1", intent: "post-cancellation", state: "queued", submittedAt: 5, text: "Continue after stop" },
   ]);
 });
 
@@ -766,7 +187,10 @@ test("hydrates only bounded valid interrupted-turn markers", () => {
         { eventCount: 14.5, streamIndex: 122, turnId: "turn-fractional" },
         { eventCount: 15, streamIndex: 123, turnId: "" },
         { eventCount: 16, streamIndex: -1, turnId: "turn-stream-negative" },
-        { eventCount: 18, streamIndex: 128, turnId: "turn-valid" },
+        { eventCount: 18, streamIndex: 128, turnId: "turn-valid", settled: false, pendingClientMessageId: "stopped-send",
+          pendingMessage: { id: "stopped-send", operation: "send", state: "interrupted", submittedAt: 5, text: "keep this row" } },
+        { eventCount: 19, streamIndex: 129, turnId: "turn-invalid-pending", settled: false, pendingClientMessageId: "expected-id",
+          pendingMessage: { id: "other-id", operation: "send", state: "interrupted", submittedAt: 5, text: "reject mismatched row" } },
       ],
       preferences: { modelId: "model", reasoning: "medium" },
       queuedTurns: [],
@@ -779,7 +203,9 @@ test("hydrates only bounded valid interrupted-turn markers", () => {
   });
 
   assert.deepEqual(collection.threads[0]?.interruptedTurns, [
-    { eventCount: 18, streamIndex: 128, turnId: "turn-valid" },
+    { eventCount: 18, streamIndex: 128, turnId: "turn-valid", settled: false, pendingClientMessageId: "stopped-send",
+      pendingMessage: { id: "stopped-send", operation: "send", state: "interrupted", submittedAt: 5, text: "keep this row" } },
+    { eventCount: 19, streamIndex: 129, turnId: "turn-invalid-pending", settled: false, pendingClientMessageId: "expected-id" },
   ]);
 });
 
@@ -857,7 +283,7 @@ test("preserves validated attachments for a durable edited-turn retry", () => {
           { filename: "invalid.png", mediaType: "image/png" },
         ],
         id: "pending-edit",
-        state: "resubmitting",
+        state: "submitting",
         submittedAt: 2,
         text: "",
       },
@@ -873,7 +299,7 @@ test("preserves validated attachments for a durable edited-turn retry", () => {
   assert.deepEqual(collection.threads[0]?.pendingTurn, {
     files: [{ filename: "reference.png", mediaType: "image/png", url: "data:image/png;base64,AA==" }],
     id: "pending-edit",
-    state: "resubmitting",
+    state: "submitting",
     submittedAt: 2,
     text: "",
   });
@@ -889,15 +315,15 @@ test("hydrates durable input responses and rejects malformed response snapshots"
         id: "response-1",
         mailboxItemId: "mail-response-1",
         responses: [
-          { optionId: "approve", requestId: "request-1" },
-          { requestId: "request-2" },
+          { optionId: "approve", interactionId: "request-1" },
+          { interactionId: "request-2" },
         ],
         state: "committed",
         streamIndexAtSubmission: 12,
         submittedAt: 2,
       }, {
         id: "response-2",
-        responses: [{ requestId: "request-3", text: "Confirmed" }],
+        responses: [{ interactionId: "request-3", text: "Confirmed" }],
         settledAtStreamIndex: 24,
         state: "committed",
         streamIndexAtSubmission: 12,
@@ -914,10 +340,45 @@ test("hydrates durable input responses and rejects malformed response snapshots"
 
   assert.deepEqual(collection.threads[0]?.inputResponseSubmissions, [{
     id: "response-2",
-    responses: [{ requestId: "request-3", text: "Confirmed" }],
+    responses: [{ interactionId: "request-3", text: "Confirmed" }],
     settledAtStreamIndex: 24,
     state: "committed",
     streamIndexAtSubmission: 12,
     submittedAt: 3,
   }]);
+});
+
+test("a refused approval restores its controls despite a committed mailbox receipt", () => {
+  const submission = {
+    id: "answer-1", state: "committed" as const, streamIndexAtSubmission: 10,
+    submittedAt: 100, responses: [{ interactionId: "approval-1", optionId: "approve" }],
+  };
+  const events = [
+    ...line(10, { type: "response.submitted", data: { deliveryId: "answer-delivery", interactionId: "approval-1", responseId: "response-1", value: { optionId: "approve" } } }),
+    ...line(11, { type: "response.settled", data: { responseId: "response-1", outcome: "refused", reason: "Only the requester can approve." } }),
+  ];
+  assert.equal(inputResponseSubmissionProjectsAnswer(submission, events.slice(0, 1)), true);
+  assert.equal(inputResponseSubmissionProjectsAnswer(submission, events), false);
+  assert.equal(inputResponseSubmissionFailure(submission, events), "Only the requester can approve.");
+  const retry = { ...submission, id: "answer-2", streamIndexAtSubmission: 12, submittedAt: 200 };
+  assert.equal(inputResponseSubmissionProjectsAnswer(retry, events), true, "old refusal must not hide a new attempt");
+  const applied = [...events,
+    ...line(12, { type: "response.submitted", data: { deliveryId: "retry-delivery", interactionId: "approval-1", responseId: "response-2", value: { optionId: "approve" } } }),
+    ...line(13, { type: "response.settled", data: { responseId: "response-2", outcome: "applied" } }),
+  ];
+  assert.equal(inputResponseSubmissionProjectsAnswer(retry, applied), true);
+  assert.equal(inputResponseSubmissionFailure(retry, applied), undefined);
+  assert.equal(inputResponseSubmissionProjectsAnswer(submission, applied), false);
+});
+
+test("unrelated approval failures do not change an answer's projection", () => {
+  const submission = {
+    id: "answer-1", state: "committed" as const, streamIndexAtSubmission: 10,
+    submittedAt: 100, responses: [{ interactionId: "approval-1", optionId: "approve" }],
+  };
+  const events = [
+    ...line(10, { type: "response.submitted", data: { deliveryId: "other-delivery", interactionId: "approval-2", responseId: "response-2", value: { optionId: "approve" } } }),
+    ...line(11, { type: "response.settled", data: { responseId: "response-2", outcome: "failed" } }),
+  ];
+  assert.equal(inputResponseSubmissionProjectsAnswer(submission, events), true);
 });

@@ -166,7 +166,10 @@ function enqueueOnlyStore(results: EnqueueAgentMailboxResult[]): AgentMailboxSto
     cancelOwned: unsupported,
     claimNext: unsupported,
     commit: unsupported,
-    consumeEdit: unsupported,
+    prepareEdit: unsupported,
+    claimEditClear: unsupported,
+    recordEditClear: unsupported,
+    completeEditClear: unsupported,
     defer: unsupported,
     deferRejectedAdmission: unsupported,
     async enqueue() {

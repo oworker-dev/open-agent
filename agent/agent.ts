@@ -74,9 +74,7 @@ function createAgentModel(
 export default defineAgent({
   build: { externalDependencies: ["sharp"] },
   description: "A general-purpose autonomous agent for research, software, and knowledge work.",
-  model: defineDynamic({
-    events: {
-      "step.started": (_event, ctx) => {
+  model: defineDynamic((ctx) => {
         if (evalFixtureModel) {
           return {
             model: evalFixtureModel,
@@ -110,8 +108,6 @@ export default defineAgent({
             },
           },
         };
-      },
-    },
   }),
   reasoning: "provider-default",
   compaction: {
@@ -121,6 +117,6 @@ export default defineAgent({
     ...definitionLimits,
   },
   experimental: {
-    ...(workflowWorld ? { workflow: { world: workflowWorld } } : {}),
+    workflow: { ...(workflowWorld ? { world: workflowWorld } : {}), retention: "default" },
   },
 });

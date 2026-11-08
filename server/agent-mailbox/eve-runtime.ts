@@ -1,6 +1,6 @@
 import type { AgentMailboxRuntime } from "./service.ts";
 import { AgentMailboxAdmissionError } from "./service.ts";
-import type { MessageStreamEvent } from "eve/client";
+import type { SessionStreamEvent } from "eve/client";
 import { signMailboxDispatchBody } from "../../agent/lib/mailbox-dispatch-auth.ts";
 import { normalizeAgentRuntimeHost } from "../agent-runs/eve-adapter.ts";
 
@@ -41,7 +41,7 @@ export function createEveAgentMailboxRuntime(
     return { parsed, response } as const;
   };
 
-  const transcript = async function* (input: { readonly sessionId: string; readonly startIndex: number }): AsyncIterable<MessageStreamEvent> {
+  const transcript = async function* (input: { readonly sessionId: string; readonly startIndex: number }): AsyncIterable<SessionStreamEvent> {
     const body = JSON.stringify({ action: "transcript", sessionId: input.sessionId, startIndex: input.startIndex });
     const response = await fetchImplementation(endpoint, {
       body,
@@ -107,7 +107,6 @@ export function createEveAgentMailboxRuntime(
       }
       if (parsed.state === "running") {
         return {
-          ...(parsed.editAdmissionGuard === true ? { editAdmissionGuard: true as const } : {}),
           ...(validText(parsed.lastEventAt) ? { lastEventAt: parsed.lastEventAt } : {}),
           state: "running",
           ...(safeNonNegativeInteger(parsed.tailIndex) ? { tailIndex: parsed.tailIndex } : {}),
@@ -125,7 +124,6 @@ export function createEveAgentMailboxRuntime(
       }
       if (parsed.state === "waiting") {
         return {
-          ...(parsed.editAdmissionGuard === true ? { editAdmissionGuard: true as const } : {}),
           state: "waiting",
           ...(safeNonNegativeInteger(parsed.tailIndex) ? { tailIndex: parsed.tailIndex } : {}),
         };
@@ -152,6 +150,7 @@ export function createEveAgentMailboxRuntime(
       try {
         result = await request({
           action: "deliver",
+          ...(input.payload.callerAuth ? { callerAuth: input.payload.callerAuth } : {}),
           ...(input.payload.operation?.beforeTurnId
             ? { beforeTurnId: input.payload.operation.beforeTurnId }
             : {}),
@@ -189,14 +188,14 @@ export function createEveAgentMailboxRuntime(
       if (response.status === 409 && isRecord(parsed) && parsed.code === "mailbox_turn_active") {
         throw new AgentMailboxAdmissionError("busy", message);
       }
-      const rejected = [400, 401, 403, 404, 409, 410, 413].includes(response.status) &&
+      const rejected = [400, 401, 403, 404, 409, 410, 413, 422].includes(response.status) &&
         isRecord(parsed) && parsed.code !== "mailbox_session_identity_changed";
       throw new AgentMailboxAdmissionError(rejected ? "rejected" : "ambiguous", message);
     },
   };
 }
 
-function parseTranscriptEvent(line: string): MessageStreamEvent {
+function parseTranscriptEvent(line: string): SessionStreamEvent {
   let value: unknown;
   try {
     value = JSON.parse(line);
@@ -206,7 +205,7 @@ function parseTranscriptEvent(line: string): MessageStreamEvent {
   if (!isRecord(value) || typeof value.type !== "string") {
     throw new Error("The Agent transcript bridge returned an invalid event.");
   }
-  return value as unknown as MessageStreamEvent;
+  return value as unknown as SessionStreamEvent;
 }
 
 function readTimeout(value: string | undefined): number {

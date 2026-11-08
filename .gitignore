@@ -6,6 +6,10 @@ node_modules
 .next
 .output
 .nitro
+# Local rollback builds and runtime identity backups are not source artifacts.
+/.eve-*/
+/.next-*/
+/.output-*/
 dist
 !packages/*/dist/
 !packages/*/dist/**

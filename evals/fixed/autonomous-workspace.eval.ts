@@ -17,7 +17,7 @@ export default defineEval({
       input: { filePath: "/workspace/autonomy.txt" },
       count: 1,
     });
-    t.noFailedActions();
+    t.noFailedCalls();
     t.messageIncludes("AUTONOMY_FILE_COMPLETED");
   },
 });

@@ -3,8 +3,11 @@ export function safeAssetContentType(value: string): string {
   return isSafeInlineType(value) ? value : "application/octet-stream";
 }
 
-export function assetContentDisposition(value: string, filename: string): string {
-  return `${isSafeInlineType(value) ? "inline" : "attachment"}; filename="${safeHeaderFilename(filename)}"`;
+export function assetContentDisposition(value: string, filename: string, forceAttachment = false): string {
+  const fallback = safeHeaderFilename(filename);
+  const encoded = encodeURIComponent(filename.toWellFormed()).replace(/[!'()*]/gu,
+    (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+  return `${!forceAttachment && isSafeInlineType(value) ? "inline" : "attachment"}; filename="${fallback}"; filename*=UTF-8''${encoded}`;
 }
 
 function isSafeInlineType(value: string): boolean {
@@ -17,5 +20,5 @@ function isSafeInlineType(value: string): boolean {
 }
 
 function safeHeaderFilename(value: string): string {
-  return value.replace(/["\\\r\n]/gu, "_");
+  return value.replace(/[^\x20-\x7E]|["\\]/gu, "_");
 }

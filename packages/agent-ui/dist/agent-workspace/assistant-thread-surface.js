@@ -2,7 +2,7 @@
 import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-runtime";
 import { ActionBarPrimitive, AttachmentPrimitive, ComposerPrimitive, MessagePrimitive, ThreadPrimitive, unstable_useMentionAdapter, useAui, useAuiState, } from "@assistant-ui/react";
 import { LexicalComposerInput } from "@assistant-ui/react-lexical";
-import { ArrowDownIcon, ArrowUpIcon, AtSignIcon, CheckIcon, CircleGaugeIcon, CircleXIcon, CopyIcon, ChevronDownIcon, FileIcon, ImageIcon, LockKeyholeIcon, LoaderCircleIcon, PlusIcon, PencilIcon, RotateCcwIcon, ShieldCheckIcon, SlashIcon, SquareIcon, WrenchIcon, WifiIcon, XIcon, } from "lucide-react";
+import { ArrowDownIcon, ArrowUpIcon, AtSignIcon, CheckIcon, CircleGaugeIcon, CircleXIcon, CopyIcon, ChevronDownIcon, DownloadIcon, EyeIcon, FileIcon, ImageIcon, LockKeyholeIcon, LoaderCircleIcon, PlusIcon, PencilIcon, RotateCcwIcon, ShieldCheckIcon, SlashIcon, SquareIcon, WrenchIcon, WifiIcon, XIcon, } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ComposerTriggerPopover } from "../assistant-ui/composer-trigger-popover.js";
 import { copyText } from "../assistant-ui/copy-text.js";
@@ -14,29 +14,24 @@ import { ToolFallback } from "../assistant-ui/tool-fallback.js";
 import { TooltipIconButton } from "../assistant-ui/tooltip-icon-button.js";
 import { Button } from "../ui/button.js";
 import { Alert, AlertDescription, AlertTitle } from "../ui/alert.js";
-import { Attachment, AttachmentContent, AttachmentDescription, AttachmentGroup, AttachmentMedia, AttachmentTitle, AttachmentTrigger } from "../ui/attachment.js";
+import { Attachment, AttachmentAction, AttachmentContent, AttachmentDescription, AttachmentGroup, AttachmentMedia, AttachmentTitle, AttachmentTrigger } from "../ui/attachment.js";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "../ui/dialog.js";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "../ui/collapsible.js";
 import { cn } from "../utils.js";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuLabel, DropdownMenuRadioGroup, DropdownMenuRadioItem, DropdownMenuTrigger, } from "../ui/dropdown-menu.js";
 import { AgentMessage } from "./agent-message.js";
 import { classifyAgentFailure, presentAgentTurn } from "./turn-presentation.js";
+import { useAssetDownload, useAssetPreview, useAssetText } from "./asset-preview.js";
 export function AssistantThreadSurface({ assetUrl, approvalTakeover, cancellationState, closedInputRequestIds, commands, composerTop, draftStorageKey, draftRestore, events, eveMessages, fallbackStartedAt, historyHasMore = false, historyLoading = false, historyStartIndex, inputDisabled, isBusy, scrollToBottomOnInitialize = true, scrollToBottomOnThreadSwitch = true, sessionTerminal, sessionSettled, messageEditingAllowed, onCancel, locale, mentions, messages, models, onInputResponses, onCloseInputRequest, onDraftRestoreConsumed, onOpenDeliverable, onOpenSubagent, onLoadEarlier, onPreferencesChange, onRetryRuntimeError, preferences, reasoningLevels, runtimeError, runtimeFailure, runtimeRetry, usage, }) {
     const composerIsEditing = useAuiState((state) => state.composer.isEditing);
     const viewportRef = useRef(null);
     const historyRequestInFlightRef = useRef(false);
-    const [historyPrepending, setHistoryPrepending] = useState(false);
     const pendingHistoryAnchorRef = useRef(undefined);
     const viewportScrollOnInitialize = scrollToBottomOnInitialize && !composerIsEditing;
     const viewportScrollOnThreadSwitch = scrollToBottomOnThreadSwitch && !composerIsEditing;
     const eveMessagesById = useMemo(() => new Map(eveMessages.map((message) => [message.id, message])), [eveMessages]);
-    const eveMessagesByTurnId = useMemo(() => new Map(eveMessages.flatMap((message) => {
-        const turnId = typeof message.metadata?.turnId === "string" ? message.metadata.turnId : undefined;
-        return turnId ? [[turnId, message]] : [];
-    })), [eveMessages]);
     const lastAssistantMessageId = [...eveMessages].reverse().find((message) => message.role === "assistant")?.id;
-    const canRespondToInputRequest = eveMessages.some((message) => message.parts.some((part) => part.type === "dynamic-tool" &&
-        Boolean(part.toolMetadata?.eve?.inputRequest) &&
-        part.toolMetadata?.eve?.inputResponse === undefined));
+    const canRespondToInputRequest = eveMessages.some((message) => message.parts.some((part) => (part.type === "tool" && part.interaction?.status === "open") || (part.type === "interaction" && part.status === "open")));
     const loadEarlierNearTop = useCallback(() => {
         const viewport = viewportRef.current;
         if (!viewport || !historyHasMore || historyLoading ||
@@ -46,7 +41,6 @@ export function AssistantThreadSurface({ assetUrl, approvalTakeover, cancellatio
         const viewportTop = viewport.getBoundingClientRect().top;
         const visibleMessage = [...viewport.querySelectorAll("[data-message-id]")].find((element) => element.getBoundingClientRect().bottom > viewportTop);
         historyRequestInFlightRef.current = true;
-        setHistoryPrepending(true);
         pendingHistoryAnchorRef.current = {
             ...(visibleMessage?.dataset.messageId
                 ? {
@@ -90,18 +84,15 @@ export function AssistantThreadSurface({ assetUrl, approvalTakeover, cancellatio
                 const nextOffsetTop = currentMessage.getBoundingClientRect().top - currentViewport.getBoundingClientRect().top;
                 currentViewport.scrollTop += nextOffsetTop - anchor.messageOffsetTop;
                 pendingHistoryAnchorRef.current = undefined;
-                setHistoryPrepending(false);
                 return;
             }
             if (pageRendered) {
                 currentViewport.scrollTop = anchor.scrollTop + (currentViewport.scrollHeight - anchor.scrollHeight);
                 pendingHistoryAnchorRef.current = undefined;
-                setHistoryPrepending(false);
                 return;
             }
             if (frameCount >= 8) {
                 pendingHistoryAnchorRef.current = undefined;
-                setHistoryPrepending(false);
             }
             else {
                 frameCount += 1;
@@ -114,30 +105,7 @@ export function AssistantThreadSurface({ assetUrl, approvalTakeover, cancellatio
                 window.cancelAnimationFrame(frame);
         };
     }, [eveMessages.length, historyLoading, historyStartIndex]);
-    return (_jsx(ThreadPrimitive.Root, { className: "aui-root flex h-full min-h-0 flex-col bg-background", style: { "--thread-max-width": "48rem" }, children: _jsxs(ThreadPrimitive.Viewport, { "aria-live": "polite", autoScroll: !historyPrepending, onScroll: handleViewportScroll, ref: viewportRef, scrollToBottomOnInitialize: viewportScrollOnInitialize, scrollToBottomOnThreadSwitch: viewportScrollOnThreadSwitch, turnAnchor: "top", className: "relative flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-auto px-3 pt-3 sm:px-4 sm:pt-4", "data-slot": "thread-viewport", role: "log", children: [historyLoading ? (_jsxs("div", { className: "pointer-events-none absolute left-1/2 top-2 z-10 -translate-x-1/2 text-muted-foreground", "data-agent-history-loading": true, role: "status", children: [_jsx(LoaderCircleIcon, { className: "size-4 animate-spin" }), _jsx("span", { className: "sr-only", children: locale === "zh-CN" ? "正在加载更早消息" : "Loading earlier messages" })] })) : null, _jsxs("div", { className: "mx-auto mb-14 flex w-full max-w-(--thread-max-width) flex-col gap-y-6 empty:hidden", children: [_jsx(ThreadPrimitive.Messages, { children: ({ message }) => message.composer.isEditing ? (_jsx(EditMessage, { messages: messages })) : message.role === "user" ? (_jsx(UserMessage, { isBusy: isBusy, messages: messages, messageEditingAllowed: messageEditingAllowed, sessionTerminal: sessionTerminal, sessionSettled: sessionSettled })) : (_jsx(AssistantMessage, { assetUrl: assetUrl, canRespond: !isBusy || canRespondToInputRequest, events: events, fallbackStartedAt: fallbackStartedAt, isStreaming: isBusy && !runtimeError && message.id === lastAssistantMessageId, isTurnContinuation: isSteeringContinuationMessage(message, events), locale: locale, message: eveMessagesById.get(message.id) ?? (() => {
-                                    const turnId = typeof message.metadata?.custom?.turnId === "string"
-                                        ? message.metadata.custom.turnId
-                                        : undefined;
-                                    return turnId ? eveMessagesByTurnId.get(turnId) : undefined;
-                                })(), messages: messages, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, closedInputRequestIds: closedInputRequestIds, onRetryRuntimeError: onRetryRuntimeError, runtimeError: message.id === lastAssistantMessageId ? runtimeError : undefined, runtimeFailure: message.id === lastAssistantMessageId ? runtimeFailure : undefined, runtimeRetry: message.id === lastAssistantMessageId ? runtimeRetry : undefined })) }), runtimeError && !lastAssistantMessageId ? (_jsx(RuntimeErrorMessage, { locale: locale, message: runtimeError, messages: messages, onRetry: onRetryRuntimeError, failure: runtimeFailure, retry: runtimeRetry })) : null] }), _jsx(ThreadPrimitive.Empty, { children: !isBusy ? _jsx(AssistantEmptyState, { messages: messages }) : null }), _jsxs(ThreadPrimitive.ViewportFooter, { className: "sticky bottom-0 z-20 mx-auto mt-auto flex w-full max-w-(--thread-max-width) flex-col bg-background pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-0 sm:pb-4 md:pb-5", children: [_jsx(ThreadPrimitive.ScrollToBottom, { asChild: true, children: _jsx(TooltipIconButton, { tooltip: locale === "zh-CN" ? "滚动到底部" : "Scroll to bottom", className: "absolute -top-9 left-1/2 z-10 size-8 -translate-x-1/2 rounded-full disabled:invisible", variant: "outline", children: _jsx(ArrowDownIcon, { className: "size-4" }) }) }), _jsx(AssistantComposer, { approvalTakeover: approvalTakeover, cancellationState: cancellationState, commands: commands, composerTop: composerTop, draftStorageKey: draftStorageKey, draftRestore: draftRestore, inputDisabled: inputDisabled, isBusy: isBusy, sessionSettled: sessionSettled, locale: locale, mentions: mentions, messages: messages, models: models, onPreferencesChange: onPreferencesChange, onInputResponses: onInputResponses, onCancel: onCancel, onDraftRestoreConsumed: onDraftRestoreConsumed, preferences: preferences, reasoningLevels: reasoningLevels, usage: usage })] })] }) }));
-}
-function isSteeringContinuationMessage(message, events) {
-    const metadata = typeof message.metadata === "object" && message.metadata !== null
-        ? message.metadata
-        : undefined;
-    const turnId = typeof metadata?.turnId === "string" ? metadata.turnId : undefined;
-    if (message.role !== "assistant" || !turnId)
-        return false;
-    const segmentMarker = ":assistant:";
-    const segmentStart = message.id.lastIndexOf(segmentMarker);
-    if (segmentStart < 0)
-        return false;
-    const clientMessageId = message.id.slice(segmentStart + segmentMarker.length);
-    if (!clientMessageId)
-        return false;
-    const receipts = events.filter((event) => event.type === "message.received" && event.data.turnId === turnId);
-    const segmentIndex = receipts.findIndex((event) => event.type === "message.received" && event.data.clientMessageId === clientMessageId);
-    return segmentIndex > 0 || (segmentIndex < 0 && receipts.length > 0);
+    return (_jsx(ThreadPrimitive.Root, { className: "aui-root flex h-full min-h-0 flex-col bg-background", style: { "--thread-max-width": "48rem" }, children: _jsxs(ThreadPrimitive.Viewport, { "aria-live": "polite", autoScroll: false, scrollToBottomOnRunStart: false, onScroll: handleViewportScroll, ref: viewportRef, scrollToBottomOnInitialize: viewportScrollOnInitialize, scrollToBottomOnThreadSwitch: viewportScrollOnThreadSwitch, turnAnchor: "top", className: "relative flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-auto px-3 pt-3 sm:px-4 sm:pt-4", "data-slot": "thread-viewport", role: "log", children: [historyLoading ? (_jsxs("div", { className: "pointer-events-none absolute left-1/2 top-2 z-10 -translate-x-1/2 text-muted-foreground", "data-agent-history-loading": true, role: "status", children: [_jsx(LoaderCircleIcon, { className: "size-4 animate-spin" }), _jsx("span", { className: "sr-only", children: locale === "zh-CN" ? "正在加载更早消息" : "Loading earlier messages" })] })) : null, _jsxs("div", { className: "mx-auto mb-14 flex w-full max-w-(--thread-max-width) flex-col gap-y-6 empty:hidden", children: [_jsx(ThreadPrimitive.Messages, { children: ({ message }) => message.composer.isEditing ? (_jsx(EditMessage, { messages: messages })) : message.role === "user" ? (_jsx(UserMessage, { isBusy: isBusy, messages: messages, messageEditingAllowed: messageEditingAllowed, sessionTerminal: sessionTerminal, sessionSettled: sessionSettled })) : (_jsx(AssistantMessage, { assetUrl: assetUrl, canRespond: !isBusy || canRespondToInputRequest, events: events, fallbackStartedAt: fallbackStartedAt, isStreaming: isBusy && !runtimeError && message.id === lastAssistantMessageId, locale: locale, message: eveMessagesById.get(message.id), messages: messages, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, closedInputRequestIds: closedInputRequestIds, onRetryRuntimeError: onRetryRuntimeError, runtimeError: message.id === lastAssistantMessageId ? runtimeError : undefined, runtimeFailure: message.id === lastAssistantMessageId ? runtimeFailure : undefined, runtimeRetry: message.id === lastAssistantMessageId ? runtimeRetry : undefined })) }), runtimeError && !lastAssistantMessageId ? (_jsx(RuntimeErrorMessage, { locale: locale, message: runtimeError, messages: messages, onRetry: onRetryRuntimeError, failure: runtimeFailure, retry: runtimeRetry })) : null] }), _jsx(ThreadPrimitive.Empty, { children: !isBusy ? _jsx(AssistantEmptyState, { messages: messages }) : null }), _jsxs(ThreadPrimitive.ViewportFooter, { className: "sticky bottom-0 z-20 mx-auto mt-auto flex w-full max-w-(--thread-max-width) flex-col bg-background pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-0 sm:pb-4 md:pb-5", children: [_jsx(ThreadPrimitive.ScrollToBottom, { asChild: true, children: _jsx(TooltipIconButton, { tooltip: locale === "zh-CN" ? "滚动到底部" : "Scroll to bottom", className: "absolute -top-9 left-1/2 z-10 size-8 -translate-x-1/2 rounded-full disabled:invisible", variant: "outline", children: _jsx(ArrowDownIcon, { className: "size-4" }) }) }), _jsx(AssistantComposer, { approvalTakeover: approvalTakeover, cancellationState: cancellationState, commands: commands, composerTop: composerTop, draftStorageKey: draftStorageKey, draftRestore: draftRestore, inputDisabled: inputDisabled, isBusy: isBusy, sessionSettled: sessionSettled, locale: locale, mentions: mentions, messages: messages, models: models, onPreferencesChange: onPreferencesChange, onInputResponses: onInputResponses, onCancel: onCancel, onDraftRestoreConsumed: onDraftRestoreConsumed, preferences: preferences, reasoningLevels: reasoningLevels, usage: usage })] })] }) }));
 }
 function RuntimeErrorMessage({ failure, locale, message, messages, onRetry, retry, }) {
     const category = classifyAgentFailure(failure ?? { code: "", message });
@@ -180,16 +148,27 @@ function UserMessage({ isBusy, messages, messageEditingAllowed, sessionTerminal 
         return lastUser?.id === state.message.id;
     });
     const canEdit = messageEditingAllowed && isLastUserMessage && !isBusy && !sessionTerminal && sessionSettled !== false;
-    return (_jsxs(MessagePrimitive.Root, { className: "group fade-in slide-in-from-bottom-1 animate-in mx-auto grid w-full max-w-(--thread-max-width) auto-rows-auto grid-cols-[minmax(72px,1fr)_auto] content-start gap-y-2 px-2 duration-150 [&:where(>*)]:col-start-2", children: [_jsx(AttachmentGroup, { className: "col-start-2 mb-0 max-w-[88%] justify-end py-0", children: _jsx(MessagePrimitive.Attachments, { children: ({ attachment }) => _jsx(UserAttachment, { attachment: attachment, messages: messages }) }) }), _jsxs("div", { className: "relative col-start-2 min-w-0", children: [_jsx("div", { className: "peer rounded-xl bg-muted px-4 py-2 text-foreground wrap-break-word empty:hidden", onClick: () => {
+    return (_jsxs(MessagePrimitive.Root, { className: "group fade-in slide-in-from-bottom-1 animate-in mx-auto grid w-full max-w-(--thread-max-width) auto-rows-auto grid-cols-[minmax(72px,1fr)_auto] content-start gap-y-2 px-2 duration-150 [&:where(>*)]:col-start-2", children: [_jsx(AttachmentGroup, { className: "col-start-2 mb-0 ml-auto max-w-[88%] justify-start py-0", children: _jsx(MessagePrimitive.Attachments, { children: ({ attachment }) => _jsx(UserAttachment, { attachment: attachment, messages: messages }) }) }), _jsxs("div", { className: "relative col-start-2 min-w-0", children: [_jsx("div", { className: "peer rounded-xl bg-muted px-4 py-2 text-foreground wrap-break-word empty:hidden", onClick: () => {
                             if (window.matchMedia("(pointer: coarse)").matches)
                                 setActionsVisible((visible) => !visible);
                         }, children: _jsx(MessagePrimitive.Parts, { components: { Text: DirectiveText } }) }), _jsx("div", { className: cn("flex min-h-7.5 items-center justify-end gap-0.5 pt-1.5 transition-opacity peer-empty:hidden", actionsVisible ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"), children: _jsxs(ActionBarPrimitive.Root, { className: "flex items-center justify-end gap-0.5 text-muted-foreground", children: [_jsx(ReliableCopyButton, { label: messages.copyResponse }), canEdit ? (_jsx(ActionBarPrimitive.Edit, { asChild: true, children: _jsx(TooltipIconButton, { "aria-label": messages.editMessage, className: "text-muted-foreground hover:text-foreground", tooltip: messages.editMessage, children: _jsx(PencilIcon, { className: "size-3.5" }) }) })) : null] }) })] })] }));
 }
 function UserAttachment({ attachment, messages }) {
     const isImage = attachment.contentType?.startsWith("image/") ?? attachment.type === "image";
-    const previewUrl = isImage ? attachmentContentUrl(attachment) : undefined;
-    const [previewOpen, setPreviewOpen] = useState(false);
-    return (_jsxs(_Fragment, { children: [isImage ? (_jsxs(Attachment, { className: "size-24 min-w-0 overflow-hidden p-0 sm:size-28", orientation: "vertical", size: "sm", state: "done", children: [_jsx(AttachmentMedia, { className: "size-full rounded-xl", variant: previewUrl ? "image" : "icon", children: previewUrl ? _jsx("img", { alt: attachment.name, src: previewUrl }) : _jsx(ImageIcon, { className: "size-5" }) }), previewUrl ? (_jsx(AttachmentTrigger, { "aria-label": `${messages.attachment}: ${attachment.name}`, onClick: () => setPreviewOpen(true) })) : null] })) : (_jsxs(Attachment, { className: "max-w-72", size: "sm", state: "done", children: [_jsx(AttachmentMedia, { variant: "icon", children: _jsx(FileIcon, { className: "size-4" }) }), _jsxs(AttachmentContent, { children: [_jsx(AttachmentTitle, { children: attachment.name }), _jsx(AttachmentDescription, { children: attachment.contentType ?? messages.attachment })] })] })), previewOpen && previewUrl ? (_jsx("button", { "aria-label": messages.dismiss, className: "fixed inset-0 z-50 flex cursor-zoom-out items-center justify-center bg-black/70 p-4", onClick: () => setPreviewOpen(false), type: "button", children: _jsx("img", { alt: attachment.name, className: "max-h-[90vh] max-w-[90vw] rounded-xl object-contain", src: previewUrl }) })) : null] }));
+    const isTextPreviewable = isTextAssetPreviewable(attachment.contentType);
+    const contentUrl = attachmentContentUrl(attachment);
+    const { url: previewUrl, error: previewError, retry: retryPreview } = useAssetPreview(isImage ? attachmentContentUrl(attachment) : undefined);
+    const [imagePreviewOpen, setImagePreviewOpen] = useState(false);
+    const [textPreviewOpen, setTextPreviewOpen] = useState(false);
+    const textPreview = useAssetText(textPreviewOpen && isTextPreviewable ? contentUrl : undefined);
+    const download = useAssetDownload(contentUrl, attachment.name);
+    return (_jsxs(_Fragment, { children: [isImage ? (_jsxs(Attachment, { className: "size-24 min-w-0 overflow-hidden p-0 sm:size-28", orientation: "vertical", size: "sm", state: previewError ? "error" : previewUrl ? "done" : "processing", children: [_jsx(AttachmentMedia, { className: "size-full rounded-xl", variant: previewUrl ? "image" : "icon", children: previewUrl ? _jsx("img", { alt: attachment.name, src: previewUrl }) : _jsx(ImageIcon, { className: "size-5" }) }), previewUrl ? (_jsx(AttachmentTrigger, { "aria-label": `${messages.attachment}: ${attachment.name}`, onClick: () => setImagePreviewOpen(true) })) : previewError ? (_jsx(AttachmentTrigger, { "aria-label": messages.retry, onClick: retryPreview, title: previewError, children: _jsx(RotateCcwIcon, { className: "m-auto size-4" }) })) : null] })) : (_jsxs(Attachment, { className: "w-[min(18rem,100%)] flex-nowrap", size: "sm", state: "done", children: [_jsx(AttachmentMedia, { variant: "icon", children: _jsx(FileIcon, { className: "size-4" }) }), _jsxs(AttachmentContent, { children: [_jsx(AttachmentTitle, { children: attachment.name }), _jsx(AttachmentDescription, { children: attachment.contentType ?? messages.attachment })] }), isTextPreviewable ? _jsx(AttachmentAction, { "aria-label": `${messages.previewFile}: ${attachment.name}`, disabled: textPreviewOpen, onClick: () => setTextPreviewOpen(true), title: messages.previewFile, children: _jsx(EyeIcon, { className: "size-3.5" }) }) : null, _jsx(AttachmentAction, { "aria-label": `${messages.attachment}: ${attachment.name}`, disabled: download.loading, onClick: () => void download.download(), title: attachment.name, children: _jsx(DownloadIcon, { className: "size-3.5" }) })] })), download.error ? _jsx("p", { className: "text-xs text-destructive", role: "alert", children: download.error }) : null, imagePreviewOpen && previewUrl ? (_jsx("button", { "aria-label": messages.dismiss, className: "fixed inset-0 z-50 flex cursor-zoom-out items-center justify-center bg-black/70 p-4", onClick: () => setImagePreviewOpen(false), type: "button", children: _jsx("img", { alt: attachment.name, className: "max-h-[90vh] max-w-[90vw] rounded-xl object-contain", src: previewUrl }) })) : null, isTextPreviewable ? _jsx(Dialog, { open: textPreviewOpen, onOpenChange: setTextPreviewOpen, children: _jsxs(DialogContent, { className: "grid max-h-[min(80vh,48rem)] max-w-3xl grid-rows-[auto_minmax(0,1fr)_auto]", children: [_jsxs(DialogHeader, { children: [_jsx(DialogTitle, { className: "truncate pr-8", children: attachment.name }), _jsx(DialogDescription, { children: attachment.contentType ?? messages.attachment })] }), _jsx("div", { className: "min-h-0 overflow-auto rounded-md border bg-muted/20 p-3", children: textPreview.error ? _jsx("p", { className: "text-sm text-destructive", role: "alert", children: textPreview.error })
+                                : textPreview.text !== undefined ? _jsx("pre", { className: "whitespace-pre-wrap break-words font-mono text-xs leading-5", children: textPreview.text })
+                                    : _jsx("p", { "aria-live": "polite", className: "text-sm text-muted-foreground", children: messages.loading }) }), _jsxs(DialogFooter, { className: "flex-row items-center justify-between sm:justify-between", children: [_jsxs("div", { className: "min-w-0 flex-1 text-xs text-muted-foreground", children: [textPreview.truncated ? messages.previewTruncated : null, textPreview.error ? _jsxs(Button, { className: "mt-1", onClick: textPreview.retry, size: "sm", variant: "ghost", children: [_jsx(RotateCcwIcon, { className: "size-3.5" }), messages.retry] }) : null] }), _jsxs(Button, { disabled: download.loading, onClick: () => void download.download(), size: "sm", children: [_jsx(DownloadIcon, { className: "size-3.5" }), messages.downloadCompleteFile] })] })] }) }) : null] }));
+}
+function isTextAssetPreviewable(mediaType) {
+    const normalized = mediaType?.split(";", 1)[0]?.trim().toLowerCase();
+    return Boolean(normalized && (["text/plain", "text/markdown", "text/csv", "text/tab-separated-values", "application/json", "application/x-ndjson", "application/yaml", "application/x-yaml"].includes(normalized)));
 }
 function attachmentContentUrl(attachment) {
     for (const part of attachment.content) {
@@ -202,9 +181,9 @@ function attachmentContentUrl(attachment) {
     }
     return undefined;
 }
-function AssistantMessage({ assetUrl, canRespond, closedInputRequestIds, events, fallbackStartedAt, isStreaming, isTurnContinuation, locale, message, messages, onInputResponses, onCloseInputRequest, onOpenDeliverable, onOpenSubagent, onRetryRuntimeError, runtimeError, runtimeFailure, runtimeRetry, }) {
+function AssistantMessage({ assetUrl, canRespond, closedInputRequestIds, events, fallbackStartedAt, isStreaming, locale, message, messages, onInputResponses, onCloseInputRequest, onOpenDeliverable, onOpenSubagent, onRetryRuntimeError, runtimeError, runtimeFailure, runtimeRetry, }) {
     const task = message
-        ? presentAgentTurn(message, events, closedInputRequestIds, { mergeSameTurn: true })
+        ? presentAgentTurn(message, events, closedInputRequestIds)
         : undefined;
     const copyableText = message
         ? task
@@ -217,7 +196,7 @@ function AssistantMessage({ assetUrl, canRespond, closedInputRequestIds, events,
                     .join("\n")
                     .trim() || undefined
         : undefined;
-    return (_jsxs(MessagePrimitive.Root, { className: "group relative mx-auto w-full max-w-(--thread-max-width)", children: [_jsxs("div", { className: "min-w-0 px-2 leading-relaxed text-foreground wrap-break-word", children: [message ? (_jsx(AgentMessage, { assetUrl: assetUrl, canRespond: canRespond, closedInputRequestIds: closedInputRequestIds, events: events, fallbackStartedAt: fallbackStartedAt, isStreaming: isStreaming, isTurnContinuation: isTurnContinuation, locale: locale, message: message, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, showCopyAction: false })) : (_jsx(MessagePrimitive.Parts, { components: { Text: MarkdownText, tools: { Fallback: ToolFallback } } })), runtimeError ? (_jsx(RuntimeErrorMessage, { failure: runtimeFailure, locale: locale, message: runtimeError, messages: messages, onRetry: onRetryRuntimeError, retry: runtimeRetry })) : null] }), !isStreaming && copyableText ? (_jsx("div", { className: "-mb-7.5 ml-2 flex min-h-7.5 items-center pt-1.5", children: _jsx(ActionBarPrimitive.Root, { autohide: "not-last", className: "text-muted-foreground flex gap-1", hideWhenRunning: true, children: _jsx(ReliableCopyButton, { label: messages.copyResponse, text: copyableText }) }) })) : null] }));
+    return (_jsxs(MessagePrimitive.Root, { className: "group relative mx-auto w-full max-w-(--thread-max-width)", children: [_jsxs("div", { className: "min-w-0 px-2 leading-relaxed text-foreground wrap-break-word", children: [message ? (_jsx(AgentMessage, { assetUrl: assetUrl, canRespond: canRespond, closedInputRequestIds: closedInputRequestIds, events: events, fallbackStartedAt: fallbackStartedAt, isStreaming: isStreaming, locale: locale, message: message, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, showCopyAction: false })) : (_jsx(MessagePrimitive.Parts, { components: { Text: MarkdownText, tools: { Fallback: ToolFallback } } })), runtimeError ? (_jsx(RuntimeErrorMessage, { failure: runtimeFailure, locale: locale, message: runtimeError, messages: messages, onRetry: onRetryRuntimeError, retry: runtimeRetry })) : null] }), !isStreaming && copyableText ? (_jsx("div", { className: "-mb-7.5 ml-2 flex min-h-7.5 items-center pt-1.5", children: _jsx(ActionBarPrimitive.Root, { autohide: "not-last", className: "text-muted-foreground flex gap-1", hideWhenRunning: true, children: _jsx(ReliableCopyButton, { label: messages.copyResponse, text: copyableText }) }) })) : null] }));
 }
 function ReliableCopyButton({ label, text }) {
     const aui = useAui();
@@ -252,7 +231,7 @@ export function AssistantComposer({ approvalTakeover, cancellationState, command
     const runtimeInputDisabled = useAuiState((state) => state.thread.isDisabled);
     const stopping = cancellationState !== "idle";
     const runtimeBusy = isBusy || (isRunning && !sessionSettled);
-    const composerDisabled = inputDisabled || runtimeInputDisabled || stopping;
+    const composerDisabled = inputDisabled || runtimeInputDisabled;
     const composerInputRef = useRef(null);
     const auiRef = useRef(aui);
     const draftHydrationRef = useRef(undefined);
@@ -360,23 +339,23 @@ export function AssistantComposer({ approvalTakeover, cancellationState, command
                     aui.composer.send();
                     blurComposerOnTouch(composerInputRef);
                 }
-            }, children: [_jsx("div", { className: "flex w-full flex-col gap-2 rounded-[1.5rem] border border-border/70 bg-background p-2.5 shadow-[0_8px_24px_-16px_rgba(0,0,0,0.24)]", children: approvalTakeover ? (_jsx(ApprovalComposerTakeover, { locale: locale, onRespond: onInputResponses, request: approvalTakeover })) : (_jsxs(_Fragment, { children: [composerTop, _jsx(AttachmentGroup, { className: "px-1 py-0.5 empty:hidden", children: _jsx(ComposerPrimitive.Attachments, { children: ({ attachment }) => (_jsx(ComposerAttachment, { attachment: attachment, messages: messages })) }) }), _jsx(LexicalComposerInput, { "aria-disabled": composerDisabled, directiveChip: DirectiveChip, placeholder: messages.inputPlaceholder, ref: composerInputRef, submitMode: touchInput ? "ctrlEnter" : "enter", onKeyDownCapture: (event) => {
-                                    if (touchInput || !isRunning || event.key !== "Enter" || event.shiftKey || composerDisabled || composerIsEmpty)
-                                        return;
-                                    const input = event.target instanceof HTMLElement
-                                        ? event.target.closest('[role="textbox"]')
-                                        : null;
-                                    const pickerOpen = input?.getAttribute("aria-expanded") === "true" ||
-                                        Boolean(composerInputRef.current?.querySelector('[data-slot="composer-trigger-popover"][data-state="open"]'));
-                                    if (pickerOpen)
-                                        return;
-                                    event.preventDefault();
-                                    aui.composer.send();
-                                    blurComposerOnTouch(composerInputRef);
-                                }, className: "aui-composer-input relative max-h-40 min-h-12 w-full resize-none overflow-y-auto bg-transparent px-2 py-1 text-[15px] leading-6 outline-none aria-disabled:pointer-events-none aria-disabled:opacity-50 [&_.aui-directive-chip]:inline-flex [&_.aui-directive-chip]:items-center [&_.aui-directive-chip]:gap-1 [&_.aui-directive-chip]:rounded-md [&_.aui-directive-chip]:bg-muted [&_.aui-directive-chip]:px-1.5 [&_.aui-directive-chip]:py-0.5 [&_.aui-directive-chip]:text-[13px] [&_.aui-directive-chip]:font-medium [&_.aui-directive-chip]:text-foreground [&_.aui-directive-chip-icon]:text-muted-foreground [&_.aui-lexical-input]:min-h-6 [&_.aui-lexical-input]:outline-none [&_.aui-lexical-placeholder]:pointer-events-none [&_.aui-lexical-placeholder]:absolute [&_.aui-lexical-placeholder]:inset-x-0 [&_.aui-lexical-placeholder]:top-0 [&_.aui-lexical-placeholder]:truncate [&_.aui-lexical-placeholder]:px-2 [&_.aui-lexical-placeholder]:py-1 [&_.aui-lexical-placeholder]:text-muted-foreground" }), _jsxs("div", { className: "flex min-h-9 items-center gap-0.5 sm:min-h-8 sm:gap-1", children: [_jsx(ComposerPrimitive.AddAttachment, { asChild: true, children: _jsx(Button, { "aria-label": messages.addFiles, className: "size-9 rounded-full text-muted-foreground sm:size-8", size: "icon-sm", type: "button", variant: "ghost", children: _jsx(PlusIcon, { className: "size-4" }) }) }), _jsx(ExecutionModeMenu, { messages: messages, onChange: (executionMode) => onPreferencesChange({ ...preferences, executionMode }), value: preferences.executionMode ?? "standard" }), _jsx(ModelSelector, { align: "start", className: "h-9 min-w-0 max-w-48 rounded-full px-2 text-muted-foreground sm:h-8 sm:max-w-64", contentClassName: "w-72 max-w-[calc(100vw-1.5rem)] text-xs", effort: preferences.reasoning, effortLabel: messages.reasoning, models: selectorModels, onEffortChange: (reasoning) => onPreferencesChange({ ...preferences, reasoning }), onValueChange: (modelId) => onPreferencesChange({ ...preferences, modelId }), searchable: models.length > 6, size: "sm", value: model?.id ?? preferences.modelId, valueClassName: "text-xs font-normal", variant: "ghost", triggerLabel: messages.model }), _jsxs("span", { className: "ml-auto flex min-w-0 items-center gap-0.5 sm:gap-1", children: [model ? (_jsx(ContextDisplay.Ring, { className: "h-9 shrink-0 rounded-full px-1.5 sm:h-8", label: messages.context, labels: contextLabels, modelContextWindow: model.contextWindowTokens, side: "top", sessionUsage: sessionUsage, usage: contextUsage })) : null, _jsx(Button, { "aria-hidden": !(stopping || (runtimeBusy && composerIsEmpty)), "aria-label": cancellationState === "idle" ? messages.cancel : messages.stopping, className: cn("size-9 shrink-0 rounded-full sm:size-8", !(stopping || (runtimeBusy && composerIsEmpty)) && "hidden"), disabled: cancellationState !== "idle" || !(stopping || (runtimeBusy && composerIsEmpty)), onClick: () => onCancel?.(), size: "icon-sm", tabIndex: stopping || (runtimeBusy && composerIsEmpty) ? 0 : -1, type: "button", children: cancellationState === "idle" ? (_jsx(SquareIcon, { className: "size-3.5 fill-current" })) : (_jsx(LoaderCircleIcon, { className: "size-4 animate-spin" })) }), _jsx(Button, { "aria-hidden": stopping || (runtimeBusy && composerIsEmpty), "aria-label": runtimeBusy ? messages.queueFollowUp : messages.send, className: cn("size-9 shrink-0 rounded-full sm:size-8", (stopping || (runtimeBusy && composerIsEmpty)) && "hidden"), disabled: composerDisabled || stopping || (runtimeBusy && composerIsEmpty), onClick: () => {
-                                                    aui.composer.send();
-                                                    blurComposerOnTouch(composerInputRef);
-                                                }, size: "icon-sm", tabIndex: stopping || (runtimeBusy && composerIsEmpty) ? -1 : 0, type: "button", children: _jsx(ArrowUpIcon, { className: "size-4" }) })] })] })] })) }), _jsx(ComposerTriggerPopover, { char: "@", ...mention, emptyItemsLabel: messages.noPromptItems }), _jsx(ComposerTriggerPopover, { char: "/", ...command, emptyItemsLabel: messages.noPromptItems })] }) }));
+            }, children: [_jsxs("div", { className: "flex w-full flex-col gap-2 rounded-[1.5rem] border border-border/70 bg-background p-2.5 shadow-[0_8px_24px_-16px_rgba(0,0,0,0.24)]", children: [composerTop, approvalTakeover ? (_jsx(ApprovalComposerTakeover, { cancellationState: cancellationState, locale: locale, onCancel: onCancel, onRespond: onInputResponses, request: approvalTakeover })) : (_jsxs(_Fragment, { children: [_jsx(AttachmentGroup, { className: "px-1 py-0.5 empty:hidden", children: _jsx(ComposerPrimitive.Attachments, { children: ({ attachment }) => (_jsx(ComposerAttachment, { attachment: attachment, messages: messages })) }) }), _jsx(LexicalComposerInput, { "aria-disabled": composerDisabled, directiveChip: DirectiveChip, placeholder: messages.inputPlaceholder, ref: composerInputRef, submitMode: touchInput ? "ctrlEnter" : "enter", onKeyDownCapture: (event) => {
+                                        if (touchInput || !isRunning || event.key !== "Enter" || event.shiftKey || composerDisabled || composerIsEmpty)
+                                            return;
+                                        const input = event.target instanceof HTMLElement
+                                            ? event.target.closest('[role="textbox"]')
+                                            : null;
+                                        const pickerOpen = input?.getAttribute("aria-expanded") === "true" ||
+                                            Boolean(composerInputRef.current?.querySelector('[data-slot="composer-trigger-popover"][data-state="open"]'));
+                                        if (pickerOpen)
+                                            return;
+                                        event.preventDefault();
+                                        aui.composer.send();
+                                        blurComposerOnTouch(composerInputRef);
+                                    }, className: "aui-composer-input relative max-h-40 min-h-12 w-full resize-none overflow-y-auto bg-transparent px-2 py-1 text-[15px] leading-6 outline-none aria-disabled:pointer-events-none aria-disabled:opacity-50 [&_.aui-directive-chip]:inline-flex [&_.aui-directive-chip]:items-center [&_.aui-directive-chip]:gap-1 [&_.aui-directive-chip]:rounded-md [&_.aui-directive-chip]:bg-muted [&_.aui-directive-chip]:px-1.5 [&_.aui-directive-chip]:py-0.5 [&_.aui-directive-chip]:text-[13px] [&_.aui-directive-chip]:font-medium [&_.aui-directive-chip]:text-foreground [&_.aui-directive-chip-icon]:text-muted-foreground [&_.aui-lexical-input]:min-h-6 [&_.aui-lexical-input]:outline-none [&_.aui-lexical-placeholder]:pointer-events-none [&_.aui-lexical-placeholder]:absolute [&_.aui-lexical-placeholder]:inset-x-0 [&_.aui-lexical-placeholder]:top-0 [&_.aui-lexical-placeholder]:truncate [&_.aui-lexical-placeholder]:px-2 [&_.aui-lexical-placeholder]:py-1 [&_.aui-lexical-placeholder]:text-muted-foreground" }), _jsxs("div", { className: "flex min-h-9 items-center gap-0.5 sm:min-h-8 sm:gap-1", children: [_jsx(ComposerPrimitive.AddAttachment, { asChild: true, children: _jsx(Button, { "aria-label": messages.addFiles, className: "size-9 rounded-full text-muted-foreground sm:size-8", size: "icon-sm", type: "button", variant: "ghost", children: _jsx(PlusIcon, { className: "size-4" }) }) }), _jsx(ExecutionModeMenu, { messages: messages, onChange: (executionMode) => onPreferencesChange({ ...preferences, executionMode }), value: preferences.executionMode ?? "standard" }), _jsx(ModelSelector, { align: "start", className: "h-9 min-w-0 max-w-48 rounded-full px-2 text-muted-foreground sm:h-8 sm:max-w-64", contentClassName: "w-72 max-w-[calc(100vw-1.5rem)] text-xs", effort: preferences.reasoning, effortLabel: messages.reasoning, models: selectorModels, onEffortChange: (reasoning) => onPreferencesChange({ ...preferences, reasoning }), onValueChange: (modelId) => onPreferencesChange({ ...preferences, modelId }), searchable: models.length > 6, size: "sm", value: model?.id ?? preferences.modelId, valueClassName: "text-xs font-normal", variant: "ghost", triggerLabel: messages.model }), _jsxs("span", { className: "ml-auto flex min-w-0 items-center gap-0.5 sm:gap-1", children: [model ? (_jsx(ContextDisplay.Ring, { className: "h-9 shrink-0 rounded-full px-1.5 sm:h-8", label: messages.context, labels: contextLabels, modelContextWindow: model.contextWindowTokens, side: "top", sessionUsage: sessionUsage, usage: contextUsage })) : null, _jsx(Button, { "aria-hidden": !((stopping || runtimeBusy) && composerIsEmpty), "aria-label": cancellationState === "idle" ? messages.cancel : messages.stopping, className: cn("size-9 shrink-0 rounded-full sm:size-8", !((stopping || runtimeBusy) && composerIsEmpty) && "hidden"), disabled: cancellationState !== "idle" || !((stopping || runtimeBusy) && composerIsEmpty), onClick: () => onCancel?.(), size: "icon-sm", tabIndex: (stopping || runtimeBusy) && composerIsEmpty ? 0 : -1, type: "button", children: cancellationState === "idle" ? (_jsx(SquareIcon, { className: "size-3.5 fill-current" })) : (_jsx(LoaderCircleIcon, { className: "size-4 animate-spin" })) }), _jsx(Button, { "aria-hidden": (stopping || runtimeBusy) && composerIsEmpty, "aria-label": runtimeBusy && !stopping ? messages.queueFollowUp : messages.send, className: cn("size-9 shrink-0 rounded-full sm:size-8", ((stopping || runtimeBusy) && composerIsEmpty) && "hidden"), disabled: composerDisabled || ((stopping || runtimeBusy) && composerIsEmpty), onClick: () => {
+                                                        aui.composer.send();
+                                                        blurComposerOnTouch(composerInputRef);
+                                                    }, size: "icon-sm", tabIndex: (stopping || runtimeBusy) && composerIsEmpty ? -1 : 0, type: "button", children: _jsx(ArrowUpIcon, { className: "size-4" }) })] })] })] }))] }), _jsx(ComposerTriggerPopover, { char: "@", ...mention, emptyItemsLabel: messages.noPromptItems }), _jsx(ComposerTriggerPopover, { char: "/", ...command, emptyItemsLabel: messages.noPromptItems })] }) }));
 }
 function blurComposerOnTouch(inputRef) {
     if (!window.matchMedia("(pointer: coarse)").matches)
@@ -408,21 +387,22 @@ function ComposerAttachment({ attachment, messages }) {
                                 ? attachment.status.message ?? messages.attachment
                                 : messages.attachment })] }), _jsx(AttachmentPrimitive.Remove, { "aria-label": messages.removeAttachment, className: "relative z-20 rounded-sm text-muted-foreground hover:text-foreground", children: _jsx(XIcon, { className: "size-3" }) })] }));
 }
-function ApprovalComposerTakeover({ locale, onRespond, request, }) {
+function ApprovalComposerTakeover({ cancellationState, locale, onCancel, onRespond, request, }) {
     const isZh = locale === "zh-CN";
+    const stopping = cancellationState !== "idle";
     const [submitting, setSubmitting] = useState(false);
     const respond = async (optionId) => {
-        if (submitting)
+        if (submitting || stopping)
             return;
         setSubmitting(true);
         try {
-            await onRespond([{ optionId, requestId: request.requestId }]);
+            await onRespond([{ optionId, interactionId: request.requestId }]);
         }
         finally {
             setSubmitting(false);
         }
     };
-    return (_jsxs("section", { "aria-label": isZh ? "工具调用等待批准" : "Tool call awaiting approval", className: "flex min-h-28 items-start gap-3 px-1 py-1", "data-agent-approval-takeover": true, role: "alertdialog", children: [_jsx("span", { className: "flex size-8 shrink-0 items-center justify-center rounded-full bg-amber-500/10 text-amber-700 dark:text-amber-300", children: _jsx(ShieldCheckIcon, { className: "size-4" }) }), _jsxs("div", { className: "min-w-0 flex-1", children: [_jsx("p", { className: "text-sm font-medium text-foreground", children: isZh ? `批准工具调用：${approvalToolLabel(request.toolName, locale)}` : `Approve tool call: ${approvalToolLabel(request.toolName, locale)}` }), _jsx("p", { className: "mt-1 line-clamp-2 text-xs leading-5 text-muted-foreground", children: request.prompt }), _jsx(ApprovalTakeoverDetails, { input: request.input, toolName: request.toolName }), _jsxs("div", { className: "mt-3 flex justify-end gap-2", children: [_jsx(Button, { className: "min-w-16", disabled: submitting, onClick: () => void respond("deny"), size: "sm", variant: "ghost", children: isZh ? "拒绝" : "Deny" }), _jsxs(Button, { className: "min-w-16", disabled: submitting, onClick: () => void respond("approve"), size: "sm", children: [submitting ? _jsx(LoaderCircleIcon, { className: "size-3.5 animate-spin" }) : null, isZh ? "批准" : "Approve"] })] })] })] }));
+    return (_jsxs("section", { "aria-label": isZh ? "工具调用等待批准" : "Tool call awaiting approval", className: "flex min-h-28 items-start gap-3 px-1 py-1", "data-agent-approval-takeover": true, role: "alertdialog", children: [_jsx("span", { className: "flex size-8 shrink-0 items-center justify-center rounded-full bg-amber-500/10 text-amber-700 dark:text-amber-300", children: _jsx(ShieldCheckIcon, { className: "size-4" }) }), _jsxs("div", { className: "min-w-0 flex-1", children: [_jsx("p", { className: "text-sm font-medium text-foreground", children: isZh ? `批准工具调用：${approvalToolLabel(request.toolName, locale)}` : `Approve tool call: ${approvalToolLabel(request.toolName, locale)}` }), _jsx("p", { className: "mt-1 line-clamp-2 text-xs leading-5 text-muted-foreground", children: request.prompt }), _jsx(ApprovalTakeoverDetails, { input: request.input, toolName: request.toolName }), _jsxs("div", { className: "mt-3 flex justify-end gap-2", children: [onCancel ? _jsxs(Button, { className: "mr-auto", disabled: submitting || stopping, onClick: onCancel, size: "sm", title: isZh ? "停止当前任务" : "Stop the current task", variant: "ghost", children: [stopping ? _jsx(LoaderCircleIcon, { className: "size-3.5 animate-spin" }) : _jsx(SquareIcon, { className: "size-3 fill-current" }), stopping ? (isZh ? "正在停止" : "Stopping") : (isZh ? "停止" : "Stop")] }) : null, _jsx(Button, { className: "min-w-16", disabled: submitting || stopping, onClick: () => void respond("deny"), size: "sm", variant: "ghost", children: isZh ? "拒绝" : "Deny" }), _jsxs(Button, { className: "min-w-16", disabled: submitting || stopping, onClick: () => void respond("approve"), size: "sm", children: [submitting ? _jsx(LoaderCircleIcon, { className: "size-3.5 animate-spin" }) : null, isZh ? "批准" : "Approve"] })] })] })] }));
 }
 function ApprovalTakeoverDetails({ input, toolName }) {
     if (input === undefined)

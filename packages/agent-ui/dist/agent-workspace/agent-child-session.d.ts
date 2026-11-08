@@ -1,4 +1,4 @@
-import type { MessageStreamEvent } from "eve/client";
+import { type SessionStreamEvent } from "eve/client";
 import type { AgentModelOption, AgentPromptMenuItem, AgentSessionDeliverable, AgentThreadPreferences, AgentWorkspaceClientConfig, AgentWorkspaceMailbox } from "./contracts.js";
 import type { AgentLocale } from "./i18n.js";
 import { type AgentThreadStorage } from "./thread-storage.js";
@@ -9,7 +9,7 @@ export declare function AgentChildSessionView({ client, commands, locale, mailbo
     readonly mailbox?: AgentWorkspaceMailbox;
     readonly mentions: readonly AgentPromptMenuItem[];
     readonly models: readonly AgentModelOption[];
-    readonly onEvent?: (event: MessageStreamEvent) => void;
+    readonly onEvent?: (event: SessionStreamEvent) => void;
     readonly onOpenDeliverable?: (deliverable: AgentSessionDeliverable) => void;
     readonly onOpenSubagent?: (sessionId: string) => void;
     readonly onStorageError?: (error: unknown) => void;

@@ -3,6 +3,7 @@ import { defineHook } from "eve/hooks";
 import {
   initializeRunPolicy,
   readAgentRunPolicy,
+  recordRunPolicyActivity,
   recordRunPolicyBoundary,
   recordRunPolicyUsage,
 } from "../lib/run-policy.ts";
@@ -10,22 +11,30 @@ import {
 export default defineHook({
   events: {
     "session.started"(_event, ctx) {
-      initializeRunPolicy();
+      initializeRunPolicy(ctx.now.getTime());
       readAgentRunPolicy(ctx);
     },
     "turn.started"(_event, ctx) {
-      recordRunPolicyBoundary(readAgentRunPolicy(ctx), "turn");
+      recordRunPolicyBoundary(readAgentRunPolicy(ctx), "turn", 1, ctx.now.getTime());
     },
-    "step.started"(_event, ctx) {
-      recordRunPolicyBoundary(readAgentRunPolicy(ctx), "model");
+    "delivery.consumed"(_event, ctx) {
+      recordRunPolicyActivity(true, ctx.now.getTime());
     },
-    "actions.requested"(event, ctx) {
-      const actions = Array.isArray(event.data.actions) ? event.data.actions : [];
-      recordRunPolicyBoundary(readAgentRunPolicy(ctx), "tool", actions.length);
+    "turn.paused"(_event, ctx) {
+      recordRunPolicyActivity(false, ctx.now.getTime());
     },
-    "step.completed"(event, ctx) {
+    "turn.settled"(_event, ctx) {
+      recordRunPolicyActivity(false, ctx.now.getTime());
+    },
+    "model.requested"(_event, ctx) {
+      recordRunPolicyBoundary(readAgentRunPolicy(ctx), "model", 1, ctx.now.getTime());
+    },
+    "call.requested"(_event, ctx) {
+      recordRunPolicyBoundary(readAgentRunPolicy(ctx), "tool", 1, ctx.now.getTime());
+    },
+    "usage.recorded"(event, ctx) {
       const usage = toUsage(event.data.usage);
-      recordRunPolicyUsage(readAgentRunPolicy(ctx), usage);
+      recordRunPolicyUsage(readAgentRunPolicy(ctx), usage, ctx.now.getTime());
     },
   },
 });

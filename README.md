@@ -220,11 +220,10 @@ environment is too late. Use `npm run build:eve:local` only for an explicit
 local-disk development build.
 
 This Docker topology is for a trusted single-tenant operator or staging
-baseline. Eve 0.56.0 does not expose Docker CPU, memory, PID, Linux capability,
-or non-root controls through its backend. `doctor:production` therefore rejects
-Docker when `AGENT_DEPLOYMENT_TENANCY=multi-tenant`; use a reviewed microVM
-backend such as microsandbox or Vercel Sandbox before admitting mutually
-untrusted tenants.
+baseline. Open Agent's Eve 0.85.0 sandbox provider applies CPU, memory, and PID
+limits and bounded admission to Docker compute. `doctor:production` rejects
+Docker when `AGENT_DEPLOYMENT_TENANCY=multi-tenant`; use Vercel Sandbox before
+admitting mutually untrusted tenants.
 
 `npm run build` verifies the generated Next.js route manifest after compilation.
 It fails if `/embed` does not contain the exact origins from
@@ -232,9 +231,8 @@ It fails if `/embed` does not contain the exact origins from
 `frame-ancestors 'none'` artifact from being promoted as a working Host
 integration.
 
-Eve documents automatic local runtime startup from `next start`, but the
-installed Next.js 16.3 preview does not currently invoke that resolver reliably.
-For local production verification, start the two official services explicitly:
+Eve's Next.js integration starts the built runtime from `next start`.
+For local production verification, start Next.js with the deployment environment:
 
 ```bash
 AGENT_DEPLOYMENT_TENANCY=single-tenant \
@@ -243,13 +241,11 @@ AGENT_SANDBOX_IMAGE=ghcr.io/oworker/open-agent-sandbox@sha256:... \
 WORKFLOW_TARGET_WORLD=@workflow/world-postgres \
 WORKFLOW_POSTGRES_URL=postgres://... \
 WORKFLOW_POSTGRES_JOB_PREFIX=open_agent_ \
-  npm run start:eve -- --port 4275
-AGENT_RUNTIME_URL=http://127.0.0.1:4275 \
 EVE_NEXT_PRODUCTION_PORT=4275 npm start -- -p 3100
 ```
 
 Verify `http://127.0.0.1:3100/eve/v1/health` before sending a turn. Vercel uses
-generated service routes and does not use this two-process local fallback.
+generated service routes.
 
 Run `npm run doctor:production` with the deployment environment before building.
 It fails when Node is not 24, a production sandbox backend is implicit, the Eve
@@ -560,13 +556,12 @@ denied instead of approving themselves. Production rejects `never`.
 Each Eve sub-agent has an independent durable session and stream. The Web UI
 can inspect, reconnect to, and cancel that session. Eve's built-in `agent` copy
 shares the root sandbox; a declared specialist uses its own sandbox unless
-configured otherwise. Open Agent enables Eve 0.56.0 persistent subagent
-sessions: a completed child parks, receives a stable `agentId`, and can be
-continued by the parent on a later model step. Open Agent patches the Eve turn
-driver with Codex-style root-session steering at safe model boundaries; it still
-does not expose detached/no-wait children, injection into a busy child, or a
-public close lifecycle. Open Agent does not replace Eve's model loop or display
-fake controls for operations the runtime cannot perform.
+configured otherwise. Eve 0.85.0 runs subagent calls as tasks: the parent gets a
+`taskId` immediately, can continue working, and receives the child's result
+through the durable task. Later calls can continue that child with the same
+`taskId`. Web steering uses Eve's native `turnPolicy: "steer"`; no Eve runtime
+patch is required. Open Agent does not replace Eve's model loop or display fake
+controls for operations the runtime cannot perform.
 
 Run the deterministic Harness suite against a real Docker sandbox:
 

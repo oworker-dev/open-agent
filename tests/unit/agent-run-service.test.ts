@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ClientError, type MessageStreamEvent } from "eve/client";
+import { ClientError, type SessionStreamEvent } from "eve/client";
 
 import {
   DEFAULT_AGENT_PROFILE,
@@ -320,22 +320,13 @@ test("reuses the bounded synchronization page when the public cursor is current"
 
 test("projects durable provider argument snapshots as typed AgentRun events", () => {
   const [event] = projectAgentEvents("arun-stream", [{
-    data: {
-      callId: "call-patch",
-      input: { patch: "*** Begin Patch" },
-      inputTextDelta: "Patch",
-      inputTextSoFar: '{"patch":"*** Begin Patch',
-      sequence: 0,
-      stepIndex: 0,
-      toolName: "apply_patch",
-      turnId: "turn-stream",
-    },
-    meta: { at: "2026-08-17T00:00:00.000Z", id: "event-stream" },
-    type: "action.input.partial",
+    type: "call.input", scope: { turnId: "turn-stream", runId: "run-stream" },
+    data: { callId: "call-patch", name: "apply_patch", kind: "tool", delta: '{"patch":"*** Begin Patch' },
+    meta: eventMeta(1),
   }]);
   assert.equal(event?.type, "tool.input.delta");
   assert.equal(event?.data.callId, "call-patch");
-  assert.equal(event?.data.inputTextSoFar, '{"patch":"*** Begin Patch');
+  assert.equal(event?.data.delta, '{"patch":"*** Begin Patch');
 });
 
 test("synchronizes long AgentRuns in bounded cursor pages", async () => {
@@ -835,112 +826,44 @@ function parseInputResponse(input: unknown) {
   return parsed.value;
 }
 
-function runningEvents(): readonly MessageStreamEvent[] {
+function runningEvents(): readonly SessionStreamEvent[] {
   return [
     { type: "session.started", data: {}, meta: eventMeta(1) },
-    { type: "turn.started", data: { sequence: 1, turnId: "turn-1" }, meta: eventMeta(2) },
+    { type: "turn.started", data: { cause: { deliveryId: "delivery-test" }, follows: null, turnId: "turn-1" }, meta: eventMeta(2) },
   ];
 }
 
-function completedEvents(): readonly MessageStreamEvent[] {
-  return [
-    { type: "session.started", data: {}, meta: eventMeta(1) },
-    { type: "turn.started", data: { sequence: 1, turnId: "turn-1" }, meta: eventMeta(2) },
-    {
-      type: "message.completed",
-      data: { finishReason: "stop", message: "Done", sequence: 2, stepIndex: 0, turnId: "turn-1" },
-      meta: eventMeta(3),
-    },
-    {
-      type: "step.completed",
-      data: {
-        finishReason: "stop",
-        sequence: 3,
-        stepIndex: 0,
-        turnId: "turn-1",
-        usage: {
-          cacheReadTokens: 7,
-          cacheWriteTokens: 3,
-          costUsd: 0.0125,
-          inputTokens: 21,
-          outputTokens: 8,
-        },
-      },
-      meta: eventMeta(4),
-    },
-    { type: "turn.completed", data: { sequence: 4, turnId: "turn-1" }, meta: eventMeta(5) },
-    waitingEvent(6),
-  ];
-}
-
-function cancelledEvents(): readonly MessageStreamEvent[] {
+function completedEvents(): readonly SessionStreamEvent[] {
   return [
     ...runningEvents(),
-    { type: "turn.cancelled", data: { sequence: 2, turnId: "turn-1" }, meta: eventMeta(3) },
-    waitingEvent(4),
+    { type: "content.completed", scope: { turnId: "turn-1" }, data: { partId: "answer", runId: "model-1", kind: "text", phase: "reply", value: "Done" }, meta: eventMeta(3) },
+    { type: "model.settled", scope: { turnId: "turn-1" }, data: { runId: "model-1", outcome: "completed", finishReason: "stop" }, meta: eventMeta(4) },
+    { type: "usage.recorded", data: { kind: "model", owner: { runId: "model-1" }, usage: { cacheReadTokens: 7, cacheWriteTokens: 3, costUsd: 0.0125, inputTokens: 21, outputTokens: 8 } }, meta: eventMeta(5) },
+    { type: "turn.settled", data: { turnId: "turn-1", outcome: "completed" }, meta: eventMeta(6) },
+    waitingEvent(7),
   ];
 }
 
-function waitingInputEvents(requestId: string): readonly MessageStreamEvent[] {
-  return [
-    ...runningEvents(),
-    {
-      type: "input.requested",
-      data: {
-        requests: [{
-          action: {
-            callId: "call-canvas",
-            input: { title: "Canvas item" },
-            kind: "tool-call",
-            toolName: "canvas.item.put",
-          },
-          display: "confirmation",
-          kind: "tool-approval",
-          options: [{ id: "approve", label: "Yes" }, { id: "deny", label: "No" }],
-          prompt: "Approve tool call: canvas.item.put",
-          requestId,
-        }],
-        sequence: 2,
-        stepIndex: 0,
-        turnId: "turn-1",
-      },
-      meta: eventMeta(3),
-    },
-    waitingEvent(4),
-  ] as unknown as readonly MessageStreamEvent[];
+function cancelledEvents(): readonly SessionStreamEvent[] {
+  return [...runningEvents(),
+    { type: "turn.settled", data: { turnId: "turn-1", outcome: "cancelled" }, meta: eventMeta(3) }, waitingEvent(4)];
 }
 
-function longCompletedEvents(count: number): readonly MessageStreamEvent[] {
-  const events: MessageStreamEvent[] = [
+function waitingInputEvents(interactionId: string): readonly SessionStreamEvent[] {
+  return [...runningEvents(),
+    { type: "interaction.opened", scope: { turnId: "turn-1" }, data: { interactionId, subject: { turnId: "turn-1" }, request: { kind: "approval", display: "confirmation", prompt: "Approve canvas.item.put", options: [{ id: "approve", label: "Yes" }, { id: "deny", label: "No" }] } }, meta: eventMeta(3) },
+    { type: "turn.paused", data: { turnId: "turn-1", awaiting: [{ interactionId }] }, meta: eventMeta(4) }];
+}
+
+function longCompletedEvents(count: number): readonly SessionStreamEvent[] {
+  const events: SessionStreamEvent[] = [
     { type: "session.started", data: {}, meta: eventMeta(1) },
-    { type: "turn.started", data: { sequence: 0, turnId: "turn-long" }, meta: eventMeta(2) },
-  ];
+    { type: "turn.started", data: { cause: { deliveryId: "delivery-test" }, follows: null, turnId: "turn-long" }, meta: eventMeta(2) }];
   while (events.length < count - 2) {
-    const sequence = events.length + 1;
-    events.push({
-      type: "message.appended",
-      data: {
-        messageDelta: "x",
-        messageSoFar: "x".repeat(sequence),
-        sequence: 0,
-        stepIndex: 0,
-        turnId: "turn-long",
-      },
-      meta: eventMeta(sequence),
-    });
+    events.push({ type: "content.delta", scope: { turnId: "turn-long", runId: "model-long" }, data: { partId: "answer", kind: "text", delta: "x" }, meta: eventMeta(events.length + 1) });
   }
-  events.push({
-    type: "message.completed",
-    data: {
-      finishReason: "stop",
-      message: "Done",
-      sequence: 0,
-      stepIndex: 0,
-      turnId: "turn-long",
-    },
-    meta: eventMeta(count - 1),
-  });
-  events.push(waitingEvent(count));
+  events.push({ type: "content.completed", scope: { turnId: "turn-long" }, data: { partId: "answer", runId: "model-long", kind: "text", phase: "reply", value: "Done" }, meta: eventMeta(count - 1) });
+  events.push({ type: "turn.settled", data: { turnId: "turn-long", outcome: "completed" }, meta: eventMeta(count) });
   return events;
 }
 
@@ -953,7 +876,7 @@ const immediateCancellation = {
 function fakeRuntime(options: {
   readonly cancelError?: Error;
   readonly cancelStatus?: "accepted" | "no_active_turn";
-  readonly events?: readonly MessageStreamEvent[];
+  readonly events?: readonly SessionStreamEvent[];
   readonly resetError?: Error;
   readonly startError?: Error;
 } = {}): AgentRunRuntime & {
@@ -1076,15 +999,11 @@ class MemoryAgentRunInputStore implements AgentRunInputStore {
 }
 
 function eventMeta(sequence: number) {
-  return { at: new Date(sequence * 1_000).toISOString(), id: `evt_test_${sequence}` };
+  return { at: new Date(sequence * 1_000).toISOString(), position: { line: sequence - 1, index: 0 } };
 }
 
-function waitingEvent(sequence: number): MessageStreamEvent {
-  return {
-    type: "session.waiting",
-    data: { wait: "next-user-message" },
-    meta: eventMeta(sequence),
-  } as unknown as MessageStreamEvent;
+function waitingEvent(sequence: number): SessionStreamEvent {
+  return { type: "delivery.settled", data: { deliveryId: "delivery-1", turnId: "turn-1", outcome: "handled" }, meta: eventMeta(sequence) };
 }
 
 class MemoryAgentRunStore implements AgentRunStore {

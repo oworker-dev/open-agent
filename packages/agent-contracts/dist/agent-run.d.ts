@@ -17,6 +17,7 @@ export type AgentExtensionRef = {
     readonly version: string;
 };
 export type AgentRunLimits = {
+    /** Cumulative active execution time; excludes paused interactions and idle turns. */
     readonly maxDurationMs?: number;
     readonly maxInputTokens?: number;
     readonly maxModelCalls?: number;
@@ -117,6 +118,11 @@ export type AgentEvent = {
     readonly data: Readonly<Record<string, JsonValue>>;
     readonly runId: string;
     readonly sequence: number;
+    readonly position: {
+        readonly line: number;
+        readonly index: number;
+    };
+    readonly cursor: number;
     readonly type: AgentEventType;
 };
 //# sourceMappingURL=agent-run.d.ts.map

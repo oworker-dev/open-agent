@@ -1,57 +1,37 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { defaultDeliverResult } from "../../node_modules/eve/dist/src/channel/adapter.js";
 import { createSession } from "../../node_modules/eve/dist/src/channel/session.js";
+import { defaultDeliverResult } from "../../node_modules/eve/dist/src/channel/adapter.js";
 
-test("Eve default channel delivery preserves an edit revert precondition", () => {
-  const revert = {
-    beforeTurnId: "turn-latest",
-    clientMessageId: "edit-session-turn-latest",
-  } as const;
-  const result = defaultDeliverResult({
-    message: "Edited request",
-    operation: "edit",
-    revert,
+// Exercise the current channel contract instead of patching retired revert fields.
+test("native default delivery keeps ordinary message and answer contracts", () => {
+  assert.deepEqual(defaultDeliverResult({ message: "New request" }), {
+    message: "New request", answers: undefined, context: undefined, outputSchema: undefined,
   });
-
-  assert.deepEqual(result, {
-    message: "Edited request",
-    inputResponses: undefined,
-    context: undefined,
-    outputSchema: undefined,
-    revert,
+  assert.deepEqual(defaultDeliverResult({ answers: [{ interactionId: "approval", optionId: "approve" }] }), {
+    answers: [{ interactionId: "approval", optionId: "approve" }], context: undefined, outputSchema: undefined,
   });
 });
 
-test("Eve default channel delivery does not invent a revert for ordinary messages", () => {
-  const result = defaultDeliverResult({ message: "New request" });
-
-  assert.deepEqual(result, {
-    message: "New request",
-    inputResponses: undefined,
-    context: undefined,
-    outputSchema: undefined,
-  });
-  assert.equal(result && "revert" in result, false);
-});
-
-test("Eve session.send serializes the edit revert into the durable command payload", async () => {
+test("native session send imports the immutable edit prefix with one idempotency key", async () => {
   const commands: unknown[] = [];
-  const session = createSession("session-1", {
-    dispatchSession: async (input: unknown) => {
-      commands.push(input);
-      return { status: "accepted", sessionId: "session-1" };
-    },
-  } as never);
+  const session = createSession("session-1", { dispatchSession: async (input: unknown) => {
+    commands.push(input); return { status: "accepted", sessionId: "session-1" };
+  } } as never);
+  const history = [{ id: "first:user", role: "user" as const, text: "First request" }, { id: "first:assistant", role: "assistant" as const, text: "First response" }];
+  await session.send("Edited request", { auth: null, history, idempotencyKey: "edit-operation-123", turnPolicy: "queue" });
+  const command = (commands[0] as { command: { payload: unknown; idempotencyKey: string; turnPolicy: string } }).command;
+  assert.deepEqual(command.payload, { message: "Edited request", history });
+  assert.equal(command.idempotencyKey, "edit-operation-123");
+  assert.equal(command.turnPolicy, "queue");
+});
 
-  const revert = {
-    beforeTurnId: "turn-latest",
-    clientMessageId: "edit-session-turn-latest",
-  } as const;
-  await session.send("Edited request", { auth: null, revert });
-
-  assert.deepEqual((commands[0] as { command: { payload: unknown } }).command.payload, {
-    message: "Edited request",
-    revert,
-  });
+test("native channel cancellation preserves the observed turn target", async () => {
+  let command: unknown;
+  const session = createSession("session-1", { dispatchSession: async (input: { command: unknown }) => {
+    command = input.command; return { status: "accepted", sessionId: "session-1" };
+  } } as never);
+  const receipt = await session.cancel({ turnId: "observed-turn" });
+  assert.equal(receipt.sessionId, "session-1");
+  assert.deepEqual((command as { turnId: string }).turnId, "observed-turn");
 });

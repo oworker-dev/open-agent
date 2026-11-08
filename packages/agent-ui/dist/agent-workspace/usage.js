@@ -6,9 +6,9 @@ export function summarizeUsage(events) {
     let inputTokens = 0;
     let outputTokens = 0;
     let steps = 0;
-    let lastCompletedStepIndex = -1;
+    let lastUsageIndex = -1;
     for (const [eventIndex, event] of events.entries()) {
-        if (event.type !== "step.completed" || !event.data.usage)
+        if (event.type !== "usage.recorded")
             continue;
         const usage = event.data.usage;
         cacheReadTokens += usage.cacheReadTokens ?? 0;
@@ -18,9 +18,9 @@ export function summarizeUsage(events) {
         inputTokens += usage.inputTokens ?? 0;
         outputTokens += usage.outputTokens ?? 0;
         steps += 1;
-        lastCompletedStepIndex = eventIndex;
+        lastUsageIndex = eventIndex;
     }
-    const pending = estimatePendingTokens(events.slice(lastCompletedStepIndex + 1));
+    const pending = estimatePendingTokens(events.slice(lastUsageIndex + 1));
     contextInputTokens += pending.context;
     outputTokens += pending.output;
     return {
@@ -37,33 +37,29 @@ export function summarizeUsage(events) {
 function estimatePendingTokens(events) {
     const cumulativeText = new Map();
     let contextCharacters = 0;
-    let actionCharacters = 0;
+    const callOutputs = new Map();
     for (const event of events) {
-        if (event.type === "message.appended") {
-            const key = `message:${event.data.turnId}:${event.data.stepIndex}`;
-            cumulativeText.set(key, event.data.messageSoFar ?? (cumulativeText.get(key) ?? "") + event.data.messageDelta);
+        if (event.type === "content.delta" && (event.data.kind === "text" || event.data.kind === "reasoning")) {
+            const key = `${event.data.kind}:${event.data.partId}`;
+            cumulativeText.set(key, (cumulativeText.get(key) ?? "") + event.data.delta);
         }
-        else if (event.type === "reasoning.appended") {
-            const key = `reasoning:${event.data.turnId}:${event.data.stepIndex}`;
-            cumulativeText.set(key, event.data.reasoningSoFar ?? (cumulativeText.get(key) ?? "") + event.data.reasoningDelta);
+        else if (event.type === "content.completed" && (event.data.kind === "text" || event.data.kind === "reasoning")) {
+            cumulativeText.set(`${event.data.kind}:${event.data.partId}`, typeof event.data.value === "string" ? event.data.value : "");
         }
-        else if (event.type === "message.completed") {
-            cumulativeText.set(`message:${event.data.turnId}:${event.data.stepIndex}`, event.data.message ?? "");
+        else if (event.type === "delivery.consumed") {
+            contextCharacters += event.data.parts.reduce((total, part) => total + (part.kind === "text" ? part.text.length : 0), 0);
         }
-        else if (event.type === "reasoning.completed") {
-            cumulativeText.set(`reasoning:${event.data.turnId}:${event.data.stepIndex}`, event.data.reasoning);
+        else if (event.type === "call.progress") {
+            callOutputs.set(event.data.callId, event.data.output);
         }
-        else if (event.type === "message.received") {
-            contextCharacters += event.data.message.length;
-        }
-        else if (event.type === "action.result") {
-            const length = safeModelVisibleLength(event.data.result.output);
-            actionCharacters = Math.min(actionCharacters + length, 100_000);
+        else if (event.type === "call.settled" && event.data.output !== undefined) {
+            callOutputs.set(event.data.callId, event.data.output);
         }
     }
     let outputCharacters = 0;
     for (const value of cumulativeText.values())
         outputCharacters += value.length;
+    const actionCharacters = [...callOutputs.values()].reduce((total, output) => Math.min(total + safeModelVisibleLength(output), 100_000), 0);
     return {
         context: Math.ceil((contextCharacters + actionCharacters + outputCharacters) / 4),
         output: Math.ceil(outputCharacters / 4),

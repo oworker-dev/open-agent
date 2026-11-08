@@ -122,7 +122,7 @@ export function StandaloneAgentWorkspace({
       defaultPreferences={defaultPreferences}
       extensions={extensions}
       initialSubagentSessionId={initialSubagentSessionId}
-      initialThreadId={initialThreadId}
+      initialThreadId={initialThreadId ?? null}
       inspectSession={inspectSession}
       mentions={mentions}
       models={models}

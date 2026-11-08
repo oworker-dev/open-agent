@@ -5,17 +5,19 @@ import type {
   AgentMailboxStore,
   EnqueueAgentMailboxResult,
 } from "../data/agent-mailbox-store.ts";
-import type { MessageStreamEvent } from "eve/client";
+import type { SessionStreamEvent } from "eve/client";
 import type { AgentSessionOwner } from "../data/session-ownership-store.ts";
+import type { SessionAuthContext } from "eve/context";
+import { snapshotMailboxSessionAuth } from "../../agent/lib/mailbox-session-auth.ts";
 
 const DEFAULT_BUSY_RETRY_MS = 2_000;
 
 export type AgentMailboxBoundary =
-  ({ readonly editAdmissionGuard?: true } & (
+  (
     | { readonly lastEventAt?: string; readonly state: "running"; readonly tailIndex?: number; readonly turnId?: string }
     | { readonly state: "waiting"; readonly tailIndex?: number }
     | { readonly state: "terminal"; readonly tailIndex?: number; readonly terminalStatus?: "completed" | "failed" }
-  ));
+  );
 
 export interface AgentMailboxRuntime {
   deliver(input: {
@@ -33,7 +35,7 @@ export interface AgentMailboxRuntime {
   readTranscript?(input: {
     readonly sessionId: string;
     readonly startIndex: number;
-  }): AsyncIterable<MessageStreamEvent>;
+  }): AsyncIterable<SessionStreamEvent>;
   /** Server-authorized lifecycle controls use the same signed runtime bridge. */
   cancel?(input: {
     readonly owner: AgentSessionOwner;
@@ -62,6 +64,7 @@ export class AgentMailboxAdmissionError extends Error {
 }
 
 export async function enqueueAgentMailboxMessage(options: {
+  readonly callerAuth?: SessionAuthContext;
   readonly beforeTurnId?: string;
   readonly clientMessageId: string;
   readonly clientContext?: AgentMailboxPayload["clientContext"];
@@ -85,6 +88,7 @@ export async function enqueueAgentMailboxMessage(options: {
     operationKind: options.operationKind,
   });
   const payload = {
+    ...(options.callerAuth ? { callerAuth: snapshotMailboxSessionAuth(options.callerAuth, options.owner) } : {}),
     ...(options.clientContext ? { clientContext: options.clientContext } : {}),
     ...content,
     ...(operation ? { operation } : {}),
@@ -127,7 +131,7 @@ export async function dispatchNextAgentMailboxMessage(options: {
     return { item: deferred, status: "deferred" };
   }
 
-  if (boundary.state === "running" && !canSteerBoundary(item, boundary)) {
+  if (boundary.state === "running" && !canDeliverToActiveTurn(item, boundary)) {
     return await deferClaimedMessage({
       availableAt: nextAttemptAt(options.now, options.busyRetryMs),
       claimToken,
@@ -146,9 +150,7 @@ export async function dispatchNextAgentMailboxMessage(options: {
   }
 
   try {
-    await options.store.beginAdmission(item.itemId, claimToken, {
-      guardEdit: item.payload.operation?.kind === "edit" && boundary.editAdmissionGuard === true,
-    });
+    await options.store.beginAdmission(item.itemId, claimToken);
     const delivered = await options.runtime.deliver({
       clientMessageId: item.clientMessageId,
       itemId: item.itemId,
@@ -157,7 +159,7 @@ export async function dispatchNextAgentMailboxMessage(options: {
       sessionId: item.sessionId,
     });
     const accepted = await options.store.accept(item.itemId, claimToken, delivered.sessionId);
-    // Normal messages are committed by the message.received hook. Structured
+    // Normal messages are committed by the delivery.consumed hook. Structured
     // HITL responses resume the parked turn without that event, so the durable
     // 202 admission itself is their commit boundary.
     const committed = item.payload.operation?.kind === "respond"
@@ -197,12 +199,14 @@ export async function dispatchNextAgentMailboxMessage(options: {
   }
 }
 
-function canSteerBoundary(
+function canDeliverToActiveTurn(
   item: AgentMailboxItem,
   boundary: Extract<AgentMailboxBoundary, { readonly state: "running" }>,
 ): boolean {
   const operation = item.payload.operation;
-  return operation?.kind === "steer" &&
+  // HITL keeps the turn active until its answer arrives. Let Eve validate the
+  // interaction and responder; waiting for an idle turn would deadlock it.
+  return operation?.kind === "respond" || operation?.kind === "steer" &&
     typeof operation.expectedTurnId === "string" &&
     operation.expectedTurnId === boundary.turnId;
 }
@@ -281,7 +285,7 @@ function parseMessage(value: string): string {
 }
 
 function parseMailboxContent(options: {
-  readonly inputResponses?: readonly import("eve/client").InputResponse[];
+  readonly inputResponses?: readonly import("eve/events").Answer[];
   readonly message?: string;
   readonly operationKind?: "send" | "steer" | "edit" | "respond";
 }): Pick<Extract<AgentMailboxPayload, { readonly message: string }>, "message"> |

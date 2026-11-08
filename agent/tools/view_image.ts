@@ -172,7 +172,7 @@ async function readImageFileSize(
   abortSignal?: AbortSignal,
 ): Promise<number | undefined> {
   try {
-    const result = await sandbox.run({ command: `stat -c %s -- ${shellQuote(path)}`, ...(abortSignal ? { abortSignal } : {}) });
+    const result = await sandbox.run({ command: `stat -c %s -- ${shellQuote(path)}`, ...(abortSignal ? { signal: abortSignal } : {}) });
     const value = Number(result.stdout.trim());
     return Number.isSafeInteger(value) && value > 0 ? value : undefined;
   } catch {
@@ -189,7 +189,7 @@ export async function readBoundedImage(
   path: string,
   abortSignal?: AbortSignal,
 ): Promise<{ bytes: Uint8Array; oversized: boolean; totalBytes: number } | undefined> {
-  const stream = await sandbox.readFile({ path, ...(abortSignal ? { abortSignal } : {}) });
+  const stream = await sandbox.readFile({ path, ...(abortSignal ? { signal: abortSignal } : {}) });
   if (!stream) return undefined;
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
@@ -243,9 +243,9 @@ export async function resizeImageInSandbox(
       `elif command -v convert >/dev/null 2>&1; then convert ${shellQuote(path)} -auto-orient -thumbnail '2048x2048>' -strip -quality 82 ${shellQuote(destination)};`,
       "else echo 'No ImageMagick resizer is installed' >&2; exit 127; fi",
     ].join(" ");
-    const result = await sandbox.run({ command, ...(abortSignal ? { abortSignal } : {}) });
+    const result = await sandbox.run({ command, ...(abortSignal ? { signal: abortSignal } : {}) });
     if (result.exitCode !== 0) throw new Error("The image exceeds the inline preview limit and this sandbox has no usable image resizer.");
-    const bytes = await sandbox.readBinaryFile({ path: destination, ...(abortSignal ? { abortSignal } : {}) });
+    const bytes = await sandbox.readBinaryFile({ path: destination, ...(abortSignal ? { signal: abortSignal } : {}) });
     if (!bytes || bytes.byteLength === 0) throw new Error("The image resizer produced an empty preview.");
     if (bytes.byteLength > MAX_VIEW_IMAGE_BYTES) throw new Error("The resized image still exceeds the inline preview limit.");
     if (detectMediaType(bytes, destination) !== "image/jpeg") throw new Error("The image resizer produced an invalid JPEG preview.");

@@ -103,7 +103,7 @@ export default defineTool({
       abortSignal?.throwIfAborted();
       if (state.value === state.original) continue;
       if (state.value === null) {
-        await sandbox.removePath({ abortSignal, force: true, path });
+        await sandbox.removePath({ signal: abortSignal, force: true, path });
       } else {
         await writeAtomicTextFile(sandbox, path, state.value, abortSignal);
       }
@@ -126,7 +126,7 @@ async function stateFor(
 ): Promise<TextState> {
   const known = states.get(path);
   if (known) return known;
-  const original = await sandbox.readTextFile({ path, ...(abortSignal ? { abortSignal } : {}) });
+  const original = await sandbox.readTextFile({ path, ...(abortSignal ? { signal: abortSignal } : {}) });
   const state: TextState = { original, value: original };
   states.set(path, state);
   return state;
@@ -299,16 +299,16 @@ async function writeAtomicTextFile(
   abortSignal?: AbortSignal,
 ): Promise<void> {
   if (typeof sandbox.run !== "function") {
-    await sandbox.writeTextFile({ content, path, ...(abortSignal ? { abortSignal } : {}) });
+    await sandbox.writeTextFile({ content, path, ...(abortSignal ? { signal: abortSignal } : {}) });
     return;
   }
   const slash = path.lastIndexOf("/");
   const temporary = `${path.slice(0, slash + 1)}.${path.slice(slash + 1)}.open-agent-${randomUUID()}.tmp`;
-  await sandbox.writeTextFile({ content, path: temporary, ...(abortSignal ? { abortSignal } : {}) });
+  await sandbox.writeTextFile({ content, path: temporary, ...(abortSignal ? { signal: abortSignal } : {}) });
   try {
     const result = await sandbox.run({
       command: `mv -f -- ${shellQuote(temporary)} ${shellQuote(path)}`,
-      ...(abortSignal ? { abortSignal } : {}),
+      ...(abortSignal ? { signal: abortSignal } : {}),
     });
     if (result.exitCode !== 0) throw new Error(`Atomic patch write failed for ${path}: ${result.stderr || "rename command failed"}`);
   } catch (error) {

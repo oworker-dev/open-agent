@@ -3,7 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { closeAgentDatabasePools, getAgentDatabasePool, quoteIdentifier } from "../../server/data/agent-database.ts";
-import { createPostgresAgentMailboxStore, EDIT_ADMISSION_EXPIRED, type AgentMailboxPayload } from "../../server/data/agent-mailbox-store.ts";
+import { createPostgresAgentMailboxStore, type AgentMailboxPayload } from "../../server/data/agent-mailbox-store.ts";
 import { createPostgresSessionOwnershipStore } from "../../server/data/session-ownership-store.ts";
 
 // Each run owns a separate schema. Production mailbox workers cannot dispatch
@@ -28,6 +28,8 @@ test("PostgreSQL rejects unsafe steer edits before enqueue", {
     }
   });
   await pool.query(migration.replaceAll('"__AGENT_SCHEMA__"', schema));
+  const transactionMigration = await readFile(new URL("../../server/data/migrations/0028_mailbox_edit_transactions.sql", import.meta.url), "utf8");
+  await pool.query(transactionMigration.replaceAll('"__AGENT_SCHEMA__"', schema));
   const store = createPostgresAgentMailboxStore(config);
   const owners = createPostgresSessionOwnershipStore(config);
   const owner = { tenantId: "tenant", principalId: "user", principalType: "user" };
@@ -96,56 +98,57 @@ test("PostgreSQL rejects unsafe steer edits before enqueue", {
     assert.equal((await enqueue("session-no-steer", "edit")).status, "created");
   });
 
-  const admittedEdit = async (guardEdit = true) => {
-    const sessionId = `session-guard-${randomUUID()}`;
+  const admittedEdit = async () => {
+    const sessionId = `session-edit-${randomUUID()}`;
     await owners.claim(sessionId, owner);
     await pool.query(`update ${schema}.agent_mailbox_items set available_at = now() + interval '1 day'`);
     const result = await enqueue(sessionId, "edit");
     if (!("item" in result)) throw new Error("Missing edit fixture");
     const claimed = await store.claimNext();
     assert.equal(claimed?.itemId, result.item.itemId);
-    const item = await store.beginAdmission(claimed!.itemId, claimed!.claimToken!, { guardEdit });
-    return { beforeTurnId: "turn_0", clientMessageId: item.clientMessageId, itemId: item.itemId, owner, sessionId };
+    return store.beginAdmission(claimed!.itemId, claimed!.claimToken!);
   };
-  const expire = async (itemId: string) => {
-    await pool.query(`update ${schema}.agent_mailbox_items set admission_started_at = now() - interval '3 minutes' where item_id = $1`, [itemId]);
-    await store.claimNext();
-  };
+  const plan = { phase: "prepared" as const, history: [{ id: "original", role: "user" as const, text: "prefix" }], startIndex: 7 };
 
-  await t.test("unconsumed guarded edits expire and late delivery cannot rewind context", async () => {
-    const input = await admittedEdit();
-    await expire(input.itemId);
-    const expired = await store.findOwned(owner, input.itemId);
-    assert.equal(expired?.status, "cancelled");
-    assert.equal(expired?.lastError, EDIT_ADMISSION_EXPIRED);
-    assert.equal(await store.consumeEdit(input), false);
-    const next = await enqueue(input.sessionId, "send");
-    if (!("item" in next)) throw new Error("Missing next request");
-    assert.equal((await store.claimNext())?.itemId, next.item.itemId);
+  await t.test("concurrent attempts claim one clear and preserve the immutable prefix", async () => {
+    const item = await admittedEdit();
+    await store.prepareEdit(item.itemId, plan);
+    const claims = await Promise.all([store.claimEditClear(item.itemId), store.claimEditClear(item.itemId)]);
+    assert.equal(claims.filter(Boolean).length, 1);
+    await store.prepareEdit(item.itemId, { ...plan, history: [] });
+    assert.deepEqual((await store.findOwned(owner, item.itemId))?.editPlan?.history, plan.history);
+    await store.recordEditClear(item.itemId, "native-clear-delivery");
+    await assert.rejects(store.recordEditClear(item.itemId, "different-delivery"));
+    await store.completeEditClear(item.itemId);
+    await store.completeEditClear(item.itemId);
+    assert.equal((await store.findOwned(owner, item.itemId))?.editPlan?.phase, "cleared");
   });
 
-  await t.test("consumed edits survive slow model output and durable step replay", async () => {
-    const input = await admittedEdit();
-    assert.equal(await store.consumeEdit(input), true);
-    await expire(input.itemId);
-    assert.equal((await store.findOwned(owner, input.itemId))?.status, "committed");
-    assert.equal(await store.consumeEdit(input), true);
-    assert.equal(await store.consumeEdit({ ...input, beforeTurnId: "other-turn" }), false);
-    assert.equal(await store.consumeEdit({ ...input, owner: { ...owner, principalId: "other-user" } }), false);
+  await t.test("stopping an admitted edit persists intent without unblocking its successor", async () => {
+    const item = await admittedEdit();
+    await store.prepareEdit(item.itemId, plan);
+    await store.claimEditClear(item.itemId);
+    const cancelled = await store.cancelOwned(owner, item.itemId);
+    assert.ok(cancelled?.cancellationRequestedAt);
+    assert.equal(cancelled.status, "delivering");
+    const next = await enqueue(item.sessionId, "send");
+    assert.equal(next.status, "created");
+    assert.equal(await store.claimNext(), undefined);
+    const committed = await store.commit(item.itemId, item.sessionId);
+    assert.ok(committed.cancellationRequestedAt);
+    assert.notEqual(await store.claimNext(), undefined);
+    assert.equal(await store.cancelOwned({ ...owner, principalId: "other" }, item.itemId), undefined);
   });
 
-  await t.test("expiry and consumption have exactly one winner", async () => {
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      const input = await admittedEdit();
-      await pool.query(`update ${schema}.agent_mailbox_items set admission_started_at = now() - interval '3 minutes' where item_id = $1`, [input.itemId]);
-      const [consumed] = await Promise.all([store.consumeEdit(input), store.claimNext()]);
-      assert.equal((await store.findOwned(owner, input.itemId))?.status, consumed ? "committed" : "cancelled");
-    }
-  });
-
-  await t.test("old runtimes do not opt into an unsupported expiry protocol", async () => {
-    const input = await admittedEdit(false);
-    await expire(input.itemId);
-    assert.notEqual((await store.findOwned(owner, input.itemId))?.status, "cancelled");
+  await t.test("an expired edit lease resumes its plan without reclaiming clear", async () => {
+    const item = await admittedEdit();
+    await store.prepareEdit(item.itemId, plan);
+    assert.equal(await store.claimEditClear(item.itemId), true);
+    await pool.query(`update ${schema}.agent_mailbox_items set claim_expires_at = now() - interval '1 second' where item_id = $1`, [item.itemId]);
+    const recovered = await store.claimNext();
+    assert.equal(recovered?.itemId, item.itemId);
+    assert.notEqual(recovered?.claimToken, item.claimToken);
+    assert.equal(recovered?.editPlan?.phase, "clearing");
+    assert.equal(await store.claimEditClear(item.itemId), false);
   });
 });

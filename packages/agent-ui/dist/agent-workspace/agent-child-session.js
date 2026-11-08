@@ -1,9 +1,11 @@
 "use client";
 import { jsx as _jsx } from "react/jsx-runtime";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { conversationOf } from "eve/client";
+import { activeTurn, session as sessionState, waiting } from "eve/events";
 import { AgentThreadView } from "./agent-thread.js";
 import { attachAgentSession, createAgentSession } from "./agent-client.js";
-import { AGENT_THREAD_STORAGE_VERSION, appendThreadEventIndexed, eventIdentity, rememberThreadEventCursor, compactThreadEvents } from "./thread-storage.js";
+import { AGENT_THREAD_STORAGE_VERSION, appendThreadEventIndexed, eventIdentity, threadEventCursor, compactThreadEvents } from "./thread-storage.js";
 export function AgentChildSessionView({ client, commands, locale, mailbox, mentions, models, onEvent, onOpenDeliverable, onOpenSubagent, onStorageError, preferences, providerReady = true, reasoningLevels, sessionId, storageKey, threadStorage, }) {
     const [thread, setThread] = useState();
     const [loadError, setLoadError] = useState();
@@ -101,7 +103,9 @@ export function AgentChildSessionView({ client, commands, locale, mailbox, menti
                     for await (const event of session.stream({ follow, startIndex: cursor, signal: controller.signal })) {
                         if (controller.signal.aborted)
                             return;
-                        rememberThreadEventCursor(event, cursor++);
+                        const eventCursor = threadEventCursor(event);
+                        if (eventCursor !== undefined)
+                            cursor = Math.max(cursor, eventCursor);
                         appendThreadEventIndexed(events, ids, event);
                         onEvent?.(event);
                         if (follow && isChildSnapshotBoundary(event))
@@ -279,49 +283,10 @@ function persistedChildControls(thread) {
     };
 }
 async function readChildSnapshot(session, signal) {
-    try {
-        return await session.snapshot({ signal });
-    }
-    catch (error) {
-        if (signal.aborted || !isMissingTailBoundaryError(error))
-            throw error;
-    }
-    const events = [];
-    const controller = new AbortController();
-    const abort = () => controller.abort();
-    const timeout = window.setTimeout(abort, CHILD_SNAPSHOT_FALLBACK_TIMEOUT_MS);
-    signal.addEventListener("abort", abort, { once: true });
-    try {
-        for await (const event of session.stream({
-            follow: true,
-            signal: controller.signal,
-            startIndex: 0,
-            streamReconnectPolicy: { reconnect: false },
-        })) {
-            events.push(event);
-            if (isChildSnapshotBoundary(event))
-                break;
-        }
-    }
-    catch (error) {
-        if (!controller.signal.aborted || signal.aborted)
-            throw error;
-    }
-    finally {
-        window.clearTimeout(timeout);
-        signal.removeEventListener("abort", abort);
-    }
-    return {
-        events,
-        session: { sessionId: session.state.sessionId, streamIndex: events.length },
-    };
-}
-const CHILD_SNAPSHOT_FALLBACK_TIMEOUT_MS = 5_000;
-function isMissingTailBoundaryError(error) {
-    return error instanceof Error && error.message.includes("x-eve-stream-tail-index");
+    return await session.snapshot({ signal });
 }
 function isChildSnapshotBoundary(event) {
-    return event.type === "session.waiting" || event.type === "session.completed" || event.type === "session.failed";
+    return event.type === "turn.settled" || event.type === "session.ended" || event.type === "delivery.settled";
 }
 function createChildThread(sessionId, preferences) {
     const now = Date.now();
@@ -339,14 +304,14 @@ function createChildThread(sessionId, preferences) {
     };
 }
 function statusFromEvents(events) {
-    const last = events.at(-1);
-    if (!last)
+    const view = conversationOf(events).view;
+    const currentSession = sessionState(view);
+    if (currentSession.status === "ended")
+        return currentSession.outcome === "failed" ? "error" : "ready";
+    const turn = activeTurn(view);
+    if (!turn)
         return "ready";
-    if (last.type === "session.failed" || last.type === "turn.failed")
-        return "error";
-    if (last.type === "session.completed")
-        return "ready";
-    if (last.type === "session.waiting" || last.type === "turn.completed" || last.type === "turn.cancelled")
+    if (waiting(view, turn.turnId))
         return "waiting";
     return "streaming";
 }

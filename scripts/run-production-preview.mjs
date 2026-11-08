@@ -22,6 +22,7 @@ import {
 const WEB_PORT = PRODUCTION_PREVIEW_PORTS.web;
 const NEXT_PORT = PRODUCTION_PREVIEW_PORTS.next;
 const EVE_PORT = configureEveNextProductionPort();
+const NEXT_DIST_DIR = process.env.OPEN_AGENT_NEXT_DIST_DIR?.trim() || ".next";
 const SANDBOX_IMAGE = "ghcr.io/oworker-dev/open-agent-sandbox@sha256:44e675839b0e4e16a97e5aceb86ef001fd379ae2642efe4d3bbead9d333f14d9";
 const previewNodeEnv = process.env.OPEN_AGENT_PREVIEW_NODE_ENV?.trim() || "production";
 if (previewNodeEnv !== "production" && previewNodeEnv !== "development") {
@@ -29,11 +30,11 @@ if (previewNodeEnv !== "production" && previewNodeEnv !== "development") {
 }
 
 await Promise.all([
-  access(new URL("../.next/BUILD_ID", import.meta.url)),
+  access(new URL(`../${NEXT_DIST_DIR}/BUILD_ID`, import.meta.url)),
   access(new URL("../.output/server/index.mjs", import.meta.url)),
 ]);
 const routesManifest = JSON.parse(
-  await readFile(new URL("../.next/routes-manifest.json", import.meta.url), "utf8"),
+  await readFile(new URL(`../${NEXT_DIST_DIR}/routes-manifest.json`, import.meta.url), "utf8"),
 );
 assertBuiltEveProxy(routesManifest, EVE_PORT);
 const compiledAgentManifest = JSON.parse(
@@ -54,7 +55,7 @@ const metricsSecret = process.env.AGENT_METRICS_SECRET?.trim() || randomBytes(32
 const runtimeEnvironment = {
   ...process.env,
   AGENT_BASH_APPROVAL_MODE: "risky",
-  AGENT_DATABASE_SCHEMA: "open_agent",
+  AGENT_DATABASE_SCHEMA: process.env.AGENT_DATABASE_SCHEMA?.trim() || "open_agent",
   AGENT_ASSET_CLEANUP_INTERVAL_MS: "3600000",
   AGENT_ASSET_CLEANUP_LIMIT: "100",
   AGENT_ASSET_CLAMAV_HOST: "127.0.0.1",
@@ -127,7 +128,7 @@ const runtimeEnvironment = {
   OPEN_AGENT_PREVIEW_PROXY_MAX_SOCKETS: String(readPreviewProxyMaxSockets()),
   OTEL_EXPORTER_OTLP_PROTOCOL: process.env.OTEL_EXPORTER_OTLP_PROTOCOL || "http/json",
   OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT || "http://127.0.0.1:4318/v1/traces",
-  WORKFLOW_POSTGRES_JOB_PREFIX: "open_agent_",
+  WORKFLOW_POSTGRES_JOB_PREFIX: process.env.WORKFLOW_POSTGRES_JOB_PREFIX?.trim() || "open_agent_",
   WORKFLOW_POSTGRES_MAX_POOL_SIZE: "22",
   WORKFLOW_POSTGRES_URL: postgresUrl("open-agent-gate-world", 56433),
   WORKFLOW_POSTGRES_WORKER_CONCURRENCY: "20",
@@ -180,16 +181,9 @@ try {
   });
   await waitForHealth("http://127.0.0.1:4318/debug/traces", collector);
 
-  const eve = spawnManaged("eve", process.execPath, [".output/server/index.mjs"], {
-    env: {
-      ...runtimeEnvironment,
-      HOST: "127.0.0.1",
-      PORT: String(EVE_PORT),
-    },
-    stdio: "inherit",
-  });
-  await waitForHealth(`http://127.0.0.1:${EVE_PORT}/eve/v1/health`, eve);
-
+  // `withEve()` starts the built Eve runtime as part of `next start` in the
+  // production-server phase. Starting `.output/server/index.mjs` here as well
+  // binds EVE_PORT twice and makes the Web process exit with EADDRINUSE.
   const web = spawnManaged(
     "web",
     process.execPath,

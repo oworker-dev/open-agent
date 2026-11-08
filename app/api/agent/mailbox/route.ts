@@ -21,6 +21,7 @@ export async function POST(request: Request): Promise<Response> {
     );
   }
   return await enqueueAgentMailboxHttpRequest({
+    callerAuth: authenticated.sessionAuth,
     owner: authenticated.identity,
     ...(ownershipStore ? { ownershipStore } : {}),
     request,

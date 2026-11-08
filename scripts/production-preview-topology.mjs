@@ -1,7 +1,7 @@
 export const PRODUCTION_PREVIEW_PORTS = Object.freeze({
-  eve: 4275,
-  next: 3101,
-  web: 3100,
+  eve: configuredPort("OPEN_AGENT_PREVIEW_EVE_PORT", 4275),
+  next: configuredPort("OPEN_AGENT_PREVIEW_NEXT_PORT", 3101),
+  web: configuredPort("OPEN_AGENT_PREVIEW_WEB_PORT", 3100),
 });
 
 export const PRODUCTION_PREVIEW_DEFAULT_ACTIVE_RUNS = 12;
@@ -53,4 +53,13 @@ export function productionPreviewExitCode(outcome, shutdownRequested) {
   if (shutdownRequested) return 0;
   if (typeof outcome?.code === "number" && outcome.code !== 0) return outcome.code;
   return 1;
+}
+
+function configuredPort(name, fallback) {
+  const configured = process.env[name]?.trim();
+  const port = configured ? Number(configured) : fallback;
+  if (!Number.isInteger(port) || port < 1 || port > 65_535 || String(port) !== String(configured || port)) {
+    throw new Error(`${name} must be an integer between 1 and 65535.`);
+  }
+  return port;
 }

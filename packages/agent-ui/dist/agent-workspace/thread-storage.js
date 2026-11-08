@@ -1,8 +1,9 @@
+import { conversationOf } from "eve/client";
+import { conversation } from "eve/events";
 import { parseAssetPrompt } from "@oworker/open-agent-contracts/asset";
 import { sanitizeRetainedContext } from "./retained-context.js";
 export const AGENT_THREAD_STORAGE_VERSION = 2;
 const EMPTY_SESSION = { streamIndex: 0 };
-const eventCursors = new WeakMap();
 const FALLBACK_PREFERENCES = {
     executionMode: "standard",
     modelId: "default",
@@ -31,11 +32,7 @@ export function mergeThreadCollectionsForConflict(local, remote) {
             continue;
         }
         const selected = thread.updatedAt >= existing.updatedAt ? thread : existing;
-        const editInProgress = thread.pendingTurn?.state === "clearing" ||
-            thread.pendingTurn?.state === "resubmitting";
-        const events = editInProgress
-            ? thread.events
-            : mergeConflictEvents(thread, existing);
+        const events = mergeConflictEvents(thread, existing);
         byId.set(thread.id, {
             ...selected,
             events,
@@ -161,14 +158,18 @@ function parseThread(value) {
             .slice(0, 5)
         : [];
     const retainedContext = sanitizeRetainedContext(value.retainedContext) ?? [];
-    const transcriptCoverage = parseTranscriptCoverage(value.transcriptCoverage);
+    let transcriptCoverage = parseTranscriptCoverage(value.transcriptCoverage);
     const transcriptWindow = parseTranscriptWindow(value.transcriptWindow);
-    const rawEvents = Array.isArray(value.events)
+    const cachedEvents = Array.isArray(value.events)
         ? value.events
         : [];
-    const storedStreamIndex = typeof session.streamIndex === "number" && session.streamIndex >= 0
+    const validCache = cachedEvents.every(isThreadEvent);
+    const rawEvents = validCache ? cachedEvents : [];
+    if (!validCache)
+        transcriptCoverage = undefined;
+    const storedStreamIndex = typeof session.streamIndex === "number" && Number.isSafeInteger(session.streamIndex) && session.streamIndex >= 0
         ? session.streamIndex
-        : 0;
+        : transcriptWindow?.endIndex ?? (transcriptCoverage?.complete ? transcriptCoverage.endIndex : cursorAfterEvents(rawEvents));
     return {
         createdAt,
         closedInputRequestIds,
@@ -193,7 +194,7 @@ function parseThread(value) {
             : 0,
         session: {
             sessionId: typeof session.sessionId === "string" ? session.sessionId : undefined,
-            streamIndex: Math.max(storedStreamIndex, rawEvents.length),
+            streamIndex: storedStreamIndex,
         },
         status,
         ...(transcriptCoverage ? { transcriptCoverage } : {}),
@@ -201,6 +202,14 @@ function parseThread(value) {
         title: value.title,
         updatedAt,
     };
+}
+function cursorAfterEvents(events) {
+    const last = events.at(-1);
+    if (!last || !Number.isSafeInteger(last.meta?.position?.line))
+        return 0;
+    if (Number.isSafeInteger(last.meta.next))
+        return last.meta.next;
+    return last.meta.endOfLine === false ? last.meta.position.line : last.meta.position.line + 1;
 }
 function parseInputResponseSubmissions(value) {
     if (!Array.isArray(value))
@@ -216,13 +225,13 @@ function parseInputResponseSubmissions(value) {
             !isInputResponseSubmissionState(candidate.state))
             continue;
         const responses = candidate.responses.flatMap((response) => {
-            if (!isRecord(response) || typeof response.requestId !== "string" || !response.requestId)
+            if (!isRecord(response) || typeof response.interactionId !== "string" || !response.interactionId)
                 return [];
             const optionId = typeof response.optionId === "string" && response.optionId ? response.optionId : undefined;
             const text = typeof response.text === "string" && response.text ? response.text : undefined;
             if (!optionId && !text)
                 return [];
-            return [{ ...(optionId ? { optionId } : {}), requestId: response.requestId, ...(text ? { text } : {}) }];
+            return [{ ...(optionId ? { optionId } : {}), interactionId: response.interactionId, ...(text ? { text } : {}) }];
         });
         if (responses.length !== candidate.responses.length)
             continue;
@@ -259,8 +268,25 @@ export function mergeInputResponseSubmissions(left, right) {
     }
     return [...submissions.values()].sort((a, b) => a.submittedAt - b.submittedAt);
 }
-export function inputResponseSubmissionProjectsAnswer(submission) {
-    return submission.state !== "failed" && submission.state !== "cancelled";
+export function inputResponseSubmissionFailure(submission, events) {
+    for (const answer of submission.responses) {
+        const submitted = events.find((event) => event.type === "response.submitted" &&
+            event.meta.position.line >= submission.streamIndexAtSubmission &&
+            event.data.interactionId === answer.interactionId &&
+            event.data.value?.optionId === answer.optionId && event.data.value?.text === answer.text);
+        if (submitted?.type !== "response.submitted")
+            continue;
+        const settled = events.find((event) => event.type === "response.settled" &&
+            event.data.responseId === submitted.data.responseId);
+        if (settled?.type === "response.settled" && settled.data.outcome !== "applied") {
+            return settled.data.reason || "The response was not accepted. Please try again.";
+        }
+    }
+    return undefined;
+}
+export function inputResponseSubmissionProjectsAnswer(submission, events = []) {
+    return submission.state !== "failed" && submission.state !== "cancelled" &&
+        inputResponseSubmissionFailure(submission, events) === undefined;
 }
 export function hasUnsettledInputResponseSubmission(submissions) {
     return submissions.some((submission) => submission.settledAtStreamIndex === undefined &&
@@ -314,7 +340,7 @@ function parseTranscriptCoverage(value) {
         ...(value.authoritative === true ? { authoritative: true } : {}),
         complete: value.complete,
         endIndex: value.endIndex,
-        ...(value.projection === "logical-edits-v1" ? { projection: value.projection } : {}),
+        ...(value.projection === "v27-source-lines" ? { projection: value.projection } : {}),
         startIndex: value.startIndex,
         version: 1,
     };
@@ -338,8 +364,13 @@ function parseInterruptedTurns(value) {
             typeof candidate.streamIndex !== "number" ||
             !Number.isSafeInteger(candidate.streamIndex) || candidate.streamIndex < 0)
             continue;
+        const pendingMessage = parsePendingTurn(candidate.pendingMessage);
         turns.set(candidate.turnId, {
             eventCount: candidate.eventCount,
+            ...(pendingMessage?.state === "interrupted" && pendingMessage.id === candidate.pendingClientMessageId
+                ? { pendingMessage } : {}),
+            ...(typeof candidate.pendingClientMessageId === "string" && candidate.pendingClientMessageId
+                ? { pendingClientMessageId: candidate.pendingClientMessageId } : {}),
             ...(typeof candidate.settled === "boolean" ? { settled: candidate.settled } : {}),
             streamIndex: candidate.streamIndex,
             turnId: candidate.turnId,
@@ -369,17 +400,13 @@ function parseQueuedTurn(value) {
     if (durableDeliveryPhase && (value.delivery !== "server" || !mailboxItemId)) {
         return undefined;
     }
-    if (value.intent === "post-cancellation" &&
-        (value.delivery !== "browser" || value.state !== "queued" || mailboxItemId)) {
-        return undefined;
-    }
     return {
         ...(value.delivery === "server" || value.delivery === "browser"
             ? { delivery: value.delivery }
             : {}),
         ...(expectedTurnId ? { expectedTurnId } : {}),
         id: value.id,
-        ...(value.intent === "active-turn" || value.intent === "post-cancellation"
+        ...(value.intent === "active-turn"
             ? { intent: value.intent }
             : {}),
         ...(mailboxItemId ? { mailboxItemId } : {}),
@@ -395,7 +422,7 @@ function parsePendingTurn(value) {
     if (typeof value.id !== "string" || !value.id ||
         typeof value.text !== "string" || (!value.text.trim() && files.length === 0) ||
         typeof value.submittedAt !== "number" || !Number.isFinite(value.submittedAt) ||
-        (value.state !== "clearing" && value.state !== "submitting" && value.state !== "resubmitting" && value.state !== "delivery-failed" && value.state !== "interrupted")) {
+        (value.state !== "submitting" && value.state !== "delivery-failed" && value.state !== "interrupted")) {
         return undefined;
     }
     const beforeTurnId = typeof value.beforeTurnId === "string" && value.beforeTurnId
@@ -445,38 +472,18 @@ function parsePromptFiles(value) {
 }
 const MAX_PENDING_FILES = 20;
 export function appendThreadEvent(events, event) {
-    if (hasEventIdentity(events, event)) {
+    if (events.some((candidate) => eventIdentity(candidate) === eventIdentity(event)))
         return events;
-    }
-    const cumulativeKey = cumulativeEventKey(event);
-    if (cumulativeKey) {
-        const existingIndex = findLastCumulativeEventIndex(events, cumulativeKey);
-        if (existingIndex !== undefined && canReplaceCumulativeEvent(events, existingIndex, event)) {
-            return [...events.slice(0, existingIndex), projectAppendEvent(event, events[existingIndex]), ...events.slice(existingIndex + 1)];
-        }
-        return [...events, projectAppendEvent(event)];
-    }
-    if (event.type === "message.completed" || event.type === "reasoning.completed") {
-        return [...events, event];
-    }
-    return [...events, event];
+    const next = [...events];
+    insertEventInPositionOrder(next, event);
+    return next;
 }
 export function appendThreadEventIndexed(events, eventIds, event) {
     const identity = eventIdentity(event);
     if (eventIds.has(identity))
         return false;
     eventIds.add(identity);
-    const cumulativeKey = cumulativeEventKey(event);
-    if (cumulativeKey) {
-        const cumulativeIndexes = cumulativeIndexFor(events);
-        const existingIndex = cumulativeIndexes.get(cumulativeKey);
-        if (existingIndex !== undefined && canReplaceCumulativeEvent(events, existingIndex, event)) {
-            events[existingIndex] = projectAppendEvent(event, events[existingIndex]);
-            return true;
-        }
-        cumulativeIndexes.set(cumulativeKey, events.length);
-    }
-    events.push(projectAppendEvent(event));
+    insertEventInPositionOrder(events, event);
     return true;
 }
 export function mergeThreadEventSnapshots(left, right) {
@@ -484,259 +491,76 @@ export function mergeThreadEventSnapshots(left, right) {
         return right;
     if (right.length === 0)
         return left;
-    const leftIds = new Set(left.map(eventIdentity));
-    const rightIds = new Set(right.map(eventIdentity));
-    const rightSubsetOfLeft = [...rightIds].every((id) => leftIds.has(id));
-    const leftSubsetOfRight = [...leftIds].every((id) => rightIds.has(id));
-    if (rightSubsetOfLeft && (right.length < left.length || sameEventIdentityOrder(left, right)))
-        return left;
-    if (leftSubsetOfRight && (left.length < right.length || sameEventIdentityOrder(left, right)))
-        return right;
-    const seen = new Set();
-    const candidates = [];
-    let position = 0;
-    for (const event of [...left, ...right]) {
-        const identity = eventIdentity(event);
-        if (seen.has(identity))
-            continue;
-        seen.add(identity);
-        candidates.push({ event, position });
-        position += 1;
-    }
-    candidates.sort((a, b) => compareEventOrder(a.event, b.event) || a.position - b.position);
-    return compactThreadEvents(candidates.map((candidate) => candidate.event));
+    const byIdentity = new Map();
+    for (const event of [...left, ...right])
+        byIdentity.set(eventIdentity(event), event);
+    return [...byIdentity.values()].sort(compareEventPosition);
 }
-function sameEventIdentityOrder(left, right) {
-    return left.length === right.length && left.every((event, index) => eventIdentity(event) === eventIdentity(right[index]));
-}
-function compareEventOrder(left, right) {
-    const leftCursor = eventCursors.get(left);
-    const rightCursor = eventCursors.get(right);
-    if (leftCursor !== undefined && rightCursor !== undefined && leftCursor !== rightCursor) {
-        return leftCursor - rightCursor;
-    }
-    const leftTurnId = eventTurnId(left);
-    const rightTurnId = eventTurnId(right);
-    if (leftTurnId !== undefined && leftTurnId === rightTurnId) {
-        const leftSequence = eventSequence(left);
-        const rightSequence = eventSequence(right);
-        if (leftSequence !== undefined && rightSequence !== undefined && leftSequence !== rightSequence) {
-            return leftSequence - rightSequence;
-        }
-        const leftStep = eventStepIndex(left);
-        const rightStep = eventStepIndex(right);
-        if (leftStep !== undefined && rightStep !== undefined && leftStep !== rightStep) {
-            return leftStep - rightStep;
-        }
-    }
-    const leftAt = eventTimestamp(left);
-    const rightAt = eventTimestamp(right);
-    if (leftAt !== undefined && rightAt !== undefined && leftAt !== rightAt) {
-        return leftAt - rightAt;
-    }
-    return eventLifecycleRank(left) - eventLifecycleRank(right);
-}
-function eventSequence(event) {
-    const value = event.data?.sequence;
-    return typeof value === "number" && Number.isSafeInteger(value) ? value : undefined;
-}
-function eventStepIndex(event) {
-    const value = event.data?.stepIndex;
-    return typeof value === "number" && Number.isSafeInteger(value) ? value : undefined;
-}
-function eventTimestamp(event) {
-    const value = event.meta?.at;
-    if (typeof value !== "string")
-        return undefined;
-    const timestamp = Date.parse(value);
-    return Number.isFinite(timestamp) ? timestamp : undefined;
-}
-function eventLifecycleRank(event) {
-    switch (event.type) {
-        case "session.started": return -2;
-        case "session.waiting":
-        case "session.completed":
-        case "session.failed": return 100;
-        case "turn.started": return 0;
-        case "message.received": return 1;
-        case "context.cleared": return 1;
-        case "step.started": return 2;
-        case "reasoning.appended":
-        case "reasoning.completed":
-        case "message.appended":
-        case "message.completed":
-        case "action.input.partial":
-        case "action.input.appended":
-        case "actions.requested":
-        case "input.requested":
-        case "authorization.required":
-        case "model.retrying": return 3;
-        case "action.partial":
-        case "action.result":
-        case "authorization.completed": return 4;
-        case "step.completed":
-        case "step.failed": return 5;
-        case "turn.completed":
-        case "turn.failed":
-        case "turn.cancelled": return 6;
-        default: return 50;
-    }
-}
-const cumulativeIndexesByEvents = new WeakMap();
-function cumulativeIndexFor(events) {
-    const existing = cumulativeIndexesByEvents.get(events);
-    if (existing)
-        return existing;
-    const indexes = new Map();
-    for (let index = 0; index < events.length; index += 1) {
-        const key = cumulativeEventKey(events[index]);
-        if (key)
-            indexes.set(key, index);
-    }
-    cumulativeIndexesByEvents.set(events, indexes);
-    return indexes;
-}
-function findLastCumulativeEventIndex(events, key) {
-    for (let index = events.length - 1; index >= 0; index -= 1) {
-        if (cumulativeEventKey(events[index]) === key)
-            return index;
-    }
-    return undefined;
+function compareEventPosition(left, right) {
+    return left.meta.position.line - right.meta.position.line ||
+        left.meta.position.index - right.meta.position.index;
 }
 export function eventIdentity(event) {
-    if (typeof event.meta?.id === "string" && event.meta.id.length > 0) {
-        return `id:${event.meta.id}`;
-    }
-    return `event:${JSON.stringify(event)}`;
+    const { line, index } = event.meta.position;
+    return `position:${line}:${index}`;
 }
-export function rememberThreadEventCursor(event, cursor) {
-    if (Number.isSafeInteger(cursor) && cursor >= 0 && event && typeof event === "object") {
-        eventCursors.set(event, cursor);
-    }
+export function isThreadEvent(value) {
+    if (!isRecord(value) || typeof value.type !== "string" || !isRecord(value.data) ||
+        !isRecord(value.meta) || typeof value.meta.at !== "string" || !isRecord(value.meta.position))
+        return false;
+    const { line, index } = value.meta.position;
+    if (typeof line !== "number" || !Number.isSafeInteger(line) || line < 0 ||
+        typeof index !== "number" || !Number.isSafeInteger(index) || index < 0)
+        return false;
+    if (value.meta.endOfLine !== undefined && typeof value.meta.endOfLine !== "boolean")
+        return false;
+    return value.meta.next === undefined || (value.meta.endOfLine !== false &&
+        typeof value.meta.next === "number" && Number.isSafeInteger(value.meta.next) && value.meta.next > line);
+}
+export function threadEventCursor(event) {
+    if (!Number.isSafeInteger(event.meta?.position?.line))
+        return undefined;
+    if (event.meta.next !== undefined)
+        return event.meta.next;
+    return event.meta.endOfLine === false ? undefined : event.meta.position.line + 1;
 }
 function hasEventIdentity(events, event) {
     const identity = eventIdentity(event);
     return events.some((candidate) => eventIdentity(candidate) === identity);
 }
 export function compactThreadEvents(events) {
-    const compacted = [];
-    const identities = new Set();
-    const cumulativeIndexes = new Map();
-    for (const event of events) {
-        const identity = eventIdentity(event);
-        if (identities.has(identity))
-            continue;
-        identities.add(identity);
-        const cumulativeKey = cumulativeEventKey(event);
-        if (cumulativeKey) {
-            const existingIndex = cumulativeIndexes.get(cumulativeKey);
-            if (existingIndex !== undefined && canReplaceCumulativeEvent(compacted, existingIndex, event)) {
-                compacted[existingIndex] = projectAppendEvent(event, compacted[existingIndex]);
-                continue;
-            }
-            cumulativeIndexes.set(cumulativeKey, compacted.length);
-        }
-        compacted.push(projectAppendEvent(event));
-    }
-    return compacted;
+    const byIdentity = new Map();
+    for (const event of events)
+        byIdentity.set(eventIdentity(event), event);
+    return [...byIdentity.values()].sort(compareEventPosition);
 }
-function cumulativeEventKey(event) {
-    if (event.type === "message.appended" || event.type === "reasoning.appended") {
-        return `${event.type}:${event.data.turnId}:${event.data.stepIndex}`;
+function insertEventInPositionOrder(events, event) {
+    if (!events.length || compareEventPosition(events[events.length - 1], event) <= 0) {
+        events.push(event);
+        return;
     }
-    if (event.type === "action.input.partial" || event.type === "action.input.appended") {
-        return `action.input:${event.data.turnId}:${event.data.stepIndex}:${event.data.callId}`;
+    let low = 0;
+    let high = events.length;
+    while (low < high) {
+        const middle = (low + high) >>> 1;
+        if (compareEventPosition(events[middle], event) <= 0)
+            low = middle + 1;
+        else
+            high = middle;
     }
-    return undefined;
-}
-function canReplaceCumulativeEvent(events, existingIndex, next) {
-    const existing = events[existingIndex];
-    if (!existing || !cumulativeEventKey(existing) || cumulativeEventKey(existing) !== cumulativeEventKey(next)) {
-        return false;
-    }
-    const scope = stepScope(next);
-    for (let index = existingIndex + 1; index < events.length; index += 1) {
-        const candidate = events[index];
-        if (candidate.type === "step.started" && stepScope(candidate) === scope) {
-            return false;
-        }
-        if ((candidate.type === "message.completed" || candidate.type === "reasoning.completed") &&
-            candidate.data.turnId === next.data.turnId &&
-            candidate.data.stepIndex === next.data.stepIndex)
-            return false;
-    }
-    const previousSnapshot = cumulativeSnapshot(existing);
-    const nextSnapshot = cumulativeSnapshot(next);
-    if (nextSnapshot === undefined && (next.type === "message.appended" ||
-        next.type === "reasoning.appended" || next.type === "action.input.appended"))
-        return true;
-    if (previousSnapshot === undefined || nextSnapshot === undefined)
-        return false;
-    return nextSnapshot.length >= previousSnapshot.length;
-}
-function stepScope(event) {
-    if (event.type === "step.started" ||
-        event.type === "message.appended" ||
-        event.type === "reasoning.appended" ||
-        event.type === "action.input.partial" || event.type === "action.input.appended") {
-        return `${event.data.turnId}:${event.data.stepIndex}`;
-    }
-    return undefined;
-}
-function cumulativeSnapshot(event) {
-    if (event.type === "message.appended")
-        return event.data.messageSoFar;
-    if (event.type === "reasoning.appended")
-        return event.data.reasoningSoFar;
-    if (event.type === "action.input.partial")
-        return event.data.inputTextSoFar;
-    return undefined;
-}
-function projectAppendEvent(event, previous) {
-    let projected = event;
-    const prefix = previous ? cumulativeSnapshot(previous) ?? "" : "";
-    if (event.type === "message.appended" && event.data.messageSoFar === undefined) {
-        projected = { ...event, data: { ...event.data, messageSoFar: prefix + event.data.messageDelta } };
-    }
-    else if (event.type === "reasoning.appended" && event.data.reasoningSoFar === undefined) {
-        projected = { ...event, data: { ...event.data, reasoningSoFar: prefix + event.data.reasoningDelta } };
-    }
-    else if (event.type === "action.input.appended") {
-        projected = { ...event, type: "action.input.partial", data: {
-                ...event.data, inputTextSoFar: prefix + event.data.inputTextDelta,
-            } };
-    }
-    const cursor = eventCursors.get(event);
-    if (cursor !== undefined && projected !== event)
-        eventCursors.set(projected, cursor);
-    return projected;
+    events.splice(low, 0, event);
 }
 export function reconcilePendingTurnWithEvents(pendingTurn, events) {
     if (!pendingTurn)
         return undefined;
-    const latestReceived = [...events].reverse().find((event) => event.type === "message.received");
-    const latestReceivedIndex = latestReceived ? events.lastIndexOf(latestReceived) : -1;
-    const eventAt = latestReceived?.meta.at ? Date.parse(latestReceived.meta.at) : Number.NaN;
-    const submittedAt = pendingTurn.submittedAt;
-    const eventCanAcknowledge = !Number.isFinite(eventAt) || eventAt >= submittedAt - 5_000;
-    const clientMessageId = latestReceived?.type === "message.received" ? receivedClientMessageId(latestReceived) : undefined;
-    const isAfterSubmission = pendingTurn.eventCountAtSubmission === undefined ||
-        latestReceivedIndex >= pendingTurn.eventCountAtSubmission;
-    const accepted = latestReceived?.type === "message.received" && (clientMessageId === pendingTurn.id ||
-        (!clientMessageId && isAfterSubmission && eventCanAcknowledge && legacyPendingPromptMatches(pendingTurn, latestReceived.data.message)));
+    const accepted = events.some((event) => event.type === "delivery.consumed" && receivedClientMessageId(event) === pendingTurn.id);
     return accepted ? undefined : pendingTurn;
 }
 export function receivedClientMessageId(event) {
-    return event.data.clientMessageId || parseAssetPrompt(event.data.message).clientMessageId;
+    return parseAssetPrompt(textFromDelivery(event)).clientMessageId;
 }
-export function legacyPendingPromptMatches(pending, message) {
-    const parsed = parseAssetPrompt(message);
-    if (parsed.text !== pending.text.trim())
-        return false;
-    const files = pending.files ?? [];
-    if (!files.length)
-        return pending.text.trim().length > 0 && !parsed.assets.length;
-    return files.length === parsed.assets.length && files.every((file, index) => file.url === `asset://${parsed.assets[index]?.id}` && file.mediaType === parsed.assets[index]?.mediaType);
+export function textFromDelivery(event) {
+    return event.data.parts.flatMap((part) => part.kind === "text" ? [part.text] : []).join("\n");
 }
 export function reconcileHydratedPendingTurn(pendingTurn, events) {
     const reconciled = reconcilePendingTurnWithEvents(pendingTurn, events);
@@ -745,84 +569,17 @@ export function reconcileHydratedPendingTurn(pendingTurn, events) {
     if (reconciled.operation === "edit" && reconciled.delivery === "server") {
         return reconciled;
     }
-    if (reconciled.state !== "clearing" && reconciled.state !== "resubmitting" && reconciled.state !== "submitting")
+    if (reconciled.state !== "submitting")
         return reconciled;
     return { ...reconciled, state: "delivery-failed" };
 }
-export function projectThreadEditBranches(events) {
-    const rejectedEditTurnIds = new Set(events.flatMap((event) => event.type === "turn.failed" && event.data.code === "turn_revert_conflict"
-        ? [event.data.turnId]
-        : []));
-    const acceptedEvents = rejectedEditTurnIds.size === 0
-        ? events
-        : events.filter((event) => {
-            const turnId = eventTurnId(event);
-            return turnId === undefined || !rejectedEditTurnIds.has(turnId);
-        });
-    if (!acceptedEvents.some((event) => event.type === "context.cleared"))
-        return acceptedEvents;
-    const projected = [];
-    for (const event of acceptedEvents) {
-        if (event.type === "context.cleared") {
-            const targetTurnId = event.data.turnId;
-            const previousClearIndex = projected.findLastIndex((candidate) => candidate.type === "context.cleared" && candidate.data.turnId === targetTurnId);
-            if (previousClearIndex >= 0)
-                projected.splice(previousClearIndex);
-            let targetIndex = projected.findLastIndex((candidate) => eventTurnId(candidate) === targetTurnId);
-            if (targetIndex >= 0) {
-                const actualTargetTurnId = eventTurnId(projected[targetIndex]);
-                const turnStartIndex = projected.findLastIndex((candidate, index) => index <= targetIndex && candidate.type === "turn.started" &&
-                    candidate.data.turnId === actualTargetTurnId);
-                projected.splice(turnStartIndex >= 0 ? turnStartIndex : targetIndex);
-            }
-        }
-        projected.push(event);
-    }
-    return projected;
-}
-export function projectPendingThreadEdit(events, beforeTurnId) {
-    if (!beforeTurnId || events.some((event) => event.type === "context.cleared" && event.data.turnId === beforeTurnId))
-        return events;
-    if (hasSteeredMessages(events, beforeTurnId))
-        return events;
-    const targetIndex = events.findIndex((event) => eventTurnId(event) === beforeTurnId);
-    if (targetIndex < 0)
-        return events;
-    const turnStartIndex = events.findLastIndex((event, index) => index <= targetIndex && event.type === "turn.started" && event.data.turnId === beforeTurnId);
-    return events.slice(0, turnStartIndex >= 0 ? turnStartIndex : targetIndex);
-}
 export function latestEditableTurnId(events) {
-    const conflictTurns = new Set(events.flatMap((event) => event.type === "turn.failed" && event.data.code === "turn_revert_conflict"
-        ? [event.data.turnId]
-        : []));
-    for (const event of [...events].reverse()) {
-        if (event.type !== "message.received" || typeof event.data.turnId !== "string")
-            continue;
-        if (conflictTurns.has(event.data.turnId))
-            continue;
-        if (hasSteeredMessages(events, event.data.turnId))
-            return undefined;
-        if (!events.some((candidate) => candidate.type === "turn.started" && candidate.data.turnId === event.data.turnId))
-            return undefined;
-        return event.data.turnId;
-    }
-    return undefined;
-}
-function hasSteeredMessages(events, turnId) {
-    let received = false;
-    for (const event of events) {
-        if (event.type !== "message.received" || event.data.turnId !== turnId)
-            continue;
-        if (received)
-            return true;
-        received = true;
-    }
-    return false;
-}
-function eventTurnId(event) {
-    return "data" in event && "turnId" in event.data && typeof event.data.turnId === "string"
-        ? event.data.turnId
-        : undefined;
+    const latest = conversation(conversationOf(events).view).at(-1);
+    if (!latest)
+        return undefined;
+    const userReceipts = events.filter((event) => event.type === "delivery.consumed" &&
+        event.data.turnId === latest.turnId && event.data.parts.length > 0);
+    return userReceipts.length === 1 ? latest.turnId : undefined;
 }
 export function dedupeThreadEvents(events) {
     const seen = new Set();

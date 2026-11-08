@@ -1,5 +1,6 @@
+import { eveEventCursor, eveEventsCursor } from "../../lib/eve-stream.ts";
 import { createHash, randomUUID } from "node:crypto";
-import type { MessageStreamEvent } from "eve/client";
+import type { SessionStreamEvent } from "eve/client";
 import {
   AGENT_SESSION_CONTRACT_VERSION,
   type AgentSessionEvent,
@@ -44,7 +45,7 @@ export type AgentSessionRuntime = {
     readonly after: number;
     readonly limit: number;
     readonly sessionId: string;
-  }) => Promise<readonly MessageStreamEvent[]>;
+  }) => Promise<readonly SessionStreamEvent[]>;
   readonly cancel: (input: {
     readonly accessToken: string;
     readonly sessionId: string;
@@ -114,8 +115,8 @@ export async function readAgentSession(options: {
     limit,
     sessionId: options.sessionId,
   });
-  const projected = events.map((event, index) => projectSessionEvent(event, after + index + 1));
-  let session = projectSessionSnapshot(options.sessionId, after + events.length, events);
+  const projected = events.map((event, index) => projectSessionEvent(event, eveEventCursor(event)));
+  let session = projectSessionSnapshot(options.sessionId, eveEventsCursor(events, after), events);
   const runtime = options.runtime ?? eveAgentSessionRuntime;
   // A page read from the middle of a long stream can contain only tool and
   // message events. The browser must not infer "unknown" or keep showing a
@@ -140,22 +141,14 @@ export async function readAgentSession(options: {
   return {
     events: projected,
     hasMore: events.length >= limit,
-    nextCursor: after + events.length,
+    nextCursor: eveEventsCursor(events, after),
     owner: options.identity,
     session,
   };
 }
 
-function hasLifecycleBoundary(events: readonly MessageStreamEvent[]): boolean {
-  return events.some((event) => [
-    "turn.started",
-    "turn.completed",
-    "turn.cancelled",
-    "turn.failed",
-    "session.waiting",
-    "session.completed",
-    "session.failed",
-  ].includes(event.type));
+function hasLifecycleBoundary(events: readonly SessionStreamEvent[]): boolean {
+  return events.some((event) => ["turn.started", "turn.paused", "turn.settled", "session.ended"].includes(event.type));
 }
 
 function applyRuntimeBoundary(
@@ -295,7 +288,7 @@ export function parseSessionPageLimit(value: number): number {
   return value;
 }
 
-function projectSessionEvent(event: MessageStreamEvent, cursor: number): AgentSessionEvent {
+function projectSessionEvent(event: SessionStreamEvent, cursor: number): AgentSessionEvent {
   const candidate = event as unknown as {
     readonly data?: AgentSessionEvent["data"];
     readonly meta?: AgentSessionEvent["meta"];
@@ -303,6 +296,8 @@ function projectSessionEvent(event: MessageStreamEvent, cursor: number): AgentSe
   };
   return {
     contractVersion: AGENT_SESSION_CONTRACT_VERSION,
+    position: event.meta.position,
+    ...(event.scope ? { scope: event.scope } : {}),
     cursor,
     ...(candidate.data === undefined ? {} : { data: candidate.data }),
     ...(candidate.meta === undefined ? {} : { meta: candidate.meta }),
@@ -313,7 +308,7 @@ function projectSessionEvent(event: MessageStreamEvent, cursor: number): AgentSe
 function projectSessionSnapshot(
   sessionId: string,
   eventCursor: number,
-  events: readonly MessageStreamEvent[],
+  events: readonly SessionStreamEvent[],
 ): AgentSessionSnapshot {
   let status: AgentSessionSnapshot["status"] = "unknown";
   let activeTurnId: string | undefined;
@@ -326,31 +321,25 @@ function projectSessionSnapshot(
       status = "running";
       activeTurnId = turnId;
     } else if (
-      event.type === "step.started" ||
-      event.type === "message.appended" ||
-      event.type === "reasoning.appended" ||
-      event.type === "actions.requested"
+      event.type === "model.requested" ||
+      event.type === "content.delta" ||
+      event.type === "call.requested"
     ) {
       status = "running";
-    } else if (event.type === "turn.completed") {
+    } else if (event.type === "turn.settled") {
       activeTurnId = undefined;
+      status = event.data.outcome === "cancelled" ? "cancelled" : event.data.outcome === "failed" ? "failed" : "waiting";
+    } else if (event.type === "turn.paused") {
+      activeTurnId = event.data.turnId;
       status = "waiting";
-    } else if (event.type === "turn.cancelled") {
+    } else if (event.type === "session.ended") {
       activeTurnId = undefined;
-      status = "cancelled";
-    } else if (event.type === "session.waiting") {
-      activeTurnId = undefined;
-      status = "waiting";
-    } else if (event.type === "session.completed") {
-      activeTurnId = undefined;
-      status = "completed";
-    } else if (event.type === "session.failed" || event.type === "turn.failed") {
-      activeTurnId = undefined;
-      status = "failed";
+      status = event.data.outcome === "failed" ? "failed" : "completed";
     }
   }
+
   return {
-    cursor: { eventCursor, sessionId },
+    cursor: { streamIndex: eventCursor, sessionId },
     ...(activeTurnId ? { activeTurnId } : {}),
     sessionId,
     status,

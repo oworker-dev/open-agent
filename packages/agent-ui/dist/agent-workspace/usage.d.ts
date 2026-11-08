@@ -1,4 +1,4 @@
-import type { MessageStreamEvent } from "eve/client";
+import type { SessionStreamEvent } from "eve/client";
 export type AgentUsageSummary = {
     readonly cacheReadTokens: number;
     readonly cacheWriteTokens: number;
@@ -9,6 +9,6 @@ export type AgentUsageSummary = {
     readonly outputTokens: number;
     readonly steps: number;
 };
-export declare function summarizeUsage(events: readonly MessageStreamEvent[]): AgentUsageSummary;
+export declare function summarizeUsage(events: readonly SessionStreamEvent[]): AgentUsageSummary;
 export declare function formatTokenCount(value: number): string;
 //# sourceMappingURL=usage.d.ts.map

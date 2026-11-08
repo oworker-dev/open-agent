@@ -9,11 +9,11 @@ export function createAgentSession(config, preferences, state) {
             "x-agent-reasoning": currentPreferences.reasoning,
         };
     };
-    const host = config?.host ?? "";
+    const baseUrl = config?.host ?? "";
     const client = new Client({
         auth: config?.auth,
+        baseUrl,
         headers,
-        host,
         redirect: config?.redirect,
     });
     const initialSession = state?.sessionId
@@ -23,7 +23,7 @@ export function createAgentSession(config, preferences, state) {
         ...(config?.auth ? { auth: config.auth } : {}),
         client,
         headers,
-        host,
+        baseUrl,
         ...(initialSession ? { initialSession } : {}),
     };
 }

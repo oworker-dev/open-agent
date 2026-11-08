@@ -5,8 +5,18 @@ import { createAgentThread } from "@oworker/open-agent-ui/agent-workspace";
 import {
   applyThreadCollectionPatch,
   parseThreadCollectionPatch,
+  parseStrictThreadCollection,
   summarizeThreadCollection,
 } from "../../server/http/thread-collection-contract.ts";
+
+test("strict checkpoint writes reject obsolete cached events rather than silently dropping them", () => {
+  const thread = { ...createAgentThread(1, "Old cache"), events: [
+    { type: "session.started", data: {}, meta: { id: "old-id", timestamp: 1 } },
+  ] };
+  assert.equal(parseStrictThreadCollection({ version: 2, threads: [thread] }), undefined);
+  assert.equal(parseThreadCollectionPatch({ version: 2, activeThreadId: thread.id,
+    deletedThreadIds: [], eventAppends: [], upsertThreads: [thread] }), undefined);
+});
 
 test("thread indexes omit inactive transcripts and retain the requested thread", () => {
   const first = { ...createAgentThread(1, "First"), events: [event("evt-first")] };
@@ -85,7 +95,7 @@ test("thread patches update only touched threads while retaining server historie
     { activeThreadId: first.id, threads: [first, second], version: 2 },
     patch,
   );
-  assert.equal(result.threads[0]?.events[0]?.meta.id, "evt-first");
+  assert.equal(result.threads[0]?.events[0]?.meta.position.line, 0);
   assert.equal(result.threads[1]?.title, "Updated");
   assert.equal(result.activeThreadId, second.id);
 });
@@ -93,9 +103,9 @@ test("thread patches update only touched threads while retaining server historie
 test("thread patches can append a streamed event without sending the existing transcript", () => {
   const first = { ...createAgentThread(1, "First"), events: [event("evt-first")] };
   const streamed = {
-    data: { sequence: 1, turnId: "turn-1" },
-    meta: { at: new Date(0).toISOString(), id: "evt-second" },
-    type: "step.started" as const,
+    data: { runId: "run-1", modelId: "test", attempt: 0 },
+    meta: { at: new Date(0).toISOString(), position: { line: 1, index: 0 } },
+    type: "model.started" as const,
   };
   const patch = parseThreadCollectionPatch({
     activeThreadId: first.id,
@@ -110,7 +120,7 @@ test("thread patches can append a streamed event without sending the existing tr
     { activeThreadId: first.id, threads: [first], version: 2 },
     patch,
   );
-  assert.deepEqual(result.threads[0]?.events.map((item) => item.meta.id), ["evt-first", "evt-second"]);
+  assert.deepEqual(result.threads[0]?.events.map((item) => item.meta.position.line), [0, 1]);
 });
 
 test("summary patches clear a stale pending edit instead of resurrecting it", () => {
@@ -118,7 +128,7 @@ test("summary patches clear a stale pending edit instead of resurrecting it", ()
     ...createAgentThread(1, "First"),
     pendingTurn: {
       id: "pending-edit",
-      state: "clearing" as const,
+      state: "submitting" as const,
       submittedAt: 2,
       text: "updated prompt",
     },
@@ -175,7 +185,7 @@ test("thread indexes retain durable input responses for refresh projection", () 
     inputResponseSubmissions: [{
       id: "response-approval-1",
       mailboxItemId: "mail-approval-1",
-      responses: [{ optionId: "approve", requestId: "request-approval-1" }],
+      responses: [{ optionId: "approve", interactionId: "request-approval-1" }],
       state: "committed" as const,
       streamIndexAtSubmission: 8,
       submittedAt: 2,
@@ -253,16 +263,6 @@ test("an edit checkpoint in submitting state preserves prior coverage", () => {
   assert.equal(result.threads[0]?.pendingTurn?.operation, "edit");
 });
 
-function event(id: string) {
-  return {
-    data: {
-      runtime: {
-        agentId: "open-agent",
-        eveVersion: "test",
-        modelId: "test/model",
-      },
-    },
-    meta: { at: new Date(0).toISOString(), id },
-    type: "session.started" as const,
-  };
+function event(_id: string) {
+  return { data: {}, meta: { at: new Date(0).toISOString(), position: { line: 0, index: 0 } }, type: "session.started" as const };
 }

@@ -1,3 +1,5 @@
+import { conversationOf } from "eve/client";
+import { activeTurn, call, calls, children, contentPreviews, failure, openInteractions, parts, runs, session, turn, turns } from "eve/events";
 export function mergeSubagentSessions(events, durable = []) {
     const projected = presentSubagentSessions(events);
     const bySession = new Map(durable.map((child) => [child.childSessionId, child]));
@@ -57,1336 +59,238 @@ export function isRetryableAgentFailure(failure) {
     const value = `${failure.code} ${failure.message}`.toLocaleLowerCase();
     return !/\b(?:400|401|403|404|422|unauthori[sz]ed|forbidden|rejected|invalid[_ -]?request)\b/u.test(value);
 }
-function failureFromData(data) {
-    const statusCode = typeof data.details?.statusCode === "number" && Number.isInteger(data.details.statusCode)
-        ? data.details.statusCode
-        : typeof data.details?.status === "number" && Number.isInteger(data.details.status)
-            ? data.details.status
-            : undefined;
-    const retryable = typeof data.details?.isRetryable === "boolean"
-        ? data.details.isRetryable
-        : typeof data.details?.retryable === "boolean"
-            ? data.details.retryable
-            : undefined;
-    return {
-        code: data.code,
-        message: data.message,
-        ...(retryable === undefined ? {} : { retryable }),
-        ...(statusCode === undefined ? {} : { statusCode }),
-    };
+const snapshots = new WeakMap();
+export function presentationSnapshot(events) {
+    const cached = snapshots.get(events);
+    if (cached?.length === events.length && cached.last === events.at(-1))
+        return cached.value;
+    const value = conversationOf(events);
+    snapshots.set(events, { length: events.length, last: events.at(-1), value });
+    return value;
 }
-const eventSnapshotIndexes = new WeakMap();
-function eventSnapshotIndex(events) {
-    const cached = eventSnapshotIndexes.get(events);
-    if (cached)
-        return cached;
-    const byTurn = new Map();
-    const byTurnStep = new Map();
-    const maximumStepByTurn = new Map();
-    let latestSessionFailure;
-    for (const event of events) {
-        if (event.type === "session.failed")
-            latestSessionFailure = event;
-        const turnId = eventTurnId(event);
-        if (!turnId)
-            continue;
-        const turnEvents = byTurn.get(turnId) ?? [];
-        turnEvents.push(event);
-        byTurn.set(turnId, turnEvents);
-        const stepIndex = eventStepIndex(event);
-        if (stepIndex === undefined)
-            continue;
-        const key = `${turnId}:${stepIndex}`;
-        const stepEvents = byTurnStep.get(key) ?? [];
-        stepEvents.push(event);
-        byTurnStep.set(key, stepEvents);
-        maximumStepByTurn.set(turnId, Math.max(maximumStepByTurn.get(turnId) ?? -1, stepIndex));
-    }
-    const index = {
-        byTurn,
-        byTurnStep,
-        maximumStepByTurn,
-        ...(latestSessionFailure ? { latestSessionFailure } : {}),
-    };
-    eventSnapshotIndexes.set(events, index);
-    return index;
+export function eventTurnId(event) {
+    return event.scope?.turnId ?? ("turnId" in event.data ? event.data.turnId : undefined);
 }
-function modelRetryingEvents(events, turnId, stepIndex) {
-    const candidates = eventSnapshotIndex(events).byTurnStep.get(`${turnId}:${stepIndex}`) ?? [];
-    return candidates.filter((event) => {
-        const candidate = event;
-        if (candidate.type !== "model.retrying" || !candidate.data || typeof candidate.data !== "object")
-            return false;
-        const data = candidate.data;
-        return data.turnId === turnId && data.stepIndex === stepIndex &&
-            typeof data.attempt === "number" && Number.isInteger(data.attempt) && data.attempt > 0 &&
-            typeof data.maximum === "number" && Number.isInteger(data.maximum) && data.maximum > 0;
-    });
+export function eventStepIndex(event, events) {
+    const runId = event.scope?.runId ?? ("runId" in event.data ? event.data.runId : undefined);
+    const turnId = eventTurnId(event);
+    const allRuns = runs(presentationSnapshot(events).view, turnId ? { turnId } : undefined);
+    return runId ? ((index) => index < 0 ? undefined : index)(allRuns.findIndex((candidate) => candidate.runId === runId)) : undefined;
 }
-function normalizeRetryFailure(failure) {
-    return failure.code === "MODEL_CALL_FAILED"
-        ? failure
-        : { ...failure, code: "MODEL_CALL_FAILED" };
+export function eventTimestamp(event) {
+    return timestamp(event?.meta.at);
 }
-export function stableUserMessageId(sourceId, turnId, stableRoot) {
-    const prefix = `${turnId}:user`;
-    if (sourceId === prefix)
-        return `${stableRoot}:user`;
-    if (sourceId.startsWith(`${prefix}:`)) {
-        return `${stableRoot}:user:${sourceId.slice(prefix.length + 1)}`;
-    }
+function timestamp(at) {
+    const value = at ? Date.parse(at) : NaN;
+    return Number.isFinite(value) ? value : undefined;
+}
+export function stableUserMessageId(sourceId, _turnId, _stableRoot) {
     return sourceId;
 }
-export function activeTurnIdAfterPendingSubmission(events, pendingTurn) {
-    const startedIndex = events.findLastIndex((event) => event.type === "turn.started");
-    if (startedIndex < 0)
+export function activeTurnIdAfterPendingSubmission(events, pending) {
+    const current = activeTurn(presentationSnapshot(events).view);
+    if (!current)
         return undefined;
-    const started = events[startedIndex];
-    if (started?.type !== "turn.started")
-        return undefined;
-    const turnId = started.data.turnId;
-    const settled = events.some((event) => (event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled") &&
-        event.data.turnId === turnId);
-    if (settled)
-        return undefined;
-    const submissionIndex = pendingTurn.eventCountAtSubmission;
-    if (submissionIndex !== undefined && events.length >= submissionIndex) {
-        return startedIndex >= submissionIndex ? turnId : undefined;
+    const index = events.findIndex((event) => event.type === "turn.started" && event.data.turnId === current.turnId);
+    if (pending.eventCountAtSubmission !== undefined && events.length >= pending.eventCountAtSubmission) {
+        return index >= pending.eventCountAtSubmission ? current.turnId : undefined;
     }
-    const eventAt = started.meta.at ? Date.parse(started.meta.at) : Number.NaN;
-    return Number.isFinite(eventAt) && eventAt >= pendingTurn.submittedAt - 1_000
-        ? turnId
-        : undefined;
+    return (timestamp(current.startedAt) ?? 0) >= pending.submittedAt - 1000 ? current.turnId : undefined;
 }
 export const INTERRUPTED_TOOL_ERROR = "Open Agent: tool call cancelled before completion.";
 export const CANCELLING_TOOL_ERROR = "Open Agent: tool call cancellation is pending.";
 export const INCOMPLETE_TOOL_ERROR = "Open Agent: tool call did not complete.";
-export function isInterruptedToolPart(part) {
-    return part.state === "output-error" && part.errorText === INTERRUPTED_TOOL_ERROR;
+export function isInterruptedToolPart(part) { return part.state === "cancelled"; }
+export function isCancellationPendingToolPart(part) { return part.error?.code === "LOCAL_CANCELLATION_PENDING"; }
+export function isLocallyInterruptedMessage(message) {
+    return message.metadata?.localStatus === "cancelled";
 }
-export function isCancellationPendingToolPart(part) {
-    return part.state === "output-error" && part.errorText === CANCELLING_TOOL_ERROR;
+export function eventsForMessagePresentation(message, events) {
+    const boundary = message.metadata?.localStopStreamIndex;
+    return boundary === undefined ? events : events.filter((event) => event.meta.position.line < boundary);
 }
-function isLocalInterruptedBoundary(event) {
-    return event.type === "turn.cancelled" && event.meta?.id?.startsWith("local-interrupt-") === true;
-}
-export function sanitizeSettledThreadEvents(events) {
-    const anchoredTurns = new Set(events.flatMap((event) => event.type === "message.received" ? [event.data.turnId] : []));
-    const startedTurns = new Set(events.flatMap((event) => event.type === "turn.started" ? [event.data.turnId] : []));
-    const continuationTurns = continuationTurnIds(events, anchoredTurns);
-    const orphanTurns = new Set();
-    if (anchoredTurns.size > 0) {
-        for (const event of events) {
-            const turnId = eventTurnId(event);
-            if (turnId && !anchoredTurns.has(turnId) && !startedTurns.has(turnId) && !continuationTurns.has(turnId)) {
-                orphanTurns.add(turnId);
-            }
-        }
-    }
-    const terminalTurns = new Set();
-    const cancelledTurns = new Set();
-    const completedCalls = new Set();
-    const lastPartialIndex = new Map();
-    for (const [index, event] of events.entries()) {
-        if (event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled") {
-            terminalTurns.add(event.data.turnId);
-            if (event.type === "turn.cancelled")
-                cancelledTurns.add(event.data.turnId);
-        }
-        if (event.type === "action.input.partial") {
-            lastPartialIndex.set(`${event.data.turnId}:${event.data.callId}`, index);
-        }
-        if (event.type === "action.result" && event.data.status === "completed" && event.data.result.kind === "tool-result") {
-            completedCalls.add(`${event.data.turnId}:${event.data.result.callId}`);
-        }
-    }
-    const filtered = events.filter((event, index) => {
-        const turnId = eventTurnId(event);
-        if (turnId && orphanTurns.has(turnId))
-            return false;
-        if (event.type !== "action.input.partial" || !terminalTurns.has(event.data.turnId) || cancelledTurns.has(event.data.turnId))
-            return true;
-        const key = `${event.data.turnId}:${event.data.callId}`;
-        return completedCalls.has(key) && lastPartialIndex.get(key) === index;
-    });
-    const stepEvidence = new Set();
-    for (const event of filtered) {
-        const turnId = eventTurnId(event);
-        const stepIndex = eventStepIndex(event);
-        if (!turnId || stepIndex === undefined)
+export function projectInterruptedMessages(messages, events, interruptions) {
+    if (!interruptions.length)
+        return messages;
+    const frozen = new Map();
+    for (const interruption of interruptions) {
+        if (frozen.has(interruption.turnId))
             continue;
-        if (event.type !== "step.started" &&
-            event.type !== "turn.completed" &&
-            event.type !== "turn.failed" &&
-            event.type !== "turn.cancelled")
-            stepEvidence.add(`${turnId}:${stepIndex}`);
+        const prefix = events.filter((event) => event.meta.position.line < interruption.streamIndex);
+        const snapshot = conversationOf(prefix);
+        frozen.set(interruption.turnId, { streamIndex: interruption.streamIndex, messages: new Map(snapshot.messages
+                .filter((message) => message.role === "assistant" && message.metadata?.turnId === interruption.turnId)
+                .map((message) => [message.id, message])) });
     }
-    const normalized = filtered.filter((event) => {
-        if (event.type !== "step.started" || !terminalTurns.has(event.data.turnId))
-            return true;
-        return stepEvidence.has(`${event.data.turnId}:${event.data.stepIndex}`);
-    });
-    const compacted = [];
-    for (const event of normalized) {
-        if (event.type === "message.appended" || event.type === "reasoning.appended") {
-            const last = compacted.at(-1);
-            if (last?.type === event.type &&
-                last.data.turnId === event.data.turnId &&
-                last.data.stepIndex === event.data.stepIndex) {
-                compacted[compacted.length - 1] = event;
-                continue;
-            }
-        }
-        if (event.type === "session.waiting" && compacted.at(-1)?.type === "session.waiting") {
-            compacted[compacted.length - 1] = event;
-            continue;
-        }
-        compacted.push(event);
-    }
-    return compacted;
-}
-function continuationTurnIds(events, anchoredTurns) {
-    const continuation = new Set();
-    let inputContinuationPending = false;
-    for (const event of events) {
-        if (event.type === "input.requested" || event.type === "authorization.required") {
-            inputContinuationPending = true;
-            continue;
-        }
-        if (event.type === "message.received") {
-            inputContinuationPending = false;
-            continue;
-        }
-        if (event.type === "turn.started") {
-            if (inputContinuationPending && !anchoredTurns.has(event.data.turnId)) {
-                continuation.add(event.data.turnId);
-            }
-            inputContinuationPending = false;
-        }
-    }
-    return continuation;
-}
-export function normalizeSettledAgentMessages(messages, events) {
-    const terminalTurns = new Map();
-    for (const event of events) {
-        if (event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled") {
-            terminalTurns.set(event.data.turnId, event.type === "turn.completed"
-                ? "completed"
-                : event.type === "turn.failed"
-                    ? "failed"
-                    : isLocalInterruptedBoundary(event) ? "cancelling" : "cancelled");
-        }
-    }
-    const rootEventsCache = new Map();
-    const segmentEventsCache = new Map();
-    const segmentEventsFor = (message, turnId) => {
-        const clientMessageId = assistantSegmentClientMessageId(message);
-        const cacheKey = `${turnId}\u0000${clientMessageId ?? ""}`;
-        const cached = segmentEventsCache.get(cacheKey);
-        if (cached)
-            return cached;
-        let rootEvents = rootEventsCache.get(turnId);
-        if (!rootEvents) {
-            rootEvents = eventsForRootTurn(events, turnId);
-            rootEventsCache.set(turnId, rootEvents);
-        }
-        const receiptIndex = rootEvents.findIndex((event) => event.type === "message.received" &&
-            event.data.turnId === turnId &&
-            (clientMessageId === undefined
-                ? event.data.clientMessageId === undefined
-                : event.data.clientMessageId === clientMessageId));
-        const segment = receiptIndex < 0
-            ? rootEvents
-            : (() => {
-                const nextReceiptIndex = rootEvents.findIndex((event, index) => index > receiptIndex &&
-                    event.type === "message.received" &&
-                    event.data.turnId === turnId);
-                return rootEvents.slice(receiptIndex, nextReceiptIndex < 0 ? undefined : nextReceiptIndex);
-            })();
-        segmentEventsCache.set(cacheKey, segment);
-        return segment;
-    };
-    return messages.map((message) => {
-        if (message.role !== "assistant" || !message.metadata?.turnId)
-            return message;
-        const messageTurnId = message.metadata.turnId;
-        const terminal = terminalTurns.get(messageTurnId);
-        if (!terminal)
-            return message;
-        const segmentEvents = segmentEventsFor(message, messageTurnId);
-        const segmentCompletedResults = new Map();
-        const segmentPartialToolInputs = new Map();
-        for (const event of segmentEvents) {
-            if (event.type === "action.result" && event.data.status === "completed" && event.data.result.kind === "tool-result") {
-                segmentCompletedResults.set(event.data.result.callId, {
-                    output: event.data.result.output,
-                    toolName: event.data.result.toolName,
-                });
-            }
-            if (event.type === "action.input.partial") {
-                segmentPartialToolInputs.set(event.data.callId, event);
-            }
-        }
-        let changed = false;
-        const parts = message.parts.flatMap((part) => {
-            if (part.type !== "dynamic-tool" || !isOpenToolPart(part))
-                return [part];
-            const completed = segmentCompletedResults.get(part.toolCallId);
-            changed = true;
-            if (!completed) {
-                if (terminal === "cancelled" || terminal === "cancelling") {
-                    const toolMetadata = part.toolMetadata?.eve
-                        ? {
-                            ...part.toolMetadata,
-                            eve: {
-                                kind: part.toolMetadata.eve.kind,
-                                name: part.toolMetadata.eve.name,
-                            },
-                        }
-                        : part.toolMetadata;
-                    return [{
-                            errorText: terminal === "cancelled" ? INTERRUPTED_TOOL_ERROR : CANCELLING_TOOL_ERROR,
-                            input: part.input,
-                            ...(part.inputText !== undefined ? { inputText: part.inputText } : {}),
-                            ...(part.stepIndex !== undefined ? { stepIndex: part.stepIndex } : {}),
-                            state: "output-error",
-                            toolCallId: part.toolCallId,
-                            ...(toolMetadata ? { toolMetadata } : {}),
-                            toolName: part.toolName,
-                            type: "dynamic-tool",
-                        }];
-                }
-                return [{
-                        errorText: incompleteToolError(segmentEvents, messageTurnId, part),
-                        input: part.input,
-                        ...(part.inputText !== undefined ? { inputText: part.inputText } : {}),
-                        ...(part.stepIndex !== undefined ? { stepIndex: part.stepIndex } : {}),
-                        state: "output-error",
-                        toolCallId: part.toolCallId,
-                        ...(part.toolMetadata ? { toolMetadata: part.toolMetadata } : {}),
-                        toolName: part.toolName,
-                        type: "dynamic-tool",
-                    }];
-            }
-            return [{
-                    input: part.input,
-                    ...(part.inputText !== undefined ? { inputText: part.inputText } : {}),
-                    ...(part.stepIndex !== undefined ? { stepIndex: part.stepIndex } : {}),
-                    output: completed.output,
-                    state: "output-available",
-                    toolCallId: part.toolCallId,
-                    ...(part.toolMetadata ? { toolMetadata: part.toolMetadata } : {}),
-                    toolName: completed.toolName || part.toolName,
-                    type: "dynamic-tool",
-                }];
-        });
-        const cleanedParts = [];
-        const markerIndexByStep = new Map();
-        const partialsForMessage = [...segmentPartialToolInputs.values()];
-        let markerStepIndex = 0;
-        for (let index = 0; index < parts.length; index += 1) {
-            const part = parts[index];
-            if (part.type !== "step-start") {
-                if ((part.type === "text" || part.type === "reasoning") && part.state === "streaming") {
-                    changed = true;
-                    cleanedParts.push({ ...part, state: "done" });
-                }
-                else {
-                    cleanedParts.push(part);
-                }
-                continue;
-            }
-            const nextStep = parts.findIndex((candidate, candidateIndex) => candidateIndex > index && candidate.type === "step-start");
-            const end = nextStep < 0 ? parts.length : nextStep;
-            const hasContent = parts.slice(index + 1, end).some((candidate) => candidate.type !== "step-start");
-            const hasPartialInput = partialsForMessage.some((partial) => partial.data.stepIndex === markerStepIndex);
-            if (hasContent || hasPartialInput) {
-                markerIndexByStep.set(markerStepIndex, cleanedParts.length);
-                cleanedParts.push(part);
-            }
-            else
-                changed = true;
-            markerStepIndex += 1;
-        }
-        const visibleToolCallIds = new Set(cleanedParts.flatMap((part) => part.type === "dynamic-tool" ? [part.toolCallId] : []));
-        const syntheticByStep = new Map();
-        for (const partial of partialsForMessage) {
-            if (visibleToolCallIds.has(partial.data.callId))
-                continue;
-            changed = true;
-            visibleToolCallIds.add(partial.data.callId);
-            const synthetic = {
-                errorText: terminal === "cancelled" || terminal === "cancelling"
-                    ? terminal === "cancelled" ? INTERRUPTED_TOOL_ERROR : CANCELLING_TOOL_ERROR
-                    : incompleteToolError(segmentEvents, messageTurnId, {
-                        input: partial.data.input ?? {},
-                        stepIndex: partial.data.stepIndex,
-                        toolCallId: partial.data.callId,
-                        toolName: partial.data.toolName,
-                        type: "dynamic-tool",
-                        state: "input-streaming",
-                    }),
-                input: partial.data.input ?? {},
-                inputText: partial.data.inputTextSoFar,
-                state: "output-error",
-                stepIndex: partial.data.stepIndex,
-                toolCallId: partial.data.callId,
-                toolName: partial.data.toolName,
-                type: "dynamic-tool",
-            };
-            const stepParts = syntheticByStep.get(partial.data.stepIndex) ?? [];
-            stepParts.push(synthetic);
-            syntheticByStep.set(partial.data.stepIndex, stepParts);
-        }
-        for (const [stepIndex, retryParts] of failedRetryToolParts(segmentEvents, messageTurnId, visibleToolCallIds)) {
-            changed = true;
-            const stepParts = syntheticByStep.get(stepIndex) ?? [];
-            stepParts.push(...retryParts);
-            syntheticByStep.set(stepIndex, stepParts);
-        }
-        const insertions = [...syntheticByStep.entries()]
-            .map(([stepIndex, stepParts]) => ({
-            index: markerIndexByStep.get(stepIndex) ?? cleanedParts.length - 1,
-            stepParts,
-        }))
-            .sort((left, right) => right.index - left.index);
-        for (const insertion of insertions) {
-            cleanedParts.splice(insertion.index + 1, 0, ...insertion.stepParts);
-        }
-        if (message.metadata?.status === "streaming") {
-            changed = true;
-        }
-        return changed
-            ? {
+    return messages.flatMap((message) => {
+        const turnId = message.metadata?.turnId;
+        const stopped = message.role === "assistant" && turnId ? frozen.get(turnId) : undefined;
+        if (!stopped)
+            return [message];
+        const observed = stopped.messages.get(message.id);
+        return [{
                 ...message,
-                metadata: message.metadata?.status === "streaming"
-                    ? { ...message.metadata, status: "complete" }
-                    : message.metadata,
-                parts: cleanedParts,
-            }
-            : message;
+                parts: (observed?.parts ?? []).map((part) => {
+                    if (part.type === "text" || part.type === "reasoning")
+                        return { ...part, state: "done" };
+                    if (part.type === "interaction" && part.status === "open")
+                        return { ...part, status: "settled", outcome: "interrupted" };
+                    if (part.type === "tool" && !["completed", "failed", "rejected", "cancelled"].includes(part.state)) {
+                        return { ...part, inputText: undefined, state: "cancelled",
+                            ...(part.interaction ? { interaction: { ...part.interaction, status: "settled", outcome: "interrupted" } } : {}),
+                            error: { code: "LOCAL_CANCELLATION_PENDING", message: CANCELLING_TOOL_ERROR } };
+                    }
+                    return part;
+                }),
+                metadata: { ...message.metadata, status: "complete", localStatus: "cancelled", localStopStreamIndex: stopped.streamIndex },
+            }];
     });
-}
-function failedRetryToolParts(events, turnId, visibleToolCallIds) {
-    const attempts = [];
-    let current;
-    for (const event of events) {
-        if (eventTurnId(event) !== turnId)
-            continue;
-        if (event.type === "step.started") {
-            current = { actions: [], stepIndex: event.data.stepIndex };
-            attempts.push(current);
-            continue;
-        }
-        if (event.type === "actions.requested") {
-            if (!current || current.stepIndex !== event.data.stepIndex) {
-                current = { actions: [], stepIndex: event.data.stepIndex };
-                attempts.push(current);
-            }
-            current.actions = [...current.actions, ...event.data.actions];
-            continue;
-        }
-        if (event.type === "step.failed") {
-            if (!current || current.stepIndex !== event.data.stepIndex)
-                continue;
-            current.failure = failureFromData(event.data);
-        }
-    }
-    const failedAttempts = attempts.filter((attempt) => attempt.failure && attempt.actions.length > 0);
-    if (failedAttempts.length === 0)
-        return new Map();
-    const completedCallIds = new Set(events.flatMap((event) => event.type === "action.result" && event.data.status === "completed"
-        ? [event.data.result.callId]
-        : []));
-    const lastFailedAttemptByCall = new Map();
-    failedAttempts.forEach((attempt, index) => {
-        for (const action of attempt.actions)
-            lastFailedAttemptByCall.set(action.callId, index);
-    });
-    const byStep = new Map();
-    failedAttempts.forEach((attempt, attemptIndex) => {
-        for (const action of attempt.actions) {
-            if (visibleToolCallIds.has(action.callId) &&
-                !completedCallIds.has(action.callId) &&
-                lastFailedAttemptByCall.get(action.callId) === attemptIndex)
-                continue;
-            const toolName = "toolName" in action && typeof action.toolName === "string"
-                ? action.toolName
-                : "subagentName" in action && typeof action.subagentName === "string"
-                    ? action.subagentName
-                    : "tool";
-            const stepParts = byStep.get(attempt.stepIndex) ?? [];
-            stepParts.push({
-                errorText: attempt.failure.message,
-                input: "input" in action ? action.input ?? {} : {},
-                state: "output-error",
-                stepIndex: attempt.stepIndex,
-                toolCallId: `retry:${turnId}:${attempt.stepIndex}:${attemptIndex}:${action.callId}`,
-                toolName,
-                type: "dynamic-tool",
-            });
-            byStep.set(attempt.stepIndex, stepParts);
-        }
-    });
-    return byStep;
-}
-function incompleteToolError(events, turnId, part) {
-    const result = [...events].reverse().find((event) => event.type === "action.result" &&
-        event.data.turnId === turnId &&
-        event.data.result.callId === part.toolCallId &&
-        event.data.status !== "completed");
-    if (result?.type === "action.result" && result.data.error?.message) {
-        return result.data.error.message;
-    }
-    const stepFailure = [...events].reverse().find((event) => event.type === "step.failed" &&
-        event.data.turnId === turnId &&
-        (part.stepIndex === undefined || event.data.stepIndex === part.stepIndex));
-    if (stepFailure?.type === "step.failed")
-        return stepFailure.data.message;
-    const turnFailure = [...events].reverse().find((event) => event.type === "turn.failed" && event.data.turnId === turnId);
-    if (turnFailure?.type === "turn.failed")
-        return turnFailure.data.message;
-    return INCOMPLETE_TOOL_ERROR;
-}
-function isOpenToolPart(part) {
-    return part.state === "input-streaming" ||
-        part.state === "input-available" ||
-        (part.state === "output-available" && part.partial === true);
-}
-const MAX_DURABLE_STEP_RETRIES = 3;
-function shouldPresentRetryFailure(failure) {
-    return isRetryableAgentFailure(failure);
-}
-export function shouldSuppressInterruptedTurnDisplayEvent(event, eventIndex, turns) {
-    return shouldSuppressInterruptedTurnEvent(event, turns, (turn) => eventIndex >= turn.eventCount);
-}
-export function shouldSuppressInterruptedTurnStreamEvent(event, streamIndex, turns) {
-    return shouldSuppressInterruptedTurnEvent(event, turns, (turn) => streamIndex >= turn.streamIndex);
-}
-function shouldSuppressInterruptedTurnEvent(event, turns, isAfterCancellation) {
-    if (event.type === "message.received" ||
-        event.type === "turn.cancelled" ||
-        event.type === "turn.started")
-        return false;
-    const turnId = eventTurnId(event);
-    if (!turnId)
-        return false;
-    const interrupted = turns.find((turn) => turn.turnId === turnId);
-    return Boolean(interrupted && interrupted.settled !== false && isAfterCancellation(interrupted));
-}
-export function projectAgentDisplayTimeline(messages, events) {
-    const turns = turnDisplayCoordinates(events);
-    if (turns.size === 0)
-        return { events, messages };
-    const projectedEvents = [];
-    let latestSourceTerminalTurnId;
-    for (const event of events) {
-        if (event.type === "session.waiting") {
-            const coordinates = latestSourceTerminalTurnId ? turns.get(latestSourceTerminalTurnId) : undefined;
-            if (coordinates && !coordinates.finalTurn)
-                continue;
-            projectedEvents.push(event);
-            continue;
-        }
-        const sourceTurnId = eventTurnId(event);
-        const coordinates = sourceTurnId ? turns.get(sourceTurnId) : undefined;
-        if (!coordinates) {
-            projectedEvents.push(event);
-            continue;
-        }
-        if ((event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled") &&
-            !coordinates.finalTurn) {
-            latestSourceTerminalTurnId = sourceTurnId;
-            continue;
-        }
-        if (event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled") {
-            latestSourceTerminalTurnId = sourceTurnId;
-        }
-        projectedEvents.push(remapEventCoordinates(event, coordinates.rootTurnId, coordinates.stepOffset));
-    }
-    const projectedMessages = [];
-    const assistantByRoot = new Map();
-    for (const message of messages) {
-        if (message.role !== "assistant" || !message.metadata?.turnId) {
-            if (message.role === "user" && message.metadata?.turnId) {
-                const coordinates = turns.get(message.metadata.turnId);
-                if (coordinates)
-                    assistantByRoot.delete(coordinates.rootTurnId);
-            }
-            projectedMessages.push(message);
-            continue;
-        }
-        const coordinates = turns.get(message.metadata.turnId);
-        if (!coordinates) {
-            projectedMessages.push(message);
-            continue;
-        }
-        const remapped = remapAssistantMessage(message, coordinates.rootTurnId, coordinates.stepOffset);
-        const existingIndex = assistantByRoot.get(coordinates.rootTurnId);
-        if (existingIndex === undefined) {
-            assistantByRoot.set(coordinates.rootTurnId, projectedMessages.length);
-            projectedMessages.push(remapped);
-            continue;
-        }
-        const existing = projectedMessages[existingIndex];
-        if (existing?.role !== "assistant")
-            continue;
-        projectedMessages[existingIndex] = mergeAssistantMessages(existing, remapped);
-    }
-    return { events: projectedEvents, messages: projectedMessages };
 }
 export function presentAgentStep(events, turnId, stepIndex) {
     if (!turnId)
         return { status: "running" };
-    const index = eventSnapshotIndex(events);
-    const stepEvents = index.byTurnStep.get(`${turnId}:${stepIndex}`) ?? [];
-    const turnEvents = index.byTurn.get(turnId) ?? [];
-    const starts = stepEvents.filter((event) => event.type === "step.started");
-    const failures = stepEvents.filter((event) => event.type === "step.failed");
-    const completed = [...stepEvents].reverse().find((event) => event.type === "step.completed");
-    const maximumTurnStepIndex = index.maximumStepByTurn.get(turnId) ?? -1;
-    const terminalFailureEvent = stepIndex === maximumTurnStepIndex
-        ? [...turnEvents].reverse().find((event) => event.type === "turn.failed" && event.data.turnId === turnId) ?? index.latestSessionFailure
-        : undefined;
-    const terminalFailure = terminalFailureEvent
-        ? failureFromData(terminalFailureEvent.data)
-        : undefined;
-    const latestFailure = failures.at(-1);
-    const retryFailure = latestFailure?.type === "step.failed"
-        ? failureFromData(latestFailure.data)
-        : terminalFailure;
-    const retryableFailure = retryFailure && shouldPresentRetryFailure(retryFailure)
-        ? retryFailure
-        : undefined;
-    const retrying = modelRetryingEvents(events, turnId, stepIndex);
-    const retryExhausted = Boolean(terminalFailure && (retryableFailure || retrying.length > 0));
-    const retryEvents = retrying.length > 0
-        ? retrying.map((event, index) => ({
-            attempt: event.data.attempt,
-            error: normalizeRetryFailure(index === retrying.length - 1 && terminalFailure
-                ? terminalFailure
-                : event.data.error ?? retryableFailure ?? terminalFailure ?? { code: "MODEL_CALL_FAILED", message: "The model request failed." }),
-            ...(retryExhausted && index === retrying.length - 1 ? { exhausted: true } : {}),
-            maximum: event.data.maximum,
-        }))
-        : failures.flatMap((failure, index) => {
-            const candidate = failureFromData(failure.data);
-            return shouldPresentRetryFailure(candidate)
-                ? [{
-                        attempt: index + 1,
-                        error: normalizeRetryFailure(candidate),
-                        ...(retryExhausted && index === failures.length - 1 ? { exhausted: true } : {}),
-                        maximum: MAX_DURABLE_STEP_RETRIES,
-                    }]
-                : [];
-        });
-    const retries = retryEvents.length > 0
-        ? retryEvents
-        : retryableFailure
-            ? [{ attempt: 1, error: normalizeRetryFailure(retryableFailure), ...(retryExhausted ? { exhausted: true } : {}), maximum: MAX_DURABLE_STEP_RETRIES }]
-            : [];
-    const observedRetryAttempt = retryEvents.at(-1)?.attempt;
-    const latestStartIndex = stepEvents.findLastIndex((event) => event.type === "step.started");
-    const latestAttemptEvents = latestStartIndex >= 0 ? stepEvents.slice(latestStartIndex) : stepEvents;
-    const latestAttemptFailed = latestAttemptEvents.some((event) => event.type === "step.failed");
-    const endedAt = latestAttemptFailed && !completed && !terminalFailure
-        ? undefined
-        : modelOutputBoundaryTime(latestAttemptEvents) ?? eventTimestamp(completed ?? terminalFailureEvent);
+    const view = presentationSnapshot(events).view;
+    const run = runs(view, { turnId })[stepIndex];
+    const latest = runs(view, { turnId }).at(-1);
+    const terminalFailure = latest?.runId === run?.runId ? failure(view, turnId) : undefined;
+    const runFailure = run?.outcome === "failed" ? run.error : undefined;
+    const error = terminalFailure ?? runFailure;
+    const retries = events.flatMap((event) => event.type === "model.retried" && event.data.runId === run?.runId
+        ? [{ attempt: event.data.attempt + 1, error: event.data.error, ...(error ? { exhausted: true } : {}) }]
+        : []);
     return {
-        ...(endedAt ? { endedAt } : {}),
-        ...(terminalFailure ? { failure: terminalFailure } : {}),
-        ...(retryableFailure && !completed
-            ? {
-                retry: {
-                    ...(observedRetryAttempt !== undefined ? { attempt: observedRetryAttempt } : {}),
-                    ...(retryExhausted ? { exhausted: true } : {}),
-                    error: normalizeRetryFailure(retryableFailure),
-                    maximum: MAX_DURABLE_STEP_RETRIES,
-                },
-            }
-            : {}),
-        ...(retries.length > 0 ? { retries } : {}),
-        ...(eventTimestamp(starts.at(-1)) ? { startedAt: eventTimestamp(starts.at(-1)) } : {}),
-        status: terminalFailure
-            ? "failed"
-            : completed || endedAt
-                ? "completed"
-                : "running",
+        ...(timestamp(run?.startedAt) !== undefined ? { startedAt: timestamp(run?.startedAt) } : {}),
+        ...(timestamp(run?.endedAt) !== undefined ? { endedAt: timestamp(run?.endedAt) } : {}),
+        ...(error ? { failure: error } : {}),
+        ...(retries.length ? { retries, retry: retries.at(-1) } : {}),
+        status: error ? "failed" : run?.status === "settled" ? "completed" : "running",
     };
 }
 export function reasoningContentForStep(events, turnId, stepIndex) {
     if (!turnId)
         return "";
-    const index = eventSnapshotIndex(events);
-    const scopedEvents = stepIndex === undefined
-        ? index.byTurn.get(turnId) ?? []
-        : index.byTurnStep.get(`${turnId}:${stepIndex}`) ?? [];
-    let content = "";
-    let completedBlock = false;
-    for (const event of scopedEvents) {
-        if (event.type === "step.started" &&
-            (turnId === undefined || event.data.turnId === turnId) &&
-            (stepIndex === undefined || event.data.stepIndex === stepIndex)) {
-            content = "";
-            completedBlock = false;
-            continue;
-        }
-        if ((event.type !== "reasoning.appended" && event.type !== "reasoning.completed") ||
-            (turnId !== undefined && event.data.turnId !== turnId) ||
-            (stepIndex !== undefined && event.data.stepIndex !== stepIndex))
-            continue;
-        if (event.type === "reasoning.completed") {
-            if (event.data.reasoning.trim())
-                content = event.data.reasoning;
-            completedBlock = true;
-            continue;
-        }
-        if (completedBlock) {
-            content = "";
-            completedBlock = false;
-        }
-        if (event.data.reasoningSoFar?.trim()) {
-            content = event.data.reasoningSoFar;
-        }
-        else if (event.data.reasoningDelta.trim()) {
-            content += event.data.reasoningDelta;
-        }
-    }
-    return content.trim();
+    const view = presentationSnapshot(events).view;
+    const selected = runs(view, { turnId }).filter((_run, index) => stepIndex === undefined || index === stepIndex);
+    const ids = new Set(selected.map((run) => run.runId));
+    return [...parts(view, { turnId, kind: "reasoning" }).flatMap((part) => ids.has(part.runId) && typeof part.value === "string" ? [part.value] : []),
+        ...contentPreviews(view).flatMap((part) => part.kind === "reasoning" && part.runId && ids.has(part.runId) ? [part.text] : [])].join("\n").trim();
 }
-export function presentAgentTurn(message, events, closedInputRequestIds = new Set(), options = {}) {
-    if (message.role !== "assistant" || !message.metadata?.turnId)
+export function presentAgentTurn(message, events, closedIds = new Set()) {
+    const turnId = message.metadata?.turnId;
+    if (message.role !== "assistant" || !turnId)
         return undefined;
-    const turnId = message.metadata.turnId;
-    const messageSegment = eventsForAssistantSegment(message, events);
-    const turnEvents = options.mergeSameTurn
-        ? eventsForRootTurn(events, turnId)
-        : messageSegment.events;
-    const partEvents = options.mergeSameTurn ? messageSegment.events : turnEvents;
-    const pendingIds = new Set(unresolvedInputRequests(events, closedInputRequestIds).map((request) => request.requestId));
-    const pendingRequests = partEvents
-        .flatMap((event) => event.type === "input.requested" ? event.data.requests : [])
-        .filter((request) => pendingIds.has(request.requestId));
-    const firstAction = turnEvents.find((event) => event.type === "actions.requested");
-    const hasTools = firstAction !== undefined || pendingRequests.length > 0 || message.parts.some((part) => part.type === "dynamic-tool");
-    if (!hasTools)
+    const view = presentationSnapshot(events).view;
+    const owner = turn(view, turnId);
+    const segment = eventsForAssistantSegment(message, events);
+    const interactionIds = new Set(message.parts.flatMap((part) => part.type === "interaction"
+        ? [part.interactionId] : part.type === "tool" && part.interaction ? [part.interaction.interactionId] : []));
+    const pending = unresolvedInputRequests(events, closedIds).filter((item) => interactionIds.has(item.interactionId));
+    const hasExecution = isLocallyInterruptedMessage(message) || message.parts.some((part) => part.type !== "text") || runs(view, { turnId }).length > 0 || pending.length > 0;
+    if (!hasExecution)
         return undefined;
-    const terminal = [...turnEvents].reverse().find((event) => (event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled" || event.type === "session.failed") &&
-        !isLocalInterruptedBoundary(event));
-    const segmentStarted = partEvents.find((event) => event.type === "actions.requested" || event.type === "step.started");
-    const segmentTerminal = [...messageSegment.events].reverse().find((event) => (event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled" || event.type === "session.failed") &&
-        !isLocalInterruptedBoundary(event));
-    const status = pendingRequests.length > 0
-        ? "waiting"
-        : terminal?.type === "turn.completed"
-            ? "completed"
-            : terminal?.type === "turn.failed" || terminal?.type === "session.failed"
-                ? "failed"
-                : terminal?.type === "turn.cancelled"
-                    ? "cancelled"
-                    : !options.mergeSameTurn && messageSegment.settledAt !== undefined
-                        ? "completed"
-                        : "running";
-    const finalStepIndex = finalDeliveryStepIndex(turnEvents, message, status);
-    let finalPart;
-    const processParts = [];
-    for (const part of orderAssistantMessageParts(message.parts, partEvents, turnId)) {
-        if (part.type === "text" && part.stepIndex === finalStepIndex) {
-            finalPart = part;
-            continue;
-        }
-        processParts.push(part);
+    const showExecutionGroup = pending.length > 0 || message.parts.some((part) => part.type === "interaction" || part.type === "tool" && part.kind !== "control");
+    const replyIds = new Set(parts(view, { turnId }).filter((part) => part.kind === "text" && part.phase === "reply").map((part) => part.partId));
+    const finalPart = message.parts.findLast((part) => part.type === "text" && part.id !== undefined && replyIds.has(part.id));
+    let ended = timestamp(owner?.endedAt);
+    let status;
+    if (isLocallyInterruptedMessage(message))
+        status = "cancelled";
+    else if (segment.settledAt !== undefined) {
+        const ownCalls = message.parts.flatMap((part) => part.type === "tool" ? [call(view, part.callId)] : []).filter((item) => item !== undefined);
+        status = pending.length ? "waiting" : ownCalls.some((item) => item.state === "requested" || item.state === "approval" || item.state === "running" || item.state === "blocked") ? "running" : "completed";
+        ended = status === "completed" ? Math.max(segment.settledAt, ...ownCalls.flatMap((item) => {
+            const at = timestamp(item.endedAt);
+            return at === undefined ? [] : [at];
+        })) : undefined;
     }
-    const failedStep = status === "failed" && turnEvents.some((event) => event.type === "step.failed" && event.data.turnId === turnId);
-    const failedStepEvent = failedStep
-        ? [...turnEvents].reverse().find((event) => event.type === "step.failed" && event.data.turnId === turnId)
-        : undefined;
-    const failedStepIndex = failedStepEvent?.data.stepIndex ?? (status === "failed" ? latestStepIndex(turnEvents, turnId) : undefined);
-    const failedStepHasPart = failedStepIndex !== undefined && processParts.some((part) => "stepIndex" in part && part.stepIndex === failedStepIndex);
-    const markerAnchored = status === "failed" && failedStepIndex !== undefined && hasStepMarkerForIndex(processParts, partEvents, turnId, failedStepIndex);
-    const shouldAddFailureMarker = status === "failed" && failedStepIndex !== undefined && !failedStepHasPart && !markerAnchored;
-    const displayProcessParts = shouldAddFailureMarker
-        ? [...processParts, { type: "step-start" }]
-        : processParts;
-    const failureAnchored = status === "failed" && (failedStepHasPart || markerAnchored || shouldAddFailureMarker);
+    else
+        status = owner?.outcome ?? (pending.length ? "waiting" : ended !== undefined ? "completed" : "running");
     return {
-        endedAt: eventTimestamp(segmentTerminal) ?? messageSegment.settledAt ?? eventTimestamp(terminal),
+        endedAt: ended,
         finalPart,
-        ...(failureAnchored ? { failureAnchored: true } : {}),
-        proxiedInputParts: pendingRequests
-            .filter((request) => !message.parts.some((part) => part.type === "dynamic-tool" && part.approval?.id === request.requestId))
-            .map(toProxiedInputPart),
-        processParts: displayProcessParts,
-        startedAt: eventTimestamp(segmentStarted),
+        processParts: message.parts.filter((part) => part !== finalPart),
+        proxiedInputParts: [],
+        showExecutionGroup,
+        startedAt: eventTimestamp(segment.events.find((event) => event.type === "model.started" || event.type === "call.requested")) ?? timestamp(owner?.startedAt),
         status,
-        ...(pendingRequests[0]?.kind ? { waitingFor: pendingRequests[0].kind } : {}),
+        ...(pending[0] ? { waitingFor: pending[0].request.kind } : {}),
     };
 }
-function orderAssistantMessageParts(parts, events, turnId) {
-    if (parts.length < 2 || events.length < 2)
-        return parts;
-    const markerSteps = new Map();
-    let previousStep = -1;
-    for (let index = 0; index < parts.length; index += 1) {
-        const part = parts[index];
-        if (part.type !== "step-start")
-            continue;
-        const nextMarker = parts.findIndex((candidate, candidateIndex) => candidateIndex > index && candidate.type === "step-start");
-        const group = parts.slice(index + 1, nextMarker < 0 ? parts.length : nextMarker);
-        const explicitStep = group
-            .flatMap((candidate) => "stepIndex" in candidate && typeof candidate.stepIndex === "number"
-            ? [candidate.stepIndex]
-            : [])
-            .sort((left, right) => left - right)[0];
-        const nextStep = explicitStep !== undefined
-            ? explicitStep
-            : events.map(eventStepIndex).find((step) => step !== undefined && step > previousStep);
-        if (nextStep !== undefined) {
-            markerSteps.set(index, nextStep);
-            previousStep = nextStep;
-        }
-    }
-    let activeStep;
-    const indexed = parts.map((part, index) => {
-        if (part.type === "step-start")
-            activeStep = markerSteps.get(index);
-        else if ("stepIndex" in part && typeof part.stepIndex === "number")
-            activeStep = part.stepIndex;
-        const eventIndex = partEventIndex(part, events, turnId, activeStep);
-        const eventStep = eventIndex === undefined || !Number.isInteger(eventIndex)
-            ? undefined
-            : eventStepIndex(events[eventIndex]);
-        return {
-            eventIndex,
-            index,
-            isMarker: part.type === "step-start",
-            part,
-            stepIndex: activeStep,
-            sortStep: activeStep ?? eventStep,
-        };
-    });
-    const groups = new Map();
-    for (const entry of indexed) {
-        if (entry.stepIndex === undefined)
-            continue;
-        const group = groups.get(entry.stepIndex) ?? [];
-        group.push(entry);
-        groups.set(entry.stepIndex, group);
-    }
-    const localOrder = new Map();
-    for (const group of groups.values()) {
-        const known = group
-            .map((entry) => entry.eventIndex)
-            .filter((position) => position !== undefined)
-            .sort((left, right) => left - right);
-        const firstKnown = known[0];
-        const lastKnown = known.at(-1);
-        let unknownAfter = 0;
-        for (const entry of group) {
-            if (entry.eventIndex !== undefined) {
-                localOrder.set(entry.index, entry.eventIndex);
-                continue;
-            }
-            const nextKnown = group
-                .filter((candidate) => candidate.index > entry.index && candidate.eventIndex !== undefined)
-                .map((candidate) => candidate.eventIndex)
-                .sort((left, right) => left - right)[0];
-            if (entry.isMarker && firstKnown !== undefined) {
-                localOrder.set(entry.index, firstKnown - 1);
-            }
-            else if (nextKnown !== undefined) {
-                localOrder.set(entry.index, nextKnown - 0.25);
-            }
-            else if (lastKnown !== undefined) {
-                localOrder.set(entry.index, lastKnown + 0.25 + unknownAfter++ / 100);
-            }
-            else {
-                localOrder.set(entry.index, entry.index);
-            }
-        }
-    }
-    for (const entry of indexed) {
-        if (!localOrder.has(entry.index)) {
-            localOrder.set(entry.index, entry.eventIndex ?? entry.index);
-        }
-    }
-    const hasComparablePosition = indexed.some((entry) => entry.eventIndex !== undefined);
-    if (!hasComparablePosition)
-        return parts;
-    return indexed
-        .toSorted((left, right) => (left.sortStep ?? Number.MAX_SAFE_INTEGER) - (right.sortStep ?? Number.MAX_SAFE_INTEGER) ||
-        (localOrder.get(left.index) ?? Number.MAX_SAFE_INTEGER) - (localOrder.get(right.index) ?? Number.MAX_SAFE_INTEGER) ||
-        left.index - right.index)
-        .map((entry) => entry.part);
+export function syntheticMessageReceiptClientMessageId(event, _ordinal) { return event.data.deliveryId; }
+export function unresolvedInputRequests(events, closedIds = new Set()) {
+    return openInteractions(presentationSnapshot(events).view).filter((item) => !closedIds.has(item.interactionId));
 }
-function partEventIndex(part, events, turnId, stepIndex) {
-    const matchesStep = (event) => eventTurnId(event) === turnId && (stepIndex === undefined || eventStepIndex(event) === stepIndex);
-    if (part.type === "step-start") {
-        return firstEventIndex(events, (event) => event.type === "step.started" && matchesStep(event));
-    }
-    if (part.type === "reasoning") {
-        const appended = firstEventIndex(events, (event) => matchesStep(event) && event.type === "reasoning.appended");
-        if (appended !== undefined)
-            return appended;
-        const stepStarted = firstEventIndex(events, (event) => event.type === "step.started" && matchesStep(event));
-        if (stepStarted !== undefined)
-            return stepStarted + 0.1;
-        const firstStepEvent = firstEventIndex(events, matchesStep);
-        return firstStepEvent === undefined ? undefined : firstStepEvent - 0.1;
-    }
-    if (part.type === "text") {
-        return firstEventIndex(events, (event) => matchesStep(event) && (event.type === "message.appended" || event.type === "message.completed"));
-    }
-    if (part.type === "dynamic-tool") {
-        return firstEventIndex(events, (event) => matchesStep(event) && ((event.type === "action.input.partial" && event.data.callId === part.toolCallId) ||
-            (event.type === "actions.requested" && event.data.actions.some((action) => action.callId === part.toolCallId)) ||
-            (event.type === "action.result" && event.data.result.callId === part.toolCallId)));
-    }
-    return firstEventIndex(events, matchesStep);
-}
-function firstEventIndex(events, predicate) {
-    const index = events.findIndex(predicate);
-    return index >= 0 ? index : undefined;
-}
-function latestStepIndex(events, turnId) {
-    return events.reduce((latest, event) => {
-        if (eventTurnId(event) !== turnId)
-            return latest;
-        const stepIndex = eventStepIndex(event);
-        return stepIndex === undefined ? latest : Math.max(latest ?? stepIndex, stepIndex);
-    }, undefined);
-}
-function hasStepMarkerForIndex(parts, events, turnId, targetStepIndex) {
-    let previousStepIndex = -1;
-    for (let index = 0; index < parts.length; index += 1) {
-        if (parts[index]?.type !== "step-start")
-            continue;
-        const nextStep = parts.findIndex((candidate, candidateIndex) => candidateIndex > index && candidate.type === "step-start");
-        const stepParts = parts.slice(index + 1, nextStep < 0 ? parts.length : nextStep);
-        const explicit = stepParts.find((part) => "stepIndex" in part && typeof part.stepIndex === "number");
-        const stepIndex = explicit && "stepIndex" in explicit && typeof explicit.stepIndex === "number"
-            ? explicit.stepIndex
-            : events
-                .map(eventStepIndex)
-                .filter((candidate) => candidate !== undefined && candidate > previousStepIndex)
-                .find((candidate) => events.some((event) => eventTurnId(event) === turnId && eventStepIndex(event) === candidate));
-        if (stepIndex === undefined)
-            continue;
-        previousStepIndex = stepIndex;
-        if (stepIndex === targetStepIndex)
-            return true;
-    }
-    return false;
-}
-export function isProxiedInputOnlyMessage(message, events) {
-    if (message.role !== "assistant" || !message.metadata?.turnId)
-        return false;
-    const turnId = message.metadata.turnId;
-    if (events.some((event) => event.type === "turn.started" && event.data.turnId === turnId)) {
-        return false;
-    }
-    const requests = events.flatMap((event) => event.type === "input.requested" && event.data.turnId === turnId
-        ? event.data.requests
-        : []);
-    if (requests.length === 0)
-        return false;
-    const requestIds = new Set(requests.map((request) => request.requestId));
-    return message.parts.every((part) => part.type === "step-start" ||
-        (part.type === "dynamic-tool" && part.approval !== undefined && requestIds.has(part.approval.id)));
-}
-export function unresolvedInputRequests(events, closedInputRequestIds = new Set()) {
-    let pending = new Map();
-    let hasRequestedInput = false;
-    for (const event of events) {
-        if (event.type === "input.requested") {
-            hasRequestedInput = true;
-            for (const request of event.data.requests)
-                pending.set(request.requestId, request);
-            continue;
-        }
-        if (event.type === "turn.started" && hasRequestedInput) {
-            pending = new Map();
-            hasRequestedInput = false;
-            continue;
-        }
-        if (event.type === "turn.cancelled" || event.type === "session.completed" || event.type === "session.failed") {
-            pending = new Map();
-            hasRequestedInput = false;
-        }
-    }
-    return [...pending.values()].filter((request) => !closedInputRequestIds.has(request.requestId));
-}
-export function hasUnresolvedInputRequests(events, closedInputRequestIds = new Set()) {
-    return unresolvedInputRequests(events, closedInputRequestIds).length > 0;
-}
+export function hasUnresolvedInputRequests(events, closedIds = new Set()) { return unresolvedInputRequests(events, closedIds).length > 0; }
 export function hasSettledLatestTurn(events) {
-    const startedIndex = events.findLastIndex((event) => event.type === "turn.started");
-    const sessionBoundaryIndex = events.findLastIndex((event) => event.type === "session.waiting" || event.type === "session.completed" || event.type === "session.failed");
-    if (sessionBoundaryIndex > startedIndex)
-        return true;
-    if (startedIndex < 0)
-        return false;
-    const started = events[startedIndex];
-    if (started?.type !== "turn.started")
-        return false;
-    return events.slice(startedIndex + 1).some((event) => (event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.cancelled") &&
-        event.data.turnId === started.data.turnId) || events.slice(startedIndex + 1).some((event) => event.type === "session.failed");
+    const view = presentationSnapshot(events).view;
+    const state = session(view);
+    return state.status === "ended" || turns(view).at(-1)?.status === "settled";
 }
-export function hasTerminalSessionBoundary(events) {
-    const startedIndex = events.findLastIndex((event) => event.type === "turn.started");
-    const terminalIndex = events.findLastIndex((event) => event.type === "session.completed" || event.type === "session.failed");
-    return terminalIndex > startedIndex;
-}
-export function failureForTurn(events, turnId) {
-    if (!turnId)
-        return undefined;
-    const event = [...events].reverse().find((candidate) => candidate.type === "turn.failed" && candidate.data.turnId === turnId);
-    if (event?.type === "turn.failed") {
-        return failureFromData(event.data);
-    }
-    const startedIndex = events.findLastIndex((candidate) => candidate.type === "turn.started" && candidate.data.turnId === turnId);
-    const sessionFailureIndex = events.findLastIndex((candidate) => candidate.type === "session.failed");
-    const sessionFailure = sessionFailureIndex > startedIndex ? events[sessionFailureIndex] : undefined;
-    return sessionFailure?.type === "session.failed"
-        ? failureFromData(sessionFailure.data)
-        : undefined;
-}
+export function hasTerminalSessionBoundary(events) { return session(presentationSnapshot(events).view).status === "ended"; }
+export function failureForTurn(events, turnId) { return turnId ? failure(presentationSnapshot(events).view, turnId) : undefined; }
 export function eventsBeforeLastUserTurn(events) {
-    const lastUserEvent = events.findLast((event) => event.type === "message.received");
-    if (lastUserEvent?.type !== "message.received")
+    const receipt = events.findLast((event) => event.type === "delivery.consumed" && event.data.parts.length > 0);
+    if (receipt?.type !== "delivery.consumed")
         return [];
-    const turnStartIndex = events.findLastIndex((event) => event.type === "turn.started" && event.data.turnId === lastUserEvent.data.turnId);
-    if (turnStartIndex >= 0)
-        return events.slice(0, turnStartIndex);
-    const lastUserTurnIndex = events.lastIndexOf(lastUserEvent);
-    return events.slice(0, lastUserTurnIndex);
+    const index = events.findIndex((event) => event.type === "turn.started" && event.data.turnId === receipt.data.turnId);
+    return events.slice(0, index < 0 ? events.indexOf(receipt) : index);
 }
 export function presentSubagentCall(events, callId) {
-    const started = events.find((event) => event.type === "subagent.called" && event.data.callId === callId);
-    const completed = [...events].reverse().find((event) => event.type === "subagent.completed" && event.data.callId === callId && !event.data.backgroundTask);
-    const result = [...events].reverse().find((event) => event.type === "action.result" &&
-        event.data.result.kind === "subagent-result" &&
-        !("backgroundTask" in event.data.result && event.data.result.backgroundTask) &&
-        event.data.result.callId === callId);
-    const owningTurnId = started?.type === "subagent.called" ? started.data.turnId : undefined;
-    const parentCancellation = owningTurnId
-        ? [...events].reverse().find((event) => event.type === "turn.cancelled" && event.data.turnId === owningTurnId)
-        : undefined;
-    const terminalSession = [...events].reverse().find((event) => event.type === "session.completed" || event.type === "session.failed");
-    if (result?.type === "action.result" && result.data.status !== "completed") {
-        return {
-            childSessionId: started?.type === "subagent.called" ? started.data.childSessionId : undefined,
-            endedAt: eventTimestamp(result),
-            name: started?.type === "subagent.called" ? started.data.name : undefined,
-            startedAt: eventTimestamp(started),
-            status: "failed",
-        };
-    }
-    if (completed || result) {
-        return {
-            childSessionId: started?.type === "subagent.called" ? started.data.childSessionId : undefined,
-            endedAt: eventTimestamp(result ?? completed),
-            name: started?.type === "subagent.called" ? started.data.name : undefined,
-            startedAt: eventTimestamp(started),
-            status: "completed",
-        };
-    }
-    if (parentCancellation?.type === "turn.cancelled") {
-        return {
-            childSessionId: started?.type === "subagent.called" ? started.data.childSessionId : undefined,
-            name: started?.type === "subagent.called" ? started.data.name : undefined,
-            startedAt: eventTimestamp(started),
-            status: "waiting",
-        };
-    }
-    if (terminalSession) {
-        return {
-            childSessionId: started?.type === "subagent.called" ? started.data.childSessionId : undefined,
-            endedAt: eventTimestamp(terminalSession),
-            name: started?.type === "subagent.called" ? started.data.name : undefined,
-            startedAt: eventTimestamp(started),
-            status: "failed",
-        };
-    }
-    if (started?.type !== "subagent.called")
-        return { status: "starting" };
+    const view = presentationSnapshot(events).view;
+    const child = children(view).find((entry) => entry.callId === callId);
+    const entry = call(view, callId);
+    const state = entry?.state;
     return {
-        childSessionId: started.data.childSessionId,
-        name: started.data.name,
-        startedAt: eventTimestamp(started),
-        status: "running",
+        ...(child ? { childSessionId: child.sessionId, name: child.name } : {}),
+        startedAt: timestamp(entry?.startedAt), endedAt: timestamp(entry?.endedAt),
+        status: !entry ? "starting" : state === "completed" ? "completed" : state === "failed" || state === "rejected" ? "failed" : state === "cancelled" ? "cancelled" : state === "approval" || state === "blocked" ? "waiting" : "running",
     };
 }
 export function presentSubagentSessions(events) {
-    const calls = events.flatMap((event) => event.type === "actions.requested"
-        ? event.data.actions.filter((action) => action.kind === "subagent-call")
+    return events.flatMap((event) => event.type === "call.requested" && event.data.capability.kind === "agent"
+        ? [{ ...presentSubagentCall(events, event.data.callId), callId: event.data.callId, task: subagentTask(event.data.input) }]
         : []);
-    return calls.map((call) => ({
-        ...presentSubagentCall(events, call.callId),
-        callId: call.callId,
-        task: subagentTask(call.input),
-    }));
 }
-function eventsForRootTurn(events, turnId) {
-    const start = events.findIndex((event) => event.type === "turn.started" && event.data.turnId === turnId);
-    if (start < 0)
-        return events.filter((event) => eventTurnId(event) === turnId);
-    const next = events.findIndex((event, index) => index > start && ((event.type === "turn.started" && event.data.turnId !== turnId) ||
-        (event.type === "message.received" && event.data.turnId !== turnId)));
-    return events.slice(start, next < 0 ? undefined : next);
-}
-function eventsForAssistantSegment(message, events) {
+export function eventsForAssistantSegment(message, events) {
     const turnId = message.metadata?.turnId;
     if (!turnId)
         return { events: [] };
-    const rootEvents = eventsForRootTurn(events, turnId);
-    const clientMessageId = assistantSegmentClientMessageId(message);
-    const receiptIndex = rootEvents.findIndex((event) => event.type === "message.received" &&
-        event.data.turnId === turnId &&
-        (clientMessageId === undefined
-            ? event.data.clientMessageId === undefined
-            : event.data.clientMessageId === clientMessageId));
-    if (receiptIndex < 0)
-        return { events: rootEvents };
-    const nextReceiptIndex = rootEvents.findIndex((event, index) => index > receiptIndex &&
-        event.type === "message.received" &&
-        event.data.turnId === turnId);
-    if (nextReceiptIndex < 0)
-        return { events: rootEvents.slice(receiptIndex) };
-    return {
-        events: rootEvents.slice(receiptIndex, nextReceiptIndex),
-        ...(eventTimestamp(rootEvents[nextReceiptIndex]) !== undefined
-            ? { settledAt: eventTimestamp(rootEvents[nextReceiptIndex]) }
-            : {}),
-    };
+    const messages = presentationSnapshot(events).messages;
+    let index = messages.findIndex((item) => item.id === message.id);
+    if (index < 0)
+        index = messages.findIndex((item) => item.id === `${turnId}:assistant`);
+    const previousUser = messages.slice(0, index < 0 ? 0 : index).findLast((item) => item.role === "user" && item.metadata?.turnId === turnId);
+    const nextUser = index < 0 ? undefined : messages.slice(index + 1).find((item) => item.role === "user" && item.metadata?.turnId === turnId);
+    const receiptIndex = (user) => user ? events.findIndex((event) => event.type === "delivery.consumed" && `${event.data.deliveryId}:user` === user.id) : -1;
+    const receipt = receiptIndex(previousUser);
+    const start = receipt >= 0 ? receipt : events.findIndex((event) => event.type === "turn.started" && event.data.turnId === turnId);
+    const next = receiptIndex(nextUser);
+    return { events: events.slice(Math.max(0, start), next < 0 ? undefined : next).filter((event) => eventTurnId(event) === turnId), ...(next >= 0 ? { settledAt: eventTimestamp(events[next]) } : {}) };
 }
-function assistantSegmentClientMessageId(message) {
-    const delimiter = ":assistant:";
-    const index = message.id.indexOf(delimiter);
-    return index < 0 ? undefined : message.id.slice(index + delimiter.length) || undefined;
-}
-function toProxiedInputPart(request) {
-    return {
-        approval: { id: request.requestId },
-        input: request.action.input,
-        state: "approval-requested",
-        toolCallId: request.action.callId,
-        toolMetadata: {
-            eve: {
-                inputRequest: {
-                    allowFreeform: request.allowFreeform,
-                    display: request.display,
-                    kind: request.kind,
-                    options: request.options,
-                    prompt: request.prompt,
-                    requestId: request.requestId,
-                },
-                kind: "tool-call",
-                name: request.action.toolName,
-            },
-        },
-        toolName: request.action.toolName,
-        type: "dynamic-tool",
-    };
-}
-function finalDeliveryStepIndex(events, message, status) {
-    const completedDeliveries = events
-        .map((event, index) => ({ event, index }))
-        .filter(({ event }) => event.type === "message.completed" &&
-        event.data.message !== null &&
-        event.data.finishReason !== "tool-calls")
-        .reverse();
-    for (const candidate of completedDeliveries) {
-        if (candidate.event.type !== "message.completed")
-            continue;
-        const candidateStep = candidate.event.data.stepIndex;
-        const hasLaterExecution = events.slice(candidate.index + 1).some((event) => (event.type === "step.started" && event.data.stepIndex > candidateStep) ||
-            event.type === "actions.requested" ||
-            event.type === "action.input.partial" ||
-            event.type === "action.result" ||
-            event.type === "input.requested");
-        if (!hasLaterExecution)
-            return candidateStep;
-    }
-    if (status !== "running")
-        return undefined;
-    const latestExecutionStep = events.reduce((latest, event) => {
-        if (event.type === "step.started" ||
-            event.type === "actions.requested" ||
-            event.type === "action.input.partial" ||
-            event.type === "action.result" ||
-            event.type === "input.requested")
-            return Math.max(latest, event.data.stepIndex);
-        return latest;
-    }, -1);
-    const latestText = [...message.parts].reverse().find((part) => part.type === "text");
-    return latestText?.type === "text" && (latestText.stepIndex ?? 0) > latestExecutionStep
-        ? latestText.stepIndex
-        : undefined;
-}
-function eventTurnId(event) {
-    if (!("data" in event) || !event.data || typeof event.data !== "object")
-        return undefined;
-    return "turnId" in event.data && typeof event.data.turnId === "string"
-        ? event.data.turnId
-        : undefined;
-}
-function eventTimestamp(event) {
-    const timestamp = event?.meta?.at;
-    if (!timestamp)
-        return undefined;
-    const parsed = Date.parse(timestamp);
-    return Number.isFinite(parsed) ? parsed : undefined;
-}
-function turnDisplayCoordinates(events) {
-    const turnIds = [];
-    const userTurns = new Set();
-    const maximumStepByTurn = new Map();
-    for (const event of events) {
-        if (event.type === "turn.started")
-            turnIds.push(event.data.turnId);
-        if (event.type === "message.received")
-            userTurns.add(event.data.turnId);
-        const turnId = eventTurnId(event);
-        const stepIndex = eventStepIndex(event);
-        if (turnId !== undefined && stepIndex !== undefined) {
-            maximumStepByTurn.set(turnId, Math.max(maximumStepByTurn.get(turnId) ?? -1, stepIndex));
-        }
-    }
-    const continuations = continuationTurnIds(events, userTurns);
-    const preliminary = new Map();
-    let rootTurnId;
-    let nextStepOffset = 0;
-    for (const turnId of turnIds) {
-        if (!rootTurnId || userTurns.has(turnId) || !continuations.has(turnId)) {
-            rootTurnId = turnId;
-            nextStepOffset = 0;
-        }
-        preliminary.set(turnId, { rootTurnId, stepOffset: nextStepOffset });
-        const maximumStepIndex = maximumStepByTurn.get(turnId) ?? -1;
-        nextStepOffset += maximumStepIndex + 1;
-    }
-    const finalTurns = new Map();
-    for (const [turnId, coordinates] of preliminary)
-        finalTurns.set(coordinates.rootTurnId, turnId);
-    return new Map([...preliminary].map(([turnId, coordinates]) => [turnId, {
-            ...coordinates,
-            finalTurn: finalTurns.get(coordinates.rootTurnId) === turnId,
-        }]));
-}
-function remapEventCoordinates(event, rootTurnId, stepOffset) {
-    if (!("data" in event) || !event.data || typeof event.data !== "object")
-        return event;
-    const data = event.data;
-    const remapped = {
-        ...data,
-        ...(typeof data.turnId === "string" ? { turnId: rootTurnId } : {}),
-        ...(typeof data.stepIndex === "number" ? { stepIndex: data.stepIndex + stepOffset } : {}),
-    };
-    return { ...event, data: remapped };
-}
-function eventStepIndex(event) {
-    if (!("data" in event) || !event.data || typeof event.data !== "object")
-        return undefined;
-    return "stepIndex" in event.data && typeof event.data.stepIndex === "number"
-        ? event.data.stepIndex
-        : undefined;
-}
-function remapAssistantMessage(message, rootTurnId, stepOffset) {
-    const sourceTurnId = message.metadata?.turnId;
-    if (sourceTurnId === rootTurnId && stepOffset === 0)
-        return message;
-    const segmentPrefix = sourceTurnId ? `${sourceTurnId}:assistant:` : undefined;
-    const segmentId = segmentPrefix && message.id.startsWith(segmentPrefix)
-        ? message.id.slice(segmentPrefix.length)
-        : undefined;
-    return {
-        ...message,
-        id: segmentId ? `${rootTurnId}:assistant:${segmentId}` : `${rootTurnId}:assistant`,
-        metadata: { ...message.metadata, turnId: rootTurnId },
-        parts: message.parts.map((part) => "stepIndex" in part && typeof part.stepIndex === "number"
-            ? { ...part, stepIndex: part.stepIndex + stepOffset }
-            : part),
-    };
-}
-function mergeAssistantMessages(left, right) {
-    const parts = [...left.parts];
-    for (const part of right.parts) {
-        if (part.type === "dynamic-tool") {
-            const existing = parts.findIndex((candidate) => candidate.type === "dynamic-tool" && candidate.toolCallId === part.toolCallId);
-            if (existing >= 0) {
-                parts[existing] = mergeDynamicToolParts(parts[existing], part);
-                continue;
-            }
-        }
-        if (part.type === "reasoning" && part.stepIndex !== undefined) {
-            const existing = parts.findIndex((candidate) => candidate.type === "reasoning" && candidate.stepIndex === part.stepIndex);
-            if (existing >= 0) {
-                parts[existing] = part;
-                continue;
-            }
-        }
-        parts.push(part);
-    }
-    return {
-        ...left,
-        metadata: {
-            ...left.metadata,
-            status: right.metadata?.status ?? left.metadata?.status,
-        },
-        parts,
-    };
-}
-function mergeDynamicToolParts(left, right) {
-    const rank = (part) => {
-        switch (part.state) {
-            case "input-streaming": return 0;
-            case "input-available": return 1;
-            case "approval-requested": return 2;
-            case "approval-responded": return 3;
-            case "output-error":
-            case "output-denied": return 4;
-            case "output-available": return part.partial === true ? 3 : 5;
-        }
-    };
-    const selected = rank(right) >= rank(left) ? right : left;
-    const eveLeft = left.toolMetadata?.eve;
-    const eveRight = right.toolMetadata?.eve;
-    const inputResponse = eveRight?.inputResponse ?? eveLeft?.inputResponse;
-    const inputRequest = eveRight?.inputRequest ?? eveLeft?.inputRequest;
-    const toolMetadata = eveLeft || eveRight
-        ? {
-            ...(left.toolMetadata ?? {}),
-            ...(right.toolMetadata ?? {}),
-            eve: {
-                ...(eveLeft ?? {}),
-                ...(eveRight ?? {}),
-                ...(inputRequest ? { inputRequest } : {}),
-                ...(inputResponse ? { inputResponse } : {}),
-            },
-        }
-        : undefined;
-    return {
-        ...selected,
-        ...(left.input !== undefined && right.input === undefined ? { input: left.input } : {}),
-        ...(left.inputText !== undefined && right.inputText === undefined ? { inputText: left.inputText } : {}),
-        ...(left.approval && !right.approval ? { approval: left.approval } : {}),
-        ...(toolMetadata ? { toolMetadata } : {}),
-    };
-}
-function modelOutputBoundaryTime(events) {
-    const boundary = events.find((event) => event.type === "reasoning.appended" ||
-        event.type === "reasoning.completed" ||
-        event.type === "message.appended" ||
-        event.type === "message.completed" ||
-        event.type === "actions.requested" ||
-        event.type === "step.failed");
-    return eventTimestamp(boundary);
+export function withThinkingPlaceholder(message, events) {
+    const turnId = message.metadata?.turnId;
+    if (!turnId || message.metadata?.status !== "streaming" || isLocallyInterruptedMessage(message))
+        return message.parts;
+    const view = presentationSnapshot(events).view;
+    const steps = runs(view, { turnId });
+    const stepIndex = steps.length - 1;
+    const run = steps[stepIndex];
+    if (!run || run.status === "settled" || message.parts.some((part) => part.type === "reasoning" && part.stepIndex === stepIndex))
+        return message.parts;
+    if (calls(view, { turnId }).some((item) => item.runId === run.runId && item.kind !== "control") ||
+        parts(view, { turnId, kind: "text" }).some((part) => part.runId === run.runId && typeof part.value === "string" && part.value.trim()) ||
+        contentPreviews(view).some((part) => part.runId === run.runId && part.kind === "text" && part.text.trim()))
+        return message.parts;
+    return [...message.parts, { type: "reasoning", state: "streaming", stepIndex, text: "" }];
 }
 function subagentTask(input) {
-    if (typeof input !== "object" || input === null || Array.isArray(input))
+    if (!input || typeof input !== "object")
         return undefined;
-    const message = "message" in input ? input.message : undefined;
-    return typeof message === "string" && message.trim() ? message.trim() : undefined;
+    for (const key of ["task", "prompt", "message"]) {
+        const value = Reflect.get(input, key);
+        if (typeof value === "string")
+            return value;
+    }
+    return undefined;
 }
 //# sourceMappingURL=turn-presentation.js.map

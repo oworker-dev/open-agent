@@ -43,6 +43,13 @@ canvas concepts never become a dependency of this package. Hosts can use the
 default UI, replace tool renderers, or omit this package and use
 `@oworker/open-agent-client/eve-session` directly.
 
+On initial load, the workspace restores a valid `initialThreadId`, otherwise
+the saved active thread (or the first existing thread). An empty collection
+opens a temporary new task. Pass `initialThreadId={null}` when a host route
+explicitly means “new task”; the standalone `/` route uses this behavior.
+Keep client and storage adapters stable within the same service/account scope,
+and read rotating credentials from their request callbacks.
+
 `deliverableEndpoint` may be a URL template or `(sessionId) => url` resolver
 returning `{ deliverables: [...] }`. `onOpenDeliverable` can hand a published
 file or website to a host-owned workbench. Without an override, the default UI

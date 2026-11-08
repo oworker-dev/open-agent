@@ -2,7 +2,11 @@
   "$schema": "https://json.schemastore.org/tsconfig",
   "compilerOptions": {
     "target": "ES2017",
-    "lib": ["dom", "dom.iterable", "esnext"],
+    "lib": [
+      "dom",
+      "dom.iterable",
+      "esnext"
+    ],
     "allowJs": true,
     "allowImportingTsExtensions": true,
     "skipLibCheck": true,
@@ -21,7 +25,9 @@
       }
     ],
     "paths": {
-      "@/*": ["./*"]
+      "@/*": [
+        "./*"
+      ]
     }
   },
   "include": [
@@ -29,7 +35,17 @@
     "**/*.ts",
     "**/*.tsx",
     ".next/types/**/*.ts",
-    ".next/dev/types/**/*.ts"
+    ".next/dev/types/**/*.ts",
+    ".next-attachments-release-20261031/types/**/*.ts",
+    ".next-attachments-release-20261031/dev/types/**/*.ts",
+    ".next-steering-20261105/types/**/*.ts",
+    ".next-steering-20261105/dev/types/**/*.ts",
+    ".next-steering-final-20261105/types/**/*.ts",
+    ".next-steering-final-20261105/dev/types/**/*.ts",
+    ".next-embed-renewal-20261106/types/**/*.ts",
+    ".next-embed-renewal-20261106/dev/types/**/*.ts"
   ],
-  "exclude": ["node_modules"]
+  "exclude": [
+    "node_modules"
+  ]
 }

@@ -9,6 +9,7 @@ import { Attachment, AttachmentAction, AttachmentContent, AttachmentDescription,
 import { Button } from "../ui/button.js";
 import { cn } from "../utils.js";
 import { mergeSessionDeliverables, splitSessionDeliverables } from "./session-deliverables.js";
+import { useAssetDownload, useAssetPreview, useAssetText } from "./asset-preview.js";
 export function AgentSecondaryView({ assetUrl, assets = [], assetsError, assetsLoading = false, childContent, children, deliverables, deliverablesError, deliverablesLoading, locale, onClose, onOpenAsset, onOpenChild, onOpenDeliverable, onRefreshAssets, onRefreshDeliverables, onSelectTab, requestedDeliverable, requestedDeliverableRequestId, tab, }) {
     const isZh = locale === "zh-CN";
     const deliverableGroups = useMemo(() => splitSessionDeliverables(mergeSessionDeliverables(deliverables, assets)), [assets, deliverables]);
@@ -98,7 +99,9 @@ function DeliverableList({ deliverables, error, isZh, loading, onOpen, onRefresh
 function SessionAssetRow({ assetUrl, deliverable, onOpen }) {
     const url = deliverableUrl(deliverable, assetUrl);
     const image = deliverable.mediaType?.startsWith("image/") ?? false;
-    return _jsxs(Attachment, { className: "w-full max-w-none", size: "sm", state: "done", children: [_jsxs("button", { "aria-label": `${image ? "Preview" : "Open"} ${deliverable.title}`, className: "flex min-w-0 flex-1 items-center gap-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/50", onClick: onOpen, type: "button", children: [_jsx(AttachmentMedia, { variant: image ? "image" : "icon", children: image ? _jsx("img", { alt: "", className: "size-full object-cover", loading: "lazy", src: url }) : _jsx(FileIcon, { className: "size-4" }) }), _jsxs(AttachmentContent, { children: [_jsx(AttachmentTitle, { children: deliverable.title }), _jsx(AttachmentDescription, { children: sessionAssetMeta(deliverable) })] })] }), _jsx(AttachmentAction, { asChild: true, "aria-label": "Download asset", title: "Download asset", children: _jsx("a", { download: deliverable.title, href: url, rel: "noreferrer", target: "_blank", children: _jsx(DownloadIcon, { className: "size-3.5" }) }) })] });
+    const { url: previewUrl } = useAssetPreview(image ? url : undefined);
+    const download = useAssetDownload(url, deliverable.title);
+    return _jsxs(Attachment, { className: "w-full max-w-none", size: "sm", state: "done", children: [_jsxs("button", { "aria-label": `${image ? "Preview" : "Open"} ${deliverable.title}`, className: "flex min-w-0 flex-1 items-center gap-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/50", onClick: onOpen, type: "button", children: [_jsx(AttachmentMedia, { variant: image ? "image" : "icon", children: image && previewUrl ? _jsx("img", { alt: "", className: "size-full object-cover", loading: "lazy", src: previewUrl }) : _jsx(FileIcon, { className: "size-4" }) }), _jsxs(AttachmentContent, { children: [_jsx(AttachmentTitle, { children: deliverable.title }), _jsx(AttachmentDescription, { children: sessionAssetMeta(deliverable) })] })] }), download.error ? _jsx("span", { className: "text-xs text-destructive", role: "alert", children: download.error }) : null, _jsx(AttachmentAction, { "aria-label": "Download asset", disabled: download.loading, onClick: () => void download.download(), title: download.loading ? "Preparing download…" : "Download asset", children: _jsx(DownloadIcon, { className: "size-3.5" }) })] });
 }
 function PublishedDeliverableRow({ deliverable, isZh, onOpen }) {
     const image = deliverable.mediaType?.startsWith("image/") ?? false;
@@ -117,27 +120,16 @@ function WebsitePreview({ title, url }) {
     return _jsx(WebPreview, { className: "min-h-0 flex-1", loading: loading, onOpenExternal: () => window.open(url, "_blank", "noopener,noreferrer"), onReload: () => { setLoading(true); setGeneration((value) => value + 1); }, origin: origin, children: _jsx("iframe", { className: "size-full min-h-[20rem] border-0 bg-white", onLoad: () => setLoading(false), sandbox: "allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-scripts allow-same-origin", src: url, title: title }, generation) });
 }
 function FilePreview({ deliverable, locale, url }) {
-    const [text, setText] = useState();
-    const [error, setError] = useState();
     const isImage = deliverable.mediaType?.startsWith("image/") ?? false;
     const isText = deliverable.mediaType?.startsWith("text/") || /\.(?:md|markdown|txt|json|csv|html|css|js|ts|tsx|jsx)$/iu.test(deliverable.title);
-    useEffect(() => {
-        if (!isText || isImage)
-            return;
-        const controller = new AbortController();
-        void fetch(url, { credentials: "include", signal: controller.signal })
-            .then((response) => { if (!response.ok)
-            throw new Error(`HTTP ${response.status}`); return response.text(); })
-            .then((value) => setText(value.slice(0, 500_000)))
-            .catch((reason) => { if (!controller.signal.aborted)
-            setError(reason instanceof Error ? reason.message : "Unable to load deliverable."); });
-        return () => controller.abort();
-    }, [isImage, isText, url]);
+    const { url: previewUrl, error: previewError } = useAssetPreview(isImage ? url : undefined);
+    const { text, error, truncated, retry } = useAssetText(isText && !isImage ? url : undefined);
+    const download = useAssetDownload(url, deliverable.title);
     if (isImage)
-        return _jsx("div", { className: "flex min-h-0 flex-1 items-start justify-center overflow-auto bg-muted/20 p-4", children: _jsx("img", { alt: deliverable.title, className: "max-h-[calc(100vh-7rem)] max-w-full rounded-md object-contain", src: url }) });
+        return _jsx("div", { className: "flex min-h-0 flex-1 items-start justify-center overflow-auto bg-muted/20 p-4", children: previewUrl ? _jsx("img", { alt: deliverable.title, className: "max-h-[calc(100vh-7rem)] max-w-full rounded-md object-contain", src: previewUrl }) : _jsx("p", { role: previewError ? "alert" : "status", children: previewError ?? (locale === "zh-CN" ? "加载中…" : "Loading…") }) });
     if (isText)
-        return _jsx("div", { className: "min-h-0 flex-1 overflow-auto p-4", children: error ? _jsx("p", { className: "text-sm text-destructive", children: error }) : text === undefined ? _jsx("p", { className: "text-sm text-muted-foreground", children: locale === "zh-CN" ? "加载中…" : "Loading…" }) : /\.(?:md|markdown)$/iu.test(deliverable.title) ? _jsx("article", { className: "prose prose-sm max-w-none dark:prose-invert", children: _jsx(StaticMarkdownText, { text: text }) }) : _jsx("pre", { className: "whitespace-pre-wrap break-words rounded-md bg-muted/40 p-3 font-mono text-xs leading-5", children: text }) });
-    return _jsxs("div", { className: "flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-6 text-center", children: [_jsx(FileIcon, { className: "size-8 text-muted-foreground" }), _jsx("p", { className: "text-sm text-muted-foreground", children: locale === "zh-CN" ? "此文件类型不支持在线预览" : "This file type is not previewable online" }), _jsx(Button, { asChild: true, size: "sm", variant: "outline", children: _jsxs("a", { download: deliverable.title, href: url, rel: "noreferrer", target: "_blank", children: [_jsx(DownloadIcon, { className: "size-3.5" }), locale === "zh-CN" ? "下载文件" : "Download"] }) })] });
+        return _jsx("div", { className: "min-h-0 flex-1 overflow-auto p-4", children: error ? _jsxs("div", { className: "space-y-2", children: [_jsx("p", { className: "text-sm text-destructive", role: "alert", children: error }), _jsx(Button, { onClick: retry, size: "sm", variant: "outline", children: locale === "zh-CN" ? "重试" : "Retry" })] }) : text === undefined ? _jsx("p", { className: "text-sm text-muted-foreground", children: locale === "zh-CN" ? "加载中…" : "Loading…" }) : _jsxs(_Fragment, { children: [truncated ? _jsx("p", { className: "mb-3 text-sm text-muted-foreground", role: "status", children: locale === "zh-CN" ? "内容较长，仅显示前 512 KiB。下载可查看完整文件。" : "Showing the first 512 KiB. Download to view the complete file." }) : null, /\.(?:md|markdown)$/iu.test(deliverable.title) ? _jsx("article", { className: "prose prose-sm max-w-none dark:prose-invert", children: _jsx(StaticMarkdownText, { text: text }) }) : _jsx("pre", { className: "whitespace-pre-wrap break-words rounded-md bg-muted/40 p-3 font-mono text-xs leading-5", children: text }), _jsxs(Button, { className: "mt-3", disabled: download.loading, onClick: () => void download.download(), size: "sm", variant: "outline", children: [_jsx(DownloadIcon, { className: "size-3.5" }), locale === "zh-CN" ? "下载完整文件" : "Download complete file"] }), download.error ? _jsx("p", { className: "mt-2 text-sm text-destructive", role: "alert", children: download.error }) : null] }) });
+    return _jsxs("div", { className: "flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-6 text-center", children: [_jsx(FileIcon, { className: "size-8 text-muted-foreground" }), _jsx("p", { className: "text-sm text-muted-foreground", children: locale === "zh-CN" ? "此文件类型不支持在线预览" : "This file type is not previewable online" }), _jsxs(Button, { disabled: download.loading, onClick: () => void download.download(), size: "sm", variant: "outline", children: [_jsx(DownloadIcon, { className: "size-3.5" }), locale === "zh-CN" ? "下载文件" : "Download"] }), download.error ? _jsx("p", { className: "text-sm text-destructive", role: "alert", children: download.error }) : null] });
 }
 function TabButton({ active, count, label, onClick }) {
     return _jsxs("button", { "aria-current": active ? "page" : undefined, className: cn("min-w-0 flex-1 truncate rounded-md px-2.5 py-1.5 text-xs text-muted-foreground hover:bg-accent hover:text-foreground", active && "font-medium text-foreground"), onClick: onClick, title: label, type: "button", children: [label, count ? _jsx("span", { className: "ml-1 tabular-nums", children: count }) : null] });

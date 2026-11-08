@@ -29,6 +29,7 @@ import { cn } from "../utils.js";
 import type { AgentSessionAsset, AgentSessionDeliverable } from "./contracts.js";
 import type { AgentLocale } from "./i18n.js";
 import { mergeSessionDeliverables, splitSessionDeliverables } from "./session-deliverables.js";
+import { useAssetDownload, useAssetPreview, useAssetText } from "./asset-preview.js";
 
 export type AgentSecondaryTab = "home" | "children" | "assets" | "deliverables";
 export type AgentSecondaryChild = {
@@ -285,12 +286,15 @@ function DeliverableList({ deliverables, error, isZh, loading, onOpen, onRefresh
 function SessionAssetRow({ assetUrl, deliverable, onOpen }: { readonly assetUrl?: (assetId: string) => string; readonly deliverable: AgentSessionDeliverable; readonly onOpen: () => void }) {
   const url = deliverableUrl(deliverable, assetUrl);
   const image = deliverable.mediaType?.startsWith("image/") ?? false;
+  const { url: previewUrl } = useAssetPreview(image ? url : undefined);
+  const download = useAssetDownload(url, deliverable.title);
   return <Attachment className="w-full max-w-none" size="sm" state="done">
     <button aria-label={`${image ? "Preview" : "Open"} ${deliverable.title}`} className="flex min-w-0 flex-1 items-center gap-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/50" onClick={onOpen} type="button">
-      <AttachmentMedia variant={image ? "image" : "icon"}>{image ? <img alt="" className="size-full object-cover" loading="lazy" src={url} /> : <FileIcon className="size-4" />}</AttachmentMedia>
+      <AttachmentMedia variant={image ? "image" : "icon"}>{image && previewUrl ? <img alt="" className="size-full object-cover" loading="lazy" src={previewUrl} /> : <FileIcon className="size-4" />}</AttachmentMedia>
       <AttachmentContent><AttachmentTitle>{deliverable.title}</AttachmentTitle><AttachmentDescription>{sessionAssetMeta(deliverable)}</AttachmentDescription></AttachmentContent>
     </button>
-    <AttachmentAction asChild aria-label="Download asset" title="Download asset"><a download={deliverable.title} href={url} rel="noreferrer" target="_blank"><DownloadIcon className="size-3.5" /></a></AttachmentAction>
+    {download.error ? <span className="text-xs text-destructive" role="alert">{download.error}</span> : null}
+    <AttachmentAction aria-label="Download asset" disabled={download.loading} onClick={() => void download.download()} title={download.loading ? "Preparing download…" : "Download asset"}><DownloadIcon className="size-3.5" /></AttachmentAction>
   </Attachment>;
 }
 
@@ -334,22 +338,14 @@ function WebsitePreview({ title, url }: { readonly title: string; readonly url: 
 }
 
 function FilePreview({ deliverable, locale, url }: { readonly deliverable: AgentSessionDeliverable; readonly locale: AgentLocale; readonly url: string }) {
-  const [text, setText] = useState<string>();
-  const [error, setError] = useState<string>();
   const isImage = deliverable.mediaType?.startsWith("image/") ?? false;
   const isText = deliverable.mediaType?.startsWith("text/") || /\.(?:md|markdown|txt|json|csv|html|css|js|ts|tsx|jsx)$/iu.test(deliverable.title);
-  useEffect(() => {
-    if (!isText || isImage) return;
-    const controller = new AbortController();
-    void fetch(url, { credentials: "include", signal: controller.signal })
-      .then((response) => { if (!response.ok) throw new Error(`HTTP ${response.status}`); return response.text(); })
-      .then((value) => setText(value.slice(0, 500_000)))
-      .catch((reason: unknown) => { if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : "Unable to load deliverable."); });
-    return () => controller.abort();
-  }, [isImage, isText, url]);
-  if (isImage) return <div className="flex min-h-0 flex-1 items-start justify-center overflow-auto bg-muted/20 p-4"><img alt={deliverable.title} className="max-h-[calc(100vh-7rem)] max-w-full rounded-md object-contain" src={url} /></div>;
-  if (isText) return <div className="min-h-0 flex-1 overflow-auto p-4">{error ? <p className="text-sm text-destructive">{error}</p> : text === undefined ? <p className="text-sm text-muted-foreground">{locale === "zh-CN" ? "加载中…" : "Loading…"}</p> : /\.(?:md|markdown)$/iu.test(deliverable.title) ? <article className="prose prose-sm max-w-none dark:prose-invert"><StaticMarkdownText text={text} /></article> : <pre className="whitespace-pre-wrap break-words rounded-md bg-muted/40 p-3 font-mono text-xs leading-5">{text}</pre>}</div>;
-  return <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-6 text-center"><FileIcon className="size-8 text-muted-foreground" /><p className="text-sm text-muted-foreground">{locale === "zh-CN" ? "此文件类型不支持在线预览" : "This file type is not previewable online"}</p><Button asChild size="sm" variant="outline"><a download={deliverable.title} href={url} rel="noreferrer" target="_blank"><DownloadIcon className="size-3.5" />{locale === "zh-CN" ? "下载文件" : "Download"}</a></Button></div>;
+  const { url: previewUrl, error: previewError } = useAssetPreview(isImage ? url : undefined);
+  const { text, error, truncated, retry } = useAssetText(isText && !isImage ? url : undefined);
+  const download = useAssetDownload(url, deliverable.title);
+  if (isImage) return <div className="flex min-h-0 flex-1 items-start justify-center overflow-auto bg-muted/20 p-4">{previewUrl ? <img alt={deliverable.title} className="max-h-[calc(100vh-7rem)] max-w-full rounded-md object-contain" src={previewUrl} /> : <p role={previewError ? "alert" : "status"}>{previewError ?? (locale === "zh-CN" ? "加载中…" : "Loading…")}</p>}</div>;
+  if (isText) return <div className="min-h-0 flex-1 overflow-auto p-4">{error ? <div className="space-y-2"><p className="text-sm text-destructive" role="alert">{error}</p><Button onClick={retry} size="sm" variant="outline">{locale === "zh-CN" ? "重试" : "Retry"}</Button></div> : text === undefined ? <p className="text-sm text-muted-foreground">{locale === "zh-CN" ? "加载中…" : "Loading…"}</p> : <>{truncated ? <p className="mb-3 text-sm text-muted-foreground" role="status">{locale === "zh-CN" ? "内容较长，仅显示前 512 KiB。下载可查看完整文件。" : "Showing the first 512 KiB. Download to view the complete file."}</p> : null}{/\.(?:md|markdown)$/iu.test(deliverable.title) ? <article className="prose prose-sm max-w-none dark:prose-invert"><StaticMarkdownText text={text} /></article> : <pre className="whitespace-pre-wrap break-words rounded-md bg-muted/40 p-3 font-mono text-xs leading-5">{text}</pre>}<Button className="mt-3" disabled={download.loading} onClick={() => void download.download()} size="sm" variant="outline"><DownloadIcon className="size-3.5" />{locale === "zh-CN" ? "下载完整文件" : "Download complete file"}</Button>{download.error ? <p className="mt-2 text-sm text-destructive" role="alert">{download.error}</p> : null}</>}</div>;
+  return <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-6 text-center"><FileIcon className="size-8 text-muted-foreground" /><p className="text-sm text-muted-foreground">{locale === "zh-CN" ? "此文件类型不支持在线预览" : "This file type is not previewable online"}</p><Button disabled={download.loading} onClick={() => void download.download()} size="sm" variant="outline"><DownloadIcon className="size-3.5" />{locale === "zh-CN" ? "下载文件" : "Download"}</Button>{download.error ? <p className="text-sm text-destructive" role="alert">{download.error}</p> : null}</div>;
 }
 
 function TabButton({ active, count, label, onClick }: { readonly active: boolean; readonly count?: number; readonly label: string; readonly onClick: () => void }) {

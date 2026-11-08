@@ -5,6 +5,7 @@ import {
   type AgentRuntimeConfigSnapshot,
   type AgentRuntimeModel,
 } from "@oworker/open-agent-contracts/runtime-config";
+import type { AgentLimitsDefinition } from "eve";
 
 export type { AgentRuntimeConfigSnapshot } from "@oworker/open-agent-contracts/runtime-config";
 
@@ -56,20 +57,17 @@ export const DEFAULT_AGENT_RUNTIME_CONFIG: AgentRuntimeConfigSnapshot = {
   },
 };
 
-export type AgentRuntimeDefinitionLimits = {
-  readonly maxInputTokensPerSession?: number | false;
-  readonly maxOutputTokensPerSession?: number | false;
-  readonly sessionTimeoutMs?: number | false;
-};
+export type AgentRuntimeDefinitionLimits = AgentLimitsDefinition;
 
 export function runtimeDefinitionLimits(
   config: AgentRuntimeConfigSnapshot,
 ): AgentRuntimeDefinitionLimits {
   return {
-    maxInputTokensPerSession: config.limits.maxInputTokens ?? false,
-    maxOutputTokensPerSession: config.limits.maxOutputTokens ?? false,
+    sessionUsage: ({ window }) =>
+      (typeof config.limits.maxInputTokens === "number" && window.inputTokens >= config.limits.maxInputTokens) ||
+      (typeof config.limits.maxOutputTokens === "number" && window.outputTokens >= config.limits.maxOutputTokens),
     // A durable Web thread is explicitly retired by its owner/host. Eve's
-    // default 30-day age timeout would otherwise split a long-lived thread
+    // default 30-day idle timeout would otherwise split a long-lived thread
     // even though context compaction and paged history remain healthy.
     sessionTimeoutMs: false,
   };

@@ -5,10 +5,10 @@ export default defineEval({
   tags: ["fixed", "hitl", "sandbox"],
   async test(t) {
     const parked = await t.send("EVAL_APPROVAL run the requested cleanup command.");
-    parked.parked();
-    t.requireInputRequest({ toolName: "bash" });
+    parked.awaitingInput();
+    parked.session.requireInteraction({ toolName: "bash" });
 
-    await t.respondAll("approve");
+    await parked.session.respondAll("approve");
     t.succeeded();
     t.calledTool("bash", {
       input: { command: /git push/u },

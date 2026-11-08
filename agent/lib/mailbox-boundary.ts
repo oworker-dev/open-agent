@@ -1,7 +1,13 @@
-import type { Session } from "eve/channels";
-import type { MessageStreamEvent } from "eve/client";
+import type { SessionReader } from "eve/sessions";
+import type { SessionStreamEvent } from "eve/client";
+import {
+  activeTurn, emptySessionView, foldEvents, idle, position, session as observeSession,
+  type SessionView,
+} from "eve/events";
 
 const DEFAULT_INSPECTION_TIMEOUT_MS = 10_000;
+const MAX_CACHED_SESSIONS = 32;
+const snapshots = new Map<string, SessionView>();
 
 export type MailboxBoundary =
   | { readonly lastEventAt?: string; readonly state: "running"; readonly tailIndex?: number; readonly turnId?: string }
@@ -15,96 +21,71 @@ export class MailboxBoundaryInspectionTimeoutError extends Error {
   }
 }
 
+/** Fold complete durable commits, never guess readiness from the last fact. */
 export async function inspectMailboxBoundary(
-  session: Pick<Session, "getEventStream" | "getStreamTailIndex">,
+  reader: SessionReader,
   timeoutMs = DEFAULT_INSPECTION_TIMEOUT_MS,
 ): Promise<MailboxBoundary> {
-  const deadline = createInspectionDeadline(timeoutMs);
-  let reader: ReadableStreamDefaultReader<MessageStreamEvent> | undefined;
-  try {
-    const tailIndex = await deadline.wait(session.getStreamTailIndex());
-    // Resolve the tail to an absolute cursor before reading it. Tail-relative
-    // streams are live-following in Eve and can remain open indefinitely.
-    if (tailIndex < 0) return { state: "running", tailIndex };
-    const stream = await deadline.wait(session.getEventStream({ startIndex: tailIndex }));
-    reader = stream.getReader();
-    const latest = await deadline.wait(reader.read(), () => reader?.cancel());
-    if (latest.done || !latest.value) return { state: "running", tailIndex };
-    if (latest.value.type === "session.waiting") {
-      return { state: "waiting", tailIndex };
-    }
-    if (latest.value.type === "session.completed") {
-      return { state: "terminal", tailIndex, terminalStatus: "completed" };
-    }
-    if (latest.value.type === "session.failed") {
-      return { state: "terminal", tailIndex, terminalStatus: "failed" };
-    }
-    const data: unknown = latest.value.data;
-    const record = isRecord(data) ? data : undefined;
-    const turnId = record && validText(record["turnId"], 512)
-      ? record["turnId"]
-      : undefined;
-    const at = latest.value.meta?.at;
-    return {
-      state: "running",
-      ...(typeof at === "string" ? { lastEventAt: at } : {}),
-      tailIndex,
-      ...(turnId ? { turnId } : {}),
-    };
-  } finally {
-    deadline.dispose();
-    if (reader) {
-      await reader.cancel().catch(() => undefined);
-      reader.releaseLock();
-    }
-  }
-}
-
-function createInspectionDeadline(timeoutMs: number) {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     throw new Error("Mailbox inspection timeout must be a positive finite number.");
   }
-  const startedAt = Date.now();
-  const timers = new Set<ReturnType<typeof setTimeout>>();
-  return {
-    dispose() {
-      for (const timer of timers) clearTimeout(timer);
-      timers.clear();
-    },
-    async wait<T>(promise: Promise<T>, onTimeout?: () => void | Promise<void>): Promise<T> {
-      const remaining = Math.max(0, timeoutMs - (Date.now() - startedAt));
-      if (remaining === 0) {
-        await onTimeout?.();
-        throw new MailboxBoundaryInspectionTimeoutError();
-      }
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const timeout = new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => {
-          if (timer) timers.delete(timer);
-          // Reject first. Cancelling a pending stream reader may resolve its
-          // read with `{ done: true }`; doing that before rejection would make
-          // a half-open tail look like a valid empty transcript.
-          reject(new MailboxBoundaryInspectionTimeoutError());
-          void Promise.resolve(onTimeout?.()).catch(() => undefined);
-        }, remaining);
-        timers.add(timer);
-      });
-      try {
-        return await Promise.race([promise, timeout]);
-      } finally {
-        if (timer) {
-          clearTimeout(timer);
-          timers.delete(timer);
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      const error = new MailboxBoundaryInspectionTimeoutError();
+      controller.abort(error);
+      reject(error);
+    }, timeoutMs);
+  });
+  let view = snapshots.get(reader.id) ?? emptySessionView();
+  let lastEventAt: string | undefined;
+  const iterator = reader.stream({ startIndex: position(view), follow: false, signal: controller.signal })[Symbol.asyncIterator]();
+  try {
+    await Promise.race([deadline, (async () => {
+      let batch: SessionStreamEvent[] = [];
+      for (;;) {
+        const next = await iterator.next();
+        if (next.done) break;
+        batch.push(next.value);
+        lastEventAt = next.value.meta.at;
+        if (batch.length >= 128 && next.value.meta.endOfLine !== false) {
+          view = foldEvents(view, batch);
+          batch = [];
         }
       }
-    },
+      if (batch.at(-1)?.meta.endOfLine === false) throw new Error("The mailbox transcript ended inside a commit.");
+      if (batch.length) view = foldEvents(view, batch);
+    })()]);
+    controller.signal.throwIfAborted();
+  } catch (error) {
+    if (controller.signal.aborted) throw controller.signal.reason;
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    // A broken reader may ignore abort. Do not let its pending next()/return()
+    // keep the HTTP request open beyond the inspection deadline.
+    if (controller.signal.aborted) void iterator.return?.().catch(() => undefined);
+  }
+  // A failed/partial read is never published. Concurrent inspections cannot
+  // replace a newer cached snapshot with an older one.
+  if (position(view) >= position(snapshots.get(reader.id) ?? emptySessionView())) {
+    snapshots.delete(reader.id);
+    snapshots.set(reader.id, view);
+    if (snapshots.size > MAX_CACHED_SESSIONS) snapshots.delete(snapshots.keys().next().value!);
+  }
+  const observed = observeSession(view);
+  if (observed.status === "new") throw new Error("The Agent session has no recorded history.");
+  const tailIndex = position(view) - 1;
+  if (observed.status === "ended") return {
+    state: "terminal", tailIndex,
+    terminalStatus: observed.outcome === "failed" ? "failed" : "completed",
   };
-}
-
-function validText(value: unknown, maximum: number): value is string {
-  return typeof value === "string" && value.trim().length > 0 && value.length <= maximum;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  const turn = activeTurn(view);
+  if (turn || !idle(view)) return {
+    state: "running", tailIndex,
+    ...(turn ? { turnId: turn.turnId } : {}),
+    ...(lastEventAt ? { lastEventAt } : {}),
+  };
+  return { state: "waiting", tailIndex };
 }

@@ -240,22 +240,12 @@ function baselineAfterPatch(previous, next, patch) {
             const prior = previousThreads.get(thread.id);
             if (!prior)
                 return thread;
-            if (isExplicitTranscriptReplacement(thread))
-                return thread;
             const append = appends.get(thread.id);
             if (!append || append.events.length === 0) {
                 return { ...thread, events: [...prior.events] };
             }
             if (append.replaceFrom === undefined) {
-                const seen = new Set(prior.events.map(eventIdentity));
-                const merged = [...prior.events];
-                for (const event of append.events) {
-                    if (seen.has(eventIdentity(event)))
-                        continue;
-                    seen.add(eventIdentity(event));
-                    merged.push(event);
-                }
-                return { ...thread, events: merged };
+                return { ...thread, events: mergeThreadEventSnapshots(prior.events, append.events) };
             }
             return thread;
         }),
@@ -274,31 +264,12 @@ function createCollectionPatch(baseline, collection) {
         const previous = previousThreads.get(thread.id);
         if (!previous)
             return [withoutTranscriptWindow(thread)];
-        const delta = appendOnlyEventDelta(previous.events, thread.events);
-        if (delta) {
-            if (delta.events.length > 0)
-                eventAppends.push({
-                    events: delta.events,
-                    ...(delta.replaceFrom === previous.events.length ? {} : {
-                        replaceFrom: (previous.transcriptWindow?.startIndex ?? 0) + delta.replaceFrom,
-                    }),
-                    threadId: thread.id,
-                });
-            return [withoutTranscriptWindow({ ...thread, events: [], hydration: "summary" })];
-        }
-        if (sameEventIds(previous.events, thread.events)) {
-            return [withoutTranscriptWindow({ ...thread, events: [], hydration: "summary" })];
-        }
-        if (!isExplicitTranscriptReplacement(thread)) {
-            const merged = mergeThreadEventSnapshots(previous.events, thread.events);
-            const previousIds = new Set(previous.events.map(eventIdentity));
-            const unseen = merged.filter((event) => !previousIds.has(eventIdentity(event)));
-            if (unseen.length > 0) {
-                eventAppends.push({ events: unseen, threadId: thread.id });
-            }
-            return [withoutTranscriptWindow({ ...thread, events: [], hydration: "summary" })];
-        }
-        return [withoutTranscriptWindow(thread)];
+        const previousIds = new Set(previous.events.map(eventIdentity));
+        const unseen = mergeThreadEventSnapshots(previous.events, thread.events)
+            .filter((event) => !previousIds.has(eventIdentity(event)));
+        if (unseen.length > 0)
+            eventAppends.push({ events: unseen, threadId: thread.id });
+        return [withoutTranscriptWindow({ ...thread, events: [], hydration: "summary" })];
     });
     return {
         activeThreadId: collection.activeThreadId ?? null,
@@ -314,34 +285,6 @@ function createCollectionPatch(baseline, collection) {
 function withoutTranscriptWindow(thread) {
     const { transcriptWindow: _derivedWindow, ...persisted } = thread;
     return persisted;
-}
-function isExplicitTranscriptReplacement(thread) {
-    const pending = thread.pendingTurn;
-    if (!pending)
-        return false;
-    return pending.state === "clearing" ||
-        pending.state === "resubmitting";
-}
-function appendOnlyEventDelta(previous, next) {
-    if (next.length < previous.length)
-        return undefined;
-    let firstDifference = -1;
-    for (let index = 0; index < previous.length; index += 1) {
-        if (eventIdentity(previous[index]) !== eventIdentity(next[index])) {
-            firstDifference = index;
-            break;
-        }
-    }
-    if (firstDifference < 0)
-        firstDifference = previous.length;
-    for (let index = firstDifference + 1; index < previous.length; index += 1) {
-        if (eventIdentity(previous[index]) !== eventIdentity(next[index]))
-            return undefined;
-    }
-    return { events: next.slice(firstDifference), replaceFrom: firstDifference };
-}
-function sameEventIds(left, right) {
-    return left.length === right.length && left.every((event, index) => right[index] !== undefined && eventIdentity(event) === eventIdentity(right[index]));
 }
 async function request(fetchImplementation, options, url, init, read) {
     const method = (init?.method ?? "GET").toUpperCase();

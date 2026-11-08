@@ -1,4 +1,4 @@
-import type { MessageStreamEvent } from "eve/client";
+import { type SessionStreamEvent } from "eve/client";
 import type { AgentInputResponseSubmission, AgentPendingTurn, AgentThread, AgentThreadPreferences, AgentTranscriptWindow } from "./contracts.js";
 export declare const AGENT_THREAD_STORAGE_VERSION = 2;
 export declare function editOperationId(sessionId: string, beforeTurnId: string, text: string): string;
@@ -28,23 +28,25 @@ export declare function parseThreadCollection(value: unknown): AgentThreadCollec
 export declare function saveThreadCollection(storageKey: string, threads: readonly AgentThread[], activeThreadId?: string): boolean;
 export declare function titleFromPrompt(prompt: string): string;
 export declare function mergeInputResponseSubmissions(left: readonly AgentInputResponseSubmission[], right: readonly AgentInputResponseSubmission[]): readonly AgentInputResponseSubmission[];
-export declare function inputResponseSubmissionProjectsAnswer(submission: AgentInputResponseSubmission): boolean;
+export declare function inputResponseSubmissionFailure(submission: AgentInputResponseSubmission, events: readonly SessionStreamEvent[]): string | undefined;
+export declare function inputResponseSubmissionProjectsAnswer(submission: AgentInputResponseSubmission, events?: readonly SessionStreamEvent[]): boolean;
 export declare function hasUnsettledInputResponseSubmission(submissions: readonly AgentInputResponseSubmission[]): boolean;
 export declare function settleInputResponseSubmissions(submissions: readonly AgentInputResponseSubmission[], streamIndex: number): readonly AgentInputResponseSubmission[];
-export declare function appendThreadEvent(events: readonly MessageStreamEvent[], event: MessageStreamEvent): readonly MessageStreamEvent[];
-export declare function appendThreadEventIndexed(events: MessageStreamEvent[], eventIds: Set<string>, event: MessageStreamEvent): boolean;
-export declare function mergeThreadEventSnapshots(left: readonly MessageStreamEvent[], right: readonly MessageStreamEvent[]): readonly MessageStreamEvent[];
-export declare function eventIdentity(event: MessageStreamEvent): string;
-export declare function rememberThreadEventCursor(event: MessageStreamEvent, cursor: number): void;
-export declare function compactThreadEvents(events: readonly MessageStreamEvent[]): readonly MessageStreamEvent[];
-export declare function reconcilePendingTurnWithEvents(pendingTurn: AgentPendingTurn | undefined, events: readonly MessageStreamEvent[]): AgentPendingTurn | undefined;
-export declare function receivedClientMessageId(event: Extract<MessageStreamEvent, {
-    type: "message.received";
+export declare function appendThreadEvent(events: readonly SessionStreamEvent[], event: SessionStreamEvent): readonly SessionStreamEvent[];
+export declare function appendThreadEventIndexed(events: SessionStreamEvent[], eventIds: Set<string>, event: SessionStreamEvent): boolean;
+export declare function mergeThreadEventSnapshots(left: readonly SessionStreamEvent[], right: readonly SessionStreamEvent[]): readonly SessionStreamEvent[];
+export declare function eventIdentity(event: SessionStreamEvent): string;
+export declare function isThreadEvent(value: unknown): value is SessionStreamEvent;
+export declare function threadEventCursor(event: SessionStreamEvent): number | undefined;
+export declare function compactThreadEvents(events: readonly SessionStreamEvent[]): readonly SessionStreamEvent[];
+export declare function reconcilePendingTurnWithEvents(pendingTurn: AgentPendingTurn | undefined, events: readonly SessionStreamEvent[]): AgentPendingTurn | undefined;
+export declare function receivedClientMessageId(event: Extract<SessionStreamEvent, {
+    type: "delivery.consumed";
 }>): string | undefined;
-export declare function legacyPendingPromptMatches(pending: Pick<AgentPendingTurn, "text" | "files">, message: string): boolean;
-export declare function reconcileHydratedPendingTurn(pendingTurn: AgentPendingTurn | undefined, events: readonly MessageStreamEvent[]): AgentPendingTurn | undefined;
-export declare function projectThreadEditBranches(events: readonly MessageStreamEvent[]): readonly MessageStreamEvent[];
-export declare function projectPendingThreadEdit(events: readonly MessageStreamEvent[], beforeTurnId?: string): readonly MessageStreamEvent[];
-export declare function latestEditableTurnId(events: readonly MessageStreamEvent[]): string | undefined;
-export declare function dedupeThreadEvents(events: readonly MessageStreamEvent[]): readonly MessageStreamEvent[];
+export declare function textFromDelivery(event: Extract<SessionStreamEvent, {
+    type: "delivery.consumed";
+}>): string;
+export declare function reconcileHydratedPendingTurn(pendingTurn: AgentPendingTurn | undefined, events: readonly SessionStreamEvent[]): AgentPendingTurn | undefined;
+export declare function latestEditableTurnId(events: readonly SessionStreamEvent[]): string | undefined;
+export declare function dedupeThreadEvents(events: readonly SessionStreamEvent[]): readonly SessionStreamEvent[];
 //# sourceMappingURL=thread-storage.d.ts.map

@@ -1,9 +1,8 @@
 import type { AgentThread, AgentThreadCollection } from "@oworker/open-agent-ui/agent-workspace";
-import { AGENT_THREAD_STORAGE_VERSION } from "@oworker/open-agent-ui/agent-workspace";
+import { AGENT_THREAD_STORAGE_VERSION, parseThreadCollection } from "@oworker/open-agent-ui/agent-workspace";
 import { createEveAgentMailboxRuntime } from "@/server/agent-mailbox/eve-runtime";
 import { createPostgresThreadCollectionStoreFromEnvironment, type ThreadCollectionPatchRecord } from "@/server/data/thread-collection-store";
 import { authenticateStandaloneRequest } from "@/server/http/standalone-request-auth";
-import { parseStrictThreadCollection } from "@/server/http/thread-collection-contract";
 import { rebuildSettledThreadTranscript } from "@/server/thread-transcript-repair";
 
 export const runtime = "nodejs";
@@ -42,7 +41,7 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
     { limit: 1 },
   );
   if (!record) return problem(404, "thread_not_found", "The Agent thread was not found.", authenticated.setCookie);
-  const parsedCollection = parseStrictThreadCollection({
+  const parsedCollection = parseThreadCollection({
     threads: [record.thread],
     version: AGENT_THREAD_STORAGE_VERSION,
   });
@@ -56,7 +55,7 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
   // enough to skip this repair path.
   if (thread.transcriptCoverage?.authoritative === true &&
       thread.transcriptCoverage.complete &&
-      thread.transcriptCoverage.projection === "logical-edits-v1" &&
+      thread.transcriptCoverage.projection === "v27-source-lines" &&
       thread.transcriptCoverage.endIndex >= thread.session.streamIndex) {
     return Response.json(
       { revision: record.revision, thread: null },
@@ -129,7 +128,7 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
       authoritative: true,
       complete: true,
       endIndex: rebuilt.endIndex,
-      projection: "logical-edits-v1",
+      projection: "v27-source-lines",
       startIndex: 0,
       version: 1,
     },

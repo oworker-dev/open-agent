@@ -175,67 +175,14 @@ export async function syncAgentSubagentsFromEvents(options: AgentSubagentSupervi
   if (ownership !== "owned") return [];
   const children = new Map((await options.store.listOwned(options.identity, options.parentSessionId)).map((item) => [item.childSessionId, item]));
   const byCall = new Map([...children.values()].filter((item) => item.callId).map((item) => [item.callId!, item]));
-  const agentIdByCall = new Map<string, string>();
-  const parentCancelled = options.events.some((event) => event.type === "turn.cancelled");
-  const parentTerminal = options.events.some((event) => event.type === "session.failed" || event.type === "session.completed");
-  for (const event of options.events) {
-    const data = eventData(event);
-    if (!data) continue;
-    if (event.type === "actions.requested" && Array.isArray(data.actions)) {
-      for (const action of data.actions) {
-        if (!isRecord(action) || typeof action.callId !== "string" || !isRecord(action.input)) continue;
-        const agentId = action.input.agentId;
-        if (typeof agentId === "string" && agentId.trim()) agentIdByCall.set(action.callId, agentId.trim());
-      }
-      continue;
-    }
-    if (event.type === "subagent.called" && typeof data.childSessionId === "string" && data.childSessionId.trim()) {
-      const childSessionId = data.childSessionId;
-      const created = await options.store.create({
-        childSessionId,
-        ...(typeof data.callId === "string" && agentIdByCall.get(data.callId) ? { agentId: agentIdByCall.get(data.callId) } : {}),
-        parentSessionId: options.parentSessionId,
-        owner: options.identity,
-        ...(typeof data.agentId === "string" ? { agentId: data.agentId } : {}),
-        ...(typeof data.callId === "string" ? { callId: data.callId } : {}),
-        ...(typeof data.toolName === "string" ? { toolName: data.toolName } : {}),
-        ...(typeof data.name === "string" ? { name: data.name } : {}),
-        ...(typeof data.task === "string" ? { task: data.task } : typeof data.input === "object" && data.input && typeof (data.input as Record<string, unknown>).message === "string" ? { task: (data.input as Record<string, unknown>).message as string } : {}),
-        status: "running",
-        waitPolicy: data.waitPolicy === "no-wait" ? "no-wait" : "wait",
-        depth: typeof data.depth === "number" && Number.isSafeInteger(data.depth) ? data.depth : 1,
-      });
-      children.set(childSessionId, created);
-      if (created.callId) byCall.set(created.callId, created);
-    } else if (event.type === "subagent.completed") {
-      // Eve 0.56 emits this event on background admission, not child completion.
-      if (isRecord(data.backgroundTask) && data.backgroundTask.status === "working") continue;
-      const callId = typeof data.callId === "string" ? data.callId : undefined;
-      const child = (callId ? byCall.get(callId) : undefined) ?? (typeof data.childSessionId === "string" ? children.get(data.childSessionId) : undefined);
-      if (!child) continue;
-      const result = data.result;
-      const failed = isRecord(result) && (
-        result.status === "failed" ||
-        result.isError === true ||
-        typeof result.error === "string"
-      );
-      const completionStatus = failed
-        ? "failed" as const
-        : await statusAfterSubagentCompletion(options, child, agentIdByCall.get(callId ?? ""));
-      const updated = await options.store.updateOwned(options.identity, child.childSessionId, {
-        ...(agentIdByCall.get(callId ?? "") ? { agentId: agentIdByCall.get(callId ?? "") } : {}),
-        status: completionStatus,
-        ...(failed && isRecord(result) && typeof result.error === "string" ? { lastError: result.error.slice(0, 2_000) } : {}),
-      });
-      if (updated) children.set(updated.childSessionId, updated);
-    }
-  }
-  if (parentCancelled || parentTerminal) {
+  const calls = new Map<string, { agentId?: string; task?: string; name: string }>();
+  const taskCalls = new Map<string, string>();
+  async function settleChildren(parentCancelled: boolean) {
     for (const child of children.values()) {
       if (child.status !== "starting" && child.status !== "running" && child.status !== "waiting") continue;
       // A detached child is deliberately allowed to outlive normal parent
       // completion. Explicit parent cancellation still interrupts every child.
-      if (parentTerminal && child.waitPolicy === "no-wait") continue;
+      if (!parentCancelled && child.waitPolicy === "no-wait") continue;
       let status: AgentSubagentStatus | undefined;
       if (parentCancelled) {
         // Eve cancels adopted children recursively, but the parent boundary
@@ -262,6 +209,51 @@ export async function syncAgentSubagentsFromEvents(options: AgentSubagentSupervi
         ? await options.store.updateOwned(options.identity, child.childSessionId, { status })
         : undefined;
       if (updated) children.set(updated.childSessionId, updated);
+    }
+  }
+  for (const event of options.events) {
+    const data = eventData(event);
+    if (!data) continue;
+    if (event.type === "session.ended" || (event.type === "turn.settled" && data.outcome === "cancelled")) {
+      await settleChildren(event.type === "turn.settled");
+      continue;
+    }
+    if (event.type === "call.requested" && typeof data.callId === "string" && isRecord(data.capability)) {
+      if (data.capability.kind !== "agent" || typeof data.capability.name !== "string") continue;
+      const input = isRecord(data.input) ? data.input : {};
+      calls.set(data.callId, {
+        name: data.capability.name,
+        ...(typeof input.agentId === "string" ? { agentId: input.agentId } : {}),
+        ...(typeof input.message === "string" ? { task: input.message } : {}),
+      });
+    } else if (event.type === "task.started" && typeof data.taskId === "string" && isRecord(data.startedBy) && typeof data.startedBy.callId === "string") {
+      taskCalls.set(data.taskId, data.startedBy.callId);
+    } else if (event.type === "child.opened" && typeof data.sessionId === "string" && isRecord(data.owner)) {
+      const callId = typeof data.owner.callId === "string" ? data.owner.callId :
+        typeof data.owner.taskId === "string" ? taskCalls.get(data.owner.taskId) : undefined;
+      const call = callId ? calls.get(callId) : undefined;
+      const created = await options.store.create({
+        childSessionId: data.sessionId, parentSessionId: options.parentSessionId, owner: options.identity,
+        ...(callId ? { callId } : {}), ...(call?.agentId ? { agentId: call.agentId } : {}),
+        ...(call?.task ? { task: call.task } : {}),
+        ...(typeof data.name === "string" ? { name: data.name } : {}),
+        status: "running", waitPolicy: "wait", depth: 1,
+      });
+      children.set(created.childSessionId, created);
+      if (created.callId) byCall.set(created.callId, created);
+    } else if (event.type === "call.settled" && typeof data.callId === "string") {
+      const child = byCall.get(data.callId);
+      if (!child) continue;
+      const agentId = calls.get(data.callId)?.agentId ?? child.agentId;
+      const status = data.outcome === "completed" ? await statusAfterSubagentCompletion(options, child, agentId) :
+        data.outcome === "interrupted" ? "interrupted" :
+        data.outcome === "failed" || data.outcome === "rejected" ? "failed" : undefined;
+      if (!status) continue;
+      const updated = await options.store.updateOwned(options.identity, child.childSessionId, {
+        ...(agentId ? { agentId } : {}), status,
+        ...(isRecord(data.error) && typeof data.error.message === "string" ? { lastError: data.error.message.slice(0, 2_000) } : {}),
+      });
+      if (updated) { children.set(updated.childSessionId, updated); byCall.set(data.callId, updated); }
     }
   }
   return [...children.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
@@ -400,7 +392,7 @@ async function statusAfterSubagentCompletion(
   agentId: string | undefined,
 ): Promise<AgentSubagentStatus> {
   // Native Eve persistent children are parked, not terminal, after the parent
-  // receives `subagent.completed`. Ask the runtime boundary before treating
+  // receives `call.settled`. Ask the runtime boundary before treating
   // the event as a final lifecycle state. One-shot children remain completed.
   try {
     const inspected = await (options.runtime ?? eveAgentSubagentRuntime).inspect({

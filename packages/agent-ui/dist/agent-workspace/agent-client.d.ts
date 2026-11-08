@@ -4,7 +4,7 @@ export type AgentSessionConnection = {
     readonly auth?: AgentWorkspaceClientConfig["auth"];
     readonly client: Client;
     readonly headers: HeadersValue;
-    readonly host: string;
+    readonly baseUrl: string;
     readonly initialSession?: ClientSessionState;
 };
 export declare function createAgentSession(config: AgentWorkspaceClientConfig | undefined, preferences: AgentThreadPreferences | (() => AgentThreadPreferences), state?: Partial<ClientSessionState>): AgentSessionConnection;

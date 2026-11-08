@@ -7,6 +7,7 @@ import {
 import { hostJwtAuthFromEnvironment } from "../../agent/lib/host-auth.ts";
 import { sessionOwnerFromAuth } from "../../agent/lib/session-ownership-auth.ts";
 import type { AgentSessionOwner } from "../data/session-ownership-store.ts";
+import type { SessionAuthContext } from "eve/context";
 import {
   resolveAgentRuntimeConfig,
   type AgentRuntimeConfigSnapshot,
@@ -19,6 +20,7 @@ export type HostRequestAuthentication =
       readonly ok: true;
       readonly runtimeConfig: AgentRuntimeConfigSnapshot;
       readonly scopes: ReadonlySet<string>;
+      readonly sessionAuth: SessionAuthContext;
     }
   | { readonly ok: false; readonly response: Response };
 
@@ -90,6 +92,7 @@ export async function authenticateHostRequest(
       ok: true,
       runtimeConfig,
       scopes: authScopes(auth.attributes.scope),
+      sessionAuth: auth,
     };
   } catch (error) {
     if (hasAuthResponse(error)) return { ok: false, response: error.response };

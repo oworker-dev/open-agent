@@ -40,6 +40,33 @@ references and metadata, never large file bytes**. The original bytes belong in
 an object store and are mounted into a session sandbox only when the Agent or a
 host operation needs them.
 
+Embedded browser image previews use the current Host headers for the protected
+asset read and render an ephemeral Blob URL; an img element cannot send a bearer
+header itself. Only the configured service's asset endpoint receives those
+headers, redirects are forbidden, and previews are bounded to 32 MiB with abort
+and URL cleanup on unmount. Text previews use the same current credentials, read
+at most 512 KiB, cancel the remaining stream and show a truncation notice with a
+full-download action. Preview limits are separate from multipart upload limits.
+A host-provided public or
+signed `assetUrl` continues to render without forwarding the Host credential to
+another origin. Signed publication/custom text URLs are fetched without Host
+credentials.
+
+For browser downloads, `POST /api/assets/:assetId/download` accepts the existing
+Host JWT (`asset:read`) or standalone owner cookie. It checks ownership, ready
+state and scan status and returns `{ok: true, url, expiresAt}` with `no-store`.
+The returned URL is a five-minute, encrypted, single-asset read grant. It contains
+no Host JWT or plaintext owner identity and is never stored in conversation events.
+The browser downloads the bytes directly from `GET /api/assets/:assetId?downloadGrant=…`,
+without buffering the entire file in JavaScript. Reads recheck lifecycle and scan
+state, support the existing byte-range protocol and force attachment disposition.
+The grant authorizes neither DELETE nor any Agent API. Invalid Authorization
+headers still fail even when a valid grant is also supplied. The key is derived
+with a separate domain from persistent `AGENT_PREVIEW_SIGNING_SECRET`; deployments
+must preserve that secret. Download URLs are short-lived bearer links and should
+be excluded from request/analytics logs. Cross-origin custom/signed asset URLs
+retain their own authorization mechanism and never receive Host credentials.
+
 Published result tool events contain the result id, kind, title, media type,
 size, creation/expiration timestamps, and signed URL so the active turn can
 render an assistant-ui Artifact Card immediately. The session registry is the
@@ -279,7 +306,7 @@ The tool must:
 - verify the source belongs to the current authorized context and decodes as
   a supported image;
 - preserve the original image in the sandbox/object store;
-- resize or encode a model-facing copy bounded to 512 KiB;
+- resize or encode a model-facing copy using the model's image budget;
 - supply typed file/image parts at the model boundary so a vision-capable model
   can actually see the pixels;
 - return dimensions, media type, and a stable asset reference for the UI;
@@ -305,11 +332,15 @@ has seen pixels that are no longer available. UI previews use the same
 authenticated asset resolver.
 
 Image preparation leaves original assets unchanged. It accepts sources up to
-32 MiB and 32 million decoded pixels; previews have a maximum edge of 2048
-pixels and size of 512 KiB. Small valid static PNG/JPEG/WebP images remain
-lossless; larger, rotated, animated, or other supported formats become a
-bounded JPEG preview (the first frame for animation). Each conversion has a
-time limit and observes cancellation. At most eight recent unique images are
+32 MiB and 32 million decoded pixels. The default high-detail model budget
+matches Codex: a maximum edge of 2048 pixels and at most 2,500 32-pixel
+patches. File size is not used as an arbitrary output target. Valid PNG/JPEG/WebP
+images that already fit the budget keep their original bytes; images that need
+preparation are re-encoded in their source format where possible (unsupported
+formats use PNG). Re-encoded model copies retain EXIF orientation and a safe
+RGB ICC profile, but do not copy unrelated EXIF fields such as location
+metadata. Each conversion has a time limit and observes cancellation.
+At most eight recent unique images are
 included in a model request, each at its latest reference. Older references
 remain available for an explicit `view_image` read. An unavailable historical
 image does not break a later unrelated text request; a current image that
@@ -390,6 +421,9 @@ re-request file permission through its injected upload adapter.
   expiry.
 - Object keys are generated server-side. User filenames are display metadata
   only and are sanitized before mounting.
+  HTTP downloads use an ASCII `filename` fallback plus RFC 5987 UTF-8
+  `filename*`, so Unicode filenames cannot fail Web Headers byte validation.
+  Malformed Unicode is replaced before encoding; header controls are sanitized.
 - The store records checksum, size, media type, upload status, ownership, and
   durable `scanStatus`. Scanner implementation remains a host responsibility;
   production imports fail closed unless the status is `clean` (or scanning was

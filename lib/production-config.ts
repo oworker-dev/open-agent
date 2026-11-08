@@ -9,7 +9,7 @@ export type ProductionDiagnostic = {
   readonly message: string;
 };
 
-export type AgentSandboxBackendName = "auto" | "docker" | "microsandbox" | "vercel";
+export type AgentSandboxBackendName = "auto" | "docker" | "vercel";
 export type AgentDeploymentTenancy = "single-tenant" | "multi-tenant";
 
 /**
@@ -22,10 +22,9 @@ export const DEFAULT_AGENT_SANDBOX_WORKSPACE_QUOTA_BYTES = 10 * 1024 ** 3;
 export const MAX_AGENT_SANDBOX_WORKSPACE_QUOTA_BYTES = 10 * 1024 ** 4;
 
 /**
- * Docker's Eve backend does not expose resource flags.  Keep a conservative
- * default for local development and require explicit values in production;
- * the Docker sandbox adapter applies these values after each container is
- * created or reattached.
+ * Resource limits are applied atomically when the managed Docker provider
+ * creates a container, then verified on every reattach. Production requires
+ * explicit limits.
  */
 export const DEFAULT_AGENT_DOCKER_MEMORY_LIMIT_BYTES = 2 * 1024 ** 3;
 export const MAX_AGENT_DOCKER_MEMORY_LIMIT_BYTES = 64 * 1024 ** 3;
@@ -220,7 +219,6 @@ export function readAgentSandboxWorkspaceQuota(
 const SANDBOX_BACKENDS = new Set<AgentSandboxBackendName>([
   "auto",
   "docker",
-  "microsandbox",
   "vercel",
 ]);
 const DEPLOYMENT_TENANCIES = new Set<AgentDeploymentTenancy>([
@@ -235,12 +233,12 @@ export function readAgentSandboxBackend(
   const configured = environment.AGENT_SANDBOX_BACKEND?.trim() || "auto";
   if (!SANDBOX_BACKENDS.has(configured as AgentSandboxBackendName)) {
     throw new Error(
-      "AGENT_SANDBOX_BACKEND must be one of auto, docker, microsandbox, or vercel.",
+      "AGENT_SANDBOX_BACKEND must be one of auto, docker, or vercel.",
     );
   }
   if (environment.NODE_ENV === "production" && configured === "auto") {
     throw new Error(
-      "AGENT_SANDBOX_BACKEND must explicitly select docker, microsandbox, or vercel in production.",
+      "AGENT_SANDBOX_BACKEND must explicitly select docker or vercel in production.",
     );
   }
   return configured as AgentSandboxBackendName;
@@ -570,7 +568,7 @@ export function inspectProductionConfiguration(
       if (sandboxNetworkMode === "standard") {
         error(
           "sandbox-network-policy-docker",
-          "AGENT_SANDBOX_NETWORK_MODE=standard requires microsandbox or vercel; Docker only supports allow-all or deny-all.",
+          "AGENT_SANDBOX_NETWORK_MODE=standard requires vercel; Docker only supports allow-all or deny-all.",
         );
       }
       try {
@@ -626,7 +624,7 @@ export function inspectProductionConfiguration(
       if (deploymentTenancy === "multi-tenant") {
         error(
           "sandbox-backend-docker-multi-tenant",
-          "Eve's Docker backend does not expose the resource, capability, or VM isolation controls required for untrusted multi-tenant production. Select microsandbox, Vercel Sandbox, or another reviewed microVM backend.",
+          "Eve's Docker backend does not expose the resource, capability, or VM isolation controls required for untrusted multi-tenant production. Select Vercel Sandbox or another reviewed microVM backend.",
         );
       } else if (deploymentTenancy === "single-tenant") {
         warning(

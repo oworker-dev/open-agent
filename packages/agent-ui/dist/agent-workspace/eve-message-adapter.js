@@ -1,11 +1,12 @@
 import { fromThreadMessageLike, } from "@assistant-ui/react";
 import { parseAssetPrompt } from "@oworker/open-agent-contracts/asset";
+import { isLocallyInterruptedMessage } from "./turn-presentation.js";
 const COMPLETE = { reason: "stop", type: "complete" };
 const RUNNING = { type: "running" };
 const CANCELLED = { reason: "cancelled", type: "incomplete" };
 const USER_COMPLETE = { reason: "unknown", type: "complete" };
-export function convertEveMessages(data, options = {}) {
-    return data.messages.map((message, index, messages) => convertEveMessage(message, index, messages, options));
+export function convertEveMessages(messages, options = {}) {
+    return messages.map((message, index) => convertEveMessage(message, index, messages, options));
 }
 function convertEveMessage(message, index, messages, options) {
     const metadata = {
@@ -36,15 +37,15 @@ function convertEveMessage(message, index, messages, options) {
 function messageStatus(message, index, messages, options) {
     if (message.role !== "assistant")
         return USER_COMPLETE;
+    if (isLocallyInterruptedMessage(message))
+        return CANCELLED;
     const isLast = index === messages.length - 1;
-    if (message.parts.some((part) => part.type === "dynamic-tool" && part.state === "approval-requested")) {
+    if (message.parts.some((part) => part.type === "tool" && part.interaction?.status === "open")) {
         return { reason: "tool-calls", type: "requires-action" };
     }
-    const requiresAuthorization = message.metadata?.status === "streaming" &&
-        (!isLast || options.error === undefined) &&
-        message.parts.some((part) => part.type === "authorization" && part.state === "required");
-    if (requiresAuthorization)
+    if (message.parts.some((part) => part.type === "interaction" && part.status === "open")) {
         return { reason: "interrupt", type: "requires-action" };
+    }
     if (message.metadata?.status === "failed")
         return { reason: "error", type: "incomplete" };
     if (isLast && options.isRunning)
@@ -52,9 +53,8 @@ function messageStatus(message, index, messages, options) {
     if (message.metadata?.status === "streaming") {
         if (options.isRunning === undefined)
             return RUNNING;
-        if (isLast && options.error !== undefined) {
+        if (isLast && options.error !== undefined)
             return { reason: "error", type: "incomplete" };
-        }
         return CANCELLED;
     }
     return COMPLETE;
@@ -63,78 +63,50 @@ function assistantPart(part, assetUrl) {
     if (part.type === "text" || part.type === "reasoning") {
         return { text: part.text, type: part.type };
     }
-    if (part.type === "dynamic-tool")
-        return dynamicToolPart(part);
-    if (part.type === "authorization")
-        return authorizationPart(part);
+    if (part.type === "tool")
+        return toolPart(part);
     if (part.type === "file")
         return filePart(part, assetUrl);
+    if (part.type === "interaction") {
+        return {
+            data: {
+                interactionId: part.interactionId,
+                kind: part.request.kind,
+                outcome: part.outcome,
+                prompt: part.request.prompt,
+                status: part.status,
+            },
+            name: "interaction",
+            type: "data",
+        };
+    }
     return null;
 }
-function dynamicToolPart(part) {
-    const approval = toolApproval(part);
+function toolPart(part) {
     const base = {
-        ...(approval ? { approval } : {}),
         args: jsonObject(part.input),
-        argsText: part.inputText ?? safeStringify(part.input),
-        toolCallId: part.toolCallId,
-        toolName: part.toolName,
+        argsText: part.state === "streaming"
+            ? part.inputText
+            : safeStringify(part.input),
+        toolCallId: part.callId,
+        toolName: part.name,
         type: "tool-call",
     };
-    if (part.state === "output-available")
+    if (part.state === "streaming")
+        return base;
+    if (part.state === "completed")
         return { ...base, result: part.output };
-    if (part.state === "output-error") {
-        return { ...base, isError: true, result: { error: part.errorText } };
+    if (part.state === "failed" || part.state === "rejected" || part.state === "cancelled") {
+        return {
+            ...base,
+            isError: true,
+            result: { error: part.error?.message ?? part.state },
+        };
     }
-    if (part.state === "output-denied") {
-        return { ...base, isError: true, result: { error: part.approval?.reason ?? "Tool approval denied" } };
+    if (part.interaction?.status === "open") {
+        return { ...base, approval: { id: part.interaction.interactionId } };
     }
     return base;
-}
-function toolApproval(part) {
-    if (!("approval" in part) || !part.approval)
-        return undefined;
-    const options = approvalOptions(part.toolMetadata?.eve?.inputRequest);
-    return {
-        ...(part.approval.approved === undefined ? {} : { approved: part.approval.approved }),
-        ...(part.approval.isAutomatic === undefined ? {} : { isAutomatic: part.approval.isAutomatic }),
-        ...(options ? { options } : {}),
-        ...(part.approval.reason ? { reason: part.approval.reason } : {}),
-        id: part.approval.id,
-    };
-}
-function approvalOptions(request) {
-    if (!request?.options?.length)
-        return undefined;
-    return request.options.map((option) => ({
-        ...(option.description ? { description: option.description } : {}),
-        ...(option.label ? { label: option.label } : {}),
-        id: option.id,
-        kind: option.id === "approve"
-            ? "allow-once"
-            : option.id === "deny"
-                ? "reject-once"
-                : `_${option.id}`,
-    }));
-}
-function authorizationPart(part) {
-    const url = part.authorization?.url;
-    return {
-        data: {
-            ...(part.description ? { description: part.description } : {}),
-            ...(part.displayName ? { displayName: part.displayName } : {}),
-            ...(part.authorization?.expiresAt ? { expiresAt: part.authorization.expiresAt } : {}),
-            ...(part.authorization?.instructions ? { instructions: part.authorization.instructions } : {}),
-            ...(part.outcome ? { outcome: part.outcome } : {}),
-            ...(part.reason ? { reason: part.reason } : {}),
-            ...(url && /^https?:\/\//u.test(url) ? { url } : {}),
-            ...(part.authorization?.userCode ? { userCode: part.authorization.userCode } : {}),
-            name: part.name,
-            state: part.state,
-        },
-        name: "authorization",
-        type: "data",
-    };
 }
 function filePart(part, assetUrl) {
     if (!part.url)
@@ -202,7 +174,8 @@ export function getEveMessageContent(message) {
             continue;
         }
         if (part.type === "image") {
-            parts.push({ data: part.image, ...(part.filename ? { filename: part.filename } : {}), mediaType: "image/*", type: "file" });
+            const image = typeof part.image === "string" ? part.image : String(part.image);
+            parts.push({ data: image, ...(part.filename ? { filename: part.filename } : {}), mediaType: "image/*", type: "file" });
         }
     }
     return parts.length === 1 && parts[0]?.type === "text" ? parts[0].text : parts;

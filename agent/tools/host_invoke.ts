@@ -34,8 +34,4 @@ const tool = defineTool({
   },
 });
 
-export default defineDynamic({
-  events: {
-    "session.started": (_event, ctx) => (shouldExposeHostCapabilities(ctx) ? tool : null),
-  },
-});
+export default defineDynamic((ctx) => shouldExposeHostCapabilities(ctx) ? tool : null);

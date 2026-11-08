@@ -1,6 +1,6 @@
 "use client";
 
-import type { MessageStreamEvent, PrepareSend } from "eve/client";
+import type { SessionStreamEvent } from "eve/client";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AgentWorkspace,
@@ -8,6 +8,7 @@ import {
   createHttpAgentThreadStorage,
   type AgentThread,
   type AgentRuntimeStatus,
+  type AgentWorkspaceClientConfig,
 } from "@oworker/open-agent-ui";
 import { createAgentUiConfig, AGENT_UI_MENTIONS } from "@/lib/agent-ui-config";
 import { DEFAULT_AGENT_RUNTIME_CONFIG } from "@/lib/agent-runtime-config";
@@ -23,7 +24,6 @@ export function AgentEmbed({ allowedOrigins, runtimeStatus }: { readonly allowed
   const [configuration, setConfiguration] = useState<AgentEmbedConfigureMessage>();
   const [fatalError, setFatalError] = useState<string>();
   const parentOriginRef = useRef<string | undefined>(undefined);
-  const accessTokenRef = useRef("");
 
   const post = useCallback((event: AgentEmbedEvent) => {
     const parentOrigin = parentOriginRef.current;
@@ -70,7 +70,6 @@ export function AgentEmbed({ allowedOrigins, runtimeStatus }: { readonly allowed
         });
         return;
       }
-      accessTokenRef.current = message.accessToken;
       applyTheme(message.theme ?? "system");
       if (message.locale) {
         window.localStorage.setItem(`${message.storageKey}:locale`, message.locale);
@@ -88,31 +87,62 @@ export function AgentEmbed({ allowedOrigins, runtimeStatus }: { readonly allowed
     return () => window.removeEventListener("message", receive);
   }, [allowedOrigins, post]);
 
-  const client = useMemo(() => configuration ? {
+  if (fatalError) {
+    return <main className="flex h-dvh items-center justify-center bg-background p-6 text-center text-sm text-muted-foreground">{fatalError}</main>;
+  }
+  if (!configuration) {
+    return <main className="flex h-dvh items-center justify-center bg-background text-sm text-muted-foreground">Connecting to host…</main>;
+  }
+  return <ConfiguredAgentEmbed
+    configuration={configuration}
+    key={JSON.stringify([configuration.serviceUrl, configuration.storageKey, configuration.profile.id, configuration.profile.version])}
+    post={post}
+    runtimeStatus={runtimeStatus}
+  />;
+}
+
+function ConfiguredAgentEmbed({ configuration, post, runtimeStatus }: {
+  readonly configuration: AgentEmbedConfigureMessage;
+  readonly post: (event: AgentEmbedEvent) => void;
+  readonly runtimeStatus: AgentRuntimeStatus;
+}) {
+  // This component is keyed by service/storage/profile scope. Renewals update
+  // request data without replacing adapters or the live Eve store. An old
+  // scope retains its own ref, so in-flight work cannot borrow a new scope's token.
+  const configurationRef = useRef(configuration);
+  configurationRef.current = configuration;
+  const hostCallIdsRef = useRef(new Set<string>());
+  const client = useMemo<AgentWorkspaceClientConfig>(() => ({
     headers: async () => ({
-      authorization: `Bearer ${accessTokenRef.current}`,
-      "x-agent-profile-id": configuration.profile.id,
-      "x-agent-profile-version": configuration.profile.version,
-      ...(configuration.runPolicy
-        ? { "x-agent-run-policy": encodeBase64Url(configuration.runPolicy) }
+      authorization: `Bearer ${configurationRef.current.accessToken}`,
+      "x-agent-profile-id": configurationRef.current.profile.id,
+      "x-agent-profile-version": configurationRef.current.profile.version,
+      ...(configurationRef.current.runPolicy
+        ? { "x-agent-run-policy": encodeBase64Url(configurationRef.current.runPolicy) }
         : {}),
     }),
     host: configuration.serviceUrl,
-    prepareSend: withClientContext(configuration.clientContext),
-  } : undefined, [configuration]);
+    prepareSend: (input) => configurationRef.current.clientContext === undefined
+      ? input
+      : { ...input, clientContext: configurationRef.current.clientContext },
+  }), [configuration.serviceUrl]);
 
-  const threadStorage = useMemo(() => configuration ? createHttpAgentThreadStorage({
+  const threadStorage = useMemo(() => createHttpAgentThreadStorage({
     endpoint: `${configuration.serviceUrl.replace(/\/$/, "")}/api/agent/thread-collections`,
-    getAccessToken: () => accessTokenRef.current,
-  }) : undefined, [configuration]);
+    getAccessToken: () => configurationRef.current.accessToken,
+  }), [configuration.serviceUrl]);
 
-  const mailbox = useMemo(() => configuration ? createHttpAgentMailbox({
+  const mailbox = useMemo(() => createHttpAgentMailbox({
     endpoint: `${configuration.serviceUrl.replace(/\/$/, "")}/api/agent/mailbox`,
-    getAccessToken: () => accessTokenRef.current,
-  }) : undefined, [configuration]);
+    getAccessToken: () => configurationRef.current.accessToken,
+  }), [configuration.serviceUrl]);
 
-  const onEvent = useCallback((event: MessageStreamEvent) => {
-    const projected = projectEmbedEvent(event);
+  const onEvent = useCallback((event: SessionStreamEvent) => {
+    if (event.type === "call.requested" && event.data.capability.name === "host_invoke") {
+      hostCallIdsRef.current.add(event.data.callId);
+    }
+    const projected = projectEmbedEvent(event, hostCallIdsRef.current);
+    if (event.type === "call.settled") hostCallIdsRef.current.delete(event.data.callId);
     if (projected) post(projected);
   }, [post]);
 
@@ -120,10 +150,10 @@ export function AgentEmbed({ allowedOrigins, runtimeStatus }: { readonly allowed
     const sessionId = thread.session.sessionId;
     if (!sessionId) return;
     const response = await fetch(
-      `${configuration?.serviceUrl.replace(/\/$/, "")}/api/agent/sessions/${encodeURIComponent(sessionId)}`,
+      `${configuration.serviceUrl.replace(/\/$/, "")}/api/agent/sessions/${encodeURIComponent(sessionId)}`,
       {
         headers: {
-          authorization: `Bearer ${accessTokenRef.current}`,
+          authorization: `Bearer ${configurationRef.current.accessToken}`,
         },
         method: "DELETE",
         redirect: "error",
@@ -138,14 +168,8 @@ export function AgentEmbed({ allowedOrigins, runtimeStatus }: { readonly allowed
       // Preserve the status-based fallback when the service returns no JSON body.
     }
     throw new Error(message);
-  }, [configuration?.serviceUrl]);
+  }, [configuration.serviceUrl]);
 
-  if (fatalError) {
-    return <main className="flex h-dvh items-center justify-center bg-background p-6 text-center text-sm text-muted-foreground">{fatalError}</main>;
-  }
-  if (!configuration || !client || !threadStorage) {
-    return <main className="flex h-dvh items-center justify-center bg-background text-sm text-muted-foreground">Connecting to host…</main>;
-  }
   const ui = createAgentUiConfig(configuration.runtimeConfig ?? DEFAULT_AGENT_RUNTIME_CONFIG);
   return (
     <AgentWorkspace
@@ -154,7 +178,6 @@ export function AgentEmbed({ allowedOrigins, runtimeStatus }: { readonly allowed
       commands={ui.commands}
       defaultPreferences={ui.defaultPreferences}
       extensions={ui.extensions}
-      key={`${configuration.storageKey}:${configuration.profile.id}@${configuration.profile.version}`}
       models={ui.models}
       mailbox={mailbox}
       mentions={AGENT_UI_MENTIONS}
@@ -169,11 +192,6 @@ export function AgentEmbed({ allowedOrigins, runtimeStatus }: { readonly allowed
   );
 }
 
-function withClientContext(clientContext: AgentEmbedConfigureMessage["clientContext"]): PrepareSend | undefined {
-  if (clientContext === undefined) return undefined;
-  return (input) => ({ ...input, clientContext });
-}
-
 function applyTheme(theme: "dark" | "light" | "system") {
   if (theme === "system") document.documentElement.removeAttribute("data-theme");
   else document.documentElement.dataset.theme = theme;
@@ -186,33 +204,32 @@ function encodeBase64Url(value: unknown): string {
   return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
 }
 
-function projectEmbedEvent(event: MessageStreamEvent): AgentEmbedEvent | undefined {
+function projectEmbedEvent(event: SessionStreamEvent, hostCallIds: ReadonlySet<string>): AgentEmbedEvent | undefined {
   if (event.type === "turn.started") {
     return { type: "agent.embed.turn-started", contractVersion: AGENT_EMBED_CONTRACT_VERSION, turnId: event.data.turnId };
   }
-  if (event.type === "turn.completed") {
+  if (event.type === "turn.settled" && event.data.outcome === "completed") {
     return { type: "agent.embed.turn-completed", contractVersion: AGENT_EMBED_CONTRACT_VERSION, turnId: event.data.turnId };
   }
-  if (event.type === "turn.cancelled") {
+  if (event.type === "turn.settled" && event.data.outcome === "cancelled") {
     return { type: "agent.embed.turn-cancelled", contractVersion: AGENT_EMBED_CONTRACT_VERSION, turnId: event.data.turnId };
   }
-  if (event.type === "turn.failed") {
-    return { type: "agent.embed.turn-failed", contractVersion: AGENT_EMBED_CONTRACT_VERSION, turnId: event.data.turnId, message: event.data.message };
+  if (event.type === "turn.settled" && event.data.outcome === "failed") {
+    return { type: "agent.embed.turn-failed", contractVersion: AGENT_EMBED_CONTRACT_VERSION, turnId: event.data.turnId, message: event.data.error?.message ?? "The agent turn failed." };
   }
   if (
-    event.type === "action.result" &&
-    event.data.status === "completed" &&
-    event.data.result.kind === "tool-result" &&
-    event.data.result.toolName === "host_invoke" &&
-    isRecord(event.data.result.output) &&
-    typeof event.data.result.output.capability === "string" &&
-    "output" in event.data.result.output
+    event.type === "call.settled" &&
+    event.data.outcome === "completed" &&
+    hostCallIds.has(event.data.callId) &&
+    isRecord(event.data.output) &&
+    typeof event.data.output.capability === "string" &&
+    "output" in event.data.output
   ) {
     return {
       type: "agent.embed.host-capability-completed",
       contractVersion: AGENT_EMBED_CONTRACT_VERSION,
-      capability: event.data.result.output.capability,
-      output: event.data.result.output.output,
+      capability: event.data.output.capability,
+      output: event.data.output.output,
     };
   }
   return undefined;

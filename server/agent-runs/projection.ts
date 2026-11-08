@@ -1,4 +1,5 @@
-import type { MessageStreamEvent } from "eve/client";
+import { eveEventCursor, eveEventsCursor } from "../../lib/eve-stream.ts";
+import type { SessionStreamEvent } from "eve/client";
 import {
   AGENT_RUN_CONTRACT_VERSION,
   type AgentEvent,
@@ -14,7 +15,7 @@ import type {
 } from "../data/agent-run-store.ts";
 
 export function projectAgentRun(
-  events: readonly MessageStreamEvent[],
+  events: readonly SessionStreamEvent[],
 ): AgentRunProjection {
   return projectAgentRunFrom(
     {
@@ -28,89 +29,70 @@ export function projectAgentRun(
 
 export function projectAgentRunDelta(
   current: AgentRunRecord,
-  events: readonly MessageStreamEvent[],
+  events: readonly SessionStreamEvent[],
 ): AgentRunProjection {
   return projectAgentRunFrom(current, events);
 }
 
 function projectAgentRunFrom(
   current: Pick<AgentRunRecord, "eventCount" | "failure" | "result" | "status" | "usage">,
-  events: readonly MessageStreamEvent[],
+  events: readonly SessionStreamEvent[],
 ): AgentRunProjection {
   let status: AgentRunStatus = current.status === "submitting" ? "running" : current.status;
   let result: AgentRunResult | undefined = current.result;
   let failure: AgentRunProjection["failure"] = current.failure;
-  let cancelled = status === "cancelled";
-  let waitingInput = status === "waiting-input";
-  let waitingAuthorization = status === "waiting-authorization";
   const usage: MutableUsage = { ...current.usage };
 
   for (const event of events) {
     switch (event.type) {
       case "turn.started":
-      case "message.received":
-        waitingInput = false;
-        waitingAuthorization = false;
-        if (!cancelled && !failure) status = "running";
-        break;
-      case "input.requested":
-        waitingInput = true;
-        status = "waiting-input";
-        break;
-      case "authorization.required":
-        waitingAuthorization = true;
-        status = "waiting-authorization";
-        break;
-      case "authorization.completed":
-        waitingAuthorization = false;
+        result = undefined;
+        failure = undefined;
         status = "running";
         break;
-      case "result.completed":
-        result = { kind: "json", value: toJsonValue(event.data.result) };
+      case "model.requested":
+      case "call.started":
+        if (status === "waiting-input" || status === "waiting-authorization") status = "running";
         break;
-      case "message.completed":
-        if (event.data.message && event.data.finishReason !== "tool-calls") {
-          result ??= { kind: "text", value: event.data.message };
+      case "interaction.opened":
+        status = event.data.request.kind === "sign-in" ? "waiting-authorization" : "waiting-input";
+        break;
+      case "interaction.settled":
+        if (status === "waiting-input" || status === "waiting-authorization") status = "running";
+        break;
+      case "content.completed":
+        if (event.data.phase !== "reply") break;
+        if (event.data.kind === "result") result = { kind: "json", value: toJsonValue(event.data.value) };
+        else if (event.data.kind === "text" && typeof event.data.value === "string" && result?.kind !== "json") {
+          result = { kind: "text", value: (result?.kind === "text" ? result.value : "") + event.data.value };
         }
         break;
-      case "step.completed":
-        if (event.data.usage) {
-          usage.cacheReadTokens += event.data.usage.cacheReadTokens ?? 0;
-          usage.cacheWriteTokens += event.data.usage.cacheWriteTokens ?? 0;
-          usage.costUsd += event.data.usage.costUsd ?? 0;
-          usage.inputTokens += event.data.usage.inputTokens ?? 0;
-          usage.outputTokens += event.data.usage.outputTokens ?? 0;
-        }
-        usage.steps += 1;
+      case "usage.recorded":
+        usage.cacheReadTokens += event.data.usage.cacheReadTokens ?? 0;
+        usage.cacheWriteTokens += event.data.usage.cacheWriteTokens ?? 0;
+        usage.costUsd += event.data.usage.costUsd ?? 0;
+        usage.inputTokens += event.data.usage.inputTokens ?? 0;
+        usage.outputTokens += event.data.usage.outputTokens ?? 0;
         break;
-      case "turn.cancelled":
-        cancelled = true;
-        status = "cancelled";
+      case "model.settled":
+        if (event.scope?.turnId) usage.steps += 1;
         break;
-      case "turn.failed":
-      case "session.failed":
-        status = "failed";
-        failure = {
-          code: event.data.code,
-          message: event.data.message,
-          retryable: false,
-        };
+      case "turn.settled":
+        status = event.data.outcome === "cancelled" ? "cancelled"
+          : event.data.outcome === "failed" ? "failed" : "completed";
+        if (event.data.error) failure = { ...event.data.error, retryable: false };
         break;
-      case "session.completed":
-        if (!cancelled && !failure) status = "completed";
-        break;
-      case "session.waiting":
-        if (cancelled) status = "cancelled";
-        else if (failure) status = "failed";
-        else if (waitingInput) status = "waiting-input";
-        else if (waitingAuthorization) status = "waiting-authorization";
-        else status = "completed";
+      case "session.ended":
+        if (event.data.outcome === "failed") {
+          status = "failed";
+          if (event.data.error) failure = { ...event.data.error, retryable: false };
+        } else if (status !== "cancelled" && status !== "failed") status = "completed";
         break;
     }
   }
 
   return {
-    eventCount: current.eventCount + events.length,
+    eventCount: eveEventsCursor(events, current.eventCount),
     ...(failure ? { failure } : {}),
     ...(result ? { result } : {}),
     status,
@@ -120,7 +102,7 @@ function projectAgentRunFrom(
 
 export function projectAgentEvents(
   runId: string,
-  events: readonly MessageStreamEvent[],
+  events: readonly SessionStreamEvent[],
   startIndex = 0,
 ): readonly AgentEvent[] {
   return events.map((event, index) => ({
@@ -128,33 +110,29 @@ export function projectAgentEvents(
     ...(event.meta?.at ? { createdAt: event.meta.at } : {}),
     data: toJsonObject("data" in event ? event.data : {}),
     runId,
-    sequence: startIndex + index + 1,
-    type: eventType(event.type),
+    sequence: event.meta.position.line + 1,
+    position: event.meta.position,
+    cursor: eveEventCursor(event),
+    type: eventType(event),
   }));
 }
 
-function eventType(type: MessageStreamEvent["type"]): AgentEventType {
-  switch (type) {
+function eventType(event: SessionStreamEvent): AgentEventType {
+  switch (event.type) {
     case "session.started": return "run.started";
-    case "session.completed":
-    case "turn.completed": return "run.completed";
-    case "session.failed":
-    case "turn.failed": return "run.failed";
-    case "turn.cancelled": return "run.cancelled";
-    case "message.received": return "message.received";
-    case "message.appended": return "message.delta";
-    case "message.completed": return "message.completed";
-    case "reasoning.appended": return "reasoning.delta";
-    case "reasoning.completed": return "reasoning.completed";
-    case "action.input.partial":
-    case "action.input.appended": return "tool.input.delta";
-    case "actions.requested": return "tool.requested";
-    case "action.result": return "tool.completed";
-    case "input.requested": return "input.requested";
-    case "authorization.required": return "authorization.required";
-    case "authorization.completed": return "authorization.completed";
-    case "result.completed": return "result.completed";
-    case "step.completed": return "usage.recorded";
+    case "turn.settled":
+      return event.data.outcome === "cancelled" ? "run.cancelled" : event.data.outcome === "failed" ? "run.failed" : "run.completed";
+    case "session.ended": return event.data.outcome === "failed" ? "run.failed" : "runtime.event";
+    case "delivery.consumed": return "message.received";
+    case "content.delta": return event.data.kind === "reasoning" ? "reasoning.delta" : "message.delta";
+    case "content.completed":
+      return event.data.kind === "result" ? "result.completed" : event.data.kind === "reasoning" ? "reasoning.completed" : "message.completed";
+    case "call.input": return "tool.input.delta";
+    case "call.requested": return "tool.requested";
+    case "call.settled": return "tool.completed";
+    case "interaction.opened": return event.data.request.kind === "sign-in" ? "authorization.required" : "input.requested";
+    case "interaction.settled": return "authorization.completed";
+    case "usage.recorded": return "usage.recorded";
     default: return "runtime.event";
   }
 }

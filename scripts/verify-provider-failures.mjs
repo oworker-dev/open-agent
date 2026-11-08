@@ -28,7 +28,7 @@ try {
   await waitFor(`${providerUrl}/v1/models`);
 
   children.push(spawnLogged("eve", process.execPath, builtRuntime ? [resolve(".output/server/index.mjs")] : [
-    resolve("node_modules/eve/bin/eve.js"), "dev", "--no-ui", "--port", String(evePort),
+    resolve("node_modules/eve/bin/eve.js"), "dev", "--no-ui", "--no-default-extensions", "--port", String(evePort),
   ], {
     ...process.env,
     AGENT_DATABASE_URL: "",
@@ -67,7 +67,8 @@ try {
     "PROVIDER_403_THREE. Reply exactly: STALE_FORBIDDEN");
   assertRecoverableFailure(exhaustedForbidden.events, "exhausted Provider 403");
   assertRetryProgress(exhaustedForbidden.events, "exhausted Provider 403");
-  assert(exhaustedForbidden.events.some((event) => event.type === "turn.failed" && event.data.details?.statusCode === 403),
+  assert(exhaustedForbidden.events.some((event) => event.type === "turn.settled" &&
+    event.data.outcome === "failed" && event.data.error?.message.includes("403")),
     "Provider 403 did not retain the status code needed for UI classification.");
   const continuedAfterForbidden = await consume(exhaustedForbidden.session,
     "Continue after restoring upstream access. Reply exactly: FORBIDDEN_CONTINUED");
@@ -122,7 +123,7 @@ try {
     "PROVIDER_STREAM_INTERRUPT_ONCE. Reply exactly: STREAM_RECOVERED");
   assert(
     interrupted.some((event) =>
-      event.type === "message.appended" && event.data.messageDelta.includes("PARTIAL_BEFORE_INTERRUPT")
+      event.type === "content.delta" && event.data.delta.includes("PARTIAL_BEFORE_INTERRUPT")
     ),
     "The interrupted stream did not expose its partial output for diagnosis.",
   );
@@ -139,20 +140,20 @@ try {
   );
   assertCompleted(firstSandbox.events, "first sandbox lifecycle turn");
   assert(
-    firstSandbox.events.some((event) => event.type === "action.result" && event.data?.status === "completed"),
+    firstSandbox.events.some((event) => event.type === "call.settled" && event.data?.outcome === "completed"),
     "The first sandbox lifecycle turn did not complete its action.",
   );
-  await firstSandbox.session.reset({ reason: "sandbox-lifecycle-first" });
+  await resetSession(firstSandbox.session, "sandbox-lifecycle-first");
   const secondSandbox = await createAndConsume(
     eveUrl,
     "SANDBOX_LIFECYCLE_E2E. Use the requested sandbox tool, then reply exactly: SANDBOX_SECOND",
   );
   assertCompleted(secondSandbox.events, "second sandbox lifecycle turn");
   assert(
-    secondSandbox.events.some((event) => event.type === "action.result" && event.data?.status === "completed"),
+    secondSandbox.events.some((event) => event.type === "call.settled" && event.data?.outcome === "completed"),
     "The second sandbox lifecycle turn did not complete its action after reset.",
   );
-  await secondSandbox.session.reset({ reason: "sandbox-lifecycle-second" });
+  await resetSession(secondSandbox.session, "sandbox-lifecycle-second");
 
   const { events: exhausted, session: exhaustedSession } = await createAndConsume(
     eveUrl,
@@ -226,9 +227,9 @@ async function completedTurn(host, message) {
 }
 
 async function createAndConsume(host, message) {
-  const { response, session } = await new Client({ host }).sessions.create({ message });
-  syntheticSessionIds.add(response.sessionId);
-  return { events: await collect(response), session };
+  const { delivery, session } = await new Client({ baseUrl: host }).sessions.create({ message });
+  syntheticSessionIds.add(session.state.sessionId);
+  return { events: await collect(delivery.stream()), session };
 }
 
 async function removeSyntheticSandboxContainers() {
@@ -249,7 +250,35 @@ async function removeSyntheticSandboxContainers() {
 }
 
 async function consume(session, message) {
-  return collect(await session.send(message));
+  return collect((await session.send(message)).stream());
+}
+
+async function resetSession(session, reason) {
+  const startIndex = session.state.streamIndex;
+  const delivery = await session.reset({ reason });
+  await waitForReset(session, startIndex, delivery.deliveryId);
+}
+
+async function waitForReset(session, startIndex, deliveryId) {
+  let sessionEnded = false;
+  let deliverySettled = false;
+  const eventTypes = [];
+  for await (const event of session.stream({ startIndex, follow: true })) {
+    eventTypes.push(event.type);
+    if (event.type === "session.ended") sessionEnded = true;
+    if (event.type === "delivery.settled" && event.data.deliveryId === deliveryId) {
+      deliverySettled = true;
+    }
+    if (sessionEnded || (deliverySettled && event.meta.endOfLine !== false)) break;
+  }
+  if (sessionEnded || deliverySettled) return;
+  const snapshot = await session.snapshot();
+  const tail = snapshot.events.slice(-10).map((event) => {
+    const delivery = "deliveryId" in event.data ? `(${event.data.deliveryId})` : "";
+    return `${event.meta.position.line}:${event.type}${delivery}`;
+  });
+  assert(false,
+    `Eve reset was not visible from cursor ${startIndex}; tail=${snapshot.session.streamIndex}; events=${eventTypes.join(", ") || "none"}; snapshot=${tail.join(", ") || "empty"}.`);
 }
 
 async function collect(response) {
@@ -259,41 +288,39 @@ async function collect(response) {
 }
 
 function assertCompleted(events, label) {
-  assert(events.some((event) => event.type === "turn.completed"), `${label} did not complete.`);
-  assert(events.some((event) => event.type === "session.waiting"), `${label} did not preserve continuation.`);
-  assert(!events.some((event) => event.type === "turn.failed"), `${label} emitted turn.failed.`);
+  assert(events.some((event) => event.type === "turn.settled" && event.data.outcome === "completed"), `${label} did not complete.`);
+  assert(events.some((event) => event.type === "delivery.settled" && event.data.outcome === "handled"), `${label} delivery did not settle.`);
+  assert(!events.some((event) => event.type === "session.ended"), `${label} did not preserve continuation.`);
+  assert(!events.some((event) => event.type === "turn.settled" && event.data.outcome === "failed"), `${label} emitted a failed turn.`);
 }
 
 function assertRecoverableFailure(events, label) {
-  assert(events.some((event) => event.type === "step.failed"), `${label} did not emit step.failed.`);
-  assert(events.some((event) => event.type === "turn.failed"), `${label} did not emit turn.failed.`);
-  assert(events.some((event) => event.type === "session.waiting"), `${label} did not preserve the session.`);
-  assert(!events.some((event) => event.type === "session.failed"), `${label} terminally failed the session.`);
+  assert(events.some((event) => event.type === "model.settled" && event.data.outcome === "failed"), `${label} did not settle its model as failed.`);
+  assert(events.some((event) => event.type === "turn.settled" && event.data.outcome === "failed"), `${label} did not settle its turn as failed.`);
+  assert(events.some((event) => event.type === "delivery.settled"), `${label} delivery did not settle.`);
+  assert(!events.some((event) => event.type === "session.ended"), `${label} terminally ended the session.`);
 }
 
 function assertRetryProgress(events, label) {
-  const retries = events
-    .filter((event) => event.type === "model.retrying")
-    .map((event) => event.data)
-    .filter((data) => data && typeof data.attempt === "number")
-    .map((data) => [data.attempt, data.maximum]);
+  const retries = events.filter((event) => event.type === "model.retried").map((event) => event.data.attempt);
+  const attempts = events.filter((event) => event.type === "model.started").map((event) => event.data.attempt);
   assert(
-    JSON.stringify(retries) === JSON.stringify([[1, 3], [2, 3], [3, 3]]),
-    `${label} did not persist ordered model.retrying progress: ${JSON.stringify(retries)}`,
+    JSON.stringify(retries) === JSON.stringify([0, 1]) && JSON.stringify(attempts) === JSON.stringify([0, 1, 2]),
+    `${label} did not persist ordered model retry progress: retries=${JSON.stringify(retries)}, attempts=${JSON.stringify(attempts)}`,
   );
 }
 
 function messageText(events) {
   return events
-    .filter((event) => event.type === "message.appended")
-    .map((event) => event.data.messageDelta)
+    .filter((event) => event.type === "content.completed" && event.data.kind === "text" && event.data.phase === "reply")
+    .map((event) => event.data.value)
     .join("");
 }
 
 function completedMessageText(events) {
   return events
-    .filter((event) => event.type === "message.completed" && event.data.finishReason !== "tool-calls")
-    .at(-1)?.data.message;
+    .filter((event) => event.type === "content.completed" && event.data.kind === "text" && event.data.phase === "reply")
+    .at(-1)?.data.value;
 }
 
 function spawnLogged(name, command, args, environment, cwd = projectRoot) {

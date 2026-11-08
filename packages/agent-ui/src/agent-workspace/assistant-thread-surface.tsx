@@ -12,7 +12,7 @@ import {
 } from "@assistant-ui/react";
 import type { Attachment as AssistantAttachment, CompleteAttachment } from "@assistant-ui/react";
 import { LexicalComposerInput, type DirectiveChipProps } from "@assistant-ui/react-lexical";
-import type { MessageStreamEvent } from "eve/client";
+import type { SessionStreamEvent } from "eve/client";
 import type { EveMessage } from "eve/react";
 import {
   ArrowDownIcon,
@@ -23,6 +23,8 @@ import {
   CircleXIcon,
   CopyIcon,
   ChevronDownIcon,
+  DownloadIcon,
+  EyeIcon,
   FileIcon,
   ImageIcon,
   LockKeyholeIcon,
@@ -48,7 +50,8 @@ import { ToolFallback } from "../assistant-ui/tool-fallback.js";
 import { TooltipIconButton } from "../assistant-ui/tooltip-icon-button.js";
 import { Button } from "../ui/button.js";
 import { Alert, AlertDescription, AlertTitle } from "../ui/alert.js";
-import { Attachment, AttachmentContent, AttachmentDescription, AttachmentGroup, AttachmentMedia, AttachmentTitle, AttachmentTrigger } from "../ui/attachment.js";
+import { Attachment, AttachmentAction, AttachmentContent, AttachmentDescription, AttachmentGroup, AttachmentMedia, AttachmentTitle, AttachmentTrigger } from "../ui/attachment.js";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "../ui/dialog.js";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "../ui/collapsible.js";
 import { cn } from "../utils.js";
 import {
@@ -64,6 +67,7 @@ import { classifyAgentFailure, presentAgentTurn, type AgentTurnFailure } from ".
 import type { AgentComposerDraftRestore, AgentExecutionMode, AgentModelOption, AgentPromptMenuItem, AgentSessionDeliverable, AgentThreadPreferences } from "./contracts.js";
 import type { AgentLocale, AgentMessages } from "./i18n.js";
 import type { AgentUsageSummary } from "./usage.js";
+import { useAssetDownload, useAssetPreview, useAssetText } from "./asset-preview.js";
 
 export type AgentCancellationState = "idle" | "requested" | "cancelling";
 
@@ -124,7 +128,7 @@ export function AssistantThreadSurface({
   readonly composerTop?: ReactNode;
   readonly draftStorageKey: string;
   readonly draftRestore?: AgentComposerDraftRestore;
-  readonly events: readonly MessageStreamEvent[];
+  readonly events: readonly SessionStreamEvent[];
   readonly eveMessages: readonly EveMessage[];
   readonly fallbackStartedAt?: number;
   readonly historyHasMore?: boolean;
@@ -173,7 +177,6 @@ export function AssistantThreadSurface({
   const composerIsEditing = useAuiState((state) => state.composer.isEditing);
   const viewportRef = useRef<HTMLDivElement>(null);
   const historyRequestInFlightRef = useRef(false);
-  const [historyPrepending, setHistoryPrepending] = useState(false);
   const pendingHistoryAnchorRef = useRef<{
     readonly messageId?: string;
     readonly messageOffsetTop?: number;
@@ -187,19 +190,10 @@ export function AssistantThreadSurface({
     () => new Map(eveMessages.map((message) => [message.id, message])),
     [eveMessages],
   );
-  const eveMessagesByTurnId = useMemo(
-    () => new Map(eveMessages.flatMap((message) => {
-      const turnId = typeof message.metadata?.turnId === "string" ? message.metadata.turnId : undefined;
-      return turnId ? [[turnId, message] as const] : [];
-    })),
-    [eveMessages],
-  );
   const lastAssistantMessageId = [...eveMessages].reverse().find((message) => message.role === "assistant")?.id;
   const canRespondToInputRequest = eveMessages.some((message) =>
     message.parts.some((part) =>
-      part.type === "dynamic-tool" &&
-      Boolean(part.toolMetadata?.eve?.inputRequest) &&
-      part.toolMetadata?.eve?.inputResponse === undefined,
+      (part.type === "tool" && part.interaction?.status === "open") || (part.type === "interaction" && part.status === "open"),
     ),
   );
 
@@ -215,7 +209,6 @@ export function AssistantThreadSurface({
       element.getBoundingClientRect().bottom > viewportTop,
     );
     historyRequestInFlightRef.current = true;
-    setHistoryPrepending(true);
     pendingHistoryAnchorRef.current = {
       ...(visibleMessage?.dataset.messageId
         ? {
@@ -260,18 +253,15 @@ export function AssistantThreadSurface({
         const nextOffsetTop = currentMessage.getBoundingClientRect().top - currentViewport.getBoundingClientRect().top;
         currentViewport.scrollTop += nextOffsetTop - anchor.messageOffsetTop;
         pendingHistoryAnchorRef.current = undefined;
-        setHistoryPrepending(false);
         return;
       }
       if (pageRendered) {
         currentViewport.scrollTop = anchor.scrollTop + (currentViewport.scrollHeight - anchor.scrollHeight);
         pendingHistoryAnchorRef.current = undefined;
-        setHistoryPrepending(false);
         return;
       }
       if (frameCount >= 8) {
         pendingHistoryAnchorRef.current = undefined;
-        setHistoryPrepending(false);
       } else {
         frameCount += 1;
         frame = window.requestAnimationFrame(restore);
@@ -290,11 +280,10 @@ export function AssistantThreadSurface({
     >
       <ThreadPrimitive.Viewport
         aria-live="polite"
-        // Keep assistant-ui's native bottom-follow behavior when the user is
-        // already at the bottom. The top turn anchor still controls the
-        // initial placement of a new turn; autoScroll only follows subsequent
-        // content growth and respects manual scroll-up.
-        autoScroll={!historyPrepending}
+        // The native top anchor owns placement for the whole response. A
+        // second bottom-follow policy races its placeholder/receipt handoff.
+        autoScroll={false}
+        scrollToBottomOnRunStart={false}
         onScroll={handleViewportScroll}
         ref={viewportRef}
         scrollToBottomOnInitialize={viewportScrollOnInitialize}
@@ -325,14 +314,8 @@ export function AssistantThreadSurface({
               // A terminal/retry error replaces the live thinking placeholder;
               // keeping it mounted leaves an empty execution shell in the row.
               isStreaming={isBusy && !runtimeError && message.id === lastAssistantMessageId}
-              isTurnContinuation={isSteeringContinuationMessage(message, events)}
               locale={locale}
-              message={eveMessagesById.get(message.id) ?? (() => {
-                const turnId = typeof message.metadata?.custom?.turnId === "string"
-                  ? message.metadata.custom.turnId
-                  : undefined;
-                return turnId ? eveMessagesByTurnId.get(turnId) : undefined;
-              })()}
+              message={eveMessagesById.get(message.id)}
               messages={messages}
               onInputResponses={onInputResponses}
               onCloseInputRequest={onCloseInputRequest}
@@ -398,35 +381,6 @@ export function AssistantThreadSurface({
       </ThreadPrimitive.Viewport>
     </ThreadPrimitive.Root>
   );
-}
-
-function isSteeringContinuationMessage(message: {
-  readonly id: string;
-  readonly metadata?: unknown;
-  readonly role: string;
-}, events: readonly MessageStreamEvent[]): boolean {
-  const metadata = typeof message.metadata === "object" && message.metadata !== null
-    ? message.metadata as { readonly turnId?: unknown }
-    : undefined;
-  const turnId = typeof metadata?.turnId === "string" ? metadata.turnId : undefined;
-  if (message.role !== "assistant" || !turnId) return false;
-  // The live workspace may retain a pending display root while Eve replaces
-  // its source id. The segment suffix is stable, so use the id shape rather
-  // than requiring the durable turn id as the prefix.
-  const segmentMarker = ":assistant:";
-  const segmentStart = message.id.lastIndexOf(segmentMarker);
-  if (segmentStart < 0) return false;
-  const clientMessageId = message.id.slice(segmentStart + segmentMarker.length);
-  if (!clientMessageId) return false;
-  const receipts = events.filter((event) =>
-    event.type === "message.received" && event.data.turnId === turnId,
-  );
-  const segmentIndex = receipts.findIndex((event) =>
-    event.type === "message.received" && event.data.clientMessageId === clientMessageId,
-  );
-  // A first message may also carry a client id. Only a receipt after another
-  // message in the same Eve turn is a steering continuation.
-  return segmentIndex > 0 || (segmentIndex < 0 && receipts.length > 0);
 }
 
 function RuntimeErrorMessage({
@@ -531,7 +485,7 @@ function UserMessage({ isBusy, messages, messageEditingAllowed, sessionTerminal 
     <MessagePrimitive.Root
       className="group fade-in slide-in-from-bottom-1 animate-in mx-auto grid w-full max-w-(--thread-max-width) auto-rows-auto grid-cols-[minmax(72px,1fr)_auto] content-start gap-y-2 px-2 duration-150 [&:where(>*)]:col-start-2"
     >
-      <AttachmentGroup className="col-start-2 mb-0 max-w-[88%] justify-end py-0">
+      <AttachmentGroup className="col-start-2 mb-0 ml-auto max-w-[88%] justify-start py-0">
         <MessagePrimitive.Attachments>
           {({ attachment }) => <UserAttachment attachment={attachment} messages={messages} />}
         </MessagePrimitive.Attachments>
@@ -564,35 +518,72 @@ function UserMessage({ isBusy, messages, messageEditingAllowed, sessionTerminal 
 
 function UserAttachment({ attachment, messages }: { readonly attachment: CompleteAttachment; readonly messages: AgentMessages }) {
   const isImage = attachment.contentType?.startsWith("image/") ?? attachment.type === "image";
-  const previewUrl = isImage ? attachmentContentUrl(attachment) : undefined;
-  const [previewOpen, setPreviewOpen] = useState(false);
+  const isTextPreviewable = isTextAssetPreviewable(attachment.contentType);
+  const contentUrl = attachmentContentUrl(attachment);
+  const { url: previewUrl, error: previewError, retry: retryPreview } = useAssetPreview(isImage ? attachmentContentUrl(attachment) : undefined);
+  const [imagePreviewOpen, setImagePreviewOpen] = useState(false);
+  const [textPreviewOpen, setTextPreviewOpen] = useState(false);
+  const textPreview = useAssetText(textPreviewOpen && isTextPreviewable ? contentUrl : undefined);
+  const download = useAssetDownload(contentUrl, attachment.name);
   return (
     <>
       {isImage ? (
-        <Attachment className="size-24 min-w-0 overflow-hidden p-0 sm:size-28" orientation="vertical" size="sm" state="done">
+        <Attachment className="size-24 min-w-0 overflow-hidden p-0 sm:size-28" orientation="vertical" size="sm" state={previewError ? "error" : previewUrl ? "done" : "processing"}>
           <AttachmentMedia className="size-full rounded-xl" variant={previewUrl ? "image" : "icon"}>
             {previewUrl ? <img alt={attachment.name} src={previewUrl} /> : <ImageIcon className="size-5" />}
           </AttachmentMedia>
           {previewUrl ? (
-            <AttachmentTrigger aria-label={`${messages.attachment}: ${attachment.name}`} onClick={() => setPreviewOpen(true)} />
+            <AttachmentTrigger aria-label={`${messages.attachment}: ${attachment.name}`} onClick={() => setImagePreviewOpen(true)} />
+          ) : previewError ? (
+            <AttachmentTrigger aria-label={messages.retry} onClick={retryPreview} title={previewError}><RotateCcwIcon className="m-auto size-4" /></AttachmentTrigger>
           ) : null}
         </Attachment>
       ) : (
-        <Attachment className="max-w-72" size="sm" state="done">
+        <Attachment className="w-[min(18rem,100%)] flex-nowrap" size="sm" state="done">
           <AttachmentMedia variant="icon"><FileIcon className="size-4" /></AttachmentMedia>
           <AttachmentContent>
             <AttachmentTitle>{attachment.name}</AttachmentTitle>
             <AttachmentDescription>{attachment.contentType ?? messages.attachment}</AttachmentDescription>
           </AttachmentContent>
+          {isTextPreviewable ? <AttachmentAction aria-label={`${messages.previewFile}: ${attachment.name}`} disabled={textPreviewOpen} onClick={() => setTextPreviewOpen(true)} title={messages.previewFile}><EyeIcon className="size-3.5" /></AttachmentAction> : null}
+          <AttachmentAction aria-label={`${messages.attachment}: ${attachment.name}`} disabled={download.loading} onClick={() => void download.download()} title={attachment.name}><DownloadIcon className="size-3.5" /></AttachmentAction>
         </Attachment>
       )}
-      {previewOpen && previewUrl ? (
-        <button aria-label={messages.dismiss} className="fixed inset-0 z-50 flex cursor-zoom-out items-center justify-center bg-black/70 p-4" onClick={() => setPreviewOpen(false)} type="button">
+      {download.error ? <p className="text-xs text-destructive" role="alert">{download.error}</p> : null}
+      {imagePreviewOpen && previewUrl ? (
+        <button aria-label={messages.dismiss} className="fixed inset-0 z-50 flex cursor-zoom-out items-center justify-center bg-black/70 p-4" onClick={() => setImagePreviewOpen(false)} type="button">
           <img alt={attachment.name} className="max-h-[90vh] max-w-[90vw] rounded-xl object-contain" src={previewUrl} />
         </button>
       ) : null}
+      {isTextPreviewable ? <Dialog open={textPreviewOpen} onOpenChange={setTextPreviewOpen}>
+        <DialogContent className="grid max-h-[min(80vh,48rem)] max-w-3xl grid-rows-[auto_minmax(0,1fr)_auto]">
+          <DialogHeader>
+            <DialogTitle className="truncate pr-8">{attachment.name}</DialogTitle>
+            <DialogDescription>{attachment.contentType ?? messages.attachment}</DialogDescription>
+          </DialogHeader>
+          <div className="min-h-0 overflow-auto rounded-md border bg-muted/20 p-3">
+            {textPreview.error ? <p className="text-sm text-destructive" role="alert">{textPreview.error}</p>
+              : textPreview.text !== undefined ? <pre className="whitespace-pre-wrap break-words font-mono text-xs leading-5">{textPreview.text}</pre>
+                : <p aria-live="polite" className="text-sm text-muted-foreground">{messages.loading}</p>}
+          </div>
+          <DialogFooter className="flex-row items-center justify-between sm:justify-between">
+            <div className="min-w-0 flex-1 text-xs text-muted-foreground">
+              {textPreview.truncated ? messages.previewTruncated : null}
+              {textPreview.error ? <Button className="mt-1" onClick={textPreview.retry} size="sm" variant="ghost"><RotateCcwIcon className="size-3.5" />{messages.retry}</Button> : null}
+            </div>
+            <Button disabled={download.loading} onClick={() => void download.download()} size="sm"><DownloadIcon className="size-3.5" />{messages.downloadCompleteFile}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog> : null}
     </>
   );
+}
+
+function isTextAssetPreviewable(mediaType: string | undefined): boolean {
+  const normalized = mediaType?.split(";", 1)[0]?.trim().toLowerCase();
+  return Boolean(normalized && (
+    ["text/plain", "text/markdown", "text/csv", "text/tab-separated-values", "application/json", "application/x-ndjson", "application/yaml", "application/x-yaml"].includes(normalized)
+  ));
 }
 
 function attachmentContentUrl(attachment: CompleteAttachment): string | undefined {
@@ -612,7 +603,6 @@ function AssistantMessage({
   events,
   fallbackStartedAt,
   isStreaming,
-  isTurnContinuation,
   locale,
   message,
   messages,
@@ -628,10 +618,9 @@ function AssistantMessage({
   readonly assetUrl?: (assetId: string) => string;
   readonly canRespond: boolean;
   readonly closedInputRequestIds: ReadonlySet<string>;
-  readonly events: readonly MessageStreamEvent[];
+  readonly events: readonly SessionStreamEvent[];
   readonly fallbackStartedAt?: number;
   readonly isStreaming: boolean;
-  readonly isTurnContinuation: boolean;
   readonly locale: AgentLocale;
   readonly message?: EveMessage;
   readonly messages: AgentMessages;
@@ -650,7 +639,7 @@ function AssistantMessage({
   };
 }) {
   const task = message
-    ? presentAgentTurn(message, events, closedInputRequestIds, { mergeSameTurn: true })
+    ? presentAgentTurn(message, events, closedInputRequestIds)
     : undefined;
   const copyableText = message
     ? task
@@ -674,7 +663,6 @@ function AssistantMessage({
             events={events}
             fallbackStartedAt={fallbackStartedAt}
             isStreaming={isStreaming}
-            isTurnContinuation={isTurnContinuation}
             locale={locale}
             message={message}
             onInputResponses={onInputResponses}
@@ -821,7 +809,7 @@ export function AssistantComposer({
   const runtimeInputDisabled = useAuiState((state) => state.thread.isDisabled);
   const stopping = cancellationState !== "idle";
   const runtimeBusy = isBusy || (isRunning && !sessionSettled);
-  const composerDisabled = inputDisabled || runtimeInputDisabled || stopping;
+  const composerDisabled = inputDisabled || runtimeInputDisabled;
   const composerInputRef = useRef<HTMLDivElement>(null);
   const auiRef = useRef(aui);
   const draftHydrationRef = useRef<{ readonly key: string; readonly text: string } | undefined>(undefined);
@@ -931,11 +919,11 @@ export function AssistantComposer({
         }}
       >
         <div className="flex w-full flex-col gap-2 rounded-[1.5rem] border border-border/70 bg-background p-2.5 shadow-[0_8px_24px_-16px_rgba(0,0,0,0.24)]">
+          {composerTop}
           {approvalTakeover ? (
-            <ApprovalComposerTakeover locale={locale} onRespond={onInputResponses} request={approvalTakeover} />
+            <ApprovalComposerTakeover cancellationState={cancellationState} locale={locale} onCancel={onCancel} onRespond={onInputResponses} request={approvalTakeover} />
           ) : (
             <>
-              {composerTop}
               <AttachmentGroup className="px-1 py-0.5 empty:hidden">
                 <ComposerPrimitive.Attachments>
                   {({ attachment }) => (
@@ -1007,13 +995,13 @@ export function AssistantComposer({
                * without changing the visual one-button interaction.
                */}
               <Button
-                aria-hidden={!(stopping || (runtimeBusy && composerIsEmpty))}
+                aria-hidden={!((stopping || runtimeBusy) && composerIsEmpty)}
                 aria-label={cancellationState === "idle" ? messages.cancel : messages.stopping}
-                className={cn("size-9 shrink-0 rounded-full sm:size-8", !(stopping || (runtimeBusy && composerIsEmpty)) && "hidden")}
-                disabled={cancellationState !== "idle" || !(stopping || (runtimeBusy && composerIsEmpty))}
+                className={cn("size-9 shrink-0 rounded-full sm:size-8", !((stopping || runtimeBusy) && composerIsEmpty) && "hidden")}
+                disabled={cancellationState !== "idle" || !((stopping || runtimeBusy) && composerIsEmpty)}
                 onClick={() => onCancel?.()}
                 size="icon-sm"
-                tabIndex={stopping || (runtimeBusy && composerIsEmpty) ? 0 : -1}
+                tabIndex={(stopping || runtimeBusy) && composerIsEmpty ? 0 : -1}
                 type="button"
               >
                 {cancellationState === "idle" ? (
@@ -1023,16 +1011,16 @@ export function AssistantComposer({
                 )}
               </Button>
               <Button
-                aria-hidden={stopping || (runtimeBusy && composerIsEmpty)}
-                aria-label={runtimeBusy ? messages.queueFollowUp : messages.send}
-                className={cn("size-9 shrink-0 rounded-full sm:size-8", (stopping || (runtimeBusy && composerIsEmpty)) && "hidden")}
-                disabled={composerDisabled || stopping || (runtimeBusy && composerIsEmpty)}
+                aria-hidden={(stopping || runtimeBusy) && composerIsEmpty}
+                aria-label={runtimeBusy && !stopping ? messages.queueFollowUp : messages.send}
+                className={cn("size-9 shrink-0 rounded-full sm:size-8", ((stopping || runtimeBusy) && composerIsEmpty) && "hidden")}
+                disabled={composerDisabled || ((stopping || runtimeBusy) && composerIsEmpty)}
                 onClick={() => {
                   aui.composer.send();
                   blurComposerOnTouch(composerInputRef);
                 }}
                 size="icon-sm"
-                tabIndex={stopping || (runtimeBusy && composerIsEmpty) ? -1 : 0}
+                tabIndex={(stopping || runtimeBusy) && composerIsEmpty ? -1 : 0}
                 type="button"
               >
                 <ArrowUpIcon className="size-4" />
@@ -1117,21 +1105,26 @@ function ComposerAttachment({ attachment, messages }: { readonly attachment: Ass
 }
 
 function ApprovalComposerTakeover({
+  cancellationState,
   locale,
+  onCancel,
   onRespond,
   request,
 }: {
+  readonly cancellationState: AgentCancellationState;
   readonly locale: AgentLocale;
+  readonly onCancel?: () => void;
   readonly onRespond: (responses: readonly AgentInputResponse[]) => void | Promise<void>;
   readonly request: AgentApprovalTakeover;
 }) {
   const isZh = locale === "zh-CN";
+  const stopping = cancellationState !== "idle";
   const [submitting, setSubmitting] = useState(false);
   const respond = async (optionId: string) => {
-    if (submitting) return;
+    if (submitting || stopping) return;
     setSubmitting(true);
     try {
-      await onRespond([{ optionId, requestId: request.requestId }]);
+      await onRespond([{ optionId, interactionId: request.requestId }]);
     } finally {
       setSubmitting(false);
     }
@@ -1153,8 +1146,12 @@ function ApprovalComposerTakeover({
         <p className="mt-1 line-clamp-2 text-xs leading-5 text-muted-foreground">{request.prompt}</p>
         <ApprovalTakeoverDetails input={request.input} toolName={request.toolName} />
         <div className="mt-3 flex justify-end gap-2">
-          <Button className="min-w-16" disabled={submitting} onClick={() => void respond("deny")} size="sm" variant="ghost">{isZh ? "拒绝" : "Deny"}</Button>
-          <Button className="min-w-16" disabled={submitting} onClick={() => void respond("approve")} size="sm">
+          {onCancel ? <Button className="mr-auto" disabled={submitting || stopping} onClick={onCancel} size="sm" title={isZh ? "停止当前任务" : "Stop the current task"} variant="ghost">
+            {stopping ? <LoaderCircleIcon className="size-3.5 animate-spin" /> : <SquareIcon className="size-3 fill-current" />}
+            {stopping ? (isZh ? "正在停止" : "Stopping") : (isZh ? "停止" : "Stop")}
+          </Button> : null}
+          <Button className="min-w-16" disabled={submitting || stopping} onClick={() => void respond("deny")} size="sm" variant="ghost">{isZh ? "拒绝" : "Deny"}</Button>
+          <Button className="min-w-16" disabled={submitting || stopping} onClick={() => void respond("approve")} size="sm">
             {submitting ? <LoaderCircleIcon className="size-3.5 animate-spin" /> : null}
             {isZh ? "批准" : "Approve"}
           </Button>

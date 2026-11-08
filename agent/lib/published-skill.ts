@@ -9,7 +9,7 @@ export function definePublishedSkill(extension: AgentRuntimeExtension) {
   }
   return defineSkill({
     description: extension.description,
-    markdown: extension.skill.markdown,
+    content: extension.skill.markdown,
     ...(extension.skill.files
       ? { files: Object.fromEntries(Object.entries(extension.skill.files).map(([path, file]) => [
         path,

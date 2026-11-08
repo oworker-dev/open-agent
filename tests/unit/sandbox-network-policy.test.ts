@@ -10,12 +10,12 @@ import {
 
 test("defaults sandbox egress to isolated mode", () => {
   assert.equal(readAgentSandboxNetworkMode({}), "isolated");
-  assert.equal(resolveAgentSandboxNetworkPolicy("isolated", "microsandbox"), "deny-all");
+  assert.equal(resolveAgentSandboxNetworkPolicy("isolated", "vercel"), "deny-all");
   assert.equal(resolveAgentDockerNetworkPolicy("isolated"), "deny-all");
 });
 
 test("standard mode allows reviewed dependency and source domains", () => {
-  const policy = resolveAgentSandboxNetworkPolicy("standard", "microsandbox", ["example.com"]);
+  const policy = resolveAgentSandboxNetworkPolicy("standard", "vercel", ["example.com"]);
   assert.equal(typeof policy, "object");
   if (typeof policy !== "object") return;
   assert.ok(Array.isArray(policy.allow));
@@ -27,7 +27,7 @@ test("standard mode allows reviewed dependency and source domains", () => {
 test("Docker rejects fine-grained standard mode", () => {
   assert.throws(
     () => resolveAgentDockerNetworkPolicy("standard"),
-    /requires microsandbox or vercel/u,
+    /requires vercel/u,
   );
 });
 

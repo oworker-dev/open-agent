@@ -1,296 +1,106 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { normalizeAgentRuntimeHost, readEveAgentEvents, resetEveAgentRun, resetEveSession } from "../../server/agent-runs/eve-adapter.ts";
+import { line, startTurn, reply, streamResponse, wireLines } from "../helpers/session-events.ts";
 
-import {
-  normalizeAgentRuntimeHost,
-  readEveAgentEvents,
-  resetEveAgentRun,
-  resetEveSession,
-} from "../../server/agent-runs/eve-adapter.ts";
-
-test("keeps an Eve runtime origin for the client route prefix", () => {
-  assert.equal(
-    normalizeAgentRuntimeHost("https://agent.example"),
-    "https://agent.example/",
-  );
-});
-
-test("repairs an Agent runtime URL that includes Eve's own route prefix", () => {
-  assert.equal(
-    normalizeAgentRuntimeHost("https://agent.example/internal/eve/v1/"),
-    "https://agent.example/internal",
-  );
-});
-
-test("rejects a non-HTTP Agent runtime URL", () => {
-  assert.throws(
-    () => normalizeAgentRuntimeHost("file:///tmp/eve"),
-    /absolute HTTP\(S\) URL/,
-  );
-});
-
-test("resets an Eve session by stable ID", async (t) => {
-  const originalFetch = globalThis.fetch;
-  const originalRuntimeUrl = process.env.AGENT_RUNTIME_URL;
-  let body: unknown;
-  t.after(() => {
-    globalThis.fetch = originalFetch;
-    if (originalRuntimeUrl === undefined) delete process.env.AGENT_RUNTIME_URL;
-    else process.env.AGENT_RUNTIME_URL = originalRuntimeUrl;
-  });
+function setup(t: import("node:test").TestContext) {
+  const original = globalThis.fetch; const url = process.env.AGENT_RUNTIME_URL;
   process.env.AGENT_RUNTIME_URL = "https://agent.example";
+  t.after(() => { globalThis.fetch = original; if (url === undefined) delete process.env.AGENT_RUNTIME_URL; else process.env.AGENT_RUNTIME_URL = url; });
+}
+const read = (start = 0, limit = 200) => readEveAgentEvents("run-1", "correlation-1", "session-1", "token", start, limit);
+
+test("normalizes an Eve runtime host and rejects non-HTTP endpoints", () => {
+  assert.equal(normalizeAgentRuntimeHost("https://agent.example/eve/v1/"), "https://agent.example/");
+  assert.throws(() => normalizeAgentRuntimeHost("file:///tmp/eve"), /absolute HTTP\(S\) URL/);
+});
+
+for (const sandbox of [false, true]) test(`reset awaits the native retirement delivery (${sandbox ? "sandbox" : "run"})`, async (t) => {
+  setup(t); let posts = 0; let reads = 0;
   globalThis.fetch = async (input, init) => {
-    assert.match(String(input), /\/eve\/v1\/session\/session-1\/reset$/);
-    assert.equal(init?.method, "POST");
-    body = init?.body;
-    return Response.json({
-      ok: true,
-      previousSessionId: "session-1",
-      status: "reset",
-    });
+    const url = new URL(String(input));
+    if (init?.method === "POST") {
+      posts++; assert.equal(url.pathname, "/eve/v1/session/session-1/reset");
+      if (sandbox) assert.match(new Headers(init.headers).get("x-agent-run-id") ?? "", /^arun_[a-f0-9]{32}$/);
+      return Response.json({ ok: true, sessionId: "session-1", deliveryId: "reset-delivery" }, { status: 202 });
+    }
+    reads++;
+    return streamResponse(line(0, { type: "delivery.admitted", data: { deliveryId: "reset-delivery", source: { channel: "eve" } } },
+      { type: "session.ended", data: { outcome: "completed" } },
+      { type: "delivery.settled", data: { deliveryId: "reset-delivery", outcome: "applied" } }));
   };
-
-  const status = await resetEveAgentRun(
-    "run-1",
-    "correlation-1",
-    "session-1",
-    "token",
-  );
-  assert.equal(status, "reset");
-  assert.deepEqual(JSON.parse(String(body)), {});
+  assert.equal(await (sandbox ? resetEveSession("session-1", "token", "cleanup") : resetEveAgentRun("run-1", "correlation-1", "session-1", "token")), "reset");
+  assert.equal(posts, 1); assert.equal(reads, 1);
 });
 
-test("uses the stable session ID as the reset handle", async (t) => {
-  const originalFetch = globalThis.fetch;
-  const originalRuntimeUrl = process.env.AGENT_RUNTIME_URL;
-  t.after(() => {
-    globalThis.fetch = originalFetch;
-    if (originalRuntimeUrl === undefined) delete process.env.AGENT_RUNTIME_URL;
-    else process.env.AGENT_RUNTIME_URL = originalRuntimeUrl;
-  });
-  process.env.AGENT_RUNTIME_URL = "https://agent.example";
-  globalThis.fetch = async (input) => {
-    assert.match(String(input), /\/eve\/v1\/session\/session-1\/reset$/);
-    return Response.json({ ok: true, previousSessionId: "session-1", status: "reset" });
-  };
-  assert.equal(
-    await resetEveAgentRun("run-1", "correlation-1", "session-1", "token"),
-    "reset",
-  );
-});
-
-test("uses a valid AgentRun-shaped control id for sandbox session reset", async (t) => {
-  const originalFetch = globalThis.fetch;
-  const originalRuntimeUrl = process.env.AGENT_RUNTIME_URL;
-  t.after(() => {
-    globalThis.fetch = originalFetch;
-    if (originalRuntimeUrl === undefined) delete process.env.AGENT_RUNTIME_URL;
-    else process.env.AGENT_RUNTIME_URL = originalRuntimeUrl;
-  });
-  process.env.AGENT_RUNTIME_URL = "https://agent.example";
-  globalThis.fetch = async (_input, init) => {
-    const headers = new Headers(init?.headers);
-    assert.match(headers.get("x-agent-run-id") ?? "", /^arun_[a-f0-9]{32}$/u);
-    return Response.json({ ok: true, status: "no_active_session" });
-  };
-  assert.equal(
-    await resetEveSession("session-1", "token", "sandbox-cleanup-1"),
-    "no_active_session",
-  );
-});
-
-test("reads a bounded no-store event page and closes at Eve's durable tail", async (t) => {
-  const originalFetch = globalThis.fetch;
-  const originalRuntimeUrl = process.env.AGENT_RUNTIME_URL;
-  let cancelled = false;
-  let requestCache: RequestCache | undefined;
-  let requestUrl = "";
-  t.after(() => {
-    globalThis.fetch = originalFetch;
-    if (originalRuntimeUrl === undefined) delete process.env.AGENT_RUNTIME_URL;
-    else process.env.AGENT_RUNTIME_URL = originalRuntimeUrl;
-  });
-  process.env.AGENT_RUNTIME_URL = "https://agent.example";
+test("reset accepts Eve's terminal event when its delivery settlement is omitted", async (t) => {
+  setup(t);
   globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    if (init?.method === "POST") {
+      assert.equal(url.pathname, "/eve/v1/session/session-1/reset");
+      return Response.json({ ok: true, sessionId: "session-1", deliveryId: "reset-delivery" }, { status: 202 });
+    }
+    return streamResponse(line(0,
+      { type: "delivery.admitted", data: { deliveryId: "reset-delivery", source: { channel: "eve" } } },
+      { type: "session.ended", data: { outcome: "completed" } }));
+  };
+
+  assert.equal(await resetEveAgentRun("run-1", "correlation-1", "session-1", "token"), "reset");
+});
+
+test("bounded pages use no-store, authorize every connection, and preserve atomic source lines", async (t) => {
+  setup(t); let requested = "";
+  const events = [...line(0, { type: "session.started", data: {} }), ...startTurn(1, "turn", "delivery", "Run"), ...reply(4, "turn", "delivery", "Done")];
+  globalThis.fetch = async (input, init) => {
+    requested = String(input); assert.equal(init?.cache, "no-store");
     const headers = new Headers(init?.headers);
     assert.equal(headers.get("authorization"), "Bearer token");
-    assert.equal(headers.get("x-agent-correlation-id"), "correlation-1");
     assert.equal(headers.get("x-agent-run-id"), "run-1");
-    requestCache = init?.cache;
-    requestUrl = String(input);
-    const stream = new ReadableStream<Uint8Array>({
-      cancel() {
-        cancelled = true;
-      },
-      start(controller) {
-        controller.enqueue(new TextEncoder().encode(
-          `${JSON.stringify({
-            data: {},
-            meta: { at: "2026-08-03T00:00:00.000Z", id: "evt_01KZ0000000000000000000000" },
-            type: "session.started",
-          })}\n`,
-        ));
-      },
-    });
-    return new Response(stream, {
-      headers: { "x-eve-stream-tail-index": "0" },
-    });
+    assert.equal(headers.get("x-agent-correlation-id"), "correlation-1");
+    return streamResponse(events);
   };
-
-  const events = await readEveAgentEvents(
-    "run-1",
-    "correlation-1",
-    "session-1",
-    "token",
-  );
-
-  assert.equal(events.length, 1);
-  assert.equal(events[0]?.type, "session.started");
-  assert.equal(requestCache, "no-store");
-  assert.match(requestUrl, /includeTailIndex=1/);
-  assert.doesNotMatch(requestUrl, /stream%3F/);
-  assert.equal(cancelled, true);
+  const page = await read(0, 3);
+  assert.match(requested, /includeTailIndex=1/); assert.match(requested, /follow=false/);
+  assert.equal(page.length, 5); // the three-fact turn-start commit is indivisible
+  assert.deepEqual(page.at(-1)?.meta.position, { line: 2, index: 2 });
 });
 
-test("stops a bounded event page at the requested limit before a large durable tail", async (t) => {
-  const originalFetch = globalThis.fetch;
-  const originalRuntimeUrl = process.env.AGENT_RUNTIME_URL;
-  let cancelled = false;
-  let emitted = 0;
-  t.after(() => {
-    globalThis.fetch = originalFetch;
-    if (originalRuntimeUrl === undefined) delete process.env.AGENT_RUNTIME_URL;
-    else process.env.AGENT_RUNTIME_URL = originalRuntimeUrl;
-  });
-  process.env.AGENT_RUNTIME_URL = "https://agent.example";
-  globalThis.fetch = async () => new Response(new ReadableStream<Uint8Array>({
-    cancel() {
-      cancelled = true;
-    },
-    pull(controller) {
-      const lines: string[] = [];
-      for (let index = 0; index < 25 && emitted < 1_000; index += 1) {
-        lines.push(JSON.stringify({
-          data: { value: emitted },
-          meta: { id: `evt_${emitted}` },
-          type: "action.input.partial",
-        }));
-        emitted += 1;
-      }
-      controller.enqueue(new TextEncoder().encode(`${lines.join("\n")}\n`));
-    },
-  }), { headers: { "x-eve-stream-tail-index": "999" } });
-
-  const events = await readEveAgentEvents(
-    "run-1",
-    "correlation-1",
-    "session-1",
-    "token",
-    0,
-    40,
-  );
-
-  assert.equal(events.length, 40);
-  assert.deepEqual(events.at(-1), {
-    data: { value: 39 },
-    meta: { id: "evt_39" },
-    type: "action.input.partial",
-  });
-  assert.equal(cancelled, true);
-  assert.ok(emitted < 1_000, "the reader should not drain the entire durable tail");
+test("bounded pages reject missing and incompatible stream versions", async (t) => {
+  setup(t);
+  for (const version of [undefined, "25"]) {
+    globalThis.fetch = async () => new Response("", { headers: version ? { "x-eve-stream-version": version } : {} });
+    await assert.rejects(read(), /version/i);
+  }
 });
 
-test("rejects a bounded event page without a valid durable tail", async (t) => {
-  const originalFetch = globalThis.fetch;
-  const originalRuntimeUrl = process.env.AGENT_RUNTIME_URL;
-  let cancelled = false;
-  t.after(() => {
-    globalThis.fetch = originalFetch;
-    if (originalRuntimeUrl === undefined) delete process.env.AGENT_RUNTIME_URL;
-    else process.env.AGENT_RUNTIME_URL = originalRuntimeUrl;
-  });
-  process.env.AGENT_RUNTIME_URL = "https://agent.example";
-  globalThis.fetch = async () => new Response(new ReadableStream({
-    cancel() {
-      cancelled = true;
-    },
-  }));
-
-  await assert.rejects(
-    readEveAgentEvents("run-1", "correlation-1", "session-1", "token"),
-    /requires the server to report the x-eve-stream-tail-index header/,
-  );
-  assert.equal(cancelled, true);
+test("bounded pages reject a missing durable tail", async (t) => {
+  setup(t); globalThis.fetch = async () => new Response("", { headers: { "x-eve-stream-version": "27" } });
+  await assert.rejects(read(), /tail-index/);
 });
 
-test("reconnects a bounded event page until it reaches the declared durable tail", async (t) => {
-  const originalFetch = globalThis.fetch;
-  const originalRuntimeUrl = process.env.AGENT_RUNTIME_URL;
-  t.after(() => {
-    globalThis.fetch = originalFetch;
-    if (originalRuntimeUrl === undefined) delete process.env.AGENT_RUNTIME_URL;
-    else process.env.AGENT_RUNTIME_URL = originalRuntimeUrl;
-  });
-  process.env.AGENT_RUNTIME_URL = "https://agent.example";
-  let requestCount = 0;
+test("an exhausted source cursor returns an empty page", async (t) => {
+  setup(t); globalThis.fetch = async () => streamResponse([], 3);
+  assert.deepEqual(await read(4), []);
+});
+
+test("transient stream-open failures retry from the same source cursor", async (t) => {
+  setup(t); let calls = 0;
   globalThis.fetch = async (input) => {
-    const startIndex = Number(new URL(String(input)).searchParams.get("startIndex") ?? "0");
-    requestCount += 1;
-    const event = startIndex === 0
-      ? { data: {}, meta: { at: "2026-08-03T00:00:00.000Z", id: "evt_01KZ0000000000000000000001" }, type: "session.started" }
-      : { data: { wait: "next-user-message" }, meta: { at: "2026-08-03T00:00:01.000Z", id: "evt_01KZ0000000000000000000002" }, type: "session.waiting" };
-    return new Response(`${JSON.stringify(event)}\n`, { headers: { "x-eve-stream-tail-index": "1" } });
+    calls++; if (calls === 1) throw new TypeError("socket closed");
+    assert.equal(new URL(String(input)).searchParams.get("startIndex"), "4");
+    return streamResponse(line(4, { type: "session.started", data: {} }));
   };
-
-  const events = await readEveAgentEvents("run-1", "correlation-1", "session-1", "token");
-  assert.deepEqual(events.map((event) => event.type), ["session.started", "session.waiting"]);
-  assert.equal(requestCount, 2);
+  assert.equal((await read(4)).length, 1); assert.equal(calls, 2);
 });
 
-test("returns immediately when an exhausted cursor is at the durable tail", async (t) => {
-  const originalFetch = globalThis.fetch;
-  const originalRuntimeUrl = process.env.AGENT_RUNTIME_URL;
-  let cancelled = false;
-  t.after(() => {
-    globalThis.fetch = originalFetch;
-    if (originalRuntimeUrl === undefined) delete process.env.AGENT_RUNTIME_URL;
-    else process.env.AGENT_RUNTIME_URL = originalRuntimeUrl;
-  });
-  process.env.AGENT_RUNTIME_URL = "https://agent.example";
-  globalThis.fetch = async () => new Response(new ReadableStream({
-    cancel() {
-      cancelled = true;
-    },
-  }), { headers: { "x-eve-stream-tail-index": "0" } });
-
-  const events = await readEveAgentEvents("run-1", "correlation-1", "session-1", "token", 1);
-
-  assert.deepEqual(events, []);
-  assert.equal(cancelled, true);
-});
-
-test("retries transient Eve stream transport failures from the same cursor", async (t) => {
-  const originalFetch = globalThis.fetch;
-  const originalRuntimeUrl = process.env.AGENT_RUNTIME_URL;
-  t.after(() => {
-    globalThis.fetch = originalFetch;
-    if (originalRuntimeUrl === undefined) delete process.env.AGENT_RUNTIME_URL;
-    else process.env.AGENT_RUNTIME_URL = originalRuntimeUrl;
-  });
-  process.env.AGENT_RUNTIME_URL = "https://agent.example";
-  let calls = 0;
+test("a disconnected bounded stream reconnects at the next complete source line", async (t) => {
+  setup(t); let calls = 0;
   globalThis.fetch = async (input) => {
-    calls += 1;
-    if (calls === 1) throw new TypeError("socket closed");
-    assert.equal(new URL(String(input)).searchParams.get("startIndex"), "0");
-    return new Response(JSON.stringify({
-      data: {},
-      meta: { at: "2026-08-03T00:00:00.000Z", id: "evt_retry" },
-      type: "session.started",
-    }) + "\n", { headers: { "x-eve-stream-tail-index": "0" } });
+    calls++;
+    if (calls === 1) return new Response(wireLines(line(0, { type: "session.started", data: {} })).replace('{"$eve":"stream.ended"}\n', ""), { headers: { "x-eve-stream-version": "27", "x-eve-stream-tail-index": "1" } });
+    assert.equal(new URL(String(input)).searchParams.get("startIndex"), "1");
+    return streamResponse(line(1, { type: "session.ended", data: { outcome: "completed" } }));
   };
-
-  const events = await readEveAgentEvents("run-1", "correlation-1", "session-1", "token");
-  assert.equal(events.length, 1);
-  assert.equal(calls, 2);
+  assert.equal((await read()).length, 2); assert.equal(calls, 2);
 });

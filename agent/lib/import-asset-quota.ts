@@ -36,7 +36,7 @@ type SandboxImportInput = {
 
 // Eve serializes a durable session's turns, but keeping a process-local lock
 // also protects hosts that invoke tools concurrently in one sandbox handle.
-const locks = new Map<string, Promise<void>>();
+const locks = new WeakMap<SandboxSession, Promise<void>>();
 
 /** Materialize one asset while holding the session's import reservation lock. */
 export async function writeSandboxImport(
@@ -157,7 +157,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 async function withSandboxImportLock<T>(sandbox: SandboxSession, work: () => Promise<T>): Promise<T> {
-  const key = sandbox.id;
+  const key = sandbox;
   const previous = locks.get(key) ?? Promise.resolve();
   let release!: () => void;
   const current = new Promise<void>((resolve) => { release = resolve; });

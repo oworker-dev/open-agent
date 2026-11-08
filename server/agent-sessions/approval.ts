@@ -10,6 +10,9 @@ import {
   type AgentDatabaseConfig,
 } from "../data/agent-database.ts";
 
+type ApprovalResolution = "approve" | "reject" | "cancel" | "expire";
+type ApprovalEvent = { readonly type: string; readonly data?: unknown; readonly meta?: unknown; readonly scope?: unknown };
+
 export type AgentSessionApprovalStore = {
   get(requestId: string): Promise<AgentSessionApprovalRequest | undefined>;
   findByToolCall(sessionId: string, toolCallId: string): Promise<AgentSessionApprovalRequest | undefined>;
@@ -17,7 +20,7 @@ export type AgentSessionApprovalStore = {
   put(request: AgentSessionApprovalRequest): Promise<AgentSessionApprovalRequest>;
   resolve(
     requestId: string,
-    resolution: "approve" | "reject",
+    resolution: ApprovalResolution,
     resolvedAt?: string,
   ): Promise<AgentSessionApprovalRequest | undefined>;
 };
@@ -27,64 +30,71 @@ export type AgentSessionApprovalStore = {
  *
  * Eve streams are replayable and may be delivered more than once after a
  * reconnect. `put` is therefore deliberately idempotent and an already
- * resolved request is never downgraded by a replayed `input.requested` event.
+ * resolved request is never downgraded by a replayed `interaction.opened` event.
  */
 export async function syncAgentSessionApprovalsFromEvents(options: {
-  readonly events: readonly { readonly type: string; readonly data?: unknown; readonly meta?: unknown }[];
+  readonly events: readonly ApprovalEvent[];
+  /** A page can open an approval for a call recorded on an earlier source line. */
+  readonly readPriorEvents?: () => Promise<readonly ApprovalEvent[]>;
   readonly sessionId: string;
   readonly store: AgentSessionApprovalStore;
 }): Promise<readonly AgentSessionApprovalRequest[]> {
+  if (options.readPriorEvents) {
+    const knownCalls = new Set(options.events.flatMap((event) => event.type === "call.requested" && isRecord(event.data)
+      && typeof event.data.callId === "string" ? [event.data.callId] : []));
+    const missingCall = options.events.some((event) => event.type === "interaction.opened" && isRecord(event.data)
+      && isRecord(event.data.request) && event.data.request.kind === "approval" && isRecord(event.data.subject)
+      && typeof event.data.subject.callId === "string" && !knownCalls.has(event.data.subject.callId)
+      && !(isRecord(event.data.origin) && isRecord(event.data.origin.call)));
+    if (missingCall) return syncAgentSessionApprovalsFromEvents({ sessionId: options.sessionId, store: options.store,
+      events: [...await options.readPriorEvents(), ...options.events] });
+  }
   const byCall = new Map<string, AgentSessionApprovalRequest>(
     (await options.store.listPending(options.sessionId)).map((request) => [request.toolCallId, request]),
   );
+  async function resolveRequest(requestId: string, resolution: ApprovalResolution, at?: string) {
+    const current = await options.store.get(requestId);
+    if (!current || current.sessionId !== options.sessionId) return;
+    const resolved = await options.store.resolve(requestId, resolution, at);
+    if (resolved) byCall.set(resolved.toolCallId, resolved);
+  }
+  const calls = new Map<string, { name: string; input: AgentSessionApprovalRequest["input"] }>();
   for (const event of options.events) {
-    if (event.type === "input.requested") {
-      const data = isRecord(event.data) ? event.data : undefined;
-      if (!data || !Array.isArray(data.requests)) continue;
-      for (const request of data.requests) {
-        if (!isInputRequest(request)) continue;
-        if (request.kind !== "tool-approval") continue;
-        const projected: AgentSessionApprovalRequest = {
-          requestId: request.requestId,
-          sessionId: options.sessionId,
-          turnId: typeof data.turnId === "string" ? data.turnId : undefined,
-          toolCallId: request.action.callId,
-          toolName: request.action.toolName,
-          input: request.action.input,
-          status: "requested",
-          createdAt: metaAt(event.meta) ?? new Date().toISOString(),
-        };
-        const persisted = await options.store.put(projected);
-        byCall.set(projected.toolCallId, persisted);
-      }
-      continue;
-    }
-    if (event.type === "message.received") {
-      const data = isRecord(event.data) ? event.data : undefined;
-      const responses = data && Array.isArray(data.inputResponses) ? data.inputResponses : [];
-      for (const response of responses) {
-        if (!isRecord(response) || typeof response.requestId !== "string") continue;
-        const resolved = await options.store.resolve(
-          response.requestId,
-          response.optionId === "approve" ? "approve" : "reject",
-          metaAt(event.meta),
-        );
-        if (resolved) byCall.set(resolved.toolCallId, resolved);
-      }
-      continue;
-    }
-    if (event.type !== "action.result") continue;
     const data = isRecord(event.data) ? event.data : undefined;
-    const result = data?.result;
-    if (!isRecord(result) || result.kind !== "tool-result" || typeof result.callId !== "string") continue;
-    const current = byCall.get(result.callId) ?? await options.store.findByToolCall(options.sessionId, result.callId);
-    if (!current || current.status !== "requested") continue;
-    if (data?.status !== "rejected" && data?.status !== "completed" && data?.status !== "failed") continue;
-    // A tool may fail after it was approved; only an explicit rejected action
-    // means the user denied the approval.
-    const resolution = data.status === "rejected" ? "reject" : "approve";
-    const resolved = await options.store.resolve(current.requestId, resolution, metaAt(event.meta));
-    if (resolved) byCall.set(current.toolCallId, resolved);
+    if (!data) continue;
+    if (event.type === "call.requested" && typeof data.callId === "string" && isRecord(data.capability) && typeof data.capability.name === "string") {
+      calls.set(data.callId, { name: data.capability.name, input: isRecord(data.input) ? data.input as AgentSessionApprovalRequest["input"] : {} });
+    } else if (event.type === "interaction.opened" && typeof data.interactionId === "string" &&
+        isRecord(data.request) && data.request.kind === "approval" && isRecord(data.subject)) {
+      const origin = isRecord(data.origin) && isRecord(data.origin.call) ? data.origin.call : undefined;
+      const callId = origin?.callId ?? data.subject.callId;
+      if (typeof callId !== "string") continue;
+      const call = origin && typeof origin.name === "string"
+        ? { name: origin.name, input: isRecord(origin.input) ? origin.input as AgentSessionApprovalRequest["input"] : {} }
+        : calls.get(callId);
+      if (!call) continue;
+      const scope = "scope" in event && isRecord(event.scope) ? event.scope : undefined;
+      const projected: AgentSessionApprovalRequest = {
+        requestId: data.interactionId,
+        sessionId: options.sessionId,
+        ...(typeof scope?.turnId === "string" ? { turnId: scope.turnId } : {}),
+        toolCallId: callId, toolName: call.name, input: call.input,
+        status: "requested", createdAt: metaAt(event.meta) ?? new Date().toISOString(),
+      };
+      byCall.set(callId, await options.store.put(projected));
+    } else if (event.type === "interaction.settled" && typeof data.interactionId === "string") {
+      if (data.outcome === "accepted" || data.outcome === "declined") {
+        await resolveRequest(data.interactionId, data.outcome === "accepted" ? "approve" : "reject", metaAt(event.meta));
+      } else if (["withdrawn", "interrupted", "abandoned", "expired", "failed"].includes(String(data.outcome))) {
+        await resolveRequest(data.interactionId, data.outcome === "expired" ? "expire" : "cancel", metaAt(event.meta));
+      }
+    } else if (event.type === "call.settled" && typeof data.callId === "string") {
+      const current = byCall.get(data.callId) ?? await options.store.findByToolCall(options.sessionId, data.callId);
+      if (!current || current.status !== "requested") continue;
+      if (data.outcome !== "rejected" && data.outcome !== "completed" && data.outcome !== "failed") continue;
+      const resolved = await options.store.resolve(current.requestId, data.outcome === "rejected" ? "reject" : "approve", metaAt(event.meta));
+      if (resolved) byCall.set(resolved.toolCallId, resolved);
+    }
   }
   return await options.store.listPending(options.sessionId);
 }
@@ -120,8 +130,8 @@ export function createMemoryAgentSessionApprovalStore(): AgentSessionApprovalSto
       const current = records.get(requestId);
       if (!current) return undefined;
       if (current.status !== "requested") return current;
-      const status: AgentSessionApprovalStatus = resolution === "approve" ? "approved" : "rejected";
-      const resolved = { ...current, resolvedAt, selection: resolution, status };
+      const status: AgentSessionApprovalStatus = resolution === "approve" ? "approved" : resolution === "reject" ? "rejected" : resolution === "expire" ? "expired" : "cancelled";
+      const resolved = { ...current, resolvedAt, ...(resolution === "approve" || resolution === "reject" ? { selection: resolution } : {}), status };
       records.set(requestId, resolved);
       return resolved;
     },
@@ -206,7 +216,7 @@ function postgresApprovalStore(pool: Pool, table: string): AgentSessionApprovalS
       return persisted;
     },
     async resolve(requestId, resolution, resolvedAt = new Date().toISOString()) {
-      const status: AgentSessionApprovalStatus = resolution === "approve" ? "approved" : "rejected";
+      const status: AgentSessionApprovalStatus = resolution === "approve" ? "approved" : resolution === "reject" ? "rejected" : resolution === "expire" ? "expired" : "cancelled";
       const result = await pool.query<ApprovalRow>(
         `update ${table}
          set status = case when status = 'requested' then $2 else status end,
@@ -214,7 +224,7 @@ function postgresApprovalStore(pool: Pool, table: string): AgentSessionApprovalS
              resolved_at = case when status = 'requested' then $4 else resolved_at end
          where request_id = $1
          returning ${approvalColumns()}`,
-        [requestId, status, resolution, resolvedAt],
+        [requestId, status, resolution === "approve" || resolution === "reject" ? resolution : null, resolvedAt],
       );
       return result.rows[0] ? toApproval(result.rows[0]) : undefined;
     },
@@ -287,14 +297,4 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function metaAt(value: unknown): string | undefined {
   return isRecord(value) && typeof value.at === "string" ? value.at : undefined;
-}
-
-function isInputRequest(value: unknown): value is {
-  readonly action: { readonly callId: string; readonly input: Readonly<Record<string, import("@oworker/open-agent-contracts/agent-run").JsonValue>>; readonly toolName: string };
-  readonly kind: string;
-  readonly requestId: string;
-} {
-  if (!isRecord(value) || !isRecord(value.action)) return false;
-  return typeof value.requestId === "string" && typeof value.kind === "string" &&
-    typeof value.action.callId === "string" && typeof value.action.toolName === "string" && isRecord(value.action.input);
 }

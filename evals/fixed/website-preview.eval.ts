@@ -18,6 +18,6 @@ export default defineEval({
       count: 1,
     });
     t.messageIncludes("WEBSITE_PREVIEW_PUBLISHED");
-    t.noFailedActions();
+    t.noFailedCalls();
   },
 });

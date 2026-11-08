@@ -9,20 +9,12 @@ import {
   type ThreadMessage,
   type ThreadMessageLike,
   type ThreadUserMessagePart,
-  type ToolApprovalOption,
   type ToolCallMessagePart,
 } from "@assistant-ui/react";
-import type {
-  EveAuthorizationOutcome,
-  EveAuthorizationPart,
-  EveDynamicToolPart,
-  EveMessage,
-  EveMessageData,
-  EveMessageInputRequest,
-  EveMessagePart,
-} from "eve/react";
 import type { ClientSession } from "eve/client";
+import type { EveMessage, EveMessagePart, EveToolPart } from "eve/react";
 import { parseAssetPrompt } from "@oworker/open-agent-contracts/asset";
+import { isLocallyInterruptedMessage } from "./turn-presentation.js";
 
 type ConvertOptions = {
   readonly assetUrl?: (assetId: string) => string;
@@ -35,11 +27,12 @@ const RUNNING = { type: "running" } satisfies MessageStatus;
 const CANCELLED = { reason: "cancelled", type: "incomplete" } satisfies MessageStatus;
 const USER_COMPLETE = { reason: "unknown", type: "complete" } satisfies MessageStatus;
 
+/** Convert the projection supplied by Eve v27 to assistant-ui's message shape. */
 export function convertEveMessages(
-  data: EveMessageData,
+  messages: readonly EveMessage[],
   options: ConvertOptions = {},
 ): ThreadMessage[] {
-  return data.messages.map((message, index, messages) =>
+  return messages.map((message, index) =>
     convertEveMessage(message, index, messages, options));
 }
 
@@ -86,117 +79,80 @@ function messageStatus(
   options: ConvertOptions,
 ): MessageStatus {
   if (message.role !== "assistant") return USER_COMPLETE;
+  if (isLocallyInterruptedMessage(message)) return CANCELLED;
   const isLast = index === messages.length - 1;
   if (message.parts.some((part) =>
-    part.type === "dynamic-tool" && part.state === "approval-requested")) {
+    part.type === "tool" && part.interaction?.status === "open")) {
     return { reason: "tool-calls", type: "requires-action" };
   }
-  const requiresAuthorization = message.metadata?.status === "streaming" &&
-    (!isLast || options.error === undefined) &&
-    message.parts.some((part) => part.type === "authorization" && part.state === "required");
-  if (requiresAuthorization) return { reason: "interrupt", type: "requires-action" };
+  if (message.parts.some((part) =>
+    part.type === "interaction" && part.status === "open")) {
+    return { reason: "interrupt", type: "requires-action" };
+  }
   if (message.metadata?.status === "failed") return { reason: "error", type: "incomplete" };
   if (isLast && options.isRunning) return RUNNING;
   if (message.metadata?.status === "streaming") {
     if (options.isRunning === undefined) return RUNNING;
-    if (isLast && options.error !== undefined) {
-      return { reason: "error", type: "incomplete" };
-    }
+    if (isLast && options.error !== undefined) return { reason: "error", type: "incomplete" };
     return CANCELLED;
   }
   return COMPLETE;
 }
 
-function assistantPart(part: EveMessagePart, assetUrl?: (assetId: string) => string): ThreadAssistantMessagePart | DataMessagePart<AuthorizationData> | null {
+function assistantPart(
+  part: EveMessagePart,
+  assetUrl?: (assetId: string) => string,
+): ThreadAssistantMessagePart | null {
   if (part.type === "text" || part.type === "reasoning") {
     return { text: part.text, type: part.type };
   }
-  if (part.type === "dynamic-tool") return dynamicToolPart(part);
-  if (part.type === "authorization") return authorizationPart(part);
+  if (part.type === "tool") return toolPart(part);
   if (part.type === "file") return filePart(part, assetUrl);
+  if (part.type === "interaction") {
+    return {
+      data: {
+        interactionId: part.interactionId,
+        kind: part.request.kind,
+        outcome: part.outcome,
+        prompt: part.request.prompt,
+        status: part.status,
+      },
+      name: "interaction",
+      type: "data",
+    };
+  }
   return null;
 }
 
-function dynamicToolPart(part: EveDynamicToolPart): ToolCallMessagePart {
-  const approval = toolApproval(part);
+function toolPart(part: EveToolPart): ToolCallMessagePart {
   const base: ToolCallMessagePart = {
-    ...(approval ? { approval } : {}),
     args: jsonObject(part.input),
-    argsText: part.inputText ?? safeStringify(part.input),
-    toolCallId: part.toolCallId,
-    toolName: part.toolName,
+    argsText: part.state === "streaming"
+      ? part.inputText
+      : safeStringify(part.input),
+    toolCallId: part.callId,
+    toolName: part.name,
     type: "tool-call",
   };
-  if (part.state === "output-available") return { ...base, result: part.output };
-  if (part.state === "output-error") {
-    return { ...base, isError: true, result: { error: part.errorText } };
+  if (part.state === "streaming") return base;
+  if (part.state === "completed") return { ...base, result: part.output };
+  if (part.state === "failed" || part.state === "rejected" || part.state === "cancelled") {
+    return {
+      ...base,
+      isError: true,
+      result: { error: part.error?.message ?? part.state },
+    };
   }
-  if (part.state === "output-denied") {
-    return { ...base, isError: true, result: { error: part.approval?.reason ?? "Tool approval denied" } };
+  if (part.interaction?.status === "open") {
+    return { ...base, approval: { id: part.interaction.interactionId } };
   }
   return base;
 }
 
-function toolApproval(part: EveDynamicToolPart): ToolCallMessagePart["approval"] | undefined {
-  if (!("approval" in part) || !part.approval) return undefined;
-  const options = approvalOptions(part.toolMetadata?.eve?.inputRequest);
-  return {
-    ...(part.approval.approved === undefined ? {} : { approved: part.approval.approved }),
-    ...(part.approval.isAutomatic === undefined ? {} : { isAutomatic: part.approval.isAutomatic }),
-    ...(options ? { options } : {}),
-    ...(part.approval.reason ? { reason: part.approval.reason } : {}),
-    id: part.approval.id,
-  };
-}
-
-function approvalOptions(request: EveMessageInputRequest | undefined): readonly ToolApprovalOption[] | undefined {
-  if (!request?.options?.length) return undefined;
-  return request.options.map((option) => ({
-    ...(option.description ? { description: option.description } : {}),
-    ...(option.label ? { label: option.label } : {}),
-    id: option.id,
-    kind: option.id === "approve"
-      ? "allow-once"
-      : option.id === "deny"
-        ? "reject-once"
-        : `_${option.id}`,
-  }));
-}
-
-type AuthorizationData = {
-  readonly description?: string;
-  readonly displayName?: string;
-  readonly expiresAt?: string;
-  readonly instructions?: string;
-  readonly name: string;
-  readonly outcome?: EveAuthorizationOutcome;
-  readonly reason?: string;
-  readonly state: EveAuthorizationPart["state"];
-  readonly url?: string;
-  readonly userCode?: string;
-};
-
-function authorizationPart(part: EveAuthorizationPart): DataMessagePart<AuthorizationData> {
-  const url = part.authorization?.url;
-  return {
-    data: {
-      ...(part.description ? { description: part.description } : {}),
-      ...(part.displayName ? { displayName: part.displayName } : {}),
-      ...(part.authorization?.expiresAt ? { expiresAt: part.authorization.expiresAt } : {}),
-      ...(part.authorization?.instructions ? { instructions: part.authorization.instructions } : {}),
-      ...(part.outcome ? { outcome: part.outcome } : {}),
-      ...(part.reason ? { reason: part.reason } : {}),
-      ...(url && /^https?:\/\//u.test(url) ? { url } : {}),
-      ...(part.authorization?.userCode ? { userCode: part.authorization.userCode } : {}),
-      name: part.name,
-      state: part.state,
-    },
-    name: "authorization",
-    type: "data",
-  };
-}
-
-function filePart(part: Extract<EveMessagePart, { type: "file" }>, assetUrl?: (assetId: string) => string): FileMessagePart | null {
+function filePart(
+  part: Extract<EveMessagePart, { type: "file" }>,
+  assetUrl?: (assetId: string) => string,
+): FileMessagePart | null {
   if (!part.url) return null;
   const assetId = part.url.startsWith("asset://") ? part.url.slice("asset://".length) : undefined;
   const url = assetId ? assetUrl?.(assetId) ?? `/api/assets/${encodeURIComponent(assetId)}` : part.url;
@@ -251,7 +207,7 @@ export function getEveMessageContent(message: AppendMessage): Parameters<ClientS
     ...message.content,
     ...(message.attachments?.flatMap((attachment) => attachment.content) ?? []),
   ];
-  const parts: Exclude<Parameters<ClientSession["send"]>[0], string> = [];
+  const parts: Array<Exclude<Parameters<ClientSession["send"]>[0], string>[number]> = [];
   for (const part of content) {
     if (part.type === "text") {
       parts.push({ text: part.text, type: "text" });
@@ -262,7 +218,8 @@ export function getEveMessageContent(message: AppendMessage): Parameters<ClientS
       continue;
     }
     if (part.type === "image") {
-      parts.push({ data: part.image, ...(part.filename ? { filename: part.filename } : {}), mediaType: "image/*", type: "file" });
+      const image = typeof part.image === "string" ? part.image : String(part.image);
+      parts.push({ data: image, ...(part.filename ? { filename: part.filename } : {}), mediaType: "image/*", type: "file" });
     }
   }
   return parts.length === 1 && parts[0]?.type === "text" ? parts[0].text : parts;

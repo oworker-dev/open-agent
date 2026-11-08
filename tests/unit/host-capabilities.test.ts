@@ -221,9 +221,6 @@ function sessionContext(agentRunPolicy?: string): SessionContext {
     getSandbox: async () => {
       throw new Error("not used");
     },
-    getSkill: () => {
-      throw new Error("not used");
-    },
   };
 }
 

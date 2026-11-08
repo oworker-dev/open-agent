@@ -32,12 +32,6 @@ export interface AgentSession {
 export interface AgentSessionClient {
     session(cursor?: AgentSessionCursor): AgentSession;
 }
-/**
- * Default interactive-session adapter for Eve 0.56.x.
- *
- * The returned surface contains no Eve classes or event types. Hosts persist
- * the AgentSession cursor and can replace this adapter without changing UI
- * ownership or thread storage.
- */
+/** Host-neutral adapter over Eve's ID-addressed v27 session and delivery API. */
 export declare function createEveAgentSessionClient(options: AgentSessionClientOptions): AgentSessionClient;
 //# sourceMappingURL=eve-session-client.d.ts.map

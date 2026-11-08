@@ -46,6 +46,7 @@ function itemResponse(item: AgentMailboxItem, setCookie?: string): Response {
     {
       item: {
         clientMessageId: item.clientMessageId,
+        ...(item.cancellationRequestedAt ? { cancellationRequested: true } : {}),
         itemId: item.itemId,
         ...(item.payload.operation?.expectedTurnId
           ? { expectedTurnId: item.payload.operation.expectedTurnId }

@@ -1,4 +1,4 @@
-import { defineDynamic, defineSkill, type DynamicResolveContext } from "eve/skills";
+import { defineDynamic, defineSkill, type DynamicContext } from "eve/skills";
 import {
   agentExtensionCatalogForConfig,
   resolveAgentRunPolicy,
@@ -15,7 +15,7 @@ const SOFTWARE_TASK = {
 } as const;
 const extensionStore = createPostgresAgentExtensionStoreFromEnvironment();
 
-async function resolvePublishedSkills(ctx: DynamicResolveContext) {
+async function resolvePublishedSkills(ctx: DynamicContext) {
   const attributes = ctx.session.auth.current?.attributes;
   const config = readAgentRuntimeConfig(ctx);
   const policy = resolveAgentRunPolicy(
@@ -35,11 +35,10 @@ async function resolvePublishedSkills(ctx: DynamicResolveContext) {
   );
   const tenantId = attributes?.tenantId;
   if (extensionStore && typeof tenantId === "string" && tenantId.trim()) {
-    await extensionStore.assertPolicyAllowed(
-      tenantId,
-      policy,
-      agentExtensionCatalogForConfig(config),
-    );
+    await ctx.memo(["policy", ctx.turn?.id ?? null, tenantId, policy], async () => {
+      await extensionStore.assertPolicyAllowed(tenantId, policy, agentExtensionCatalogForConfig(config));
+      return true;
+    });
   }
   const skills = policy.skills ?? [];
   const resolved = Object.fromEntries(
@@ -52,7 +51,7 @@ async function resolvePublishedSkills(ctx: DynamicResolveContext) {
         return [["software-task", defineSkill({
           description:
             "Use when implementing, debugging, reviewing, or validating a software change in the workspace.",
-          markdown:
+          content:
             "Inspect the repository instructions and current state before editing. Preserve unrelated changes. Prefer existing project patterns and small, coherent tests and run the narrowest useful validation first, then the broader project checks required by the risk. Report what changed, what was verified, and any remaining uncertainty.",
         })]];
       }
@@ -62,9 +61,4 @@ async function resolvePublishedSkills(ctx: DynamicResolveContext) {
   return Object.keys(resolved).length ? resolved : null;
 }
 
-export default defineDynamic({
-  events: {
-    "session.started": (_event, ctx) => resolvePublishedSkills(ctx),
-    "turn.started": (_event, ctx) => resolvePublishedSkills(ctx),
-  },
-});
+export default defineDynamic(resolvePublishedSkills);

@@ -1,4 +1,5 @@
 import { enqueueAgentMailboxHttpRequest } from "@/server/agent-mailbox/http";
+import { createEveAgentMailboxRuntime } from "@/server/agent-mailbox/eve-runtime";
 import { createPostgresAgentMailboxStoreFromEnvironment } from "@/server/data/agent-mailbox-store";
 import {
   cancelAgentSession,
@@ -64,6 +65,14 @@ export async function GET(request: Request, context: RouteContext): Promise<Resp
           events: result.events,
           sessionId,
           store: approvalStore,
+          ...(after > 0 ? { readPriorEvents: async () => {
+            const events = [];
+            for await (const event of createEveAgentMailboxRuntime().readTranscript!({ sessionId, startIndex: 0 })) {
+              if (event.meta.position.line >= after) break;
+              events.push(event);
+            }
+            return events;
+          } } : {}),
         })
       : undefined;
     return Response.json(
@@ -152,6 +161,7 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
     method: "POST",
   });
   return await enqueueAgentMailboxHttpRequest({
+    callerAuth: authenticated.sessionAuth,
     owner: authenticated.identity,
     ...(ownershipStore ? { ownershipStore } : {}),
     request: forwarded,

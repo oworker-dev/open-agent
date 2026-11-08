@@ -5,7 +5,7 @@ export type AgentSessionConnection = {
   readonly auth?: AgentWorkspaceClientConfig["auth"];
   readonly client: Client;
   readonly headers: HeadersValue;
-  readonly host: string;
+  readonly baseUrl: string;
   readonly initialSession?: ClientSessionState;
 };
 
@@ -23,11 +23,11 @@ export function createAgentSession(
       "x-agent-reasoning": currentPreferences.reasoning,
     };
   };
-  const host = config?.host ?? "";
+  const baseUrl = config?.host ?? "";
   const client = new Client({
     auth: config?.auth,
+    baseUrl,
     headers,
-    host,
     redirect: config?.redirect,
   });
   const initialSession = state?.sessionId
@@ -37,7 +37,7 @@ export function createAgentSession(
     ...(config?.auth ? { auth: config.auth } : {}),
     client,
     headers,
-    host,
+    baseUrl,
     ...(initialSession ? { initialSession } : {}),
   };
 }

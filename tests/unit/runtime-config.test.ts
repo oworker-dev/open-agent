@@ -21,11 +21,9 @@ test("standalone defaults match the Codex GPT-5.6 context policy", () => {
 });
 
 test("standalone session budgets are independent from the model context window", () => {
-  assert.deepEqual(runtimeDefinitionLimits(DEFAULT_AGENT_RUNTIME_CONFIG), {
-    maxInputTokensPerSession: false,
-    maxOutputTokensPerSession: false,
-    sessionTimeoutMs: false,
-  });
+  const limits = runtimeDefinitionLimits(DEFAULT_AGENT_RUNTIME_CONFIG);
+  assert.equal(limits.sessionTimeoutMs, false);
+  assert.equal(limits.sessionUsage!({ total: usage(90_000_000, 90_000_000), window: usage(90_000_000, 90_000_000) }), false);
 });
 
 test("host snapshots can explicitly uncap lifetime token budgets", () => {
@@ -33,11 +31,9 @@ test("host snapshots can explicitly uncap lifetime token budgets", () => {
     ...DEFAULT_AGENT_RUNTIME_CONFIG,
     limits: { maxInputTokens: false, maxOutputTokens: false },
   });
-  assert.deepEqual(runtimeDefinitionLimits(config), {
-    maxInputTokensPerSession: false,
-    maxOutputTokensPerSession: false,
-    sessionTimeoutMs: false,
-  });
+  const limits = runtimeDefinitionLimits(config);
+  assert.equal(limits.sessionTimeoutMs, false);
+  assert.equal(limits.sessionUsage!({ total: usage(90_000_000, 90_000_000), window: usage(90_000_000, 90_000_000) }), false);
 });
 
 test("numeric host lifetime budgets remain available for billing policies", () => {
@@ -45,12 +41,18 @@ test("numeric host lifetime budgets remain available for billing policies", () =
     ...DEFAULT_AGENT_RUNTIME_CONFIG,
     limits: { maxInputTokens: 2_000_000, maxOutputTokens: 200_000 },
   });
-  assert.deepEqual(runtimeDefinitionLimits(config), {
-    maxInputTokensPerSession: 2_000_000,
-    maxOutputTokensPerSession: 200_000,
-    sessionTimeoutMs: false,
-  });
+  const limits = runtimeDefinitionLimits(config);
+  const exceeds = (input: number, output: number) => limits.sessionUsage!({ total: usage(input, output), window: usage(input, output) });
+  assert.equal(limits.sessionTimeoutMs, false);
+  assert.equal(exceeds(1_999_999, 199_999), false);
+  assert.equal(exceeds(2_000_000, 0), true);
+  assert.equal(exceeds(0, 200_000), true);
+  assert.equal(limits.sessionUsage!({ total: usage(4_000_000, 400_000), window: usage(1, 1) }), false);
 });
+
+function usage(inputTokens: number, outputTokens: number) {
+  return { inputTokens, outputTokens, cacheReadTokens: 0, cacheWriteTokens: 0 };
+}
 
 test("accepts a credential-free host runtime snapshot and projects its UI catalog", () => {
   const config = parseAgentRuntimeConfigSnapshot({
@@ -234,7 +236,7 @@ test("converts a host Skill package to Eve's native package shape", () => {
     },
   });
   assert.equal(published.description, "Research procedure");
-  assert.equal(published.markdown, "Use the checklist.");
+  assert.equal(published.content, "Use the checklist.");
   assert.equal(published.files?.["references/checklist.md"], "# Checklist");
   assert.ok(published.files?.["assets/icon.bin"] instanceof Uint8Array);
   assert.deepEqual(

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import type { MessageStreamEvent } from "eve/client";
+import type { SessionStreamEvent } from "eve/client";
 import {
   AgentThreadStorageConflictError,
   createHttpAgentThreadStorage,
@@ -36,10 +36,10 @@ test("persists a loaded collection and advances its optimistic revision", async 
 test("an in-flight save snapshots its event baseline before the live buffer grows", async () => {
   type PatchBody = {
     readonly eventAppends?: readonly {
-      readonly events: readonly MessageStreamEvent[];
+      readonly events: readonly SessionStreamEvent[];
       readonly threadId: string;
     }[];
-    readonly upsertThreads?: readonly { readonly events: readonly MessageStreamEvent[] }[];
+    readonly upsertThreads?: readonly { readonly events: readonly SessionStreamEvent[] }[];
   };
   const patches: PatchBody[] = [];
   let releaseFirstSave: (() => void) | undefined;
@@ -70,7 +70,7 @@ test("an in-flight save snapshots its event baseline before the live buffer grow
   });
 
   await storage.load("workspace-live-buffer");
-  const events: MessageStreamEvent[] = [];
+  const events: SessionStreamEvent[] = [];
   const thread = { ...createAgentThread(100, "Live buffer"), events };
   const collection = {
     activeThreadId: thread.id,
@@ -81,17 +81,17 @@ test("an in-flight save snapshots its event baseline before the live buffer grow
   const firstSave = storage.save("workspace-live-buffer", collection);
   await firstSaveStarted;
   events.push({
-    data: { sequence: 0, stepIndex: 0, turnId: "turn-live" },
-    meta: { at: new Date(0).toISOString() },
-    type: "step.started",
-  } as MessageStreamEvent);
+    data: { runId: "live-run", modelId: "test", attempt: 0 },
+    meta: { at: new Date(0).toISOString(), position: { line: 0, index: 0 } },
+    type: "model.started",
+  } as SessionStreamEvent);
   releaseFirstSave?.();
   await firstSave;
   await storage.save("workspace-live-buffer", collection);
 
   assert.deepEqual(patches[0]?.upsertThreads?.[0]?.events, []);
   assert.equal(patches[1]?.eventAppends?.[0]?.events.length, 1);
-  assert.equal(patches[1]?.eventAppends?.[0]?.events[0]?.type, "step.started");
+  assert.equal(patches[1]?.eventAppends?.[0]?.events[0]?.type, "model.started");
 });
 
 test("surfaces a conflict instead of overwriting another client", async () => {
@@ -258,7 +258,7 @@ test("loads transcript windows with an absolute before cursor", async () => {
         revision: 3,
         thread: {
           ...thread,
-          events: [{ type: "step.started", data: {}, meta: { id: "evt-8", at: new Date(0).toISOString() } }],
+          events: [{ type: "session.started", data: {}, meta: { position: { line: 8, index: 0 }, at: new Date(0).toISOString() } }],
         },
       });
     }) as typeof fetch,
@@ -274,10 +274,10 @@ test("loads transcript windows with an absolute before cursor", async () => {
 });
 
 test("an unchanged index refresh retains loaded event baselines", async () => {
-  const event = (id: string): MessageStreamEvent => ({
-    data: { sequence: 0, stepIndex: 0, turnId: id },
-    meta: { at: new Date(0).toISOString(), id },
-    type: "step.started",
+  const event = (id: string): SessionStreamEvent => ({
+    data: { runId: id, modelId: "test", attempt: 0 },
+    meta: { at: new Date(0).toISOString(), position: { line: 0, index: 0 } },
+    type: "model.started",
   });
   const first = {
     ...createAgentThread(100, "First"),
@@ -293,7 +293,7 @@ test("an unchanged index refresh retains loaded event baselines", async () => {
   };
   let revision = 1;
   let savedPatch: {
-    readonly eventAppends?: readonly { readonly events: readonly MessageStreamEvent[]; readonly threadId: string }[];
+    readonly eventAppends?: readonly { readonly events: readonly SessionStreamEvent[]; readonly threadId: string }[];
   } | undefined;
   const storage = createHttpAgentThreadStorage({
     fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -336,22 +336,14 @@ test("an unchanged index refresh retains loaded event baselines", async () => {
   assert.deepEqual(savedPatch?.eventAppends, []);
 });
 
-test("maps cumulative replacements from a bounded window to absolute event indexes", async () => {
+test("appends native tool deltas from a bounded transcript window", async () => {
   const thread = {
     ...createAgentThread(100, "Windowed replacement"),
     events: [{
-      data: {
-        callId: "call-1",
-        input: "old",
-        inputTextDelta: "old",
-        inputTextSoFar: "old",
-        sequence: 0,
-        stepIndex: 0,
-        toolName: "apply_patch",
-        turnId: "turn-1",
-      },
-      meta: { at: new Date(0).toISOString(), id: "partial-1" },
-      type: "action.input.partial" as const,
+      data: { callId: "call-1", delta: "old", name: "apply_patch", kind: "tool" as const },
+      scope: { turnId: "turn-1", runId: "run-1" },
+      meta: { at: new Date(0).toISOString(), position: { line: 8, index: 0 } },
+      type: "call.input" as const,
     }],
     session: { sessionId: "session-1", streamIndex: 9 },
     transcriptWindow: { endIndex: 9, hasMoreBefore: true, startIndex: 8, total: 20 },
@@ -383,16 +375,16 @@ test("maps cumulative replacements from a bounded window to absolute event index
     activeThreadId: thread.id,
     threads: [{
       ...thread,
-      events: [{
+      events: [...thread.events, {
         ...thread.events[0]!,
-        data: { ...thread.events[0]!.data, input: "new" },
-        meta: { ...thread.events[0]!.meta, id: "partial-2" },
+        data: { ...thread.events[0]!.data, delta: "new" },
+        meta: { ...thread.events[0]!.meta, position: { line: 9, index: 0 } },
       }],
     }],
     version: AGENT_THREAD_STORAGE_VERSION,
   });
 
-  assert.equal(patch?.eventAppends?.[0]?.replaceFrom, 8);
+  assert.equal(patch?.eventAppends?.[0]?.replaceFrom, undefined);
   assert.equal(Object.prototype.hasOwnProperty.call(patch?.upsertThreads?.[0] ?? {}, "transcriptWindow"), false);
 });
 
@@ -406,9 +398,9 @@ test("a server transcript repair advances the revision used by the next metadata
   const repaired = {
     ...thread,
     events: [{
-      data: { wait: "next-user-message" },
-      meta: { at: new Date(0).toISOString(), id: "evt-repaired" },
-      type: "session.waiting" as const,
+      data: { turnId: "turn-repaired", outcome: "completed" as const },
+      meta: { at: new Date(0).toISOString(), position: { line: 12802, index: 0 } },
+      type: "turn.settled" as const,
     }],
     hydration: undefined,
     transcriptCoverage: { complete: true, endIndex: 12_803, startIndex: 0, version: 1 as const },
@@ -485,15 +477,16 @@ test("does not replace durable events with a shorter reconnect snapshot", async 
   });
   const initial = await storage.load("workspace-stale-reconnect");
   const firstEvent = {
-    data: { message: "request", parts: [{ text: "request", type: "text" }], sequence: 0, turnId: "turn-0" },
-    meta: { at: new Date(0).toISOString(), id: "event-request" },
-    type: "message.received" as const,
-  } satisfies MessageStreamEvent;
+    data: { deliveryId: "request", parts: [{ text: "request", kind: "text" as const }], turnId: "turn-0" },
+    meta: { at: new Date(0).toISOString(), position: { line: 0, index: 0 } },
+    type: "delivery.consumed" as const,
+  } satisfies SessionStreamEvent;
   const secondEvent = {
-    data: { messageDelta: "answer", messageSoFar: "answer", sequence: 0, stepIndex: 0, turnId: "turn-0" },
-    meta: { at: new Date(1).toISOString(), id: "event-answer" },
-    type: "message.appended" as const,
-  } satisfies MessageStreamEvent;
+    data: { partId: "answer", kind: "text" as const, delta: "answer" },
+    scope: { turnId: "turn-0", runId: "run-0" },
+    meta: { at: new Date(1).toISOString(), position: { line: 1, index: 0 } },
+    type: "content.delta" as const,
+  } satisfies SessionStreamEvent;
   const thread = {
     ...createAgentThread(100, "Stale reconnect"),
     events: [firstEvent, secondEvent],
@@ -524,15 +517,16 @@ test("does not treat a reordered snapshot as an append or replacement delta", as
   });
   const initial = await storage.load("workspace-reordered-reconnect");
   const makeEvent = (id: string, message: string) => ({
-    data: { messageDelta: message, messageSoFar: message, sequence: 0, stepIndex: 0, turnId: "turn-0" },
-    meta: { at: new Date(0).toISOString(), id },
-    type: "message.appended" as const,
+    data: { partId: id, kind: "text" as const, delta: message },
+    scope: { turnId: "turn-0", runId: "run-0" },
+    meta: { at: new Date(0).toISOString(), position: { line: 0, index: 0 } },
+    type: "content.delta" as const,
   });
   const first = makeEvent("event-first", "first");
   const second = {
-    data: { sequence: 0, stepIndex: 1, turnId: "turn-0" },
-    meta: { at: new Date(1).toISOString(), id: "event-second" },
-    type: "step.started" as const,
+    data: { runId: "run-1", modelId: "test", attempt: 0 },
+    meta: { at: new Date(1).toISOString(), position: { line: 1, index: 0 } },
+    type: "model.started" as const,
   };
   const thread = { ...createAgentThread(100, "Reordered"), events: [first, second] };
   await storage.save("workspace-reordered-reconnect", {
@@ -559,14 +553,14 @@ test("appends unseen events from a reordered reconnect snapshot instead of dropp
     getAccessToken: () => "test-token",
   });
   const initial = await storage.load("workspace-unseen-reconnect");
-  const event = (id: string, type: "step.started" | "message.appended") => ({
-    data: { messageDelta: id, messageSoFar: id, sequence: 0, stepIndex: 0, turnId: "turn-0" },
-    meta: { at: new Date(0).toISOString(), id },
-    type,
-  } as MessageStreamEvent);
-  const first = event("event-first", "message.appended");
-  const second = event("event-second", "step.started");
-  const third = event("event-third", "message.appended");
+  const event = (id: string, line: number): SessionStreamEvent => ({
+    type: "content.delta", scope: { turnId: "turn-0", runId: "run-0" },
+    data: { partId: "answer", kind: "text", delta: id },
+    meta: { at: new Date(0).toISOString(), position: { line, index: 0 } },
+  });
+  const first = event("event-first", 0);
+  const second = event("event-second", 1);
+  const third = event("event-third", 2);
   const thread = { ...createAgentThread(100, "Unseen reconnect"), events: [first, second, third] };
   await storage.save("workspace-unseen-reconnect", {
     ...initial,
@@ -576,20 +570,20 @@ test("appends unseen events from a reordered reconnect snapshot instead of dropp
 
   await storage.save("workspace-unseen-reconnect", {
     activeThreadId: thread.id,
-    threads: [{ ...thread, events: [event("event-new", "step.started"), third, first], updatedAt: 200 }],
+    threads: [{ ...thread, events: [event("event-new", 3), third, first], updatedAt: 200 }],
     version: AGENT_THREAD_STORAGE_VERSION,
   });
 
   const patch = server.lastPatch();
   assert.equal(patch?.eventAppends?.length, 1);
-  assert.equal(patch?.eventAppends?.[0]?.events[0]?.meta.id, "event-new");
+  assert.equal(patch?.eventAppends?.[0]?.events[0]?.meta.position.line, 3);
 });
 
 function fakeThreadServer() {
   let revision = 0;
   let collection: AgentThreadCollection = { threads: [], version: AGENT_THREAD_STORAGE_VERSION };
   let lastPatch: {
-    readonly eventAppends?: readonly { readonly events: readonly MessageStreamEvent[]; readonly threadId: string }[];
+    readonly eventAppends?: readonly { readonly events: readonly SessionStreamEvent[]; readonly threadId: string }[];
     readonly upsertThreads?: readonly ReturnType<typeof createAgentThread>[];
   } | undefined;
 
