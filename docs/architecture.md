@@ -85,7 +85,7 @@ competing stream readers.
 Eve remains the source of truth for normal conversation history and automatic
 compaction. The browser adds a recovery checkpoint only because Eve excludes an
 unsettled cancelled turn from the next model history. That checkpoint follows
-the same budget shape as Codex: the default GPT-5.6 model window is 272k tokens,
+the same budget shape: the default GPT-6.1 Sol model window is 1.05m tokens,
 automatic compaction starts at 90%, recent recovery context is capped at 20k
 approximate tokens, and one tool observation at 10k. Smaller Host models scale
 the recovery allowance down with their declared context window. Tool reducers
@@ -361,9 +361,11 @@ history must never become the source of truth.
 Model catalog, credentials, context windows, pricing, and availability must move
 to a host-controlled model registry. The standalone kernel should consume a
 validated model capability descriptor rather than import Muses administration
-code. The standalone fallback catalog mirrors Codex's current GPT-5.6 Sol and
-Terra context specification (272k); an authenticated Host snapshot can replace
-that catalog for a Provider with different limits.
+code. The standalone fallback catalog includes the generally available GPT-6
+API models and retains the GPT-5.6 options. GPT-6.1 Sol is the default with its
+documented 1.05m context window; an authenticated Host snapshot can replace the
+catalog for a Provider with different limits. GPT-6-Cyber requires approved
+organization access and remains Host-configured.
 
 ## Sandbox boundary
 

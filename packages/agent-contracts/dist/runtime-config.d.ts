@@ -1,6 +1,6 @@
 import type { AgentExtensionRef, AgentRunLimits, JsonValue } from "./agent-run.js";
 export declare const AGENT_RUNTIME_CONFIG_CONTRACT_VERSION: "0.1.0";
-export declare const AGENT_REASONING_LEVELS: readonly ["low", "medium", "high", "xhigh"];
+export declare const AGENT_REASONING_LEVELS: readonly ["none", "low", "medium", "high", "xhigh", "max"];
 export type AgentReasoningLevel = (typeof AGENT_REASONING_LEVELS)[number];
 export type AgentRuntimeModel = {
     readonly id: string;

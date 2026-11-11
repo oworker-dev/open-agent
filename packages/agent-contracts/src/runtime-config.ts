@@ -2,7 +2,7 @@ import type { AgentExtensionRef, AgentRunLimits, JsonValue } from "./agent-run.j
 
 export const AGENT_RUNTIME_CONFIG_CONTRACT_VERSION = "0.1.0" as const;
 
-export const AGENT_REASONING_LEVELS = ["low", "medium", "high", "xhigh"] as const;
+export const AGENT_REASONING_LEVELS = ["none", "low", "medium", "high", "xhigh", "max"] as const;
 
 export type AgentReasoningLevel = (typeof AGENT_REASONING_LEVELS)[number];
 

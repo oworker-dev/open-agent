@@ -86,8 +86,10 @@ export interface AgentWorkspaceMailbox {
 }
 export type AgentModelOption = {
     readonly contextWindowTokens: number;
+    readonly defaultReasoning?: string;
     readonly id: string;
     readonly label: string;
+    readonly reasoningLevels?: readonly string[];
 };
 export type AgentPromptMenuItem = {
     readonly description?: string;

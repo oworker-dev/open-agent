@@ -55,6 +55,36 @@ test("wide workspace supports navigation, search, settings, and a single draft s
   await page.screenshot({ fullPage: true, path: "/tmp/open-agent-wide.png" });
 });
 
+test("model picker exposes only the selected GPT-6 model's reasoning levels", async ({ page }) => {
+  await page.setViewportSize({ height: 844, width: 390 });
+  await page.goto("/");
+  const picker = page.getByRole("combobox", { name: "Model" });
+  await expect(picker).toContainText("GPT-6.1 Sol");
+  await picker.click();
+
+  const dialog = page.getByRole("dialog");
+  const effort = dialog.getByRole("radiogroup", { name: "Reasoning" });
+  await expect(effort.getByRole("radio", { name: "Max" })).toBeVisible();
+  await expect(effort.getByRole("radio", { name: "None" })).toHaveCount(0);
+
+  await dialog.locator('[data-slot="model-selector-item"]').filter({ hasText: "GPT-6 Luna" }).click();
+  await picker.click();
+  await expect(effort.getByRole("radio", { name: "None" })).toBeVisible();
+  await expect(effort.getByRole("radio", { name: "Max" })).toBeVisible();
+  const dialogBox = await dialog.boundingBox();
+  const effortBox = await effort.boundingBox();
+  expect(dialogBox?.x).toBeGreaterThanOrEqual(0);
+  expect((dialogBox?.x ?? 0) + (dialogBox?.width ?? 0)).toBeLessThanOrEqual(390);
+  expect(effortBox?.x).toBeGreaterThanOrEqual(dialogBox?.x ?? 0);
+  expect((effortBox?.x ?? 0) + (effortBox?.width ?? 0)).toBeLessThanOrEqual((dialogBox?.x ?? 0) + (dialogBox?.width ?? 0));
+  await effort.getByRole("radio", { name: "None" }).click();
+
+  await dialog.locator('[data-slot="model-selector-item"]').filter({ hasText: "GPT-6.1 Sol" }).click();
+  await picker.click();
+  await expect(effort.getByRole("radio", { name: "None" })).toHaveCount(0);
+  await expect(effort.getByRole("radio", { name: "High", exact: true })).toHaveAttribute("data-state", "checked");
+});
+
 test("root stays clean and an unsent draft survives refresh", async ({ page }) => {
   await page.goto("/");
   const composer = page.getByRole("textbox", { name: "Do anything" });

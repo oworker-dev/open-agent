@@ -1744,7 +1744,25 @@ function validateWorkspaceCatalog(models, reasoningLevels, defaults) {
     if (reasoningLevels.length === 0 || reasoningLevels.some((level) => !level.trim())) {
         throw new Error("AgentWorkspace requires at least one reasoning level.");
     }
-    if (!models.some((model) => model.id === defaults.modelId) || !reasoningLevels.includes(defaults.reasoning)) {
+    for (const model of models) {
+        if (model.reasoningLevels !== undefined) {
+            if (model.reasoningLevels.length === 0 || model.reasoningLevels.some((level) => !level.trim())) {
+                throw new Error(`AgentWorkspace model ${model.id} requires valid reasoning levels.`);
+            }
+            if (model.reasoningLevels.some((level) => !reasoningLevels.includes(level))) {
+                throw new Error(`AgentWorkspace model ${model.id} has reasoning levels outside the shared catalog.`);
+            }
+            if (model.defaultReasoning !== undefined && !model.reasoningLevels.includes(model.defaultReasoning)) {
+                throw new Error(`AgentWorkspace model ${model.id} has an unsupported default reasoning level.`);
+            }
+        }
+        else if (model.defaultReasoning !== undefined) {
+            throw new Error(`AgentWorkspace model ${model.id} cannot default reasoning without a model-level catalog.`);
+        }
+    }
+    const defaultModel = models.find((model) => model.id === defaults.modelId);
+    const defaultModelLevels = defaultModel?.reasoningLevels ?? reasoningLevels;
+    if (!defaultModel || !reasoningLevels.includes(defaults.reasoning) || !defaultModelLevels.includes(defaults.reasoning)) {
         throw new Error("AgentWorkspace defaults must exist in the injected model and reasoning catalogs.");
     }
 }
@@ -1752,9 +1770,17 @@ function normalizeThreadPreferences(thread, models, reasoningLevels, defaults) {
     const modelId = models.some((model) => model.id === thread.preferences.modelId)
         ? thread.preferences.modelId
         : defaults.modelId;
-    const reasoning = reasoningLevels.includes(thread.preferences.reasoning)
+    const selectedModel = models.find((model) => model.id === modelId);
+    const supportedLevels = selectedModel?.reasoningLevels ?? reasoningLevels;
+    const fallbackReasoning = selectedModel?.defaultReasoning &&
+        supportedLevels.includes(selectedModel.defaultReasoning)
+        ? selectedModel.defaultReasoning
+        : supportedLevels.includes(defaults.reasoning)
+            ? defaults.reasoning
+            : supportedLevels[0];
+    const reasoning = supportedLevels.includes(thread.preferences.reasoning)
         ? thread.preferences.reasoning
-        : defaults.reasoning;
+        : fallbackReasoning;
     const executionMode = thread.preferences.executionMode ?? defaults.executionMode;
     return modelId === thread.preferences.modelId && reasoning === thread.preferences.reasoning && executionMode === thread.preferences.executionMode
         ? thread

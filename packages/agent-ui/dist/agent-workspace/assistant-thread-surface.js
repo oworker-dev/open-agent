@@ -305,7 +305,10 @@ export function AssistantComposer({ approvalTakeover, cancellationState, command
     });
     const model = models.find((candidate) => candidate.id === preferences.modelId) ?? models[0];
     const selectorModels = useMemo(() => models.map((candidate) => ({
-        efforts: reasoningLevels.map((level) => ({ id: level, name: formatReasoningLevel(level, locale) })),
+        efforts: (candidate.reasoningLevels ?? reasoningLevels).map((level) => ({
+            id: level,
+            name: formatReasoningLevel(level, locale),
+        })),
         id: candidate.id,
         name: candidate.label,
     })), [models, reasoningLevels]);
@@ -352,7 +355,14 @@ export function AssistantComposer({ approvalTakeover, cancellationState, command
                                         event.preventDefault();
                                         aui.composer.send();
                                         blurComposerOnTouch(composerInputRef);
-                                    }, className: "aui-composer-input relative max-h-40 min-h-12 w-full resize-none overflow-y-auto bg-transparent px-2 py-1 text-[15px] leading-6 outline-none aria-disabled:pointer-events-none aria-disabled:opacity-50 [&_.aui-directive-chip]:inline-flex [&_.aui-directive-chip]:items-center [&_.aui-directive-chip]:gap-1 [&_.aui-directive-chip]:rounded-md [&_.aui-directive-chip]:bg-muted [&_.aui-directive-chip]:px-1.5 [&_.aui-directive-chip]:py-0.5 [&_.aui-directive-chip]:text-[13px] [&_.aui-directive-chip]:font-medium [&_.aui-directive-chip]:text-foreground [&_.aui-directive-chip-icon]:text-muted-foreground [&_.aui-lexical-input]:min-h-6 [&_.aui-lexical-input]:outline-none [&_.aui-lexical-placeholder]:pointer-events-none [&_.aui-lexical-placeholder]:absolute [&_.aui-lexical-placeholder]:inset-x-0 [&_.aui-lexical-placeholder]:top-0 [&_.aui-lexical-placeholder]:truncate [&_.aui-lexical-placeholder]:px-2 [&_.aui-lexical-placeholder]:py-1 [&_.aui-lexical-placeholder]:text-muted-foreground" }), _jsxs("div", { className: "flex min-h-9 items-center gap-0.5 sm:min-h-8 sm:gap-1", children: [_jsx(ComposerPrimitive.AddAttachment, { asChild: true, children: _jsx(Button, { "aria-label": messages.addFiles, className: "size-9 rounded-full text-muted-foreground sm:size-8", size: "icon-sm", type: "button", variant: "ghost", children: _jsx(PlusIcon, { className: "size-4" }) }) }), _jsx(ExecutionModeMenu, { messages: messages, onChange: (executionMode) => onPreferencesChange({ ...preferences, executionMode }), value: preferences.executionMode ?? "standard" }), _jsx(ModelSelector, { align: "start", className: "h-9 min-w-0 max-w-48 rounded-full px-2 text-muted-foreground sm:h-8 sm:max-w-64", contentClassName: "w-72 max-w-[calc(100vw-1.5rem)] text-xs", effort: preferences.reasoning, effortLabel: messages.reasoning, models: selectorModels, onEffortChange: (reasoning) => onPreferencesChange({ ...preferences, reasoning }), onValueChange: (modelId) => onPreferencesChange({ ...preferences, modelId }), searchable: models.length > 6, size: "sm", value: model?.id ?? preferences.modelId, valueClassName: "text-xs font-normal", variant: "ghost", triggerLabel: messages.model }), _jsxs("span", { className: "ml-auto flex min-w-0 items-center gap-0.5 sm:gap-1", children: [model ? (_jsx(ContextDisplay.Ring, { className: "h-9 shrink-0 rounded-full px-1.5 sm:h-8", label: messages.context, labels: contextLabels, modelContextWindow: model.contextWindowTokens, side: "top", sessionUsage: sessionUsage, usage: contextUsage })) : null, _jsx(Button, { "aria-hidden": !((stopping || runtimeBusy) && composerIsEmpty), "aria-label": cancellationState === "idle" ? messages.cancel : messages.stopping, className: cn("size-9 shrink-0 rounded-full sm:size-8", !((stopping || runtimeBusy) && composerIsEmpty) && "hidden"), disabled: cancellationState !== "idle" || !((stopping || runtimeBusy) && composerIsEmpty), onClick: () => onCancel?.(), size: "icon-sm", tabIndex: (stopping || runtimeBusy) && composerIsEmpty ? 0 : -1, type: "button", children: cancellationState === "idle" ? (_jsx(SquareIcon, { className: "size-3.5 fill-current" })) : (_jsx(LoaderCircleIcon, { className: "size-4 animate-spin" })) }), _jsx(Button, { "aria-hidden": (stopping || runtimeBusy) && composerIsEmpty, "aria-label": runtimeBusy && !stopping ? messages.queueFollowUp : messages.send, className: cn("size-9 shrink-0 rounded-full sm:size-8", ((stopping || runtimeBusy) && composerIsEmpty) && "hidden"), disabled: composerDisabled || ((stopping || runtimeBusy) && composerIsEmpty), onClick: () => {
+                                    }, className: "aui-composer-input relative max-h-40 min-h-12 w-full resize-none overflow-y-auto bg-transparent px-2 py-1 text-[15px] leading-6 outline-none aria-disabled:pointer-events-none aria-disabled:opacity-50 [&_.aui-directive-chip]:inline-flex [&_.aui-directive-chip]:items-center [&_.aui-directive-chip]:gap-1 [&_.aui-directive-chip]:rounded-md [&_.aui-directive-chip]:bg-muted [&_.aui-directive-chip]:px-1.5 [&_.aui-directive-chip]:py-0.5 [&_.aui-directive-chip]:text-[13px] [&_.aui-directive-chip]:font-medium [&_.aui-directive-chip]:text-foreground [&_.aui-directive-chip-icon]:text-muted-foreground [&_.aui-lexical-input]:min-h-6 [&_.aui-lexical-input]:outline-none [&_.aui-lexical-placeholder]:pointer-events-none [&_.aui-lexical-placeholder]:absolute [&_.aui-lexical-placeholder]:inset-x-0 [&_.aui-lexical-placeholder]:top-0 [&_.aui-lexical-placeholder]:truncate [&_.aui-lexical-placeholder]:px-2 [&_.aui-lexical-placeholder]:py-1 [&_.aui-lexical-placeholder]:text-muted-foreground" }), _jsxs("div", { className: "flex min-h-9 items-center gap-0.5 sm:min-h-8 sm:gap-1", children: [_jsx(ComposerPrimitive.AddAttachment, { asChild: true, children: _jsx(Button, { "aria-label": messages.addFiles, className: "size-9 rounded-full text-muted-foreground sm:size-8", size: "icon-sm", type: "button", variant: "ghost", children: _jsx(PlusIcon, { className: "size-4" }) }) }), _jsx(ExecutionModeMenu, { messages: messages, onChange: (executionMode) => onPreferencesChange({ ...preferences, executionMode }), value: preferences.executionMode ?? "standard" }), _jsx(ModelSelector, { align: "start", className: "h-9 min-w-0 max-w-48 rounded-full px-2 text-muted-foreground sm:h-8 sm:max-w-64", contentClassName: "w-72 max-w-[calc(100vw-1.5rem)] text-xs", effort: preferences.reasoning, effortLabel: messages.reasoning, models: selectorModels, onEffortChange: (reasoning) => onPreferencesChange({ ...preferences, reasoning }), onValueChange: (modelId) => {
+                                                const selectedModel = models.find((candidate) => candidate.id === modelId);
+                                                const supportedLevels = selectedModel?.reasoningLevels;
+                                                const reasoning = supportedLevels && !supportedLevels.includes(preferences.reasoning)
+                                                    ? selectedModel.defaultReasoning ?? supportedLevels[0] ?? preferences.reasoning
+                                                    : preferences.reasoning;
+                                                onPreferencesChange({ ...preferences, modelId, reasoning });
+                                            }, searchable: models.length > 6, size: "sm", value: model?.id ?? preferences.modelId, valueClassName: "text-xs font-normal", variant: "ghost", triggerLabel: messages.model }), _jsxs("span", { className: "ml-auto flex min-w-0 items-center gap-0.5 sm:gap-1", children: [model ? (_jsx(ContextDisplay.Ring, { className: "h-9 shrink-0 rounded-full px-1.5 sm:h-8", label: messages.context, labels: contextLabels, modelContextWindow: model.contextWindowTokens, side: "top", sessionUsage: sessionUsage, usage: contextUsage })) : null, _jsx(Button, { "aria-hidden": !((stopping || runtimeBusy) && composerIsEmpty), "aria-label": cancellationState === "idle" ? messages.cancel : messages.stopping, className: cn("size-9 shrink-0 rounded-full sm:size-8", !((stopping || runtimeBusy) && composerIsEmpty) && "hidden"), disabled: cancellationState !== "idle" || !((stopping || runtimeBusy) && composerIsEmpty), onClick: () => onCancel?.(), size: "icon-sm", tabIndex: (stopping || runtimeBusy) && composerIsEmpty ? 0 : -1, type: "button", children: cancellationState === "idle" ? (_jsx(SquareIcon, { className: "size-3.5 fill-current" })) : (_jsx(LoaderCircleIcon, { className: "size-4 animate-spin" })) }), _jsx(Button, { "aria-hidden": (stopping || runtimeBusy) && composerIsEmpty, "aria-label": runtimeBusy && !stopping ? messages.queueFollowUp : messages.send, className: cn("size-9 shrink-0 rounded-full sm:size-8", ((stopping || runtimeBusy) && composerIsEmpty) && "hidden"), disabled: composerDisabled || ((stopping || runtimeBusy) && composerIsEmpty), onClick: () => {
                                                         aui.composer.send();
                                                         blurComposerOnTouch(composerInputRef);
                                                     }, size: "icon-sm", tabIndex: (stopping || runtimeBusy) && composerIsEmpty ? -1 : 0, type: "button", children: _jsx(ArrowUpIcon, { className: "size-4" }) })] })] })] }))] }), _jsx(ComposerTriggerPopover, { char: "@", ...mention, emptyItemsLabel: messages.noPromptItems }), _jsx(ComposerTriggerPopover, { char: "/", ...command, emptyItemsLabel: messages.noPromptItems })] }) }));
@@ -455,6 +465,8 @@ function ExecutionModeMenu({ messages, onChange, value, }) {
 }
 function formatReasoningLevel(level, locale) {
     if (locale === "zh-CN") {
+        if (level === "none")
+            return "无";
         if (level === "low")
             return "低";
         if (level === "medium")
@@ -463,9 +475,15 @@ function formatReasoningLevel(level, locale) {
             return "高";
         if (level === "xhigh")
             return "极高";
+        if (level === "max")
+            return "最大";
     }
+    if (level === "none")
+        return "None";
     if (level === "xhigh")
         return "X high";
+    if (level === "max")
+        return "Max";
     if (level === "medium")
         return "Med";
     return level.charAt(0).toUpperCase() + level.slice(1);

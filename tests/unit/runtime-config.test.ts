@@ -11,13 +11,49 @@ import {
   readDeploymentAgentRuntimeConfig,
   runtimeDefinitionLimits,
 } from "../../lib/agent-runtime-config.ts";
+import { readAgentModelMaxOutputTokens } from "../../lib/agent-profile.ts";
 import { definePublishedSkill } from "../../agent/lib/published-skill.ts";
 import { createAgentUiConfig } from "../../lib/agent-ui-config.ts";
 
-test("standalone defaults match the Codex GPT-5.6 context policy", () => {
-  assert.equal(DEFAULT_AGENT_RUNTIME_CONFIG.models[0]?.contextWindowTokens, 272_000);
-  assert.equal(DEFAULT_AGENT_RUNTIME_CONFIG.models[1]?.contextWindowTokens, 272_000);
+test("standalone defaults expose the GPT-6 family and select GPT-6.1 Sol", () => {
+  assert.equal(DEFAULT_AGENT_RUNTIME_CONFIG.defaultModelId, "gpt-6.1-sol");
+  assert.equal(DEFAULT_AGENT_RUNTIME_CONFIG.models[0]?.contextWindowTokens, 1_050_000);
+  assert.equal(DEFAULT_AGENT_RUNTIME_CONFIG.models[0]?.maxOutputTokens, 128_000);
+  assert.deepEqual(
+    DEFAULT_AGENT_RUNTIME_CONFIG.models.map((model) => model.id),
+    [
+      "gpt-6.1-sol",
+      "gpt-6-astra",
+      "gpt-6.1-terra",
+      "gpt-6-luna",
+      "gpt-6-sol",
+      "gpt-5.6-sol",
+      "gpt-5.6-terra",
+    ],
+  );
+  assert.deepEqual(DEFAULT_AGENT_RUNTIME_CONFIG.models[0]?.reasoningLevels, ["low", "medium", "high", "xhigh", "max"]);
+  assert.deepEqual(DEFAULT_AGENT_RUNTIME_CONFIG.models[2]?.reasoningLevels, ["none", "low", "medium", "high", "xhigh", "max"]);
+  assert.equal(DEFAULT_AGENT_RUNTIME_CONFIG.models[5]?.contextWindowTokens, 272_000);
   assert.equal(DEFAULT_AGENT_RUNTIME_CONFIG.compaction.thresholdPercent, 0.9);
+});
+
+test("GPT-6 model options preserve model-specific reasoning capabilities", () => {
+  const ui = createAgentUiConfig();
+  assert.equal(ui.defaultPreferences.modelId, "gpt-6.1-sol");
+  assert.deepEqual(
+    ui.models.find((model) => model.id === "gpt-6.1-sol")?.reasoningLevels,
+    ["low", "medium", "high", "xhigh", "max"],
+  );
+  assert.deepEqual(
+    ui.models.find((model) => model.id === "gpt-6-luna")?.reasoningLevels,
+    ["none", "low", "medium", "high", "xhigh", "max"],
+  );
+  assert.deepEqual(ui.reasoningLevels, ["low", "medium", "high", "xhigh", "max", "none"]);
+});
+
+test("default model output budget stays bounded while the catalog records provider capability", () => {
+  assert.equal(readAgentModelMaxOutputTokens({}), 4_096);
+  assert.equal(readAgentModelMaxOutputTokens({ AGENT_MODEL_MAX_OUTPUT_TOKENS: "8192" }), 8_192);
 });
 
 test("standalone session budgets are independent from the model context window", () => {
@@ -72,7 +108,13 @@ test("accepts a credential-free host runtime snapshot and projects its UI catalo
     }],
   });
   const ui = createAgentUiConfig(config);
-  assert.deepEqual(ui.models, [{ id: "fast", label: "Fast", contextWindowTokens: 64_000 }]);
+  assert.deepEqual(ui.models, [{
+    id: "fast",
+    label: "Fast",
+    contextWindowTokens: 64_000,
+    defaultReasoning: "medium",
+    reasoningLevels: ["low", "medium"],
+  }]);
   assert.deepEqual(ui.defaultPreferences, { modelId: "fast", reasoning: "medium" });
   assert.deepEqual(ui.reasoningLevels, ["low", "medium"]);
 });

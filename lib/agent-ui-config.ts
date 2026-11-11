@@ -10,12 +10,21 @@ import {
 } from "./agent-runtime-config.ts";
 
 export function createAgentUiConfig(config: AgentRuntimeConfigSnapshot = DEFAULT_AGENT_RUNTIME_CONFIG) {
-  const modelOptions = config.models.map(({ contextWindowTokens, id, label }) => ({
+  const modelOptions = config.models.map(({
     contextWindowTokens,
+    defaultReasoning,
     id,
     label,
+    reasoningLevels,
+  }) => ({
+    contextWindowTokens,
+    defaultReasoning,
+    id,
+    label,
+    reasoningLevels,
   }));
   const defaultModel = findAgentRuntimeModel(config, config.defaultModelId) ?? config.models[0]!;
+  const reasoningLevels = [...new Set(config.models.flatMap((model) => model.reasoningLevels))];
   const skills = config.profile.allowedSkills.map((extension) => {
     const published = config.extensions?.find(
       (candidate) =>
@@ -31,7 +40,7 @@ export function createAgentUiConfig(config: AgentRuntimeConfigSnapshot = DEFAULT
   });
   return {
     models: modelOptions,
-    reasoningLevels: defaultModel.reasoningLevels,
+    reasoningLevels,
     defaultPreferences: {
       modelId: defaultModel.id,
       reasoning: defaultModel.defaultReasoning,

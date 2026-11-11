@@ -877,7 +877,10 @@ export function AssistantComposer({
   });
   const model = models.find((candidate) => candidate.id === preferences.modelId) ?? models[0];
   const selectorModels = useMemo<readonly ModelOption[]>(() => models.map((candidate) => ({
-    efforts: reasoningLevels.map((level) => ({ id: level, name: formatReasoningLevel(level, locale) })),
+    efforts: (candidate.reasoningLevels ?? reasoningLevels).map((level) => ({
+      id: level,
+      name: formatReasoningLevel(level, locale),
+    })),
     id: candidate.id,
     name: candidate.label,
   })), [models, reasoningLevels]);
@@ -966,7 +969,14 @@ export function AssistantComposer({
               effortLabel={messages.reasoning}
               models={selectorModels}
               onEffortChange={(reasoning) => onPreferencesChange({ ...preferences, reasoning })}
-              onValueChange={(modelId) => onPreferencesChange({ ...preferences, modelId })}
+              onValueChange={(modelId) => {
+                const selectedModel = models.find((candidate) => candidate.id === modelId);
+                const supportedLevels = selectedModel?.reasoningLevels;
+                const reasoning = supportedLevels && !supportedLevels.includes(preferences.reasoning)
+                  ? selectedModel.defaultReasoning ?? supportedLevels[0] ?? preferences.reasoning
+                  : preferences.reasoning;
+                onPreferencesChange({ ...preferences, modelId, reasoning });
+              }}
               searchable={models.length > 6}
               size="sm"
               value={model?.id ?? preferences.modelId}
@@ -1251,12 +1261,16 @@ function ExecutionModeMenu({
 
 function formatReasoningLevel(level: string, locale: AgentLocale): string {
   if (locale === "zh-CN") {
+    if (level === "none") return "无";
     if (level === "low") return "低";
     if (level === "medium") return "中";
     if (level === "high") return "高";
     if (level === "xhigh") return "极高";
+    if (level === "max") return "最大";
   }
+  if (level === "none") return "None";
   if (level === "xhigh") return "X high";
+  if (level === "max") return "Max";
   if (level === "medium") return "Med";
   return level.charAt(0).toUpperCase() + level.slice(1);
 }

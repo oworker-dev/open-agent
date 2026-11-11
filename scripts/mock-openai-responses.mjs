@@ -12,7 +12,7 @@ const server = http.createServer(async (request, response) => {
   if (request.method === "GET" && request.url === "/v1/models") {
     return sendJson(response, {
       object: "list",
-      data: [{ id: "gpt-5.6-sol", object: "model" }],
+      data: [{ id: "gpt-6.1-sol", object: "model" }],
     });
   }
   if (request.method === "GET" && request.url === "/debug/state") {
@@ -140,7 +140,7 @@ function sendInterruptedStream(response) {
     response: {
       id,
       created_at: Math.floor(Date.now() / 1000),
-      model: "gpt-5.6-sol",
+      model: "gpt-6.1-sol",
       service_tier: "default",
     },
   });
@@ -409,7 +409,7 @@ async function sendStream(response, planned) {
   const createdAt = Math.floor(Date.now() / 1000);
   emit(response, "response.created", {
     type: "response.created",
-    response: { id, created_at: createdAt, model: "gpt-5.6-sol", service_tier: "default" },
+    response: { id, created_at: createdAt, model: "gpt-6.1-sol", service_tier: "default" },
   });
   if (planned.kind === "tool") {
     const itemId = `item_${planned.callId}`;
@@ -491,7 +491,7 @@ function responseResult(planned, id = `resp_mock_${++responseSequence}`, created
     id,
     object: "response",
     created_at: createdAt,
-    model: "gpt-5.6-sol",
+    model: "gpt-6.1-sol",
     status: "completed",
     service_tier: "default",
     incomplete_details: null,

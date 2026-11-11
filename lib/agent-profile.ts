@@ -13,12 +13,15 @@ export const DEFAULT_CONTEXT_WINDOW_TOKENS =
   DEFAULT_AGENT_RUNTIME_CONFIG.models[0]!.contextWindowTokens;
 export const DEFAULT_MODEL_MAX_OUTPUT_TOKENS =
   DEFAULT_AGENT_RUNTIME_CONFIG.models[0]!.maxOutputTokens;
+const DEFAULT_AGENT_OUTPUT_BUDGET_TOKENS = 4_096;
 
 export function readAgentModelMaxOutputTokens(
   environment: Readonly<Record<string, string | undefined>> = process.env,
 ): number {
   const configured = environment.AGENT_MODEL_MAX_OUTPUT_TOKENS?.trim();
-  if (!configured) return DEFAULT_MODEL_MAX_OUTPUT_TOKENS;
+  if (!configured) {
+    return Math.min(DEFAULT_MODEL_MAX_OUTPUT_TOKENS, DEFAULT_AGENT_OUTPUT_BUDGET_TOKENS);
+  }
   const tokens = Number(configured);
   if (!Number.isInteger(tokens) || tokens < 256 || tokens > 128_000) {
     throw new Error(

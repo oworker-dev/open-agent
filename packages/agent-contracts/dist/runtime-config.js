@@ -1,5 +1,5 @@
 export const AGENT_RUNTIME_CONFIG_CONTRACT_VERSION = "0.1.0";
-export const AGENT_REASONING_LEVELS = ["low", "medium", "high", "xhigh"];
+export const AGENT_REASONING_LEVELS = ["none", "low", "medium", "high", "xhigh", "max"];
 export function parseAgentRuntimeConfigSnapshot(value) {
     if (!isRecord(value))
         throw invalid("must be an object");
