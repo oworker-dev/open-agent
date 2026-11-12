@@ -481,6 +481,50 @@ test("successive identical prompts stay distinct after acceptance and refresh", 
   await expect(page.getByText("Reply 2", { exact: true })).toHaveCount(1);
 });
 
+for (const freeform of [false, true]) test(`question cards submit ${freeform ? "free text" : "an option"} through the mailbox and survive refresh`, async ({ page }) => {
+  const f = fixtures.get(page)!;
+  const turnId = "question";
+  const answer: Record<string, string> = freeform ? { text: "Use plain text" } : { optionId: "Markdown" };
+  f.onSend = async (body) => {
+    await f.publish(startTurn(f.cursor, turnId, "question-delivery", String(body.message)));
+    await f.publish(line(f.cursor,
+      { type: "call.requested", scope: { turnId }, data: { callId: "ask-format", owner: { runId: `${turnId}:run` }, capability: { kind: "tool", name: "ask_question" }, input: { question: "Which output format should I use?" } } },
+      { type: "call.started", scope: { turnId }, data: { callId: "ask-format" } },
+      { type: "model.settled", scope: { turnId }, data: { runId: `${turnId}:run`, outcome: "completed", finishReason: "tool-calls" } },
+      { type: "interaction.opened", scope: { turnId }, data: { interactionId: "format", subject: { callId: "ask-format" }, request: { kind: "question", prompt: "Which output format should I use?", display: "select", allowFreeform: true, options: [{ id: "Markdown", label: "Markdown" }, { id: "JSON", label: "JSON" }] } } },
+      { type: "turn.paused", data: { turnId, awaiting: [{ interactionId: "format" }] } },
+    ));
+  };
+  f.onEdit = async (body) => {
+    expect(body.operationKind).toBe("respond");
+    expect(body.inputResponses).toEqual([{ interactionId: "format", ...answer }]);
+    f.mailboxStatus = "committed";
+    await f.publish(line(f.cursor,
+      { type: "interaction.settled", scope: { turnId }, data: { interactionId: "format", outcome: "accepted", response: answer } },
+      { type: "call.settled", scope: { turnId }, data: { callId: "ask-format", outcome: "completed", output: { status: "answered", answer: freeform ? answer.text : answer.optionId } } },
+      { type: "model.requested", scope: { turnId }, data: { runId: "after-question", owner: { turnId } } },
+      { type: "model.started", scope: { turnId }, data: { runId: "after-question", modelId: "test", attempt: 0 } },
+      { type: "content.completed", scope: { turnId }, data: { partId: "format-reply", runId: "after-question", kind: "text", phase: "reply", value: "Format confirmed" } },
+      { type: "model.settled", scope: { turnId }, data: { runId: "after-question", outcome: "completed", finishReason: "stop" } },
+      { type: "turn.settled", data: { turnId, outcome: "completed", reply: ["format-reply"] } },
+      { type: "delivery.settled", data: { deliveryId: "question-delivery", turnId, outcome: "handled" } },
+    ));
+  };
+  await page.goto("/");
+  await f.send("Help me choose an output format");
+  const card = page.locator('[data-input-request-kind="question"]');
+  await expect(card.getByRole("paragraph").filter({ hasText: "Which output format should I use?" })).toBeVisible();
+  if (freeform) await card.getByRole("textbox", { name: "Additional information" }).fill(answer.text!);
+  else await card.getByRole("radio", { name: "Markdown", exact: true }).check();
+  await card.getByRole("button", { name: "Confirm", exact: true }).click();
+  await expect(page.getByText("Format confirmed", { exact: true })).toBeVisible();
+  expect(f.edits).toHaveLength(1);
+  await expect.poll(() => f.collection.threads.some((thread) => thread.events.some((event) => event.type === "turn.settled"))).toBe(true);
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(page.getByText("Format confirmed", { exact: true })).toHaveCount(1);
+  await expect(page.getByRole("log").getByText("Help me choose an output format", { exact: true })).toHaveCount(1);
+});
+
 test("a paused approval can stop its exact turn without sending an approval decision", async ({ page }) => {
   const f = fixtures.get(page)!;
   const turnId = "approval-to-cancel";

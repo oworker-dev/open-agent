@@ -1,6 +1,6 @@
 "use client";
 import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-runtime";
-import { BracesIcon, CheckIcon, CheckCircleIcon, CircleAlertIcon, ChevronDownIcon, CircleStopIcon, CopyIcon, ExternalLinkIcon, FileIcon, ImageIcon, LoaderCircleIcon, NetworkIcon, SearchIcon, TerminalIcon, FileSearchIcon, ListChecksIcon, MessageCircleQuestionIcon, MonitorIcon, ShieldCheckIcon, WifiIcon, XCircleIcon, } from "lucide-react";
+import { BracesIcon, CheckIcon, CheckCircleIcon, CircleAlertIcon, ChevronDownIcon, CircleStopIcon, CopyIcon, ExternalLinkIcon, FileIcon, ImageIcon, LoaderCircleIcon, NetworkIcon, SearchIcon, TerminalIcon, FileSearchIcon, MessageCircleQuestionIcon, MonitorIcon, ShieldCheckIcon, WifiIcon, XCircleIcon, } from "lucide-react";
 import { createContext, useContext, useEffect, useRef, useState } from "react";
 import { contentPreviews, runs, signInEnding } from "eve/events";
 import { useScrollLock } from "@assistant-ui/react";
@@ -199,7 +199,7 @@ function ToolPart({ assetUrl, canRespond, closedInputRequestIds = EMPTY_CLOSED_I
         return _jsx(InputRequestCard, { canRespond: canRespond, closed: closedInputRequestIds.has(inputRequest.interactionId), events: events, locale: locale, onClose: onCloseInputRequest, onInputResponses: onInputResponses, part: part });
     }
     const running = !isToolTerminal(part);
-    const defaultOpen = isTodoTool(part) || part.state === "approval";
+    const defaultOpen = part.state === "approval";
     const Icon = toolIcon(part);
     const interrupted = isInterruptedToolPart(part);
     const cancellationPending = isCancellationPendingToolPart(part);
@@ -233,10 +233,6 @@ function KnownToolContent({ assetUrl, events, locale, onOpenSubagent, part, }) {
     }
     if (isViewImageTool(normalized)) {
         return _jsx(ViewImageToolContent, { assetUrl: assetUrl, input: input, locale: locale, output: output, running: !isToolTerminal(part) });
-    }
-    if (["todo", "todo_write", "update_plan"].includes(normalized)) {
-        const items = todoItems(input, output);
-        return (_jsxs("ol", { className: "space-y-1.5 text-sm", "data-tool-view": "tasks", children: [items.map((item, index) => (_jsxs("li", { className: "flex items-start gap-2", children: [_jsx("span", { className: cn("mt-1.5 size-2 shrink-0 rounded-full border", item.done && "border-foreground bg-foreground") }), _jsx("span", { className: cn("min-w-0", item.done && "text-muted-foreground line-through"), children: item.label })] }, `${item.label}:${index}`))), items.length === 0 ? _jsx("li", { className: "text-xs text-muted-foreground", children: localize(locale, "Preparing tasks...", "正在整理任务…") }) : null] }));
     }
     if (["glob", "find_files", "grep", "search_files", "web_search", "search_web", "search"].includes(normalized)) {
         const query = firstString(input, ["query", "pattern", "glob", "path"]);
@@ -378,8 +374,6 @@ function toolIcon(part) {
         return SearchIcon;
     if (["web_fetch", "fetch_url"].includes(normalized))
         return ExternalLinkIcon;
-    if (["todo", "todo_write", "update_plan"].includes(normalized))
-        return ListChecksIcon;
     if (["write_file", "edit_file", "apply_patch", "patch_file", "publish_artifact", "artifact_publish"].includes(normalized))
         return FileIcon;
     if (["record_checkpoint", "checkpoint"].includes(normalized))
@@ -398,9 +392,6 @@ function isViewImageTool(normalizedToolName) {
 }
 function isFileMutationTool(part) {
     return ["apply_patch", "patch_file", "write_file", "edit_file"].includes(normalizeToolName(part.name));
-}
-function isTodoTool(part) {
-    return ["todo", "todo_write", "update_plan"].includes(normalizeToolName(part.name));
 }
 function fileMutationSummary(part, events = []) {
     const patch = toolPatch(part, events);
@@ -783,31 +774,6 @@ function publishedDeliverableMeta(deliverable, locale) {
         : localize(locale, "Published artifact", "发布资产");
     const fileCount = deliverable.fileCount ? `${deliverable.fileCount} ${localize(locale, "files", "个文件")}` : undefined;
     return [kind, version, title, fileCount, deliverable.mediaType, formatBytes(deliverable.sizeBytes)].filter(Boolean).join(" · ");
-}
-function todoItems(inputValue, outputValue) {
-    const source = todoArray(inputValue) ?? todoArray(outputValue) ?? [];
-    return source.flatMap((item) => {
-        if (typeof item === "string")
-            return [{ done: false, label: item }];
-        const record = asRecord(item);
-        if (!record)
-            return [];
-        const label = firstString(record, ["content", "label", "title", "text", "task"]);
-        if (!label)
-            return [];
-        const status = firstString(record, ["status", "state"]);
-        const done = record.done === true || status === "completed" || status === "done";
-        return [{ done, label }];
-    });
-}
-function todoArray(value) {
-    if (Array.isArray(value))
-        return value;
-    const record = asRecord(value);
-    if (!record)
-        return undefined;
-    const candidate = record.todos ?? record.items ?? record.tasks ?? record.plan;
-    return Array.isArray(candidate) ? candidate : undefined;
 }
 function toolPatch(part, _events = []) {
     if (!["apply_patch", "patch_file"].includes(normalizeToolName(part.name)))
@@ -1276,8 +1242,6 @@ function toolTitle(locale, part, events = []) {
         const query = firstString(input, ["query", "pattern", "path"]);
         return [localize(locale, "Searched files", "搜索文件"), query].filter(Boolean).join(" ");
     }
-    if (["todo", "todo_write", "update_plan"].includes(normalized))
-        return localize(locale, "Updated tasks", "更新任务列表");
     if (["web_search", "search_web", "search"].includes(normalized))
         return localize(locale, "Searched the web", "搜索网页");
     if (["web_fetch", "fetch_url"].includes(normalized)) {

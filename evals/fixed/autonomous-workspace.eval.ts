@@ -6,7 +6,9 @@ export default defineEval({
   async test(t) {
     await t.send("EVAL_AUTONOMY_FILE complete the autonomous workspace task.");
     t.succeeded();
-    t.notCalledTool("load_skill");
+    t.eventsSatisfy("does not load a host-specific skill", (events) =>
+      !events.some((event) => event.type === "call.requested" && event.data.capability.kind === "skill"),
+    );
     t.toolOrder(["write_file", "bash", "read_file", "record_checkpoint"]);
     t.calledTool("write_file", {
       input: { filePath: "/workspace/autonomy.txt" },

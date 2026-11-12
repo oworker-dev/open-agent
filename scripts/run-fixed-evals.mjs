@@ -10,7 +10,8 @@ const environment = {
   ...process.env,
   AGENT_BASH_APPROVAL_MODE: "risky",
   AGENT_DATABASE_URL: "",
-  AGENT_EVAL_CONTEXT_WINDOW_TOKENS: "4096",
+  // Leave room for the current tool catalog before testing history compaction.
+  AGENT_EVAL_CONTEXT_WINDOW_TOKENS: "16384",
   AGENT_EVAL_FIXTURE_MODEL: "autonomy-v1",
   AGENT_HOST_JWT_AUDIENCE: "",
   AGENT_HOST_JWT_ISSUER: "",
@@ -22,6 +23,9 @@ const environment = {
   AGENT_PREVIEW_STORAGE_PATH: join(publicationRoot, "previews"),
   AGENT_PUBLIC_BASE_URL: "http://127.0.0.1:3000",
   AGENT_SANDBOX_BACKEND: process.env.FIXED_EVAL_SANDBOX_BACKEND?.trim() || "docker",
+  // Evals keep independent session sandboxes alive across sequential cases.
+  AGENT_SANDBOX_MAX_ACTIVE: "16",
+  AGENT_SANDBOX_IDLE_TIMEOUT_MS: "60000",
   AGENT_SANDBOX_IMAGE:
     process.env.FIXED_EVAL_SANDBOX_IMAGE?.trim() ||
     process.env.AGENT_SANDBOX_IMAGE?.trim() ||

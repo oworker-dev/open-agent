@@ -23,7 +23,6 @@ import {
   SearchIcon,
   TerminalIcon,
   FileSearchIcon,
-  ListChecksIcon,
   MessageCircleQuestionIcon,
   MonitorIcon,
   ShieldCheckIcon,
@@ -623,7 +622,7 @@ function ToolPart({
     return <InputRequestCard canRespond={canRespond} closed={closedInputRequestIds.has(inputRequest.interactionId)} events={events} locale={locale} onClose={onCloseInputRequest} onInputResponses={onInputResponses} part={part} />;
   }
   const running = !isToolTerminal(part);
-  const defaultOpen = isTodoTool(part) || part.state === "approval";
+  const defaultOpen = part.state === "approval";
   const Icon = toolIcon(part);
   const interrupted = isInterruptedToolPart(part);
   const cancellationPending = isCancellationPendingToolPart(part);
@@ -720,21 +719,6 @@ function KnownToolContent({
 
   if (isViewImageTool(normalized)) {
     return <ViewImageToolContent assetUrl={assetUrl} input={input} locale={locale} output={output} running={!isToolTerminal(part)} />;
-  }
-
-  if (["todo", "todo_write", "update_plan"].includes(normalized)) {
-    const items = todoItems(input, output);
-    return (
-      <ol className="space-y-1.5 text-sm" data-tool-view="tasks">
-        {items.map((item, index) => (
-          <li className="flex items-start gap-2" key={`${item.label}:${index}`}>
-            <span className={cn("mt-1.5 size-2 shrink-0 rounded-full border", item.done && "border-foreground bg-foreground")} />
-            <span className={cn("min-w-0", item.done && "text-muted-foreground line-through")}>{item.label}</span>
-          </li>
-        ))}
-        {items.length === 0 ? <li className="text-xs text-muted-foreground">{localize(locale, "Preparing tasks...", "正在整理任务…")}</li> : null}
-      </ol>
-    );
   }
 
   if (["glob", "find_files", "grep", "search_files", "web_search", "search_web", "search"].includes(normalized)) {
@@ -1023,7 +1007,6 @@ function toolIcon(part: EveToolPart): React.ComponentType<{ className?: string }
   if (["read_file", "read", "view_file", "glob", "find_files"].includes(normalized)) return FileSearchIcon;
   if (["grep", "search_files", "web_search", "search_web", "search"].includes(normalized)) return SearchIcon;
   if (["web_fetch", "fetch_url"].includes(normalized)) return ExternalLinkIcon;
-  if (["todo", "todo_write", "update_plan"].includes(normalized)) return ListChecksIcon;
   if (["write_file", "edit_file", "apply_patch", "patch_file", "publish_artifact", "artifact_publish"].includes(normalized)) return FileIcon;
   if (["record_checkpoint", "checkpoint"].includes(normalized)) return CheckCircleIcon;
   return BracesIcon;
@@ -1046,10 +1029,6 @@ function isFileMutationTool(part: EveToolPart): boolean {
   return ["apply_patch", "patch_file", "write_file", "edit_file"].includes(
     normalizeToolName(part.name),
   );
-}
-
-function isTodoTool(part: EveToolPart): boolean {
-  return ["todo", "todo_write", "update_plan"].includes(normalizeToolName(part.name));
 }
 
 type FileMutationSummary = {
@@ -1687,28 +1666,6 @@ function publishedDeliverableMeta(deliverable: AgentSessionDeliverable, locale: 
     : localize(locale, "Published artifact", "发布资产");
   const fileCount = deliverable.fileCount ? `${deliverable.fileCount} ${localize(locale, "files", "个文件")}` : undefined;
   return [kind, version, title, fileCount, deliverable.mediaType, formatBytes(deliverable.sizeBytes)].filter(Boolean).join(" · ");
-}
-
-function todoItems(inputValue: unknown, outputValue: unknown): readonly { readonly done: boolean; readonly label: string }[] {
-  const source = todoArray(inputValue) ?? todoArray(outputValue) ?? [];
-  return source.flatMap((item) => {
-    if (typeof item === "string") return [{ done: false, label: item }];
-    const record = asRecord(item);
-    if (!record) return [];
-    const label = firstString(record, ["content", "label", "title", "text", "task"]);
-    if (!label) return [];
-    const status = firstString(record, ["status", "state"]);
-    const done = record.done === true || status === "completed" || status === "done";
-    return [{ done, label }];
-  });
-}
-
-function todoArray(value: unknown): readonly unknown[] | undefined {
-  if (Array.isArray(value)) return value;
-  const record = asRecord(value);
-  if (!record) return undefined;
-  const candidate = record.todos ?? record.items ?? record.tasks ?? record.plan;
-  return Array.isArray(candidate) ? candidate : undefined;
 }
 
 function toolPatch(part: EveToolPart, _events: readonly SessionStreamEvent[] = []): string | undefined {
@@ -2561,7 +2518,6 @@ function toolTitle(
     const query = firstString(input, ["query", "pattern", "path"]);
     return [localize(locale, "Searched files", "搜索文件"), query].filter(Boolean).join(" ");
   }
-  if (["todo", "todo_write", "update_plan"].includes(normalized)) return localize(locale, "Updated tasks", "更新任务列表");
   if (["web_search", "search_web", "search"].includes(normalized)) return localize(locale, "Searched the web", "搜索网页");
   if (["web_fetch", "fetch_url"].includes(normalized)) {
     const url = firstString(input, ["url"]);

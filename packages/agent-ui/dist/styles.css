@@ -1720,9 +1720,6 @@
       border-color: color-mix(in oklab, var(--destructive, oklch(0.577 0.245 27.325)) 40%, transparent);
     }
   }
-  .border-foreground {
-    border-color: var(--foreground, oklch(0.16 0 0));
-  }
   .border-foreground\/30 {
     border-color: var(--foreground, oklch(0.16 0 0));
     @supports (color: color-mix(in lab, red, red)) {

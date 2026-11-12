@@ -8,7 +8,7 @@ export default defineEval({
     const first = await t.send("EVAL_CONTEXT_STORE remember the fixture value.");
     first.messageIncludes("CONTEXT_STORED");
 
-    const second = await t.send("EVAL_CONTEXT_RECALL read the remembered fixture value.");
+    const second = await first.session.send("EVAL_CONTEXT_RECALL read the remembered fixture value.");
     await t.require(second.sessionId, equals(first.sessionId));
     t.succeeded();
     t.toolOrder(["write_file", "read_file"]);

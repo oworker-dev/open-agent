@@ -28,7 +28,7 @@ for that topology.
 | Child sessions | Native durable snapshots, guarded navigation, shared AgentThreadView, child Composer, and bounded legacy-Eve fallback are implemented | Run host-scale lifecycle and fan-out evidence before public release |
 | Message edit/append | Main-session UI and mailbox paths exist | Formalize operation IDs, thread versions, idempotency, and child parity |
 | Approvals and ask | Eve pause/resume exists | Persist request lifecycle so refresh cannot reopen completed requests; Composer must become the active approval surface |
-| Tool streaming | Eve partial/result events exist for authored generators | Add typed deltas and custom UI for patch, terminal, todo, and image tools |
+| Tool streaming | Eve partial/result events exist for authored generators | Add typed deltas and custom UI for patch, terminal, and image tools |
 | Attachments | assistant-ui uploads immediately with real progress through a host-replaceable adapter; production S3 uses short-lived direct multipart PUT targets while filesystem development keeps bounded proxy parts; PostgreSQL stores ETags/metadata only and completion verifies size, identity, and streamed SHA-256 | Run the 100 MiB direct-upload gate against real PostgreSQL + selected S3/OSS with bucket CORS, Host JWT, scanner, quota, retention, and lifecycle evidence |
 | Result artifacts | Static preview and bounded artifact stores exist | Keep as output projection; do not use it for user uploads |
 | Vision | `view_image` validates signatures, bounds payloads, resizes oversized images, and emits typed file output | Verify provider capability negotiation and visual rendering across hosts |
@@ -211,7 +211,6 @@ than appending duplicate JSON. At minimum support:
 
 - patch paths, hunk text, added/deleted line counts, and status;
 - terminal command, live output tail, exit status, and duration;
-- todo/queue items as a read-only plan;
 - `view_image` asset metadata and preview;
 - final `action.result` that freezes the component.
 

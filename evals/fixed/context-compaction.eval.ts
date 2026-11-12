@@ -5,12 +5,12 @@ const FILLER = "context-evidence ".repeat(600);
 
 export default defineEval({
   description:
-    "Compacts a durable long-running session repeatedly without losing facts, todo state, sandbox state, or write safety.",
+    "Compacts a durable session repeatedly, preserving facts, sandbox state, and read evidence while rejecting stale writes.",
   tags: ["fixed", "compaction", "continuation", "sandbox"],
   timeoutMs: 60_000,
   async test(t) {
     const setup = await t.send(
-      "EVAL_COMPACTION_SETUP remember exact facts CERULEAN-47 and ORBIT-73, the active todo, and the workspace file.",
+      "EVAL_COMPACTION_SETUP remember exact facts CERULEAN-47 and ORBIT-73 and the workspace file.",
     );
     setup.messageIncludes("COMPACTION_SETUP_COMPLETED");
 
@@ -22,7 +22,7 @@ export default defineEval({
     }
 
     const mutation = await setup.session.send(
-      "EVAL_COMPACTION_MUTATE update the workspace fact only after satisfying write safety, then inspect the todo.",
+      "EVAL_COMPACTION_MUTATE update the workspace fact only after satisfying write safety.",
     );
     await t.require(mutation.sessionId, equals(setup.sessionId));
     mutation.messageIncludes("COMPACTION_MUTATION_COMPLETED");
@@ -34,7 +34,7 @@ export default defineEval({
     }
 
     const verified = await setup.session.send(
-      "EVAL_COMPACTION_VERIFY prove the checkpoint, active todo, and workspace facts survived.",
+      "EVAL_COMPACTION_VERIFY prove the checkpoint and workspace facts survived.",
     );
     await t.require(verified.sessionId, equals(setup.sessionId));
 
@@ -57,10 +57,9 @@ export default defineEval({
     t.calledTool("write_file", {
       input: { content: "CERULEAN-47 ORBIT-73 BETA-91\n" },
       status: "completed",
-      count: 1,
+      count: 2,
     });
-    t.calledTool("todo", { count: 3, status: "completed" });
-    t.messageIncludes("COMPACTION_VERIFIED CERULEAN-47 ORBIT-73 BETA-91 TODO_PRESERVED");
+    t.messageIncludes("COMPACTION_VERIFIED CERULEAN-47 ORBIT-73 BETA-91");
   },
 });
 

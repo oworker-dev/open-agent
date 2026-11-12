@@ -546,9 +546,17 @@ and billing. Browser headers and `clientContext` are untrusted input.
 
 ## Tools and fixed evals
 
-Eve supplies the general-purpose file, Shell, Web, todo, clarification,
-Skill, and subagent loop. Open Agent preserves those framework executors and
-overrides only the `bash` approval policy. `AGENT_BASH_APPROVAL_MODE=risky`
+Eve supplies the general-purpose file, Shell, Web, clarification,
+Skill, and subagent loop. Open Agent enables the official `ask_question`
+workflow by default, including option and free-text answers. Hosts can omit
+`ask_question` from their profile's `allowedTools` / `defaultTools`, or from an
+explicit run `policy.tools` selection. A disabled question is removed from the
+model request and rejected before its workflow starts, including indirect
+catalog calls. Omitting the tool selection keeps questions enabled; `tools: []`
+disables them. Tool approvals remain independent of the question tool.
+
+Open Agent preserves the framework executors and uses a `bash` approval policy.
+`AGENT_BASH_APPROVAL_MODE=risky`
 parks destructive, publishing, infrastructure-mutating, and external write
 commands for durable user approval. Unattended service/runtime principals are
 denied instead of approving themselves. Production rejects `never`.
@@ -575,9 +583,9 @@ continuity, repeated Eve context compaction, static website preview delivery,
 Python artifact delivery, and ImageMagick/FFmpeg media rendering. The standalone profile does not force a
 host-specific Skill; Skills are published and granted by the active runtime
 configuration. The compaction case preserves
-exact facts, active todo state, and sandbox contents across two checkpoints,
-and proves that Eve resets read-before-write evidence after summarization so an
-existing file must be read again before it can be changed. It uses
+exact facts and sandbox contents across two checkpoints,
+and verifies that read evidence survives summarization while a file changed
+since its last read must be read again before it can be overwritten. It uses
 `AGENT_EVAL_FIXTURE_MODEL` and a small
 `AGENT_EVAL_CONTEXT_WINDOW_TOKENS` only inside the runner;
 `doctor:production` rejects both test controls in production.

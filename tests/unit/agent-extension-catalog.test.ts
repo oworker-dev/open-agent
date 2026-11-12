@@ -11,6 +11,31 @@ import { parseStartAgentRun } from "../../server/agent-runs/input.ts";
 
 const profile = { profileId: "general-purpose", version: "0.1.0" } as const;
 const softwareTask = { id: "software-task", version: "1.0.0" } as const;
+
+test("removed Eve tools cannot be selected by a run policy", () => {
+  for (const name of ["todo", "load_skill"]) {
+    assert.throws(() => resolveAgentRunPolicy(profile, { tools: [name] }), /not compiled/);
+  }
+});
+
+test("hosts can exclude questions by profile or narrow them out of a run", () => {
+  const config = {
+    ...DEFAULT_AGENT_RUNTIME_CONFIG,
+    profile: {
+      ...DEFAULT_AGENT_RUNTIME_CONFIG.profile,
+      allowedTools: ["ask_question", "web_fetch"],
+      defaultTools: ["web_fetch"],
+    },
+  };
+  assert.deepEqual(resolveAgentRunPolicy(profile, {}, undefined, config).tools, ["web_fetch"]);
+  assert.deepEqual(resolveAgentRunPolicy(profile, { tools: ["ask_question"] }, undefined, config).tools, ["ask_question"]);
+  assert.deepEqual(resolveAgentRunPolicy(profile, { tools: [] }, undefined, config).tools, []);
+  assert.throws(() => resolveAgentRunPolicy(profile, { tools: ["ask_question"] }, undefined, {
+    ...config,
+    profile: { ...config.profile, allowedTools: ["web_fetch"] },
+  }), /not allowed/);
+});
+
 const softwareConfig = {
   ...DEFAULT_AGENT_RUNTIME_CONFIG,
   id: "software-host",

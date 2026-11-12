@@ -3,11 +3,13 @@ import { mockModel, type MockModelRequest } from "eve/evals";
 export const AUTONOMY_EVAL_FIXTURE = "autonomy-v1";
 
 export function createAutonomyEvalModel() {
-  return mockModel({
+  const model = mockModel({
     modelId: AUTONOMY_EVAL_FIXTURE,
     provider: "open-agent-eval",
     respond: respond,
   });
+  if (typeof model === "string") throw new Error("The eval fixture must be a model instance.");
+  return model;
 }
 
 function respond(request: MockModelRequest) {
@@ -19,6 +21,7 @@ function respond(request: MockModelRequest) {
   if (task.includes("EVAL_MEDIA_PROCESSING")) return mediaProcessing(request);
   if (task.includes("EVAL_FAILURE_RECOVERY")) return failureRecovery(request);
   if (task.includes("EVAL_APPROVAL")) return approval(request);
+  if (task.includes("EVAL_ASK")) return askQuestion(request, task);
   if (task.includes("EVAL_CANCEL")) {
     return tool("bash", { command: "sleep 30" }, "eval-cancel-bash");
   }
@@ -41,6 +44,7 @@ function latestEvalTask(request: MockModelRequest): string {
     "EVAL_MEDIA_PROCESSING",
     "EVAL_FAILURE_RECOVERY",
     "EVAL_APPROVAL",
+    "EVAL_ASK",
     "EVAL_CANCEL",
     "EVAL_CONTEXT_STORE",
     "EVAL_CONTEXT_RECALL",
@@ -76,7 +80,7 @@ function compactionCheckpoint(request: MockModelRequest) {
   return [
     hasPreviousCheckpoint ? "COMPACTION_CHECKPOINT_INCREMENTAL" : "COMPACTION_CHECKPOINT_INITIAL",
     ...facts,
-    "constraint=preserve exact facts, active todo, and read-before-write safety",
+    "constraint=preserve exact facts and reject stale file writes",
   ].join("; ");
 }
 
@@ -87,23 +91,28 @@ function compactionPrompt(request: MockModelRequest): string {
   ].join("\n");
 }
 
-function compactionSetup(request: MockModelRequest) {
-  if (!resultById(request, "eval-compaction-todo-set")) {
-    return tool("todo", {
-      todos: [
-        {
-          content: "Preserve CERULEAN-47 and ORBIT-73 across compaction",
-          priority: "high",
-          status: "completed",
-        },
-        {
-          content: "Verify compaction invariants",
-          priority: "high",
-          status: "in_progress",
-        },
-      ],
-    }, "eval-compaction-todo-set");
+function askQuestion(request: MockModelRequest, task: string) {
+  const result = resultById(request, "eval-question");
+  if (result) {
+    return result.isError
+      ? "ASK_DENIED_WITHOUT_INTERACTION"
+      : `ASK_COMPLETED ${JSON.stringify(result.output)}`;
   }
+  const offered = request.tools.some((tool) => tool.name === "ask_question");
+  if (task.includes("EVAL_ASK_DISABLED") && offered) return "ASK_UNEXPECTEDLY_ADVERTISED";
+  if (!task.includes("EVAL_ASK_DISABLED") && !offered) return "ASK_MISSING";
+  // Deliberately attempt an unadvertised call too: disabled sessions must
+  // reject it before the workflow opens an interaction.
+  return tool("ask_question", {
+    question: "Which output format should I use?",
+    options: [
+      { label: "Markdown", description: "Readable plain text." },
+      { label: "JSON", description: "Structured data." },
+    ],
+  }, "eval-question");
+}
+
+function compactionSetup(request: MockModelRequest) {
   if (!resultById(request, "eval-compaction-write-initial")) {
     return tool("write_file", {
       content: "CERULEAN-47 ORBIT-73\n",
@@ -119,14 +128,27 @@ function compactionSetup(request: MockModelRequest) {
 }
 
 function compactionMutate(request: MockModelRequest) {
-  const unsafeWrite = resultById(request, "eval-compaction-write-without-reread");
-  if (!unsafeWrite) {
+  const preservedReadWrite = resultById(request, "eval-compaction-write-preserved-read");
+  if (!preservedReadWrite) {
     return tool("write_file", {
       content: "CERULEAN-47 ORBIT-73 BETA-91\n",
       filePath: "/workspace/compaction.txt",
-    }, "eval-compaction-write-without-reread");
+    }, "eval-compaction-write-preserved-read");
   }
-  if (!unsafeWrite.isError) return "COMPACTION_SAFETY_INVALID";
+  if (preservedReadWrite.isError) return "COMPACTION_READ_TRACKING_LOST";
+  if (!resultById(request, "eval-compaction-external-write")) {
+    return tool("bash", {
+      command: "printf 'CERULEAN-47 ORBIT-73 EXTERNAL-23\\n' > /workspace/compaction.txt",
+    }, "eval-compaction-external-write");
+  }
+  const staleWrite = resultById(request, "eval-compaction-write-stale-read");
+  if (!staleWrite) {
+    return tool("write_file", {
+      content: "CERULEAN-47 ORBIT-73 BETA-91\n",
+      filePath: "/workspace/compaction.txt",
+    }, "eval-compaction-write-stale-read");
+  }
+  if (!staleWrite.isError) return "COMPACTION_STALE_WRITE_ACCEPTED";
   if (!resultById(request, "eval-compaction-reread")) {
     return tool("read_file", {
       filePath: "/workspace/compaction.txt",
@@ -138,9 +160,6 @@ function compactionMutate(request: MockModelRequest) {
       filePath: "/workspace/compaction.txt",
     }, "eval-compaction-write-after-reread");
   }
-  if (!resultById(request, "eval-compaction-todo-read")) {
-    return tool("todo", {}, "eval-compaction-todo-read");
-  }
   return "COMPACTION_MUTATION_COMPLETED BETA-91";
 }
 
@@ -150,23 +169,15 @@ function compactionVerify(request: MockModelRequest) {
       filePath: "/workspace/compaction.txt",
     }, "eval-compaction-read-final");
   }
-  if (!resultById(request, "eval-compaction-todo-final")) {
-    return tool("todo", {}, "eval-compaction-todo-final");
-  }
   const checkpoint = latestCompactionCheckpoint(request);
-  const prompt = request.messages.map((message) => message.text).join("\n");
   const file = JSON.stringify(resultById(request, "eval-compaction-read-final")?.output);
-  const todos = JSON.stringify(resultById(request, "eval-compaction-todo-final")?.output);
   const evidence = {
     checkpoint: ["CERULEAN-47", "ORBIT-73"].every((value) => checkpoint.includes(value)),
-    preservedTodoPrompt: prompt.includes("[Your task list was preserved across context compaction]") &&
-      prompt.includes("Verify compaction invariants"),
     file: ["CERULEAN-47", "ORBIT-73", "BETA-91"].every((value) => file.includes(value)),
-    todos: todos.includes("Verify compaction invariants"),
   };
   const verified = Object.values(evidence).every(Boolean);
   return verified
-    ? "COMPACTION_VERIFIED CERULEAN-47 ORBIT-73 BETA-91 TODO_PRESERVED"
+    ? "COMPACTION_VERIFIED CERULEAN-47 ORBIT-73 BETA-91"
     : `COMPACTION_VERIFICATION_FAILED ${JSON.stringify({ evidence, checkpoint })}`;
 }
 
