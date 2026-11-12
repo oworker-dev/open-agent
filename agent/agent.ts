@@ -23,7 +23,6 @@ import { providerOutputBudgetMiddleware } from "../lib/provider-output-budget";
 import { eveOwnedProviderRetryMiddleware } from "../lib/provider-retry-boundary";
 import { assetModelInputMiddleware } from "./lib/asset-model-input.ts";
 import { imageRootSession, type ImageContext } from "./lib/image-input.ts";
-import { isAskQuestionEnabled, withoutAskQuestion } from "./lib/ask-question-policy.ts";
 
 const openai = createOpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -51,7 +50,6 @@ function createAgentModel(
   reasoning?: AgentReasoningLevel,
   maxOutputTokens = modelMaxOutputTokens,
   imageContext?: ImageContext,
-  questionsEnabled = true,
 ) {
   return wrapLanguageModel({
     middleware: [
@@ -68,7 +66,6 @@ function createAgentModel(
       providerOutputBudgetMiddleware(Math.min(modelMaxOutputTokens, maxOutputTokens)),
       eveOwnedProviderRetryMiddleware,
       ...(imageContext ? [assetModelInputMiddleware(imageContext)] : []),
-      ...(!questionsEnabled ? [withoutAskQuestion] : []),
     ],
     model: openai(providerModelId),
   });
@@ -78,13 +75,9 @@ export default defineAgent({
   build: { externalDependencies: ["sharp"] },
   description: "A general-purpose autonomous agent for research, software, and knowledge work.",
   model: defineDynamic((ctx) => {
-        const questionsEnabled = isAskQuestionEnabled(ctx);
         if (evalFixtureModel) {
           return {
-            model: questionsEnabled ? evalFixtureModel : wrapLanguageModel({
-              model: evalFixtureModel,
-              middleware: withoutAskQuestion,
-            }),
+            model: evalFixtureModel,
             modelContextWindowTokens: evalContextWindowTokens,
           };
         }
@@ -103,7 +96,7 @@ export default defineAgent({
             id: ctx.session.id,
             auth: ctx.session.auth,
             parent: { rootSessionId: imageRootSession.get() ?? ctx.session.id },
-          } }, questionsEnabled),
+          } }),
           modelContextWindowTokens: model.contextWindowTokens,
           modelOptions: {
             providerOptions: {

@@ -23,7 +23,7 @@ export default [
       });
       t.succeeded();
       t.notEvent("interaction.opened");
-      t.calledTool("ask_question", { count: 1, status: "rejected" });
+      t.notCalledTool("ask_question");
       t.messageIncludes("ASK_DENIED_WITHOUT_INTERACTION");
     },
   }),

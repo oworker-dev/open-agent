@@ -15,6 +15,7 @@ export function createAutonomyEvalModel() {
 function respond(request: MockModelRequest) {
   if (isCompactionRequest(request)) return compactionCheckpoint(request);
   const task = latestEvalTask(request);
+  if (task.includes("EVAL_TOOL_POLICY")) return toolPolicy(request, task);
   if (task.includes("EVAL_AUTONOMY_FILE")) return autonomyFile(request);
   if (task.includes("EVAL_WEBSITE_PREVIEW")) return websitePreview(request);
   if (task.includes("EVAL_ARTIFACT_DELIVERY")) return artifactDelivery(request);
@@ -38,6 +39,7 @@ function latestEvalTask(request: MockModelRequest): string {
   const messages = request.messages.map((message) => message.text);
   if (request.lastUserMessage) messages.push(request.lastUserMessage);
   const markers = [
+    "EVAL_TOOL_POLICY",
     "EVAL_AUTONOMY_FILE",
     "EVAL_WEBSITE_PREVIEW",
     "EVAL_ARTIFACT_DELIVERY",
@@ -59,6 +61,27 @@ function latestEvalTask(request: MockModelRequest): string {
     if (markerIndex >= 0) return message.slice(markerIndex);
   }
   return request.lastUserMessage ?? "";
+}
+
+function toolPolicy(request: MockModelRequest, task: string) {
+  const optional = request.tools.map(tool => tool.name).filter(name => !name.startsWith("eve__"));
+  if (task.includes("EMPTY")) return optional.length === 0 ? "TOOL_POLICY_EMPTY" : "TOOL_POLICY_LEAK";
+  if (optional.join(",") !== "record_checkpoint") return `TOOL_POLICY_LEAK ${optional.join(",")}`;
+  for (const [name, input] of [
+    ["bash", { command: "echo POLICY_MUST_NOT_EXECUTE" }],
+    ["write_file", { filePath: "/workspace/policy-must-not-write", content: "denied" }],
+    ["ask_question", { question: "POLICY_MUST_NOT_ASK" }],
+    ["agent", { message: "POLICY_MUST_NOT_DELEGATE" }],
+    ["eve__tool", { name: "bash", input: { command: "echo POLICY_MUST_NOT_EXECUTE" } }],
+  ] as const) {
+    const id = `eval-policy-${name}`;
+    const result = resultById(request, id);
+    if (!result) return tool(name, input, id);
+    if (!result.isError) return `TOOL_POLICY_EXECUTED ${name}`;
+  }
+  const allowed = resultById(request, "eval-policy-allowed");
+  if (!allowed) return tool("record_checkpoint", { summary: "Allowed by the host" }, "eval-policy-allowed");
+  return allowed.isError ? "TOOL_POLICY_ALLOWED_FAILED" : "TOOL_POLICY_ENFORCED";
 }
 
 function isCompactionRequest(request: MockModelRequest): boolean {
