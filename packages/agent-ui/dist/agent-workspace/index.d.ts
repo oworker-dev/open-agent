@@ -3,6 +3,7 @@ export { AgentSecondaryView, type AgentSecondaryChild, type AgentSecondaryTab } 
 export { AgentMailboxHttpError, createHttpAgentMailbox, type HttpAgentMailboxOptions, } from "./http-agent-mailbox.js";
 export { AgentThreadStorageConflictError, AgentThreadStorageHttpError, createHttpAgentThreadStorage, type HttpAgentThreadStorageOptions, } from "./http-thread-storage.js";
 export { AgentMessage } from "./agent-message.js";
+export type { AgentToolRendererProps, AgentToolRenderers } from "./tool-renderers.js";
 export { createHttpAgentAssetUploadAdapter } from "./browser-asset-upload.js";
 export type { AgentAssetUpload, AgentInputResponse, AgentInputResponseSubmission, AgentAssetUploadAdapter, AgentExtensionInfo, AgentAssetEndpoint, AgentDeliverableEndpoint, AgentSessionAsset, AgentSessionDeliverable, AgentThread, AgentPendingTurn, AgentQueuedTurn, AgentThreadPatch, AgentThreadPreferences, AgentModelOption, AgentPromptMenuItem, PromptInputMessage, AgentRuntimeStatus, AgentWorkspaceClientConfig, AgentWorkspaceConfig, AgentWorkspaceHostSlots, AgentWorkspaceMailbox, AgentMailboxItemStatus, AgentMailboxReceipt, AgentSubagentLoader, AgentSubagentController, AgentSubagentControlAction, AgentSubagentSummary, AgentSessionBoundary, AgentSessionInspector, AgentTranscriptCoverage, AgentTranscriptWindow, } from "./contracts.js";
 export { filterPromptMenuItems, findPromptTrigger, replacePromptTrigger, type PromptTrigger, } from "./prompt-menu.js";

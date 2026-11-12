@@ -71,6 +71,7 @@ import {
 import { cn } from "../utils.js";
 import type { AgentLocale } from "./i18n.js";
 import type { AgentSessionDeliverable } from "./contracts.js";
+import { AgentToolRenderersContext, type AgentToolRenderers } from "./tool-renderers.js";
 import {
   eventsForMessagePresentation,
   isLocallyInterruptedMessage,
@@ -155,6 +156,7 @@ export function AgentMessage({
   onInputResponses,
   onCloseInputRequest = () => undefined,
   showCopyAction = true,
+  toolRenderers,
 }: {
   readonly assetUrl?: (assetId: string) => string;
   readonly canRespond: boolean;
@@ -169,7 +171,9 @@ export function AgentMessage({
   readonly onInputResponses: (responses: readonly AgentInputResponse[]) => void | Promise<void>;
   readonly onCloseInputRequest?: (requestId: string) => void;
   readonly showCopyAction?: boolean;
+  readonly toolRenderers?: AgentToolRenderers;
 }) {
+  const inheritedToolRenderers = useContext(AgentToolRenderersContext);
   const interrupted = isLocallyInterruptedMessage(message);
   const events = eventsForMessagePresentation(message, sourceEvents);
   const isStreaming = sourceStreaming && !interrupted;
@@ -225,6 +229,7 @@ export function AgentMessage({
     : task?.processParts ?? directParts;
 
   return (
+    <AgentToolRenderersContext.Provider value={toolRenderers ?? inheritedToolRenderers}>
     <InterruptedMessageContext.Provider value={stoppedAt}>
     <DeliverableOpenContext.Provider value={onOpenDeliverable}>
     <Message
@@ -324,6 +329,7 @@ export function AgentMessage({
     </Message>
     </DeliverableOpenContext.Provider>
     </InterruptedMessageContext.Provider>
+    </AgentToolRenderersContext.Provider>
   );
 }
 
@@ -595,7 +601,29 @@ function ProcessToolGroup({
   );
 }
 
-function ToolPart({
+function ToolPart(props: React.ComponentProps<typeof DefaultToolPart>) {
+  const renderers = useContext(AgentToolRenderersContext);
+  const onOpenDeliverable = useContext(DeliverableOpenContext);
+  const Renderer = renderers && Object.hasOwn(renderers, props.part.name)
+    ? renderers[props.part.name] : undefined;
+  const defaultContent = <DefaultToolPart {...props} />;
+  if (!Renderer) return defaultContent;
+  return <Renderer
+    assetUrl={props.assetUrl}
+    canRespond={props.canRespond}
+    defaultContent={defaultContent}
+    events={props.events}
+    inputRequestClosed={Boolean(props.part.interaction && props.closedInputRequestIds?.has(props.part.interaction.interactionId))}
+    locale={props.locale}
+    onCloseInputRequest={props.onCloseInputRequest ?? (() => undefined)}
+    onInputResponses={props.onInputResponses}
+    onOpenDeliverable={onOpenDeliverable}
+    onOpenSubagent={props.onOpenSubagent}
+    part={props.part}
+  />;
+}
+
+function DefaultToolPart({
   assetUrl,
   canRespond,
   closedInputRequestIds = EMPTY_CLOSED_INPUT_REQUEST_IDS,

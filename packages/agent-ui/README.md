@@ -56,3 +56,56 @@ file or website to a host-owned workbench. Without an override, the default UI
 uses the Open Agent service's owner-scoped `/api/deliverables` registry and its
 signed result URLs. Reusable assistant-ui elements are exported from
 `@oworker/open-agent-ui/assistant-ui/*` for native host composition.
+
+Pass `toolRenderers` to `AgentWorkspace` to customize individual tool calls:
+
+```tsx
+import {
+  AgentWorkspace,
+  type AgentToolRendererProps,
+  type AgentToolRenderers,
+} from "@oworker/open-agent-ui";
+
+function HostOperation({ part, defaultContent }: AgentToolRendererProps) {
+  // Preserve the default approval/question interaction when one is attached.
+  if (part.interaction) return defaultContent;
+  return (
+    <section aria-label="Host operation">
+      <strong>{part.label} · {part.state}</strong>
+      <pre>{part.state === "streaming"
+        ? part.inputText
+        : JSON.stringify(part.error ?? part.output ?? part.input, null, 2)}</pre>
+    </section>
+  );
+}
+
+// Keep component types stable so streamed updates preserve local React state.
+const toolRenderers: AgentToolRenderers = { host_invoke: HostOperation };
+
+// Add to the workspace props in the example above:
+// <AgentWorkspace {...workspaceProps} toolRenderers={toolRenderers} />
+```
+
+Keys match exact tool names, including MCP namespaces. An unspecified tool
+retains its default UI. `defaultContent` renders the entire default call or
+interaction, so a custom component can wrap it or fall back to it. The same
+renderers apply to root and child session views; standalone `AgentMessage`
+also accepts `toolRenderers`.
+
+`part.callId` is the stable call identity. `part.inputText` contains merged
+streaming arguments; after input completes, `part.input`, `part.output`,
+`part.error`, and `part.state` carry the existing Eve projection. Progress
+snapshots replace earlier progress and the final output replaces progress.
+The extension introduces no independent stream or message state.
+
+Custom interaction UIs receive `canRespond`, `inputRequestClosed`,
+`onInputResponses`, and `onCloseInputRequest`. Use the interaction's existing
+`interactionId` when responding, and honor read-only/closed states. Navigation
+callbacks, `assetUrl`, locale, and the current message's events are also passed
+through. These callbacks use the workspace's existing submission and persistence
+path. Returning `defaultContent` retains the supplied ask/approval behavior.
+
+Renderers are React components supplied locally by the host. They do not belong
+in serialized Runtime Config or cross-origin iframe messages. Tool authorization
+remains a server policy (`profile.allowedTools`, `profile.defaultTools`,
+`policy.tools`), independent of how a call is displayed.

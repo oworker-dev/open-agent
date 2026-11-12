@@ -52,6 +52,7 @@ import {
 import { loadSessionDeliverables } from "./session-deliverables.js";
 import { readCommittedRange } from "./stream-range.js";
 import { AssetPreviewProvider } from "./asset-preview.js";
+import { AgentToolRenderersContext, type AgentToolRenderers } from "./tool-renderers.js";
 
 const DEFAULT_STORAGE_KEY = "open-agent:threads:v1";
 const STORAGE_URGENT_SAVE_DELAY_MS = 50;
@@ -93,6 +94,7 @@ export function AgentWorkspace({
   runtimeStatus = { provider: "ready" },
   storageKey = DEFAULT_STORAGE_KEY,
   threadStorage = browserThreadStorage,
+  toolRenderers,
 }: {
   readonly agentName?: string;
   readonly assetEndpoint?: AgentAssetEndpoint;
@@ -123,6 +125,7 @@ export function AgentWorkspace({
   readonly runtimeStatus?: import("./contracts.js").AgentRuntimeStatus;
   readonly storageKey?: string;
   readonly threadStorage?: AgentThreadStorage;
+  readonly toolRenderers?: AgentToolRenderers;
 }) {
   validateWorkspaceCatalog(models, reasoningLevels, defaultPreferences);
   const catalogSignature = JSON.stringify({ models, reasoningLevels });
@@ -1931,6 +1934,7 @@ export function AgentWorkspace({
   const workbenchTransitioning = workbenchMode === "collapsing" || workbenchMode === "expanding";
 
   return (
+    <AgentToolRenderersContext.Provider value={toolRenderers}>
     <AssetPreviewProvider client={client}>
     <div
       className="open-agent-ui relative h-dvh overflow-hidden bg-sidebar text-foreground"
@@ -2149,6 +2153,7 @@ export function AgentWorkspace({
       <AgentSettingsDialog extensions={extensions} locale={locale} messages={messages} onLocaleChange={setLocale} onOpenChange={setSettingsOpen} open={settingsOpen} />
     </div>
     </AssetPreviewProvider>
+    </AgentToolRenderersContext.Provider>
   );
 }
 

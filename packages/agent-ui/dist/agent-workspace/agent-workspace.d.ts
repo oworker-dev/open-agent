@@ -1,7 +1,8 @@
 import { type SessionStreamEvent } from "eve/client";
 import type { AgentAssetEndpoint, AgentDeliverableEndpoint, AgentModelOption, AgentSessionAsset, AgentSessionInspector, AgentSessionDeliverable, AgentSubagentController, AgentSubagentLoader, AgentThread, AgentThreadPreferences, AgentWorkspaceClientConfig, AgentWorkspaceMailbox } from "./contracts.js";
 import { type AgentThreadStorage } from "./thread-storage.js";
-export declare function AgentWorkspace({ assetEndpoint, client, commands, defaultPreferences, deliverableEndpoint, extensions, hostSlots, initialSubagentSessionId, initialThreadId, inspectSession, loadSubagents, controlSubagent, mailbox, models, mentions, onEvent, onOpenAsset, onDeleteThread, onActiveSubagentChange, onActiveThreadChange, onOpenDeliverable, onStorageError, productName, reasoningLevels, runtimeStatus, storageKey, threadStorage, }: {
+import { type AgentToolRenderers } from "./tool-renderers.js";
+export declare function AgentWorkspace({ assetEndpoint, client, commands, defaultPreferences, deliverableEndpoint, extensions, hostSlots, initialSubagentSessionId, initialThreadId, inspectSession, loadSubagents, controlSubagent, mailbox, models, mentions, onEvent, onOpenAsset, onDeleteThread, onActiveSubagentChange, onActiveThreadChange, onOpenDeliverable, onStorageError, productName, reasoningLevels, runtimeStatus, storageKey, threadStorage, toolRenderers, }: {
     readonly agentName?: string;
     readonly assetEndpoint?: AgentAssetEndpoint;
     readonly client?: AgentWorkspaceClientConfig;
@@ -33,5 +34,6 @@ export declare function AgentWorkspace({ assetEndpoint, client, commands, defaul
     readonly runtimeStatus?: import("./contracts.js").AgentRuntimeStatus;
     readonly storageKey?: string;
     readonly threadStorage?: AgentThreadStorage;
+    readonly toolRenderers?: AgentToolRenderers;
 }): import("react/jsx-runtime").JSX.Element;
 //# sourceMappingURL=agent-workspace.d.ts.map

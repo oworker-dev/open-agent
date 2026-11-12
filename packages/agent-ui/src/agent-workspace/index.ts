@@ -12,6 +12,7 @@ export {
   type HttpAgentThreadStorageOptions,
 } from "./http-thread-storage.js";
 export { AgentMessage } from "./agent-message.js";
+export type { AgentToolRendererProps, AgentToolRenderers } from "./tool-renderers.js";
 export { createHttpAgentAssetUploadAdapter } from "./browser-asset-upload.js";
 export type {
   AgentAssetUpload,

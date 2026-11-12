@@ -2,6 +2,7 @@ import type { ClientAuth, ClientRedirectPolicy, SessionStreamEvent, HeadersValue
 import type { Answer } from "eve/events";
 import type { ReactNode } from "react";
 import type { AgentThreadStorage } from "./thread-storage.js";
+import type { AgentToolRenderers } from "./tool-renderers.js";
 export type AgentThreadStatus = "cancelling" | "error" | "ready" | "streaming" | "submitted" | "waiting";
 export type AgentExecutionMode = "automation" | "cautious" | "standard";
 export type AgentThreadPreferences = {
@@ -253,6 +254,7 @@ export type AgentWorkspaceConfig = {
     readonly defaultPreferences: AgentThreadPreferences;
     readonly extensions?: readonly AgentExtensionInfo[];
     readonly hostSlots?: AgentWorkspaceHostSlots;
+    readonly toolRenderers?: AgentToolRenderers;
     readonly initialThreadId?: string;
     readonly initialSubagentSessionId?: string;
     readonly mailbox?: AgentWorkspaceMailbox;
