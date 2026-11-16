@@ -17,7 +17,11 @@ test("empty and whitespace drafts cannot send while text and uploaded attachment
   expect(fixture.sends).toHaveLength(0);
   await input.fill("A follow-up");
   await expect(send).toBeEnabled();
-  await input.fill("");
+  // Clear through the editor's keyboard path; fill("") can leave Lexical's
+  // previous text intact in development builds.
+  await input.press("ControlOrMeta+A");
+  await input.press("Backspace");
+  await expect(input).toHaveText("");
   await expect(send).toBeDisabled();
   const chooser = page.waitForEvent("filechooser");
   await page.getByRole("button", { name: "Add files", exact: true }).click();
@@ -56,7 +60,10 @@ test("published history survives an empty registry with expiration and one versi
   await side.getByRole("button", { name: "Refresh published assets", exact: true }).click();
   await side.getByRole("button", { name: "Open live.txt", exact: true }).click();
   await expect(side.getByText("A published report", { exact: true })).toBeVisible();
-  expect(reads).toEqual([expect.stringContaining("token=refreshed")]);
+  // Strict Mode may restart the preview effect. Every request must use the
+  // refreshed capability, including any request cancelled during that restart.
+  expect(reads.length).toBeGreaterThan(0);
+  for (const url of reads) expect(new URL(url).searchParams.get("token")).toBe("refreshed");
   await page.reload();
   await page.getByRole("button", { name: "Open side view", exact: true }).click();
   await side.getByRole("button", { name: /Published assets/ }).click();

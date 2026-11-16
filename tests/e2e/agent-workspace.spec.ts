@@ -119,7 +119,7 @@ test("composer exposes assistant-ui attachments, permissions, and safe trigger s
   });
   const imageAttachment = page.locator('[data-slot="attachment"][data-orientation="vertical"]');
   await expect(imageAttachment).toBeVisible();
-  await imageAttachment.getByRole("button", { name: "Attachment: reference.png" }).click();
+  await imageAttachment.getByRole("button", { name: "Attachment: reference.png", exact: true }).click();
   await expect(page.getByRole("button", { name: "Dismiss" })).toBeVisible();
   await page.getByRole("button", { name: "Dismiss" }).click();
 
