@@ -49,7 +49,7 @@ export function AttachmentImagePreview({ children, className, dismissLabel = "Cl
       {children}
     </Attachment>
     <Dialog open={open && Boolean(preview.url) && !failed} onOpenChange={setOpen}>
-      <DialogContent aria-describedby={undefined} className="w-fit max-w-[calc(100vw-2rem)] overflow-hidden border-0 bg-background p-0 shadow-2xl sm:max-w-[calc(100vw-3rem)]" showCloseButton={false}>
+      <DialogContent aria-describedby={undefined} className="min-h-12 w-fit min-w-12 max-w-[calc(100vw-2rem)] place-items-center overflow-hidden border-0 bg-background p-0 shadow-2xl sm:max-w-[calc(100vw-3rem)]" showCloseButton={false}>
         <DialogTitle className="sr-only">{name}</DialogTitle>
         <img alt={name} className="block max-h-[85vh] max-w-full object-contain" src={preview.url} />
         <DialogClose aria-label={dismissLabel} className="absolute right-2 top-2 flex size-7 items-center justify-center rounded-full border bg-background/90 text-foreground shadow-sm focus-visible:ring-2 focus-visible:ring-ring"><XIcon className="size-4" /></DialogClose>

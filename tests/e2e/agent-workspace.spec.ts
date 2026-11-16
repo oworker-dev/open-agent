@@ -122,6 +122,7 @@ test("composer exposes assistant-ui attachments, permissions, and safe trigger s
   await imageAttachment.getByRole("button", { name: "Attachment: reference.png", exact: true }).click();
   await expect(page.getByRole("button", { name: "Dismiss" })).toBeVisible();
   await page.getByRole("button", { name: "Dismiss" }).click();
+  await expect(page.getByRole("dialog", { name: "reference.png", exact: true })).toHaveCount(0);
 
   await page.getByRole("button", { name: "Approval mode" }).click();
   await expect(page.getByText("Ask before commands and file changes.")).toBeVisible();
