@@ -2,7 +2,7 @@ import { type SessionStreamEvent } from "eve/client";
 import type { AgentModelOption, AgentPromptMenuItem, AgentSessionDeliverable, AgentThreadPreferences, AgentWorkspaceClientConfig, AgentWorkspaceMailbox } from "./contracts.js";
 import type { AgentLocale } from "./i18n.js";
 import { type AgentThreadStorage } from "./thread-storage.js";
-export declare function AgentChildSessionView({ client, commands, locale, mailbox, mentions, models, onEvent, onOpenDeliverable, onOpenSubagent, onStorageError, preferences, providerReady, reasoningLevels, sessionId, storageKey, threadStorage, }: {
+export declare function AgentChildSessionView({ client, commands, locale, mailbox, mentions, models, onEvent, onOpenDeliverable, onOpenSubagent, onStorageError, preferences, providerReady, readOnly, reasoningLevels, sessionId, storageKey, threadStorage, }: {
     readonly client?: AgentWorkspaceClientConfig;
     readonly commands: readonly AgentPromptMenuItem[];
     readonly locale: AgentLocale;
@@ -15,6 +15,7 @@ export declare function AgentChildSessionView({ client, commands, locale, mailbo
     readonly onStorageError?: (error: unknown) => void;
     readonly preferences: AgentThreadPreferences;
     readonly providerReady?: boolean;
+    readonly readOnly?: boolean;
     readonly reasoningLevels: readonly string[];
     readonly sessionId: string;
     readonly storageKey?: string;

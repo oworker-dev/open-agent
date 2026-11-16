@@ -1,4 +1,4 @@
-import type { SessionReader } from "eve/sessions";
+import type { Session, SessionReader } from "eve/sessions";
 import type { SessionStreamEvent } from "eve/client";
 import {
   activeTurn, emptySessionView, foldEvents, idle, position, session as observeSession,
@@ -18,6 +18,28 @@ export class MailboxBoundaryInspectionTimeoutError extends Error {
   constructor() {
     super("The Agent runtime did not expose a mailbox boundary in time.");
     this.name = "MailboxBoundaryInspectionTimeoutError";
+  }
+}
+
+/** A reset can close the stream before its delivery receipt is readable. */
+export async function resetMailboxSession(
+  session: Pick<Session, "id" | "stream" | "reset">,
+  reason?: string,
+) {
+  try {
+    const receipt = await session.reset(reason ? { reason } : undefined);
+    const result = await receipt.result({ signal: AbortSignal.timeout(10_000) });
+    if (result.status === "failed") return result;
+    return { status: "reset" as const };
+  } catch (error) {
+    try {
+      if ((await inspectMailboxBoundary(session, 3_000)).state === "terminal") {
+        return { status: "no_active_session" as const };
+      }
+    } catch {
+      // Missing or unreadable history cannot prove that retirement succeeded.
+    }
+    throw error;
   }
 }
 

@@ -2,7 +2,7 @@ import { type SessionStreamEvent } from "eve/client";
 import { type EveMessage } from "eve/react";
 import type { AgentModelOption, AgentPromptMenuItem, AgentQueuedTurn, AgentSessionDeliverable, AgentThread, AgentThreadPatch, AgentWorkspaceClientConfig, AgentWorkspaceMailbox } from "./contracts.js";
 import { type AgentLocale, type AgentMessages } from "./i18n.js";
-export declare function AgentThreadView({ client, commands, draftStorageKey, historyHasMore, historyLoading, isRecovering, isReconnecting, locale, mailbox, mentions, models, onChange, onCancelRecovery, onEvent, onOpenDeliverable, onOpenSubagent, onLoadEarlier, onRetryRecovery, onRecoveryNeeded, providerReady, recoveryError, reasoningLevels, thread, }: {
+export declare function AgentThreadView({ client, commands, draftStorageKey, historyHasMore, historyLoading, isRecovering, isReconnecting, locale, mailbox, mentions, models, onChange, onCancelRecovery, onEvent, onOpenDeliverable, onOpenSubagent, onLoadEarlier, onRetryRecovery, onRecoveryNeeded, providerReady, readOnly, recoveryError, reasoningLevels, thread, }: {
     readonly client?: AgentWorkspaceClientConfig;
     readonly commands: readonly AgentPromptMenuItem[];
     readonly draftStorageKey: string;
@@ -23,6 +23,7 @@ export declare function AgentThreadView({ client, commands, draftStorageKey, his
     readonly onRetryRecovery?: () => void;
     readonly onRecoveryNeeded: () => void;
     readonly providerReady: boolean;
+    readonly readOnly?: boolean;
     readonly recoveryError?: string;
     readonly reasoningLevels: readonly string[];
     readonly thread: AgentThread;

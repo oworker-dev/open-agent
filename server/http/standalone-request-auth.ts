@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
+import type { SessionAuthContext } from "eve/context";
 
 import type { AgentSessionOwner } from "../data/session-ownership-store.ts";
 
@@ -9,6 +10,16 @@ export type StandaloneRequestIdentity = {
   readonly identity: AgentSessionOwner;
   readonly setCookie?: string;
 };
+
+/** Keep direct Eve requests and authenticated mailbox deliveries the same caller. */
+export function standaloneSessionAuth(identity: AgentSessionOwner): SessionAuthContext {
+  return {
+    attributes: { tenantId: identity.tenantId },
+    authenticator: "standalone-cookie",
+    principalId: identity.principalId,
+    principalType: identity.principalType,
+  };
+}
 
 /**
  * Resolves an identity only when the browser already owns a valid standalone

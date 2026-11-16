@@ -6,9 +6,11 @@ import {
   DownloadIcon,
   FileIcon,
   ImageIcon,
+  LoaderCircleIcon,
   MonitorIcon,
   PanelRightCloseIcon,
   RefreshCwIcon,
+  SquareIcon,
   UsersRoundIcon,
   XIcon,
 } from "lucide-react";
@@ -28,7 +30,7 @@ import { Button } from "../ui/button.js";
 import { cn } from "../utils.js";
 import type { AgentSessionAsset, AgentSessionDeliverable } from "./contracts.js";
 import type { AgentLocale } from "./i18n.js";
-import { mergeSessionDeliverables, splitSessionDeliverables } from "./session-deliverables.js";
+import { deliverableExpired, mergeSessionDeliverables, publicationVersionLabel, splitSessionDeliverables } from "./session-deliverables.js";
 import { useAssetDownload, useAssetPreview, useAssetText } from "./asset-preview.js";
 
 export type AgentSecondaryTab = "home" | "children" | "assets" | "deliverables";
@@ -59,11 +61,15 @@ export function AgentSecondaryView({
   assetsLoading = false,
   childContent,
   children,
+  closingChildren = new Set(),
+  childControlError,
   deliverables,
   deliverablesError,
   deliverablesLoading,
   locale,
   onClose,
+  onCloseChild,
+  onHideChild,
   onOpenAsset,
   onOpenChild,
   onOpenDeliverable,
@@ -71,6 +77,7 @@ export function AgentSecondaryView({
   onRefreshDeliverables,
   onSelectTab,
   requestedDeliverable,
+  requestedChild,
   requestedDeliverableRequestId,
   tab,
 }: {
@@ -80,11 +87,15 @@ export function AgentSecondaryView({
   readonly assetsLoading?: boolean;
   readonly childContent?: ReactNode;
   readonly children: readonly AgentSecondaryChild[];
+  readonly closingChildren?: ReadonlySet<string>;
+  readonly childControlError?: string;
   readonly deliverables?: readonly AgentSessionDeliverable[];
   readonly deliverablesError?: string;
   readonly deliverablesLoading?: boolean;
   readonly locale: AgentLocale;
   readonly onClose: () => void;
+  readonly onCloseChild?: (sessionId: string) => void | Promise<void>;
+  readonly onHideChild?: () => void;
   readonly onOpenAsset?: (asset: AgentSessionAsset) => void;
   readonly onOpenChild: (sessionId: string) => void;
   readonly onOpenDeliverable?: (deliverable: AgentSessionDeliverable) => void;
@@ -93,6 +104,7 @@ export function AgentSecondaryView({
   /** Legacy route callback retained for alpha SDK compatibility. */
   readonly onSelectTab?: (tab: AgentSecondaryTab) => void;
   readonly requestedDeliverable?: AgentSessionDeliverable;
+  readonly requestedChild?: { readonly sessionId: string; readonly requestId: number };
   readonly requestedDeliverableRequestId?: number;
   /** Legacy initial route retained for alpha SDK compatibility. */
   readonly tab?: AgentSecondaryTab;
@@ -106,14 +118,19 @@ export function AgentSecondaryView({
   const [openTabs, setOpenTabs] = useState<readonly AgentSecondaryContentTab[]>([]);
   const [activeTabId, setActiveTabId] = useState("home");
   const consumedDeliverableRequestId = useRef<number | undefined>(undefined);
+  const consumedChildRequestId = useRef<number | undefined>(undefined);
   const activeTab = openTabs.find((candidate) => candidate.id === activeTabId);
+  const tabTitle = (contentTab: AgentSecondaryContentTab) => contentTab.kind === "child"
+    ? children.find((child) => child.childSessionId === contentTab.sessionId)?.nickname ?? contentTab.title
+    : contentTab.title;
 
   const selectOverviewRoute = useCallback((route: AgentSecondaryTab) => {
     const normalized = normalizeOverviewRoute(route);
     setOverviewRoute(normalized);
     setActiveTabId("home");
+    onHideChild?.();
     onSelectTab?.(normalized);
-  }, [onSelectTab]);
+  }, [onHideChild, onSelectTab]);
 
   const openChild = useCallback((child: AgentSecondaryChild) => {
     const contentTab: AgentSecondaryContentTab = {
@@ -126,6 +143,16 @@ export function AgentSecondaryView({
     setActiveTabId(contentTab.id);
     onOpenChild(child.childSessionId);
   }, [onOpenChild]);
+
+  useEffect(() => {
+    if (!requestedChild || consumedChildRequestId.current === requestedChild.requestId) return;
+    consumedChildRequestId.current = requestedChild.requestId;
+    openChild(children.find((child) => child.childSessionId === requestedChild.sessionId) ?? {
+      childSessionId: requestedChild.sessionId,
+      nickname: isZh ? "子代理" : "Sub-agent",
+      status: "starting",
+    });
+  }, [children, isZh, openChild, requestedChild]);
 
   const openDeliverable = useCallback((deliverable: AgentSessionDeliverable) => {
     if (onOpenDeliverable) {
@@ -141,11 +168,12 @@ export function AgentSecondaryView({
     };
     setOpenTabs((current) => upsertContentTab(current, contentTab));
     setActiveTabId(contentTab.id);
+    onHideChild?.();
     if (deliverable.kind === "asset") {
       const asset = assets.find((candidate) => candidate.assetId === deliverable.id);
       if (asset) onOpenAsset?.(asset);
     }
-  }, [assets, onOpenAsset, onOpenDeliverable]);
+  }, [assets, onHideChild, onOpenAsset, onOpenDeliverable]);
 
   useEffect(() => {
     if (!requestedDeliverable || requestedDeliverableRequestId === undefined) return;
@@ -157,13 +185,17 @@ export function AgentSecondaryView({
   const activateContentTab = (contentTab: AgentSecondaryContentTab) => {
     setActiveTabId(contentTab.id);
     if (contentTab.kind === "child") onOpenChild(contentTab.sessionId);
+    else onHideChild?.();
   };
   const closeContentTab = (contentTab: AgentSecondaryContentTab) => {
     setOpenTabs((current) => current.filter((candidate) => candidate.id !== contentTab.id));
-    if (activeTabId === contentTab.id) setActiveTabId("home");
+    if (activeTabId === contentTab.id) {
+      setActiveTabId("home");
+      onHideChild?.();
+    }
   };
 
-  const headerTitle = activeTab?.title ?? (overviewRoute === "children"
+  const headerTitle = (activeTab ? tabTitle(activeTab) : undefined) ?? (overviewRoute === "children"
     ? (isZh ? "子代理" : "Sub-agents")
     : overviewRoute === "deliverables"
       ? (isZh ? "发布资产" : "Published assets")
@@ -191,8 +223,8 @@ export function AgentSecondaryView({
           <SecondaryTabBar aria-label={isZh ? "已打开内容" : "Open content"}>
             {openTabs.map((contentTab) => (
               <div className={cn("group/tab flex w-40 shrink-0 items-center rounded-md", activeTabId === contentTab.id && "bg-accent")} key={contentTab.id}>
-                <TabButton active={activeTabId === contentTab.id} label={contentTab.title} onClick={() => activateContentTab(contentTab)} />
-                <button aria-label={`${isZh ? "关闭" : "Close"} ${contentTab.title}`} className="mr-1 flex size-5 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-background/80 hover:text-foreground" onClick={() => closeContentTab(contentTab)} type="button">
+                <TabButton active={activeTabId === contentTab.id} label={tabTitle(contentTab)} onClick={() => activateContentTab(contentTab)} />
+                <button aria-label={`${isZh ? "关闭" : "Close"} ${tabTitle(contentTab)}`} className="mr-1 flex size-5 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-background/80 hover:text-foreground" onClick={() => closeContentTab(contentTab)} type="button">
                   <XIcon className="size-3" />
                 </button>
               </div>
@@ -218,7 +250,10 @@ export function AgentSecondaryView({
               onAssets={() => selectOverviewRoute("assets")}
               onPublications={() => selectOverviewRoute("deliverables")}
             /> : null}
-            {overviewRoute === "children" ? <ChildList children={children} isZh={isZh} onOpen={openChild} /> : null}
+            {overviewRoute === "children" ? <>
+              {childControlError ? <p className="mb-2 text-xs text-destructive" role="alert">{childControlError}</p> : null}
+              <ChildList children={children} closing={closingChildren} isZh={isZh} onClose={onCloseChild} onOpen={openChild} />
+            </> : null}
             {overviewRoute === "assets" ? <SessionAssetList
               assetUrl={assetUrl}
               assets={deliverableGroups.assets}
@@ -256,14 +291,24 @@ function Overview({ assetCount, childCount, isZh, onAssets, onChildren, onPublic
   </div>;
 }
 
-function ChildList({ children, isZh, onOpen }: { readonly children: readonly AgentSecondaryChild[]; readonly isZh: boolean; readonly onOpen: (child: AgentSecondaryChild) => void }) {
+function ChildList({ children, closing, isZh, onClose, onOpen }: { readonly children: readonly AgentSecondaryChild[]; readonly closing: ReadonlySet<string>; readonly isZh: boolean; readonly onClose?: (sessionId: string) => void | Promise<void>; readonly onOpen: (child: AgentSecondaryChild) => void }) {
   if (children.length === 0) return <EmptyState label={isZh ? "还没有子代理" : "No sub-agents yet"} />;
   return <div className="divide-y divide-border/50">{children.map((child) => (
-    <button className="flex w-full items-center gap-3 px-1 py-3 text-left hover:bg-accent/60" key={child.childSessionId} onClick={() => onOpen(child)} type="button">
+    <div className="flex items-center gap-1" key={child.childSessionId}>
+    <button className="flex min-w-0 flex-1 items-center gap-3 px-1 py-3 text-left hover:bg-accent/60" onClick={() => onOpen(child)} type="button">
       <span className={cn("size-2 shrink-0 rounded-full", childStatusColor(child.status))} />
-      <span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium">{child.nickname}</span><span className="mt-0.5 block truncate text-xs text-muted-foreground">{child.task || child.status}</span></span>
+      <span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium">{child.nickname}</span><span className="mt-0.5 block truncate text-xs text-muted-foreground">{child.status === "closed" ? (isZh ? "已关闭" : "Closed") : child.task || child.status}</span></span>
       <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground" />
     </button>
+    {onClose && child.status !== "closed" ? <Button
+      aria-label={`${isZh ? "关闭子代理" : "Close sub-agent"} ${child.nickname}`}
+      disabled={closing.has(child.childSessionId)}
+      onClick={() => void onClose(child.childSessionId)}
+      size="icon-sm"
+      title={isZh ? "结束子代理会话" : "End sub-agent session"}
+      variant="ghost"
+    >{closing.has(child.childSessionId) ? <LoaderCircleIcon className="size-3.5 animate-spin" /> : <SquareIcon className="size-3.5" />}</Button> : null}
+    </div>
   ))}</div>;
 }
 
@@ -302,6 +347,7 @@ function PublishedDeliverableRow({ deliverable, isZh, onOpen }: { readonly deliv
   const image = deliverable.mediaType?.startsWith("image/") ?? false;
   return <ArtifactCard
     aria-label={`${isZh ? "打开" : "Open"} ${deliverable.title}`}
+    disabled={deliverableExpired(deliverable)}
     icon={deliverable.kind === "website-preview" ? <MonitorIcon className="size-4" /> : image ? <ImageIcon className="size-4" /> : undefined}
     meta={deliverableMeta(deliverable, isZh)}
     onClick={onOpen}
@@ -401,9 +447,9 @@ function sessionAssetMeta(deliverable: AgentSessionDeliverable): string {
 function deliverableMeta(deliverable: AgentSessionDeliverable, isZh: boolean): string {
   const title = deliverable.alias && deliverable.title !== deliverable.alias ? deliverable.title : undefined;
   const kind = deliverable.kind === "website-preview" ? (isZh ? "网站预览" : "Website preview") : (isZh ? "发布资产" : "Published artifact");
-  const version = deliverable.version ? `v${deliverable.version}` : undefined;
+  const version = publicationVersionLabel(deliverable.version);
   const fileCount = deliverable.fileCount ? `${deliverable.fileCount} ${isZh ? "个文件" : "files"}` : undefined;
-  return [kind, version, title, fileCount, deliverable.mediaType, formatBytes(deliverable.sizeBytes)].filter(Boolean).join(" · ");
+  return [kind, deliverableExpired(deliverable) ? (isZh ? "已过期" : "Expired") : undefined, version, title, fileCount, deliverable.mediaType, formatBytes(deliverable.sizeBytes)].filter(Boolean).join(" · ");
 }
 
 function childStatusColor(status: string): string {

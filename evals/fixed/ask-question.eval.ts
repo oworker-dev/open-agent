@@ -1,4 +1,5 @@
 import { defineEval } from "eve/evals";
+import { encodeMultiSelectAnswer } from "@oworker/open-agent-contracts";
 
 export default [
   ...["Markdown", "Use plain text"].map((answer) => defineEval({
@@ -14,6 +15,30 @@ export default [
       t.messageIncludes(`ASK_COMPLETED {"answer":"${answer}","status":"answered"}`);
     },
   })),
+  defineEval({
+    description: "The ask_question workflow returns every selected option and additional context.",
+    tags: ["fixed", "hitl", "ask"],
+    async test(t) {
+      const parked = await t.send("EVAL_ASK_MULTI choose output formats.");
+      parked.awaitingInput();
+      const interaction = parked.session.requireInteraction({ toolName: "ask_question" });
+      await parked.session.respond([{
+        interactionId: interaction.interactionId,
+        text: encodeMultiSelectAnswer({
+          additionalText: "Keep it concise.",
+          optionIds: ["Markdown", "JSON"],
+        }),
+      }]);
+      t.succeeded();
+      t.calledTool("ask_question", { count: 1, status: "completed" });
+      t.messageIncludes("ASK_MULTI_COMPLETED");
+      t.messageIncludes("Selected options:");
+      t.messageIncludes("Markdown");
+      t.messageIncludes("JSON");
+      t.messageIncludes("Additional information:");
+      t.messageIncludes("Keep it concise.");
+    },
+  }),
   defineEval({
     description: "A host tool policy hides questions and rejects a call even if the model attempts it anyway.",
     tags: ["fixed", "hitl", "ask"],

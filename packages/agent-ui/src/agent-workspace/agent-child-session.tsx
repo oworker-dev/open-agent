@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { conversationOf, type SessionStreamEvent } from "eve/client";
 import { activeTurn, session as sessionState, waiting } from "eve/events";
 import { AgentThreadView } from "./agent-thread.js";
+import { AgentHistoryLoading } from "./history-loading.js";
 import { attachAgentSession, createAgentSession } from "./agent-client.js";
 import type {
   AgentModelOption,
@@ -36,6 +37,7 @@ export function AgentChildSessionView({
   onStorageError,
   preferences,
   providerReady = true,
+  readOnly = false,
   reasoningLevels,
   sessionId,
   storageKey,
@@ -53,6 +55,7 @@ export function AgentChildSessionView({
   readonly onStorageError?: (error: unknown) => void;
   readonly preferences: AgentThreadPreferences;
   readonly providerReady?: boolean;
+  readonly readOnly?: boolean;
   readonly reasoningLevels: readonly string[];
   readonly sessionId: string;
   /** Optional host storage for client-only child state such as queued follow-ups. */
@@ -330,7 +333,7 @@ export function AgentChildSessionView({
     return <div className="flex min-h-0 flex-1 items-center justify-center px-6 text-sm text-destructive" role="alert">{loadError}</div>;
   }
   if (!thread) {
-    return <div className="flex min-h-0 flex-1 items-center justify-center px-6 text-sm text-muted-foreground" role="status">Loading sub-agent history…</div>;
+    return <AgentHistoryLoading locale={locale} />;
   }
 
   return (
@@ -351,6 +354,7 @@ export function AgentChildSessionView({
       isRecovering={following}
       recoveryError={followError}
       providerReady={providerReady}
+      readOnly={readOnly}
       reasoningLevels={reasoningLevels}
       thread={thread}
       key={`${thread.id}:${thread.revision ?? 0}`}

@@ -461,6 +461,9 @@ class FakeMailboxRuntime implements AgentMailboxRuntime {
 }
 
 class MemoryMailboxStore implements AgentMailboxStore {
+  async findByClientMessageId(sessionId: string, clientMessageId: string) {
+    return this.items.find((item) => item.sessionId === sessionId && item.clientMessageId === clientMessageId);
+  }
   items: AgentMailboxItem[] = [];
   private sequence = 0;
 

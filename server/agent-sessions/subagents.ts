@@ -146,6 +146,7 @@ export async function inspectAgentSubagent(options: AgentSubagentSupervisorOptio
 }): Promise<AgentSubagentRecord | undefined> {
   const child = await ownedChild(options);
   if (!child) return undefined;
+  if (child.status === "closed") return child;
   let inspected: Awaited<ReturnType<NonNullable<AgentSubagentRuntime["inspect"]>>>;
   try {
     inspected = await (options.runtime ?? eveAgentSubagentRuntime).inspect({
@@ -175,7 +176,7 @@ export async function syncAgentSubagentsFromEvents(options: AgentSubagentSupervi
   if (ownership !== "owned") return [];
   const children = new Map((await options.store.listOwned(options.identity, options.parentSessionId)).map((item) => [item.childSessionId, item]));
   const byCall = new Map([...children.values()].filter((item) => item.callId).map((item) => [item.callId!, item]));
-  const calls = new Map<string, { agentId?: string; task?: string; name: string }>();
+  const calls = new Map<string, { agentId?: string; nickname?: string; task?: string; name: string }>();
   const taskCalls = new Map<string, string>();
   async function settleChildren(parentCancelled: boolean) {
     for (const child of children.values()) {
@@ -224,6 +225,7 @@ export async function syncAgentSubagentsFromEvents(options: AgentSubagentSupervi
       calls.set(data.callId, {
         name: data.capability.name,
         ...(typeof input.agentId === "string" ? { agentId: input.agentId } : {}),
+        ...(typeof input.nickname === "string" ? { nickname: input.nickname } : {}),
         ...(typeof input.message === "string" ? { task: input.message } : {}),
       });
     } else if (event.type === "task.started" && typeof data.taskId === "string" && isRecord(data.startedBy) && typeof data.startedBy.callId === "string") {
@@ -236,6 +238,7 @@ export async function syncAgentSubagentsFromEvents(options: AgentSubagentSupervi
         childSessionId: data.sessionId, parentSessionId: options.parentSessionId, owner: options.identity,
         ...(callId ? { callId } : {}), ...(call?.agentId ? { agentId: call.agentId } : {}),
         ...(call?.task ? { task: call.task } : {}),
+        ...(call?.nickname ? { nickname: call.nickname } : {}),
         ...(typeof data.name === "string" ? { name: data.name } : {}),
         status: "running", waitPolicy: "wait", depth: 1,
       });
@@ -243,7 +246,7 @@ export async function syncAgentSubagentsFromEvents(options: AgentSubagentSupervi
       if (created.callId) byCall.set(created.callId, created);
     } else if (event.type === "call.settled" && typeof data.callId === "string") {
       const child = byCall.get(data.callId);
-      if (!child) continue;
+      if (!child || child.status === "closed") continue;
       const agentId = calls.get(data.callId)?.agentId ?? child.agentId;
       const status = data.outcome === "completed" ? await statusAfterSubagentCompletion(options, child, agentId) :
         data.outcome === "interrupted" ? "interrupted" :
@@ -411,6 +414,7 @@ export async function waitForAgentSubagent(options: AgentSubagentSupervisorOptio
 }): Promise<AgentSubagentRecord | undefined> {
   const child = await ownedChild(options);
   if (!child) return undefined;
+  if (child.status === "closed") return child;
   const timeoutMs = Math.min(Math.max(options.timeoutMs ?? 30_000, 0), 300_000);
   const deadline = Date.now() + timeoutMs;
   const runtime = options.runtime ?? eveAgentSubagentRuntime;
@@ -429,6 +433,7 @@ export async function waitForAgentSubagent(options: AgentSubagentSupervisorOptio
 export async function interruptAgentSubagent(options: AgentSubagentSupervisorOptions & { readonly childSessionId: string }): Promise<AgentSubagentRecord | undefined> {
   const child = await ownedChild(options);
   if (!child) return undefined;
+  if (child.status === "closed") return child;
   const runtime = options.runtime ?? eveAgentSubagentRuntime;
   const result = await runtime.cancel({ accessToken: options.accessToken, sessionId: child.childSessionId });
   if (result === "accepted") {
@@ -458,6 +463,7 @@ export async function interruptAgentSubagent(options: AgentSubagentSupervisorOpt
 export async function closeAgentSubagent(options: AgentSubagentSupervisorOptions & { readonly childSessionId: string }): Promise<AgentSubagentRecord | undefined> {
   const child = await ownedChild(options);
   if (!child) return undefined;
+  if (child.status === "closed") return child;
   const runtime = options.runtime ?? eveAgentSubagentRuntime;
   await retireChildSession(runtime, {
     accessToken: options.accessToken,

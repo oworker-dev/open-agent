@@ -54,9 +54,6 @@ export function createMemoryAgentSubagentStore(): AgentSubagentStore {
       const existing = records.get(input.childSessionId);
       if (existing) {
         if (!sameOwner(existing.owner, input.owner)) throw new Error("The child session is owned by another principal.");
-        if (input.status === "running" && (existing.record.status === "starting" || existing.record.status === "waiting")) {
-          return (await this.updateOwned(input.owner, input.childSessionId, { status: "running" })) ?? existing.record;
-        }
         return existing.record;
       }
       const now = new Date().toISOString();
@@ -93,8 +90,9 @@ export function createMemoryAgentSubagentStore(): AgentSubagentStore {
       const item = records.get(childSessionId);
       if (!item || !sameOwner(item.owner, owner)) return undefined;
       const current = item.record;
+      if (current.status === "closed" && patch.status && patch.status !== "closed") return current;
       const now = new Date().toISOString();
-      const status = patch.status ?? current.status;
+      const status = current.status === "closed" ? "closed" : patch.status ?? current.status;
       const idle = status === "waiting" || status === "completed" || status === "failed" || status === "interrupted" || status === "closed";
       const startedAt = patch.startedAt ?? current.startedAt ?? (status === "running" ? now : undefined);
       const finishedAt = patch.finishedAt === null || status === "running" || status === "starting"
@@ -155,9 +153,9 @@ function postgresStore(pool: Pool, table: string): AgentSubagentStore {
          on conflict (child_session_id) do update set
            agent_id = coalesce(excluded.agent_id, ${table}.agent_id),
            name = coalesce(excluded.name, ${table}.name),
-           nickname = coalesce(nullif(excluded.nickname, ''), ${table}.nickname),
+           nickname = ${table}.nickname,
            task = coalesce(excluded.task, ${table}.task),
-           status = case when ${table}.status in ('starting','waiting') and excluded.status = 'running' then excluded.status else ${table}.status end,
+           status = ${table}.status,
            updated_at = now()
          where ${table}.tenant_id = excluded.tenant_id
            and ${table}.principal_id = excluded.principal_id
@@ -225,10 +223,11 @@ function postgresStore(pool: Pool, table: string): AgentSubagentStore {
         `update ${table} set ${fields.join(", ")}
           where child_session_id = $1 and tenant_id = $2 and principal_id = $3
             and principal_type = $4 and coalesce(issuer, '') = $5
+            ${patch.status && patch.status !== "closed" ? "and status <> 'closed'" : ""}
           returning ${columns()}`,
         values,
       );
-      return result.rows[0] ? toRecord(result.rows[0]) : undefined;
+      return result.rows[0] ? toRecord(result.rows[0]) : await this.findOwned(owner, childSessionId);
     },
   };
 }

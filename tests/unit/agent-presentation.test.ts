@@ -3,9 +3,9 @@ import test from "node:test";
 import { conversationOf, type EveMessage, type SessionStreamEvent } from "eve/client";
 import {
   activeTurnIdAfterPendingSubmission, classifyAgentFailure, eventsBeforeLastUserTurn,
-  eventsForAssistantSegment, failureForTurn, hasSettledLatestTurn, hasTerminalSessionBoundary,
+  eventsForAssistantSegment, failureForTurn, hasModelStepOutput, hasSettledLatestTurn, hasTerminalSessionBoundary,
   isRetryableAgentFailure, mergeSubagentSessions, presentAgentStep, presentAgentTurn,
-  presentSubagentCall, reasoningContentForStep, unresolvedInputRequests, withThinkingPlaceholder,
+  presentSubagentCall, reasoningContentForStep, reasoningTiming, unresolvedInputRequests, withThinkingPlaceholder,
 } from "../../packages/agent-ui/dist/agent-workspace/turn-presentation.js";
 import { summarizeUsage } from "../../packages/agent-ui/dist/agent-workspace/usage.js";
 import { line, startTurn, reply } from "../helpers/session-events.ts";
@@ -57,6 +57,64 @@ test("historical reasoning is never borrowed by an optimistic placeholder", () =
 test("empty reasoning completion does not fabricate content", () => {
   const events = [...running(), ...line(4, { type: "content.completed", scope: { turnId: "turn" }, data: { partId: "reason", runId: "turn:run", kind: "reasoning", phase: "narration", value: "" } })];
   assert.equal(reasoningContentForStep(events, "turn", 0), "");
+});
+
+test("tool input previews end the empty placeholder only for their own model step", () => {
+  const events = running();
+  assert.equal(hasModelStepOutput(events, "turn", 0), false);
+  assert.equal(withThinkingPlaceholder(assistant(events), events)[0]?.type, "reasoning");
+  events.push(...line(4, { type: "call.input", scope: { turnId: "turn", runId: "turn:run" }, data: {
+    callId: "file", kind: "tool", name: "edit_file", delta: '{"path":"example.txt"',
+  } }));
+  assert.equal(hasModelStepOutput(events, "turn", 0), true);
+  assert.equal(hasModelStepOutput(events, undefined, 0), false);
+  assert.equal(hasModelStepOutput(events, "other", 0), false);
+  assert.equal(hasModelStepOutput(events, "turn", 1), false);
+  assert.deepEqual(withThinkingPlaceholder(assistant(events), events).map((part) => part.type), ["tool"]);
+});
+
+test("step output includes streamed and committed text while excluding control calls", () => {
+  const control = [...running(), ...line(4, { type: "call.requested", scope: { turnId: "turn" }, data: {
+    callId: "control", owner: { runId: "turn:run" }, capability: { kind: "control", name: "wait" }, input: {},
+  } })];
+  assert.equal(hasModelStepOutput(control, "turn", 0), false);
+  const streamed = [...running(), ...line(4, { type: "content.delta", scope: { turnId: "turn", runId: "turn:run" }, data: {
+    partId: "text", kind: "text", delta: "Reply started",
+  } })];
+  assert.equal(hasModelStepOutput(streamed, "turn", 0), true);
+  const completed = [...running(), ...line(4, { type: "content.completed", scope: { turnId: "turn" }, data: {
+    partId: "text", runId: "turn:run", kind: "text", phase: "reply", value: "Reply finished",
+  } })];
+  assert.equal(hasModelStepOutput(completed, "turn", 0), true);
+});
+
+test("reasoning stops timing at its content boundary while the model continues", () => {
+  const events = [...running(), ...line(4, { type: "content.completed", scope: { turnId: "turn" }, data: { partId: "reason", runId: "turn:run", kind: "reasoning", phase: "narration", value: "Finished thinking" } }),
+    ...line(8, { type: "content.delta", scope: { turnId: "turn", runId: "turn:run" }, data: { partId: "reply", kind: "text", delta: "Still writing" } })];
+  assert.equal(presentAgentStep(events, "turn", 0).endedAt, undefined);
+  assert.equal(reasoningTiming(events, "turn", 0).endedAt, Date.parse(events.find((event) => event.type === "content.completed")!.meta.at));
+  assert.deepEqual(reasoningTiming(events, undefined, 0), {});
+  const continued = [...events, ...line(9, { type: "content.delta", scope: { turnId: "turn", runId: "turn:run" }, data: { partId: "reason2", kind: "reasoning", delta: "Another summary" } })];
+  assert.equal(reasoningTiming(continued, "turn", 0).endedAt, undefined);
+});
+
+test("late reasoning completion stays before its tools without moving the next step", () => {
+  const events = [...running(), ...tool(), ...line(5,
+    { type: "content.completed", scope: { turnId: "turn" }, data: { partId: "reason", runId: "turn:run", kind: "reasoning", phase: "narration", value: "Earlier thought" } },
+    { type: "model.settled", scope: { turnId: "turn" }, data: { runId: "turn:run", outcome: "completed", finishReason: "tool-calls" } }),
+    ...line(6,
+      { type: "model.requested", scope: { turnId: "turn" }, data: { runId: "next", owner: { turnId: "turn" } } },
+      { type: "model.started", scope: { turnId: "turn" }, data: { runId: "next", modelId: "test", attempt: 0 } }),
+    ...line(7, { type: "content.completed", scope: { turnId: "turn" }, data: { partId: "reason2", runId: "next", kind: "reasoning", phase: "narration", value: "Next thought" } })];
+  assert.deepEqual(presentAgentTurn(assistant(events), events)?.processParts.map((part) => [part.type, part.stepIndex]), [["reasoning", 0], ["tool", 0], ["reasoning", 1]]);
+  // Presentation does not change the official transcript or its coordinates.
+  assert.equal(assistant(events).parts[0]?.type, "tool");
+});
+
+test("distinct reasoning summaries remain separate paragraphs", () => {
+  const events = [...running(), ...line(4, { type: "content.completed", scope: { turnId: "turn" }, data: { partId: "r1", runId: "turn:run", kind: "reasoning", phase: "narration", value: "**First**" } }),
+    ...line(5, { type: "content.delta", scope: { turnId: "turn", runId: "turn:run" }, data: { partId: "r2", kind: "reasoning", delta: "**Second**" } })];
+  assert.equal(reasoningContentForStep(events, "turn", 0), "**First**\n\n**Second**");
 });
 
 for (const outcome of ["failed", "interrupted", "completed"] as const) test(`a ${outcome} tool retains its durable identity and diagnostics`, () => {
@@ -253,8 +311,30 @@ test("subagent call lifecycle uses the durable child id", () => {
     { type: "child.opened", scope: { turnId: "turn" }, data: { sessionId: "child", owner: { callId: "child-call" }, name: "researcher", stream: "/sessions/child/stream" } })];
   assert.equal(presentSubagentCall(events, "child-call").childSessionId, "child");
   assert.equal(mergeSubagentSessions(events)[0]?.task, "Investigate");
+  const durable = [{ childSessionId: "child", name: "researcher", nickname: "代码审查", status: "completed" as const }];
+  assert.equal(mergeSubagentSessions(events, durable)[0]?.nickname, "代码审查");
+  assert.equal(mergeSubagentSessions([], durable)[0]?.nickname, "代码审查");
   events.push(...line(5, { type: "call.settled", scope: { turnId: "turn" }, data: { callId: "child-call", outcome: "interrupted" } }));
   assert.equal(presentSubagentCall(events, "child-call").status, "cancelled");
+});
+
+test("continued agent tasks keep their child and original role without duplicating the list", () => {
+  const events = [...running(), ...line(4,
+    { type: "call.requested", scope: { turnId: "turn" }, data: { callId: "first", owner: { runId: "turn:run" }, capability: { kind: "agent", name: "agent" }, input: { message: "Review", nickname: "代码审查" } } },
+    { type: "task.started", data: { taskId: "review-task", kind: "agent", name: "agent", startedBy: { callId: "first" } } },
+    { type: "call.started", data: { callId: "first", taskId: "review-task" } },
+    { type: "child.opened", data: { sessionId: "review-child", owner: { taskId: "review-task" }, name: "agent", stream: "/sessions/review-child/stream" } },
+    { type: "call.settled", data: { callId: "first", outcome: "completed", output: "Done" } }),
+    ...line(5,
+      { type: "call.requested", scope: { turnId: "turn" }, data: { callId: "continue", owner: { runId: "turn:run" }, capability: { kind: "agent", name: "agent" }, input: { taskId: "review-task", message: "Review again", nickname: "Changed" } } },
+      { type: "call.started", data: { callId: "continue", taskId: "review-task" } }),
+  ];
+  const continued = presentSubagentCall(events, "continue");
+  assert.equal(continued.childSessionId, "review-child");
+  assert.equal(continued.nickname, "代码审查");
+  const children = mergeSubagentSessions(events);
+  assert.equal(children.length, 1);
+  assert.equal(children[0]?.task, "Review again");
 });
 
 test("terminal session boundaries remain distinct from settled live sessions", () => {

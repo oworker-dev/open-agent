@@ -1,4 +1,8 @@
 import type { AgentDeliverableEndpoint, AgentSessionDeliverable, AgentWorkspaceClientConfig } from "./contracts.js";
+import type { SessionStreamEvent } from "eve/client";
+export declare function publicationVersionLabel(version: string | undefined): string | undefined;
+export declare function deliverableExpired(deliverable: AgentSessionDeliverable): boolean;
+export declare function sessionPublicationsFromEvents(events: readonly SessionStreamEvent[]): readonly AgentSessionDeliverable[];
 export declare function loadSessionDeliverables({ client, endpoint, fetcher, sessionId, signal, }: {
     readonly client?: AgentWorkspaceClientConfig;
     readonly endpoint?: AgentDeliverableEndpoint;

@@ -1,0 +1,5 @@
+import { jsx as _jsx, jsxs as _jsxs } from "react/jsx-runtime";
+export function AgentHistoryLoading({ locale }) {
+    return (_jsxs("div", { className: "mx-auto flex w-full max-w-3xl flex-col gap-8 px-6 py-10", "data-agent-history-loading": true, role: "status", children: [_jsx("span", { className: "sr-only", children: locale === "zh-CN" ? "正在加载会话消息…" : "Loading conversation…" }), _jsx("div", { "aria-hidden": "true", className: "h-12 w-2/3 animate-pulse self-end rounded-xl bg-muted" }), _jsxs("div", { "aria-hidden": "true", className: "space-y-3", children: [_jsx("div", { className: "h-4 w-4/5 animate-pulse rounded bg-muted" }), _jsx("div", { className: "h-4 w-full animate-pulse rounded bg-muted" }), _jsx("div", { className: "h-4 w-3/5 animate-pulse rounded bg-muted" })] })] }));
+}
+//# sourceMappingURL=history-loading.js.map

@@ -6,7 +6,27 @@ import {
   mergeSessionDeliverables,
   resolveSessionDeliverableEndpoint,
   splitSessionDeliverables,
+  publicationVersionLabel,
+  sessionPublicationsFromEvents,
 } from "../../packages/agent-ui/src/agent-workspace/session-deliverables.ts";
+import { line } from "../helpers/session-events.ts";
+
+test("historical publications survive registry cleanup and partial source windows", () => {
+  const result = { artifactId: "art_expired", kind: "artifact", filename: "report.txt", version: "v2", url: "/api/artifacts/art_expired?token=old", expiresAt: "2020-01-01T00:00:00.000Z" };
+  const events = line(20,
+    { type: "call.settled", data: { callId: "expired", outcome: "completed", output: result } },
+    { type: "call.settled", data: { callId: "failed", outcome: "failed", output: result } },
+    { type: "call.settled", data: { callId: "unsafe", outcome: "completed", output: { ...result, artifactId: "unsafe", url: "javascript:alert(1)" } } },
+  );
+  const publications = sessionPublicationsFromEvents(events);
+  assert.equal(publications.length, 1);
+  assert.equal(publications[0]?.id, "art_expired");
+  assert.equal(publications[0]?.expiresAt, result.expiresAt);
+  assert.equal(publications[0]?.createdAt, events[0]?.meta.at);
+  assert.equal(publicationVersionLabel(publications[0]?.version), "v2");
+  assert.equal(publicationVersionLabel("2"), "v2");
+  assert.equal(publicationVersionLabel(" release-beta "), "release-beta");
+});
 
 test("session deliverable parser accepts bounded host-neutral records", () => {
   assert.deepEqual(parseSessionDeliverables({ deliverables: [{

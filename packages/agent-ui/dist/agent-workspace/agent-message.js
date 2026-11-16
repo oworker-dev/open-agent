@@ -1,8 +1,9 @@
 "use client";
 import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-runtime";
-import { BracesIcon, CheckIcon, CheckCircleIcon, CircleAlertIcon, ChevronDownIcon, CircleStopIcon, CopyIcon, ExternalLinkIcon, FileIcon, ImageIcon, LoaderCircleIcon, NetworkIcon, SearchIcon, TerminalIcon, FileSearchIcon, MessageCircleQuestionIcon, MonitorIcon, ShieldCheckIcon, WifiIcon, XCircleIcon, } from "lucide-react";
+import { BracesIcon, CheckIcon, CheckCircleIcon, CircleAlertIcon, ChevronDownIcon, CircleStopIcon, CopyIcon, ExternalLinkIcon, FileIcon, ImageIcon, ImagesIcon, LoaderCircleIcon, NetworkIcon, SearchIcon, TerminalIcon, FileSearchIcon, MessageCircleQuestionIcon, MonitorIcon, ShieldCheckIcon, WifiIcon, XCircleIcon, } from "lucide-react";
 import { createContext, useContext, useEffect, useRef, useState } from "react";
-import { contentPreviews, runs, signInEnding } from "eve/events";
+import { runs, signInEnding } from "eve/events";
+import { encodeMultiSelectAnswer, parseMultiSelectAnswer } from "@oworker/open-agent-contracts";
 import { useScrollLock } from "@assistant-ui/react";
 import { useAssetDownload, useAssetPreview } from "./asset-preview.js";
 import { parsePartialJsonObject } from "assistant-stream/utils";
@@ -14,13 +15,16 @@ import { ToolFallbackContent, ToolFallbackRoot, } from "../assistant-ui/tool-fal
 import { ToolGroupContent, ToolGroupRoot, ToolGroupTrigger, } from "../assistant-ui/tool-group.js";
 import { DiffViewer } from "../assistant-ui/diff-viewer.js";
 import { Button } from "../ui/button.js";
-import { Attachment, AttachmentAction, AttachmentContent, AttachmentDescription, AttachmentMedia, AttachmentTitle, AttachmentTrigger } from "../ui/attachment.js";
+import { Attachment, AttachmentAction, AttachmentContent, AttachmentDescription, AttachmentMedia, AttachmentTitle } from "../ui/attachment.js";
 import { Alert, AlertDescription, AlertTitle } from "../ui/alert.js";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "../ui/collapsible.js";
 import { Questionnaire, QuestionnaireChoice, QuestionnaireChoiceDescription, QuestionnaireChoices, QuestionnaireError, QuestionnaireItem, QuestionnaireSubmit, QuestionnaireTitle, } from "../ui/questionnaire.js";
 import { cn } from "../utils.js";
 import { AgentToolRenderersContext } from "./tool-renderers.js";
-import { eventsForMessagePresentation, isLocallyInterruptedMessage, eventTurnId, eventStepIndex, presentationSnapshot, failureForTurn, classifyAgentFailure, isCancellationPendingToolPart, isInterruptedToolPart, presentAgentTurn, presentAgentStep, presentSubagentCall, reasoningContentForStep, withThinkingPlaceholder, } from "./turn-presentation.js";
+import { AgentSubagentsContext } from "./subagent-context.js";
+import { deliverableExpired, publicationVersionLabel } from "./session-deliverables.js";
+import { AttachmentImagePreview } from "./attachment-preview.js";
+import { eventsForMessagePresentation, isLocallyInterruptedMessage, eventTurnId, presentationSnapshot, failureForTurn, classifyAgentFailure, hasModelStepOutput, isInterruptedToolPart, presentAgentTurn, presentAgentStep, presentSubagentCall, reasoningContentForStep, reasoningTiming, withThinkingPlaceholder, } from "./turn-presentation.js";
 function Message({ children, from, ...props }) {
     return _jsx("article", { className: cn("group flex w-full flex-col", from === "user" ? "items-end" : "items-start"), ...props, children: children });
 }
@@ -132,6 +136,10 @@ function AgentMessagePart({ assetUrl, canRespond, closedInputRequestIds = EMPTY_
     }
 }
 function ProcessParts({ assetUrl, canRespond, closedInputRequestIds = EMPTY_CLOSED_INPUT_REQUEST_IDS, events, inActiveExecution, locale, onInputResponses, onCloseInputRequest = () => undefined, onOpenSubagent, parts, turnId, }) {
+    const renderers = useContext(AgentToolRenderersContext);
+    const usesImageGallery = (part) => isViewImageTool(normalizeToolName(part.name))
+        && !part.interaction && !renderers?.[part.name]
+        && !["cancelled", "failed", "rejected", "approval"].includes(part.state);
     const rendered = [];
     const toolGroupOrdinalByStep = new Map();
     const lastReasoningPartByStep = new Map();
@@ -154,11 +162,17 @@ function ProcessParts({ assetUrl, canRespond, closedInputRequestIds = EMPTY_CLOS
             index += 1;
             continue;
         }
+        const imageGallery = usesImageGallery(part);
         const toolParts = [];
         let cursor = index;
-        while (cursor < parts.length && parts[cursor]?.type === "tool") {
+        while (cursor < parts.length && parts[cursor]?.type === "tool" && usesImageGallery(parts[cursor]) === imageGallery) {
             toolParts.push(parts[cursor]);
             cursor += 1;
+        }
+        if (imageGallery) {
+            rendered.push(_jsx(ViewedImages, { assetUrl: assetUrl, locale: locale, parts: toolParts }, `images:${toolParts[0].callId}`));
+            index = cursor;
+            continue;
         }
         if (toolParts.every((toolPart) => Boolean(toolPart.interaction))) {
             rendered.push(_jsx("div", { className: "space-y-2", children: toolParts.map((toolPart) => (_jsx(AgentMessagePart, { assetUrl: assetUrl, canRespond: canRespond, events: events, inActiveExecution: inActiveExecution, locale: locale, onInputResponses: onInputResponses, onCloseInputRequest: onCloseInputRequest, closedInputRequestIds: closedInputRequestIds, onOpenSubagent: onOpenSubagent, part: toolPart, turnId: turnId }, toolPart.callId))) }, `inputs:${toolParts[0]?.callId}`));
@@ -206,6 +220,7 @@ function ToolPart(props) {
     return _jsx(Renderer, { assetUrl: props.assetUrl, canRespond: props.canRespond, defaultContent: defaultContent, events: props.events, inputRequestClosed: Boolean(props.part.interaction && props.closedInputRequestIds?.has(props.part.interaction.interactionId)), locale: props.locale, onCloseInputRequest: props.onCloseInputRequest ?? (() => undefined), onInputResponses: props.onInputResponses, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: props.onOpenSubagent, part: props.part });
 }
 function DefaultToolPart({ assetUrl, canRespond, closedInputRequestIds = EMPTY_CLOSED_INPUT_REQUEST_IDS, events, locale, onInputResponses, onCloseInputRequest = () => undefined, onOpenSubagent, part, }) {
+    const subagents = useContext(AgentSubagentsContext);
     const inputRequest = part.interaction;
     if (inputRequest) {
         return _jsx(InputRequestCard, { canRespond: canRespond, closed: closedInputRequestIds.has(inputRequest.interactionId), events: events, locale: locale, onClose: onCloseInputRequest, onInputResponses: onInputResponses, part: part });
@@ -214,13 +229,10 @@ function DefaultToolPart({ assetUrl, canRespond, closedInputRequestIds = EMPTY_C
     const defaultOpen = part.state === "approval";
     const Icon = toolIcon(part);
     const interrupted = isInterruptedToolPart(part);
-    const cancellationPending = isCancellationPendingToolPart(part);
     const statusLabel = isFileMutationTool(part) ? undefined : toolStatusLabel(locale, part);
-    return (_jsxs(ToolFallbackRoot, { className: "my-0", defaultOpen: defaultOpen, children: [_jsxs(CollapsibleTrigger, { className: "group/trigger flex w-fit max-w-full origin-left items-center gap-2 py-1.5 text-left text-sm text-muted-foreground transition-[color,scale] hover:text-foreground active:scale-[0.98]", children: [running ? (_jsx(LoaderCircleIcon, { className: "size-4 shrink-0 animate-spin [animation-duration:0.65s]" })) : interrupted ? (_jsx(CircleStopIcon, { className: "size-4 shrink-0 text-muted-foreground" })) : cancellationPending ? (_jsx(LoaderCircleIcon, { className: "size-4 shrink-0 animate-spin text-muted-foreground [animation-duration:0.9s]" })) : part.state === "failed" || part.state === "rejected" ? (_jsx(XCircleIcon, { className: "size-4 shrink-0 text-destructive" })) : (_jsx(Icon, { className: "size-4 shrink-0" })), isFileMutationTool(part) ? (_jsx(FileMutationToolTitle, { events: events, locale: locale, part: part })) : (_jsx("span", { className: "truncate", children: toolTitle(locale, part, events) })), statusLabel ? (_jsx("span", { className: cn("shrink-0 text-xs", part.state === "failed" && "text-destructive"), children: statusLabel })) : null, _jsx(ChevronDownIcon, { className: "size-3.5 shrink-0 -rotate-90 transition-transform group-data-[state=open]/trigger:rotate-0" })] }), _jsxs(ToolFallbackContent, { children: [_jsx(KnownToolContent, { assetUrl: assetUrl, events: events, locale: locale, onOpenSubagent: onOpenSubagent, part: part }), part.error?.message ? (_jsx("p", { className: cn("whitespace-pre-wrap text-xs", interrupted ? "text-muted-foreground" : "text-destructive"), children: interrupted
+    return (_jsxs(ToolFallbackRoot, { className: "my-0", defaultOpen: defaultOpen, children: [_jsxs(CollapsibleTrigger, { className: "group/trigger flex w-fit max-w-full origin-left items-center gap-2 py-1.5 text-left text-sm text-muted-foreground transition-[color,scale] hover:text-foreground active:scale-[0.98]", children: [running ? (_jsx(LoaderCircleIcon, { className: "size-4 shrink-0 animate-spin [animation-duration:0.65s]" })) : interrupted ? (_jsx(CircleStopIcon, { className: "size-4 shrink-0 text-muted-foreground" })) : part.state === "failed" || part.state === "rejected" ? (_jsx(XCircleIcon, { className: "size-4 shrink-0 text-destructive" })) : (_jsx(Icon, { className: "size-4 shrink-0" })), isFileMutationTool(part) ? (_jsx(FileMutationToolTitle, { events: events, locale: locale, part: part })) : (_jsx("span", { className: "truncate", children: toolTitle(locale, part, events, subagents) })), statusLabel ? (_jsx("span", { className: cn("shrink-0 text-xs", part.state === "failed" && "text-destructive"), children: statusLabel })) : null, _jsx(ChevronDownIcon, { className: "size-3.5 shrink-0 -rotate-90 transition-transform group-data-[state=open]/trigger:rotate-0" })] }), _jsxs(ToolFallbackContent, { children: [_jsx(KnownToolContent, { assetUrl: assetUrl, events: events, locale: locale, onOpenSubagent: onOpenSubagent, part: part }), part.error?.message ? (_jsx("p", { className: cn("whitespace-pre-wrap text-xs", interrupted ? "text-muted-foreground" : "text-destructive"), children: interrupted
                             ? localize(locale, "Tool call stopped before completion.", "工具调用在完成前已中断。")
-                            : cancellationPending
-                                ? localize(locale, "Stopping tool call…", "正在停止工具调用…")
-                                : part.error?.message })) : null] })] }));
+                            : part.error?.message })) : null] })] }));
 }
 function KnownToolContent({ assetUrl, events, locale, onOpenSubagent, part, }) {
     const normalized = normalizeToolName(part.name);
@@ -331,6 +343,13 @@ const VIEW_IMAGE_MEDIA_TYPES = new Set([
     "image/svg+xml",
     "image/webp",
 ]);
+function ViewedImages({ assetUrl, locale, parts }) {
+    const running = parts.some(part => !isToolTerminal(part));
+    const label = running
+        ? localize(locale, `Viewing ${parts.length} ${parts.length === 1 ? "image" : "images"}`, `正在查看 ${parts.length} 张图像`)
+        : localize(locale, `Viewed ${parts.length} ${parts.length === 1 ? "image" : "images"}`, `已查看 ${parts.length} 张图像`);
+    return _jsxs(ToolFallbackRoot, { className: "my-0", "data-tool-view": "view-images", defaultOpen: true, children: [_jsxs(CollapsibleTrigger, { className: "group/trigger flex max-w-full items-center gap-2 py-1.5 text-sm text-muted-foreground hover:text-foreground", children: [running ? _jsx(LoaderCircleIcon, { className: "size-4 shrink-0 animate-spin" }) : _jsx(ImagesIcon, { className: "size-4 shrink-0" }), _jsx("span", { children: label }), _jsx(ChevronDownIcon, { className: "size-3.5 shrink-0 -rotate-90 transition-transform group-data-[state=open]/trigger:rotate-0" })] }), _jsx(CollapsibleContent, { children: _jsx("div", { className: "flex flex-wrap gap-3 py-1", "data-viewed-image-thumbnails": true, children: parts.map(part => _jsx(ViewImageToolContent, { assetUrl: assetUrl, input: toolInput(part), locale: locale, output: part.output, running: !isToolTerminal(part) }, part.callId)) }) })] });
+}
 function ViewImageToolContent({ assetUrl, input, locale, output, running, }) {
     const record = asRecord(output);
     const path = firstString(record, ["path"]) ?? firstString(input, ["path"])
@@ -344,7 +363,6 @@ function ViewImageToolContent({ assetUrl, input, locale, output, running, }) {
     const sourceUrl = assetId
         ? assetUrl?.(assetId) ?? `/api/assets/${encodeURIComponent(assetId)}`
         : undefined;
-    const { url: previewUrl } = useAssetPreview(sourceUrl);
     const details = [
         mediaType && VIEW_IMAGE_MEDIA_TYPES.has(mediaType) ? mediaType : undefined,
         dimensions ? `${dimensions.width}\u00d7${dimensions.height}` : undefined,
@@ -355,12 +373,7 @@ function ViewImageToolContent({ assetUrl, input, locale, output, running, }) {
                 : localize(locale, "resized preview", "已缩放预览图")
             : undefined,
     ].filter((value) => Boolean(value));
-    const [previewOpen, setPreviewOpen] = useState(false);
-    return (_jsxs("div", { "data-tool-view": "view-image", children: [_jsxs(Attachment, { className: "max-w-[min(100%,28rem)]", size: "default", state: running ? "processing" : "done", children: [_jsx(AttachmentMedia, { className: "size-12", variant: previewUrl ? "image" : "icon", children: previewUrl ? _jsx("img", { alt: path, src: previewUrl }) : _jsx(ImageIcon, { className: "size-5" }) }), _jsxs(AttachmentContent, { children: [_jsx(AttachmentTitle, { title: path, children: path }), _jsx(AttachmentDescription, { children: details.length > 0
-                                    ? details.join(" \u00b7 ")
-                                    : running
-                                        ? localize(locale, "Preparing image preview...", "正在准备图片预览…")
-                                        : localize(locale, "Image metadata unavailable", "图片元数据不可用") })] }), previewUrl ? (_jsx(AttachmentTrigger, { "aria-label": localize(locale, `Preview ${path}`, `预览 ${path}`), onClick: () => setPreviewOpen(true), title: localize(locale, "Preview image", "预览图片") })) : null] }), previewOpen && previewUrl ? (_jsx("button", { "aria-label": localize(locale, "Close image preview", "关闭图片预览"), className: "fixed inset-0 z-50 flex cursor-zoom-out items-center justify-center bg-black/70 p-6", onClick: () => setPreviewOpen(false), type: "button", children: _jsx("img", { alt: path, className: "max-h-[90vh] max-w-[90vw] rounded-xl object-contain shadow-2xl", src: previewUrl }) })) : null] }));
+    return _jsx(AttachmentImagePreview, { dismissLabel: localize(locale, "Close image preview", "关闭图片预览"), label: localize(locale, `Preview ${path}`, `预览 ${path}`), name: path, retryLabel: localize(locale, "Retry preview", "重试预览"), source: sourceUrl, state: running ? "processing" : "done", title: [path, ...details].join(" · ") });
 }
 function imageDimensions(value) {
     const record = asRecord(value);
@@ -394,7 +407,7 @@ function toolIcon(part) {
 }
 function isToolTerminal(part) {
     return part.state === "rejected" || part.state === "failed" ||
-        (part.state === "completed");
+        part.state === "completed" || part.state === "cancelled";
 }
 function normalizeToolName(toolName) {
     return toolName.toLocaleLowerCase().replaceAll("-", "_");
@@ -423,14 +436,6 @@ function fileMutationSummary(part, events = []) {
     return { additions, deletions, operation, ...(path ? { path } : {}) };
 }
 function fileMutationTitle(locale, part, events = []) {
-    if (isCancellationPendingToolPart(part)) {
-        const summary = fileMutationSummary(part, events);
-        const stats = [
-            summary.additions > 0 ? `+${summary.additions}` : undefined,
-            summary.deletions > 0 ? `-${summary.deletions}` : undefined,
-        ].filter(Boolean).join(" ");
-        return [localize(locale, "Stopping", "正在停止"), summary.path, stats].filter(Boolean).join(" ");
-    }
     if (isInterruptedToolPart(part)) {
         const summary = fileMutationSummary(part, events);
         const stats = [
@@ -449,8 +454,6 @@ function fileMutationTitle(locale, part, events = []) {
     return [action, summary.path, stats].filter(Boolean).join(" ");
 }
 function fileMutationActionLabel(locale, part, summary) {
-    if (isCancellationPendingToolPart(part))
-        return localize(locale, "Stopping", "正在停止");
     if (isInterruptedToolPart(part))
         return localize(locale, "Stopped", "已中断");
     if (part.state === "failed")
@@ -508,27 +511,18 @@ function ReasoningPart({ events, locale, part, turnId, }) {
         : { status: "running" };
     const retryItems = step.retries ?? (step.retry ? [step.retry] : []);
     const stepIndex = part.stepIndex ?? 0;
-    const durationSeconds = useElapsedSeconds(timing.startedAt, timing.endedAt);
     const retryInFlight = hasTurnId && isReasoningRetryInFlight(events, turnId, part.stepIndex);
     const eventText = hasTurnId ? reasoningContentForStep(events, turnId, part.stepIndex) : "";
-    const run = hasTurnId ? runs(presentationSnapshot(events).view, { turnId })[stepIndex] : undefined;
-    const hasTextOutput = Boolean(run && contentPreviews(presentationSnapshot(events).view).some((preview) => preview.runId === run.runId && preview.kind === "text" && preview.text.trim()));
-    const responseStarted = Boolean(turnId) && !eventText && (hasTextOutput || events.some((event) => event.type === "content.completed" && event.data.kind === "text" &&
-        eventTurnMatches(event, turnId, stepIndex, events) && typeof event.data.value === "string" && event.data.value.trim().length > 0));
-    const streaming = !interrupted && (part.state === "streaming" || retryInFlight) && !responseStarted;
     const text = hasTurnId ? (retryInFlight ? eventText : eventText || part.text.trim()) : "";
-    if (!text && !streaming) {
-        return (_jsx(ReasoningBlock, { durationSeconds: durationSeconds, events: events, failure: step.failure, locale: locale, retryItems: retryItems, stepIndex: stepIndex, streaming: false, text: "", timing: timing, turnId: turnId }));
-    }
+    const streaming = !interrupted && (part.state === "streaming" || retryInFlight) &&
+        (Boolean(text) || !hasModelStepOutput(events, turnId, stepIndex));
+    const durationSeconds = useElapsedSeconds(text || streaming ? timing.startedAt : undefined, timing.endedAt);
     return (_jsx(ReasoningBlock, { durationSeconds: durationSeconds, events: events, failure: step.failure, locale: locale, retryItems: retryItems, stepIndex: stepIndex, streaming: streaming, text: text, timing: timing, turnId: turnId }));
 }
 function ReasoningBlock({ durationSeconds, failure, locale, retryItems, stepIndex, streaming, text, timing, turnId, }) {
     const hasText = text.trim().length > 0;
     const latestRetry = retryItems.at(-1);
     return (_jsxs(_Fragment, { children: [latestRetry ? _jsx(RetryStatus, { locale: locale, retry: latestRetry }, `retry:${turnId ?? "unknown"}:${stepIndex}`) : null, failure && !retryItems.some((retry) => retry.exhausted) ? _jsx(StepFailure, { failure: failure, locale: locale }) : null, hasText || streaming ? (_jsxs(ReasoningRoot, { className: "mb-1", role: streaming ? "status" : undefined, streaming: streaming, variant: "ghost", children: [_jsx(ReasoningTrigger, { active: streaming, duration: timing.startedAt && durationSeconds > 0 ? durationSeconds : undefined, hideChevron: !hasText, label: reasoningTriggerLabel(locale, streaming, text) }), hasText ? (_jsx(ReasoningContent, { "aria-busy": streaming, children: _jsx(ReasoningText, { children: _jsx(StaticMarkdownText, { text: text }) }) })) : null] })) : null] }));
-}
-function eventTurnMatches(event, turnId, stepIndex, events) {
-    return turnId !== undefined && eventTurnId(event) === turnId && eventStepIndex(event, events) === stepIndex;
 }
 function isReasoningRetryInFlight(events, turnId, stepIndex) {
     if (!turnId || stepIndex === undefined)
@@ -544,6 +538,8 @@ function reasoningTriggerLabel(locale, streaming, text) {
 function reasoningSummary(text) {
     const firstLine = text
         .replaceAll(/^[#>*\-\s]+/gm, "")
+        .replaceAll(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+        .replaceAll(/[*_`~]/g, "")
         .split(/\n|(?<=[.!?。！？])\s+/u)
         .map((line) => line.trim())
         .find(Boolean);
@@ -553,12 +549,6 @@ function reasoningSummary(text) {
 }
 function activeReasoningStep(events, turnId) {
     return turnId ? Math.max(0, runs(presentationSnapshot(events).view, { turnId }).length - 1) : 0;
-}
-function reasoningTiming(events, turnId, stepIndex) {
-    if (!turnId)
-        return {};
-    const step = presentAgentStep(events, turnId, stepIndex ?? 0);
-    return { startedAt: step.startedAt, endedAt: step.endedAt };
 }
 function eventTime(event) {
     const at = event?.meta?.at;
@@ -776,16 +766,16 @@ function deliverablesForTurn(events, turnId, callIds) {
 }
 function PublishedDeliverableCard({ deliverable, locale }) {
     const openDeliverable = useContext(DeliverableOpenContext);
-    return _jsx(ArtifactCard, { "aria-label": `${locale === "zh-CN" ? "打开" : "Open"} ${deliverable.title}`, icon: deliverable.kind === "website-preview" ? _jsx(MonitorIcon, { className: "size-4" }) : undefined, meta: publishedDeliverableMeta(deliverable, locale), onClick: () => openDeliverable ? openDeliverable(deliverable) : window.open(deliverable.url, "_blank", "noopener,noreferrer"), title: deliverable.alias ?? deliverable.title });
+    return _jsx(ArtifactCard, { "aria-label": `${locale === "zh-CN" ? "打开" : "Open"} ${deliverable.title}`, disabled: deliverableExpired(deliverable), icon: deliverable.kind === "website-preview" ? _jsx(MonitorIcon, { className: "size-4" }) : undefined, meta: publishedDeliverableMeta(deliverable, locale), onClick: () => openDeliverable ? openDeliverable(deliverable) : window.open(deliverable.url, "_blank", "noopener,noreferrer"), title: deliverable.alias ?? deliverable.title });
 }
 function publishedDeliverableMeta(deliverable, locale) {
     const title = deliverable.alias && deliverable.title !== deliverable.alias ? deliverable.title : undefined;
-    const version = deliverable.version ? `v${deliverable.version}` : undefined;
+    const version = publicationVersionLabel(deliverable.version);
     const kind = deliverable.kind === "website-preview"
         ? localize(locale, "Website preview", "网站预览")
         : localize(locale, "Published artifact", "发布资产");
     const fileCount = deliverable.fileCount ? `${deliverable.fileCount} ${localize(locale, "files", "个文件")}` : undefined;
-    return [kind, version, title, fileCount, deliverable.mediaType, formatBytes(deliverable.sizeBytes)].filter(Boolean).join(" · ");
+    return [kind, deliverableExpired(deliverable) ? localize(locale, "Expired", "已过期") : undefined, version, title, fileCount, deliverable.mediaType, formatBytes(deliverable.sizeBytes)].filter(Boolean).join(" · ");
 }
 function toolPatch(part, _events = []) {
     if (!["apply_patch", "patch_file"].includes(normalizeToolName(part.name)))
@@ -927,7 +917,8 @@ function normalizedHunk(lines, oldStart, newStart, suffix = "") {
     return [`@@ -${oldStart},${oldCount} +${newStart},${newCount} @@${trailer}`, ...body];
 }
 function SubagentProgress({ events, locale, onOpenSubagent, part, }) {
-    const presentation = presentSubagentCall(events, part.callId);
+    const subagents = useContext(AgentSubagentsContext);
+    const presentation = presentSubagentCall(events, part.callId, subagents);
     const elapsedSeconds = useElapsedSeconds(presentation.startedAt, presentation.endedAt);
     const isActive = presentation.status === "running" || presentation.status === "starting";
     const title = presentation.status === "completed"
@@ -1074,6 +1065,7 @@ function InputRequestCard({ canRespond, closed, events, locale, onClose, onInput
             ? localize(locale, `Approve tool call: ${approvalToolName(part.type === "tool" ? part.name : interaction.call?.name ?? "", locale)}`, `批准工具调用：${approvalToolName(part.type === "tool" ? part.name : interaction.call?.name ?? "", locale)}`)
             : localize(locale, "Session limit reached", "已达到会话限制");
     const choices = inputRequest.options ?? [];
+    const multipleSelection = isQuestion && part.type === "tool" && asRecord(part.input)?.multiple === true;
     const settled = interaction.status === "settled" || Boolean(inputResponse) || closed;
     const [open, setOpen] = useState(!settled);
     useEffect(() => {
@@ -1089,7 +1081,7 @@ function InputRequestCard({ canRespond, closed, events, locale, onClose, onInput
             : isQuestion
                 ? localize(locale, "Waiting for confirmation", "等待确认")
                 : undefined;
-    return (_jsx(Collapsible, { className: cn("my-1 max-w-full transition-[width] duration-200", open ? "w-full max-w-xl" : "w-fit"), onOpenChange: setOpen, open: open, children: _jsx("section", { className: "rounded-xl border border-border/70 bg-background px-3.5 py-3", "data-input-request-kind": inputRequest.kind, children: _jsxs("div", { className: "flex items-start gap-2.5", children: [_jsx(Icon, { className: "mt-0.5 size-4 shrink-0 text-muted-foreground" }), _jsxs("div", { className: "min-w-0 flex-1", children: [_jsxs("div", { className: "flex items-center gap-2", children: [_jsx(CollapsibleTrigger, { asChild: true, children: _jsxs("button", { className: "group/request flex min-w-0 flex-1 items-center gap-1.5 text-left text-sm font-medium text-muted-foreground hover:text-foreground", type: "button", children: [_jsx("span", { className: "truncate", children: eyebrow }), status ? _jsxs("span", { className: "shrink-0 font-normal text-muted-foreground/80", children: ["\u00B7 ", status] }) : null, _jsx(ChevronDownIcon, { className: "size-3.5 shrink-0 transition-transform group-data-[state=open]/request:rotate-180" })] }) }), !inputResponse && !closed && isQuestion ? _jsx(Button, { className: "h-6 shrink-0 px-2 text-xs", onClick: () => onClose(interaction.interactionId), size: "sm", type: "button", variant: "ghost", children: localize(locale, "Close", "关闭") }) : null] }), _jsxs(CollapsibleContent, { className: "overflow-hidden", children: [_jsx("p", { className: "mt-1 text-sm leading-6 text-foreground", children: inputRequest.prompt }), isApproval && part.type === "tool" ? _jsx(ApprovalActionPreview, { events: events, locale: locale, part: part }) : null, settled ? (_jsx(InputRequestReview, { closed: closed, inputResponse: inputResponse, locale: locale, options: choices, selectedOptionId: selectedOption?.id })) : isApproval ? (_jsx("p", { className: "mt-3 text-xs leading-5 text-muted-foreground", children: localize(locale, "Respond using the approval controls below.", "请使用下方批准控件继续。") })) : (_jsx(QuestionnaireResponseForm, { acceptsFreeform: acceptsFreeform, canRespond: canRespond, locale: locale, onInputResponses: onInputResponses, options: choices, prompt: inputRequest.prompt, requestId: interaction.interactionId }))] })] })] }) }) }));
+    return (_jsx(Collapsible, { className: cn("my-1 max-w-full transition-[width] duration-200", open ? "w-full max-w-xl" : "w-fit"), onOpenChange: setOpen, open: open, children: _jsx("section", { className: "rounded-xl border border-border/70 bg-background px-3.5 py-3", "data-input-request-kind": inputRequest.kind, children: _jsxs("div", { className: "flex items-start gap-2.5", children: [_jsx(Icon, { className: "mt-0.5 size-4 shrink-0 text-muted-foreground" }), _jsxs("div", { className: "min-w-0 flex-1", children: [_jsxs("div", { className: "flex items-center gap-2", children: [_jsx(CollapsibleTrigger, { asChild: true, children: _jsxs("button", { className: "group/request flex min-w-0 flex-1 items-center gap-1.5 text-left text-sm font-medium text-muted-foreground hover:text-foreground", type: "button", children: [_jsx("span", { className: "truncate", children: eyebrow }), status ? _jsxs("span", { className: "shrink-0 font-normal text-muted-foreground/80", children: ["\u00B7 ", status] }) : null, _jsx(ChevronDownIcon, { className: "size-3.5 shrink-0 transition-transform group-data-[state=open]/request:rotate-180" })] }) }), !inputResponse && !closed && isQuestion ? _jsx(Button, { className: "h-6 shrink-0 px-2 text-xs", onClick: () => onClose(interaction.interactionId), size: "sm", type: "button", variant: "ghost", children: localize(locale, "Close", "关闭") }) : null] }), _jsxs(CollapsibleContent, { className: "overflow-hidden", children: [_jsx("p", { className: "mt-1 text-sm leading-6 text-foreground", children: inputRequest.prompt }), isApproval && part.type === "tool" ? _jsx(ApprovalActionPreview, { events: events, locale: locale, part: part }) : null, settled ? (_jsx(InputRequestReview, { closed: closed, inputResponse: inputResponse, locale: locale, multipleSelection: multipleSelection, options: choices, selectedOptionId: selectedOption?.id })) : isApproval ? (_jsx("p", { className: "mt-3 text-xs leading-5 text-muted-foreground", children: localize(locale, "Respond using the approval controls below.", "请使用下方批准控件继续。") })) : (_jsx(QuestionnaireResponseForm, { acceptsFreeform: acceptsFreeform, canRespond: canRespond, locale: locale, multipleSelection: multipleSelection, onInputResponses: onInputResponses, options: choices, prompt: inputRequest.prompt, requestId: interaction.interactionId }))] })] })] }) }) }));
 }
 function approvalToolName(toolName, locale) {
     const normalized = normalizeToolName(toolName);
@@ -1119,15 +1111,20 @@ function ApprovalActionPreview({ events, locale, part, }) {
     }
     return (_jsx("pre", { className: "mt-3 max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-md bg-muted/50 px-3 py-2.5 text-xs text-foreground", "data-tool-view": "approval-input", children: safeStringify(part.input) }));
 }
-function InputRequestReview({ closed, inputResponse, locale, options, selectedOptionId, }) {
+function InputRequestReview({ closed, inputResponse, locale, multipleSelection, options, selectedOptionId, }) {
+    const decodedAnswer = multipleSelection && inputResponse?.text
+        ? parseMultiSelectAnswer(inputResponse.text)
+        : undefined;
+    const selectedOptionIds = new Set(decodedAnswer?.optionIds ?? (selectedOptionId ? [selectedOptionId] : []));
+    const additionalText = decodedAnswer?.additionalText ?? inputResponse?.text?.trim();
     return (_jsxs("div", { className: "mt-3 space-y-2 text-sm", "data-tool-view": "input-review", children: [_jsx("p", { className: "text-xs text-muted-foreground", children: closed
                     ? localize(locale, "This question was closed. The details remain available for review.", "此问题已关闭，详细内容仍可回看。")
-                    : localize(locale, "Response", "回复") }), options.length > 0 ? (_jsx("ul", { className: "space-y-1.5", "aria-label": localize(locale, "Options", "选项"), children: options.map((option) => (_jsxs("li", { className: cn("flex items-start gap-2 rounded-md bg-muted/40 px-2.5 py-2", selectedOptionId === option.id && "bg-accent/80 text-foreground"), children: [_jsx("span", { className: cn("mt-1 size-2 shrink-0 rounded-full border border-muted-foreground/40", selectedOptionId === option.id && "border-primary bg-primary") }), _jsxs("span", { className: "min-w-0", children: [_jsx("span", { className: "block font-medium", children: option.label }), option.description ? _jsx("span", { className: "block text-xs leading-5 text-muted-foreground", children: option.description }) : null] })] }, option.id))) })) : null, _jsxs("div", { className: "rounded-md bg-muted/40 px-2.5 py-2", children: [_jsx("p", { className: "text-xs text-muted-foreground", children: localize(locale, "Additional information", "补充信息") }), _jsx("p", { className: "mt-1 whitespace-pre-wrap break-words text-foreground", children: inputResponse?.text?.trim() || localize(locale, "No additional information provided.", "未提供补充信息。") })] })] }));
+                    : localize(locale, "Response", "回复") }), options.length > 0 ? (_jsx("ul", { className: "space-y-1.5", "aria-label": localize(locale, "Options", "选项"), children: options.map((option) => (_jsxs("li", { className: cn("flex items-start gap-2 rounded-md bg-muted/40 px-2.5 py-2", selectedOptionIds.has(option.id) && "bg-accent/80 text-foreground"), "data-option-selected": selectedOptionIds.has(option.id) ? "true" : undefined, children: [_jsx("span", { className: cn("mt-1 size-2 shrink-0 border border-muted-foreground/40", multipleSelection ? "rounded-[2px]" : "rounded-full", selectedOptionIds.has(option.id) && "border-primary bg-primary") }), _jsxs("span", { className: "min-w-0", children: [_jsx("span", { className: "block font-medium", children: option.label }), option.description ? _jsx("span", { className: "block text-xs leading-5 text-muted-foreground", children: option.description }) : null] })] }, option.id))) })) : null, _jsxs("div", { className: "rounded-md bg-muted/40 px-2.5 py-2", children: [_jsx("p", { className: "text-xs text-muted-foreground", children: localize(locale, "Additional information", "补充信息") }), _jsx("p", { className: "mt-1 whitespace-pre-wrap break-words text-foreground", children: additionalText || localize(locale, "No additional information provided.", "未提供补充信息。") })] })] }));
 }
 const FREEFORM_OPTION_ID = "__open_agent_freeform__";
-function QuestionnaireResponseForm({ acceptsFreeform, canRespond, locale, onInputResponses, options, prompt, requestId, }) {
+function QuestionnaireResponseForm({ acceptsFreeform, canRespond, locale, multipleSelection, onInputResponses, options, prompt, requestId, }) {
     const [freeformText, setFreeformText] = useState("");
-    const [selectedOptionId, setSelectedOptionId] = useState("");
+    const [selectedOptionIds, setSelectedOptionIds] = useState([]);
     const hasFreeformAnswer = acceptsFreeform && freeformText.trim().length > 0;
     const questionnaireItems = [{
             choices: [
@@ -1142,6 +1139,16 @@ function QuestionnaireResponseForm({ acceptsFreeform, canRespond, locale, onInpu
             if (!canRespond)
                 return;
             const text = freeformText.trim();
+            if (multipleSelection) {
+                if (selectedOptionIds.length === 0 && !text)
+                    return;
+                void onInputResponses([{
+                        interactionId: requestId,
+                        text: encodeMultiSelectAnswer({ additionalText: text, optionIds: selectedOptionIds }),
+                    }]);
+                return;
+            }
+            const selectedOptionId = selectedOptionIds[0];
             if (!selectedOptionId && !text)
                 return;
             void onInputResponses([{
@@ -1149,7 +1156,16 @@ function QuestionnaireResponseForm({ acceptsFreeform, canRespond, locale, onInpu
                     ...(text ? { text } : {}),
                     interactionId: requestId,
                 }]);
-        }, children: [_jsxs(QuestionnaireItem, { name: "response", required: true, children: [_jsx(QuestionnaireTitle, { className: "sr-only", children: prompt }), _jsxs(QuestionnaireChoices, { children: [options.map((option) => (_jsxs(QuestionnaireChoice, { checked: selectedOptionId === option.id, className: option.style === "danger" ? "border-destructive/40 data-checked:bg-destructive/10" : option.style === "primary" ? "data-checked:border-primary/50" : undefined, disabled: !canRespond, onChange: (event) => setSelectedOptionId(event.currentTarget.checked ? option.id : ""), value: option.id, children: [_jsx("span", { className: cn("min-w-0 break-words font-medium", option.style === "danger" && "text-destructive"), children: option.label }), option.description ? _jsx(QuestionnaireChoiceDescription, { children: option.description }) : null] }, option.id))), acceptsFreeform ? (_jsxs(_Fragment, { children: [_jsx(QuestionnaireChoice, { checked: !selectedOptionId && hasFreeformAnswer, className: "hidden", value: FREEFORM_OPTION_ID, children: localize(locale, "Freeform answer", "补充回答") }), _jsx("textarea", { "aria-label": options.length > 0 ? localize(locale, "Additional information", "补充信息") : localize(locale, "Answer", "回答"), className: "min-h-20 w-full resize-y rounded-lg border border-border/70 bg-transparent px-3 py-2 text-sm leading-5 outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-50", disabled: !canRespond, onChange: (event) => setFreeformText(event.currentTarget.value), placeholder: options.length > 0 ? localize(locale, "Add context (optional)", "补充信息（可选）") : localize(locale, "Type your answer", "输入你的回答"), value: freeformText })] })) : null] }), _jsx(QuestionnaireError, { children: localize(locale, "Choose an option or add information to continue.", "请选择一个选项或补充信息后继续。") })] }), _jsx("div", { className: "flex justify-end pt-1", children: _jsx(QuestionnaireSubmit, { disabled: !canRespond, children: localize(locale, "Confirm", "确认") }) })] }));
+        }, children: [_jsxs(QuestionnaireItem, { multiple: multipleSelection, name: "response", required: true, children: [_jsx(QuestionnaireTitle, { className: "sr-only", children: prompt }), _jsxs(QuestionnaireChoices, { children: [multipleSelection && options.length > 0 ? (_jsx("p", { className: "text-xs text-muted-foreground", children: localize(locale, "Choose all that apply.", "可多选。") })) : null, options.map((option) => (_jsxs(QuestionnaireChoice, { checked: selectedOptionIds.includes(option.id), className: option.style === "danger" ? "border-destructive/40 data-checked:bg-destructive/10" : option.style === "primary" ? "data-checked:border-primary/50" : undefined, disabled: !canRespond, multipleSelection: multipleSelection, onChange: (event) => {
+                                    const checked = event.currentTarget.checked;
+                                    setSelectedOptionIds((current) => {
+                                        if (!multipleSelection)
+                                            return checked ? [option.id] : [];
+                                        if (checked)
+                                            return current.includes(option.id) ? current : [...current, option.id];
+                                        return current.filter((id) => id !== option.id);
+                                    });
+                                }, value: option.id, children: [_jsx("span", { className: cn("min-w-0 break-words font-medium", option.style === "danger" && "text-destructive"), children: option.label }), option.description ? _jsx(QuestionnaireChoiceDescription, { children: option.description }) : null] }, option.id))), acceptsFreeform ? (_jsxs(_Fragment, { children: [_jsx(QuestionnaireChoice, { checked: (multipleSelection || selectedOptionIds.length === 0) && hasFreeformAnswer, className: "hidden", multipleSelection: multipleSelection, value: FREEFORM_OPTION_ID, children: localize(locale, "Freeform answer", "补充回答") }), _jsx("textarea", { "aria-label": options.length > 0 ? localize(locale, "Additional information", "补充信息") : localize(locale, "Answer", "回答"), className: "min-h-20 w-full resize-y rounded-lg border border-border/70 bg-transparent px-3 py-2 text-sm leading-5 outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-50", disabled: !canRespond, onChange: (event) => setFreeformText(event.currentTarget.value), placeholder: options.length > 0 ? localize(locale, "Add context (optional)", "补充信息（可选）") : localize(locale, "Type your answer", "输入你的回答"), value: freeformText })] })) : null] }), _jsx(QuestionnaireError, { children: localize(locale, "Choose an option or add information to continue.", "请选择一个选项或补充信息后继续。") })] }), _jsx("div", { className: "flex justify-end pt-1", children: _jsx(QuestionnaireSubmit, { disabled: !canRespond, children: localize(locale, "Confirm", "确认") }) })] }));
 }
 function TurnFailure({ events, failure, locale, turnId }) {
     const latestRetryEvent = events.findLast((event) => event.type === "model.retried" && eventTurnId(event) === turnId);
@@ -1188,8 +1204,6 @@ function localize(locale, english, chinese) {
     return locale === "zh-CN" ? chinese : english;
 }
 function toolStatusLabel(locale, part) {
-    if (isCancellationPendingToolPart(part))
-        return localize(locale, "Stopping", "正在停止");
     if (isInterruptedToolPart(part))
         return localize(locale, "Stopped", "已中断");
     if (part.state === "running" || part.state === "blocked") {
@@ -1212,12 +1226,15 @@ function toolStatusLabel(locale, part) {
             return localize(locale, "Stopped", "已停止");
     }
 }
-function toolTitle(locale, part, events = []) {
+function toolTitle(locale, part, events = [], subagents = []) {
     const kind = part.kind;
     if (kind === "skill")
         return localize(locale, "Loaded skill", "加载技能");
-    if (kind === "agent")
-        return localize(locale, "Sub-agent", "子代理");
+    if (kind === "agent") {
+        const child = presentSubagentCall(events, part.callId, subagents);
+        const label = child.nickname ?? (child.name !== "agent" ? child.name : undefined);
+        return [localize(locale, "Sub-agent", "子代理"), label].filter(Boolean).join(" · ");
+    }
     const normalized = part.name.toLocaleLowerCase().replaceAll("-", "_");
     if (normalized === "ask_question")
         return localize(locale, "Question", "确认问题");

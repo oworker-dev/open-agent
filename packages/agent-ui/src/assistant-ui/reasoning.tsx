@@ -151,8 +151,7 @@ function ReasoningTrigger({
     hideChevron?: boolean;
     label?: React.ReactNode;
 }) {
-  const durationText = duration !== undefined && duration > 0 ? ` ${duration}s` : "";
-  const displayLabel = typeof label === "string" ? `${label}${durationText}` : label;
+  const durationText = duration !== undefined && duration > 0 ? `${duration}s` : "";
 
   return (
     <CollapsibleTrigger
@@ -166,11 +165,12 @@ function ReasoningTrigger({
       <span
         data-slot="reasoning-trigger-label"
         className={cn(
-          "aui-reasoning-trigger-label-wrapper relative inline-block whitespace-nowrap leading-none tabular-nums",
+          "aui-reasoning-trigger-label-wrapper relative flex min-w-0 items-center gap-1.5 leading-normal tabular-nums",
           active && "text-foreground/80",
         )}
       >
-        <span>{displayLabel}</span>
+        <span className="truncate">{label}</span>
+        {durationText ? <span className="shrink-0">{durationText}</span> : null}
       </span>
       {!hideChevron ? (
         <ChevronDownIcon

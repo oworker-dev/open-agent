@@ -1,6 +1,6 @@
 "use client";
 import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-runtime";
-import { ChevronLeftIcon, ChevronRightIcon, DownloadIcon, FileIcon, ImageIcon, MonitorIcon, PanelRightCloseIcon, RefreshCwIcon, UsersRoundIcon, XIcon, } from "lucide-react";
+import { ChevronLeftIcon, ChevronRightIcon, DownloadIcon, FileIcon, ImageIcon, LoaderCircleIcon, MonitorIcon, PanelRightCloseIcon, RefreshCwIcon, SquareIcon, UsersRoundIcon, XIcon, } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { StaticMarkdownText } from "../assistant-ui/markdown-text.js";
 import { WebPreview } from "../assistant-ui/web-preview.js";
@@ -8,22 +8,27 @@ import { ArtifactCard } from "../assistant-ui/artifact-card.js";
 import { Attachment, AttachmentAction, AttachmentContent, AttachmentDescription, AttachmentMedia, AttachmentTitle, } from "../ui/attachment.js";
 import { Button } from "../ui/button.js";
 import { cn } from "../utils.js";
-import { mergeSessionDeliverables, splitSessionDeliverables } from "./session-deliverables.js";
+import { deliverableExpired, mergeSessionDeliverables, publicationVersionLabel, splitSessionDeliverables } from "./session-deliverables.js";
 import { useAssetDownload, useAssetPreview, useAssetText } from "./asset-preview.js";
-export function AgentSecondaryView({ assetUrl, assets = [], assetsError, assetsLoading = false, childContent, children, deliverables, deliverablesError, deliverablesLoading, locale, onClose, onOpenAsset, onOpenChild, onOpenDeliverable, onRefreshAssets, onRefreshDeliverables, onSelectTab, requestedDeliverable, requestedDeliverableRequestId, tab, }) {
+export function AgentSecondaryView({ assetUrl, assets = [], assetsError, assetsLoading = false, childContent, children, closingChildren = new Set(), childControlError, deliverables, deliverablesError, deliverablesLoading, locale, onClose, onCloseChild, onHideChild, onOpenAsset, onOpenChild, onOpenDeliverable, onRefreshAssets, onRefreshDeliverables, onSelectTab, requestedDeliverable, requestedChild, requestedDeliverableRequestId, tab, }) {
     const isZh = locale === "zh-CN";
     const deliverableGroups = useMemo(() => splitSessionDeliverables(mergeSessionDeliverables(deliverables, assets)), [assets, deliverables]);
     const [overviewRoute, setOverviewRoute] = useState(normalizeOverviewRoute(tab));
     const [openTabs, setOpenTabs] = useState([]);
     const [activeTabId, setActiveTabId] = useState("home");
     const consumedDeliverableRequestId = useRef(undefined);
+    const consumedChildRequestId = useRef(undefined);
     const activeTab = openTabs.find((candidate) => candidate.id === activeTabId);
+    const tabTitle = (contentTab) => contentTab.kind === "child"
+        ? children.find((child) => child.childSessionId === contentTab.sessionId)?.nickname ?? contentTab.title
+        : contentTab.title;
     const selectOverviewRoute = useCallback((route) => {
         const normalized = normalizeOverviewRoute(route);
         setOverviewRoute(normalized);
         setActiveTabId("home");
+        onHideChild?.();
         onSelectTab?.(normalized);
-    }, [onSelectTab]);
+    }, [onHideChild, onSelectTab]);
     const openChild = useCallback((child) => {
         const contentTab = {
             id: `child:${child.childSessionId}`,
@@ -35,6 +40,16 @@ export function AgentSecondaryView({ assetUrl, assets = [], assetsError, assetsL
         setActiveTabId(contentTab.id);
         onOpenChild(child.childSessionId);
     }, [onOpenChild]);
+    useEffect(() => {
+        if (!requestedChild || consumedChildRequestId.current === requestedChild.requestId)
+            return;
+        consumedChildRequestId.current = requestedChild.requestId;
+        openChild(children.find((child) => child.childSessionId === requestedChild.sessionId) ?? {
+            childSessionId: requestedChild.sessionId,
+            nickname: isZh ? "子代理" : "Sub-agent",
+            status: "starting",
+        });
+    }, [children, isZh, openChild, requestedChild]);
     const openDeliverable = useCallback((deliverable) => {
         if (onOpenDeliverable) {
             onOpenDeliverable(deliverable);
@@ -49,12 +64,13 @@ export function AgentSecondaryView({ assetUrl, assets = [], assetsError, assetsL
         };
         setOpenTabs((current) => upsertContentTab(current, contentTab));
         setActiveTabId(contentTab.id);
+        onHideChild?.();
         if (deliverable.kind === "asset") {
             const asset = assets.find((candidate) => candidate.assetId === deliverable.id);
             if (asset)
                 onOpenAsset?.(asset);
         }
-    }, [assets, onOpenAsset, onOpenDeliverable]);
+    }, [assets, onHideChild, onOpenAsset, onOpenDeliverable]);
     useEffect(() => {
         if (!requestedDeliverable || requestedDeliverableRequestId === undefined)
             return;
@@ -67,28 +83,32 @@ export function AgentSecondaryView({ assetUrl, assets = [], assetsError, assetsL
         setActiveTabId(contentTab.id);
         if (contentTab.kind === "child")
             onOpenChild(contentTab.sessionId);
+        else
+            onHideChild?.();
     };
     const closeContentTab = (contentTab) => {
         setOpenTabs((current) => current.filter((candidate) => candidate.id !== contentTab.id));
-        if (activeTabId === contentTab.id)
+        if (activeTabId === contentTab.id) {
             setActiveTabId("home");
+            onHideChild?.();
+        }
     };
-    const headerTitle = activeTab?.title ?? (overviewRoute === "children"
+    const headerTitle = (activeTab ? tabTitle(activeTab) : undefined) ?? (overviewRoute === "children"
         ? (isZh ? "子代理" : "Sub-agents")
         : overviewRoute === "deliverables"
             ? (isZh ? "发布资产" : "Published assets")
             : overviewRoute === "assets"
                 ? (isZh ? "会话资产" : "Session assets")
                 : (isZh ? "工作区" : "Workspace"));
-    return (_jsxs("aside", { className: "flex h-full min-h-0 min-w-0 flex-col bg-background", "data-agent-secondary-view": true, children: [_jsxs("header", { className: "flex h-12 shrink-0 items-center gap-2 border-b border-border/70 px-3", children: [activeTab || overviewRoute !== "home" ? (_jsx(Button, { "aria-label": activeTab ? (isZh ? "返回列表" : "Back to list") : (isZh ? "返回概览" : "Back to overview"), onClick: () => selectOverviewRoute(activeTab?.kind === "child" ? "children" : activeTab?.kind === "deliverable" ? activeTab.overviewRoute : "home"), size: "icon-sm", variant: "ghost", children: _jsx(ChevronLeftIcon, { className: "size-4" }) })) : null, openTabs.length > 0 ? (_jsx("h2", { className: "sr-only", children: headerTitle })) : null, openTabs.length > 0 ? (_jsx(SecondaryTabBar, { "aria-label": isZh ? "已打开内容" : "Open content", children: openTabs.map((contentTab) => (_jsxs("div", { className: cn("group/tab flex w-40 shrink-0 items-center rounded-md", activeTabId === contentTab.id && "bg-accent"), children: [_jsx(TabButton, { active: activeTabId === contentTab.id, label: contentTab.title, onClick: () => activateContentTab(contentTab) }), _jsx("button", { "aria-label": `${isZh ? "关闭" : "Close"} ${contentTab.title}`, className: "mr-1 flex size-5 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-background/80 hover:text-foreground", onClick: () => closeContentTab(contentTab), type: "button", children: _jsx(XIcon, { className: "size-3" }) })] }, contentTab.id))) })) : (_jsx("h2", { className: "min-w-0 flex-1 truncate text-sm font-medium", children: headerTitle })), _jsx(Button, { "aria-label": isZh ? "关闭副视图" : "Close side view", onClick: onClose, size: "icon-sm", variant: "ghost", children: _jsx(PanelRightCloseIcon, { className: "size-4" }) })] }), activeTabId === "home" ? (_jsx(_Fragment, { children: _jsxs("div", { className: "min-h-0 flex-1 overflow-y-auto p-3", children: [overviewRoute === "home" ? _jsx(Overview, { assetCount: deliverableGroups.assets.length, childCount: children.length, publicationCount: deliverableGroups.publications.length, isZh: isZh, onChildren: () => selectOverviewRoute("children"), onAssets: () => selectOverviewRoute("assets"), onPublications: () => selectOverviewRoute("deliverables") }) : null, overviewRoute === "children" ? _jsx(ChildList, { children: children, isZh: isZh, onOpen: openChild }) : null, overviewRoute === "assets" ? _jsx(SessionAssetList, { assetUrl: assetUrl, assets: deliverableGroups.assets, error: assetsError, isZh: isZh, loading: assetsLoading, onOpen: openDeliverable, onRefresh: onRefreshAssets ?? (() => undefined) }) : null, overviewRoute === "deliverables" ? _jsx(DeliverableList, { deliverables: deliverableGroups.publications, error: deliverablesError, isZh: isZh, loading: deliverablesLoading ?? false, onOpen: openDeliverable, onRefresh: onRefreshDeliverables ?? (() => undefined) }) : null] }) })) : activeTab?.kind === "child" ? (_jsx("div", { className: "flex min-h-0 flex-1 flex-col", children: childContent ?? _jsx(EmptyState, { label: isZh ? "子代理会话不可用" : "Sub-agent session unavailable" }) })) : activeTab?.kind === "deliverable" ? (_jsx(DeliverablePreview, { assetUrl: assetUrl, deliverable: activeTab.deliverable, locale: locale })) : null] }));
+    return (_jsxs("aside", { className: "flex h-full min-h-0 min-w-0 flex-col bg-background", "data-agent-secondary-view": true, children: [_jsxs("header", { className: "flex h-12 shrink-0 items-center gap-2 border-b border-border/70 px-3", children: [activeTab || overviewRoute !== "home" ? (_jsx(Button, { "aria-label": activeTab ? (isZh ? "返回列表" : "Back to list") : (isZh ? "返回概览" : "Back to overview"), onClick: () => selectOverviewRoute(activeTab?.kind === "child" ? "children" : activeTab?.kind === "deliverable" ? activeTab.overviewRoute : "home"), size: "icon-sm", variant: "ghost", children: _jsx(ChevronLeftIcon, { className: "size-4" }) })) : null, openTabs.length > 0 ? (_jsx("h2", { className: "sr-only", children: headerTitle })) : null, openTabs.length > 0 ? (_jsx(SecondaryTabBar, { "aria-label": isZh ? "已打开内容" : "Open content", children: openTabs.map((contentTab) => (_jsxs("div", { className: cn("group/tab flex w-40 shrink-0 items-center rounded-md", activeTabId === contentTab.id && "bg-accent"), children: [_jsx(TabButton, { active: activeTabId === contentTab.id, label: tabTitle(contentTab), onClick: () => activateContentTab(contentTab) }), _jsx("button", { "aria-label": `${isZh ? "关闭" : "Close"} ${tabTitle(contentTab)}`, className: "mr-1 flex size-5 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-background/80 hover:text-foreground", onClick: () => closeContentTab(contentTab), type: "button", children: _jsx(XIcon, { className: "size-3" }) })] }, contentTab.id))) })) : (_jsx("h2", { className: "min-w-0 flex-1 truncate text-sm font-medium", children: headerTitle })), _jsx(Button, { "aria-label": isZh ? "关闭副视图" : "Close side view", onClick: onClose, size: "icon-sm", variant: "ghost", children: _jsx(PanelRightCloseIcon, { className: "size-4" }) })] }), activeTabId === "home" ? (_jsx(_Fragment, { children: _jsxs("div", { className: "min-h-0 flex-1 overflow-y-auto p-3", children: [overviewRoute === "home" ? _jsx(Overview, { assetCount: deliverableGroups.assets.length, childCount: children.length, publicationCount: deliverableGroups.publications.length, isZh: isZh, onChildren: () => selectOverviewRoute("children"), onAssets: () => selectOverviewRoute("assets"), onPublications: () => selectOverviewRoute("deliverables") }) : null, overviewRoute === "children" ? _jsxs(_Fragment, { children: [childControlError ? _jsx("p", { className: "mb-2 text-xs text-destructive", role: "alert", children: childControlError }) : null, _jsx(ChildList, { children: children, closing: closingChildren, isZh: isZh, onClose: onCloseChild, onOpen: openChild })] }) : null, overviewRoute === "assets" ? _jsx(SessionAssetList, { assetUrl: assetUrl, assets: deliverableGroups.assets, error: assetsError, isZh: isZh, loading: assetsLoading, onOpen: openDeliverable, onRefresh: onRefreshAssets ?? (() => undefined) }) : null, overviewRoute === "deliverables" ? _jsx(DeliverableList, { deliverables: deliverableGroups.publications, error: deliverablesError, isZh: isZh, loading: deliverablesLoading ?? false, onOpen: openDeliverable, onRefresh: onRefreshDeliverables ?? (() => undefined) }) : null] }) })) : activeTab?.kind === "child" ? (_jsx("div", { className: "flex min-h-0 flex-1 flex-col", children: childContent ?? _jsx(EmptyState, { label: isZh ? "子代理会话不可用" : "Sub-agent session unavailable" }) })) : activeTab?.kind === "deliverable" ? (_jsx(DeliverablePreview, { assetUrl: assetUrl, deliverable: activeTab.deliverable, locale: locale })) : null] }));
 }
 function Overview({ assetCount, childCount, isZh, onAssets, onChildren, onPublications, publicationCount }) {
     return _jsxs("div", { className: "grid gap-2", children: [_jsx(OverviewCard, { count: childCount, icon: _jsx(UsersRoundIcon, { className: "size-4" }), label: isZh ? "子代理" : "Sub-agents", onClick: onChildren }), _jsx(OverviewCard, { count: assetCount, icon: _jsx(FileIcon, { className: "size-4" }), label: isZh ? "会话资产" : "Session assets", onClick: onAssets }), _jsx(OverviewCard, { count: publicationCount, icon: _jsx(MonitorIcon, { className: "size-4" }), label: isZh ? "发布资产" : "Published assets", onClick: onPublications }), _jsx("p", { className: "px-1 pt-2 text-xs leading-5 text-muted-foreground", children: isZh ? "子代理对话和 Agent 发布的文件、图片、网站会保留为会话级可访问引用。" : "Sub-agent conversations and Agent-published files, images, and websites remain accessible from this session." })] });
 }
-function ChildList({ children, isZh, onOpen }) {
+function ChildList({ children, closing, isZh, onClose, onOpen }) {
     if (children.length === 0)
         return _jsx(EmptyState, { label: isZh ? "还没有子代理" : "No sub-agents yet" });
-    return _jsx("div", { className: "divide-y divide-border/50", children: children.map((child) => (_jsxs("button", { className: "flex w-full items-center gap-3 px-1 py-3 text-left hover:bg-accent/60", onClick: () => onOpen(child), type: "button", children: [_jsx("span", { className: cn("size-2 shrink-0 rounded-full", childStatusColor(child.status)) }), _jsxs("span", { className: "min-w-0 flex-1", children: [_jsx("span", { className: "block truncate text-sm font-medium", children: child.nickname }), _jsx("span", { className: "mt-0.5 block truncate text-xs text-muted-foreground", children: child.task || child.status })] }), _jsx(ChevronRightIcon, { className: "size-4 shrink-0 text-muted-foreground" })] }, child.childSessionId))) });
+    return _jsx("div", { className: "divide-y divide-border/50", children: children.map((child) => (_jsxs("div", { className: "flex items-center gap-1", children: [_jsxs("button", { className: "flex min-w-0 flex-1 items-center gap-3 px-1 py-3 text-left hover:bg-accent/60", onClick: () => onOpen(child), type: "button", children: [_jsx("span", { className: cn("size-2 shrink-0 rounded-full", childStatusColor(child.status)) }), _jsxs("span", { className: "min-w-0 flex-1", children: [_jsx("span", { className: "block truncate text-sm font-medium", children: child.nickname }), _jsx("span", { className: "mt-0.5 block truncate text-xs text-muted-foreground", children: child.status === "closed" ? (isZh ? "已关闭" : "Closed") : child.task || child.status })] }), _jsx(ChevronRightIcon, { className: "size-4 shrink-0 text-muted-foreground" })] }), onClose && child.status !== "closed" ? _jsx(Button, { "aria-label": `${isZh ? "关闭子代理" : "Close sub-agent"} ${child.nickname}`, disabled: closing.has(child.childSessionId), onClick: () => void onClose(child.childSessionId), size: "icon-sm", title: isZh ? "结束子代理会话" : "End sub-agent session", variant: "ghost", children: closing.has(child.childSessionId) ? _jsx(LoaderCircleIcon, { className: "size-3.5 animate-spin" }) : _jsx(SquareIcon, { className: "size-3.5" }) }) : null] }, child.childSessionId))) });
 }
 function SessionAssetList({ assetUrl, assets, error, isZh, loading, onOpen, onRefresh }) {
     return _jsxs("div", { children: [_jsxs("div", { className: "mb-2 flex items-center justify-between", children: [_jsx("span", { className: "text-xs text-muted-foreground", children: isZh ? "当前会话" : "Current session" }), _jsx(Button, { "aria-label": isZh ? "刷新会话资产" : "Refresh session assets", disabled: loading, onClick: onRefresh, size: "icon-sm", variant: "ghost", children: _jsx(RefreshCwIcon, { className: cn("size-3.5", loading && "animate-spin") }) })] }), error ? _jsx("p", { className: "rounded-md bg-destructive/5 px-2.5 py-2 text-xs text-destructive", role: "alert", children: error }) : null, assets.length > 0 ? _jsx("div", { className: "flex min-w-0 flex-col gap-2", children: assets.map((asset) => _jsx(SessionAssetRow, { assetUrl: assetUrl, deliverable: asset, onOpen: () => onOpen(asset) }, `${asset.kind}:${asset.id}`)) }) : loading ? _jsx(EmptyState, { label: isZh ? "加载中…" : "Loading…" }) : _jsx(EmptyState, { label: isZh ? "当前会话还没有资产" : "No session assets" })] });
@@ -105,7 +125,7 @@ function SessionAssetRow({ assetUrl, deliverable, onOpen }) {
 }
 function PublishedDeliverableRow({ deliverable, isZh, onOpen }) {
     const image = deliverable.mediaType?.startsWith("image/") ?? false;
-    return _jsx(ArtifactCard, { "aria-label": `${isZh ? "打开" : "Open"} ${deliverable.title}`, icon: deliverable.kind === "website-preview" ? _jsx(MonitorIcon, { className: "size-4" }) : image ? _jsx(ImageIcon, { className: "size-4" }) : undefined, meta: deliverableMeta(deliverable, isZh), onClick: onOpen, title: deliverable.alias ?? deliverable.title });
+    return _jsx(ArtifactCard, { "aria-label": `${isZh ? "打开" : "Open"} ${deliverable.title}`, disabled: deliverableExpired(deliverable), icon: deliverable.kind === "website-preview" ? _jsx(MonitorIcon, { className: "size-4" }) : image ? _jsx(ImageIcon, { className: "size-4" }) : undefined, meta: deliverableMeta(deliverable, isZh), onClick: onOpen, title: deliverable.alias ?? deliverable.title });
 }
 function DeliverablePreview({ assetUrl, deliverable, locale }) {
     const url = deliverableUrl(deliverable, assetUrl);
@@ -168,9 +188,9 @@ function sessionAssetMeta(deliverable) {
 function deliverableMeta(deliverable, isZh) {
     const title = deliverable.alias && deliverable.title !== deliverable.alias ? deliverable.title : undefined;
     const kind = deliverable.kind === "website-preview" ? (isZh ? "网站预览" : "Website preview") : (isZh ? "发布资产" : "Published artifact");
-    const version = deliverable.version ? `v${deliverable.version}` : undefined;
+    const version = publicationVersionLabel(deliverable.version);
     const fileCount = deliverable.fileCount ? `${deliverable.fileCount} ${isZh ? "个文件" : "files"}` : undefined;
-    return [kind, version, title, fileCount, deliverable.mediaType, formatBytes(deliverable.sizeBytes)].filter(Boolean).join(" · ");
+    return [kind, deliverableExpired(deliverable) ? (isZh ? "已过期" : "Expired") : undefined, version, title, fileCount, deliverable.mediaType, formatBytes(deliverable.sizeBytes)].filter(Boolean).join(" · ");
 }
 function childStatusColor(status) {
     if (status === "running" || status === "starting")

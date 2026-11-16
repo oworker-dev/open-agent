@@ -19,7 +19,7 @@ export function ArtifactCard({
   return (
     <button
       className={cn(
-        "group flex w-full max-w-sm items-center gap-3 rounded-lg bg-muted/45 p-3 text-left transition-colors hover:bg-muted/70 active:bg-muted",
+        "group flex w-full max-w-sm items-center gap-3 rounded-lg bg-muted/45 p-3 text-left transition-colors hover:enabled:bg-muted/70 active:enabled:bg-muted disabled:cursor-default disabled:opacity-60",
         className,
       )}
       data-slot="artifact-card"

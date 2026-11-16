@@ -1,7 +1,8 @@
 import { receivedClientMessageId } from "./thread-storage.js";
-import { conversationOf, type SessionStreamEvent } from "eve/client";
+import type { SessionStreamEvent } from "eve/client";
 import { conversation } from "eve/events";
 import type { EveMessage } from "eve/react";
+import { presentationSnapshot } from "./turn-presentation.js";
 
 /** Select render rows from the official conversation; never filter its facts. */
 export function projectConversationMessages(
@@ -18,7 +19,7 @@ export function projectConversationMessages(
   // An unconsumed edit keeps its prefix visible even while clear is settling.
   // This is only a display query; the full source log still feeds every fold.
   const selectedEvents = target ? events.filter((event) => event.meta.position.line < target.meta.position.line) : events;
-  const view = conversationOf(selectedEvents).view;
+  const view = presentationSnapshot(selectedEvents).view;
   const selected = new Set(conversation(view).map((turn) => turn.turnId));
   const importedIds = new Set(selectedEvents.flatMap((event) =>
     event.type === "delivery.consumed" && selected.has(event.data.turnId)

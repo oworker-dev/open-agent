@@ -1,6 +1,7 @@
 "use client";
 import { jsx as _jsx, jsxs as _jsxs } from "react/jsx-runtime";
 import { Questionnaire as QuestionnairePrimitive } from "@shadcn/react/questionnaire";
+import { CheckIcon } from "lucide-react";
 import { cn } from "../utils.js";
 import { buttonVariants } from "./button.js";
 function Questionnaire({ className, ...props }) {
@@ -18,8 +19,10 @@ function QuestionnaireDescription({ className, ...props }) {
 function QuestionnaireChoices({ className, ...props }) {
     return _jsx(QuestionnairePrimitive.Choices, { "data-slot": "questionnaire-choices", className: cn("flex min-w-0 flex-col gap-1.5", className), ...props });
 }
-function QuestionnaireChoice({ children, className, ...props }) {
-    return (_jsxs(QuestionnairePrimitive.Choice, { "data-slot": "questionnaire-choice", className: cn("group/questionnaire-choice relative flex min-h-10 min-w-0 cursor-pointer items-start gap-2.5 rounded-lg border border-border/70 bg-transparent px-3 py-2 text-left text-sm transition-colors outline-none select-none hover:bg-accent/60 has-[>input:focus-visible]:border-ring has-[>input:focus-visible]:ring-2 has-[>input:focus-visible]:ring-ring/30 data-checked:border-primary/30 data-checked:bg-accent/70 data-disabled:pointer-events-none data-disabled:opacity-50", className), ...props, children: [_jsx(QuestionnairePrimitive.ChoiceInput, { "data-slot": "questionnaire-choice-input", className: "absolute inset-0 z-10 size-full cursor-pointer opacity-0" }), _jsx("span", { "aria-hidden": "true", "data-slot": "questionnaire-choice-indicator", className: "pointer-events-none mt-0.5 flex size-4 shrink-0 items-center justify-center rounded-full border border-input group-data-checked/questionnaire-choice:border-primary group-data-checked/questionnaire-choice:bg-primary", children: _jsx("span", { className: "hidden size-1.5 rounded-full bg-primary-foreground group-data-checked/questionnaire-choice:block" }) }), _jsx(QuestionnairePrimitive.ChoiceLabel, { "data-slot": "questionnaire-choice-label", className: "flex min-w-0 flex-1 flex-col gap-0.5 leading-snug", children: children })] }));
+function QuestionnaireChoice({ children, className, multipleSelection = false, ...props }) {
+    return (_jsxs(QuestionnairePrimitive.Choice, { "data-slot": "questionnaire-choice", className: cn("group/questionnaire-choice relative flex min-h-10 min-w-0 cursor-pointer items-start gap-2.5 rounded-lg border border-border/70 bg-transparent px-3 py-2 text-left text-sm transition-colors outline-none select-none hover:bg-accent/60 has-[>input:focus-visible]:border-ring has-[>input:focus-visible]:ring-2 has-[>input:focus-visible]:ring-ring/30 data-checked:border-primary/30 data-checked:bg-accent/70 data-disabled:pointer-events-none data-disabled:opacity-50", className), ...props, children: [_jsx(QuestionnairePrimitive.ChoiceInput, { "data-slot": "questionnaire-choice-input", className: "absolute inset-0 z-10 size-full cursor-pointer opacity-0" }), _jsx("span", { "aria-hidden": "true", "data-slot": "questionnaire-choice-indicator", className: cn("pointer-events-none mt-0.5 flex size-4 shrink-0 items-center justify-center border border-input group-data-checked/questionnaire-choice:border-primary group-data-checked/questionnaire-choice:bg-primary", multipleSelection ? "rounded-[3px]" : "rounded-full"), children: multipleSelection
+                    ? _jsx(CheckIcon, { className: "hidden size-3 text-primary-foreground group-data-checked/questionnaire-choice:block" })
+                    : _jsx("span", { className: "hidden size-1.5 rounded-full bg-primary-foreground group-data-checked/questionnaire-choice:block" }) }), _jsx(QuestionnairePrimitive.ChoiceLabel, { "data-slot": "questionnaire-choice-label", className: "flex min-w-0 flex-1 flex-col gap-0.5 leading-snug", children: children })] }));
 }
 function QuestionnaireChoiceDescription({ className, ...props }) {
     return _jsx("span", { "data-slot": "questionnaire-choice-description", className: cn("break-words text-xs leading-5 text-muted-foreground", className), ...props });

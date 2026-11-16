@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import { Questionnaire as QuestionnairePrimitive } from "@shadcn/react/questionnaire";
+import { CheckIcon } from "lucide-react";
 import { cn } from "../utils.js";
 import { buttonVariants, type Button } from "./button.js";
 
@@ -25,7 +26,7 @@ function QuestionnaireChoices({ className, ...props }: React.ComponentProps<type
   return <QuestionnairePrimitive.Choices data-slot="questionnaire-choices" className={cn("flex min-w-0 flex-col gap-1.5", className)} {...props} />;
 }
 
-function QuestionnaireChoice({ children, className, ...props }: React.ComponentProps<typeof QuestionnairePrimitive.Choice>) {
+function QuestionnaireChoice({ children, className, multipleSelection = false, ...props }: React.ComponentProps<typeof QuestionnairePrimitive.Choice> & { readonly multipleSelection?: boolean }) {
   return (
     <QuestionnairePrimitive.Choice
       data-slot="questionnaire-choice"
@@ -39,8 +40,13 @@ function QuestionnaireChoice({ children, className, ...props }: React.ComponentP
         data-slot="questionnaire-choice-input"
         className="absolute inset-0 z-10 size-full cursor-pointer opacity-0"
       />
-      <span aria-hidden="true" data-slot="questionnaire-choice-indicator" className="pointer-events-none mt-0.5 flex size-4 shrink-0 items-center justify-center rounded-full border border-input group-data-checked/questionnaire-choice:border-primary group-data-checked/questionnaire-choice:bg-primary">
-        <span className="hidden size-1.5 rounded-full bg-primary-foreground group-data-checked/questionnaire-choice:block" />
+      <span aria-hidden="true" data-slot="questionnaire-choice-indicator" className={cn(
+        "pointer-events-none mt-0.5 flex size-4 shrink-0 items-center justify-center border border-input group-data-checked/questionnaire-choice:border-primary group-data-checked/questionnaire-choice:bg-primary",
+        multipleSelection ? "rounded-[3px]" : "rounded-full",
+      )}>
+        {multipleSelection
+          ? <CheckIcon className="hidden size-3 text-primary-foreground group-data-checked/questionnaire-choice:block" />
+          : <span className="hidden size-1.5 rounded-full bg-primary-foreground group-data-checked/questionnaire-choice:block" />}
       </span>
       <QuestionnairePrimitive.ChoiceLabel data-slot="questionnaire-choice-label" className="flex min-w-0 flex-1 flex-col gap-0.5 leading-snug">
         {children}

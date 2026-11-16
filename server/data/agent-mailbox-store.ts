@@ -102,6 +102,7 @@ export interface AgentMailboxStore {
   }): Promise<EnqueueAgentMailboxResult>;
   fail(itemId: string, claimToken: string, message: string): Promise<AgentMailboxItem>;
   findOwned(owner: AgentSessionOwner, itemId: string): Promise<AgentMailboxItem | undefined>;
+  findByClientMessageId(sessionId: string, clientMessageId: string): Promise<AgentMailboxItem | undefined>;
   markSubmissionAmbiguous(itemId: string, claimToken: string, message: string): Promise<AgentMailboxItem>;
   retryOwned(owner: AgentSessionOwner, itemId: string): Promise<AgentMailboxItem | undefined>;
 }
@@ -390,6 +391,16 @@ function postgresAgentMailboxStore(
         lastError: compactError(message) ?? "Mailbox admission is ambiguous.",
         status: "submission-ambiguous",
       });
+    },
+    async findByClientMessageId(sessionId, clientMessageId) {
+      assertText(sessionId, "sessionId", 512);
+      assertText(clientMessageId, "clientMessageId", 200);
+      const result = await pool.query<AgentMailboxRow>(
+        `select ${selectColumns()} from ${mailboxTable}
+          where session_id = $1 and client_message_id = $2`,
+        [sessionId, clientMessageId],
+      );
+      return result.rows[0] ? toRecord(result.rows[0]) : undefined;
     },
     async findOwned(owner, itemId) {
       assertOwner(owner);

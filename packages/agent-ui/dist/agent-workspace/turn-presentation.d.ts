@@ -7,6 +7,7 @@ export type SubagentCallPresentation = {
     readonly childSessionId?: string;
     readonly endedAt?: number;
     readonly name?: string;
+    readonly nickname?: string;
     readonly startedAt?: number;
     readonly status: "cancelled" | "completed" | "failed" | "running" | "starting" | "waiting";
 };
@@ -62,10 +63,8 @@ export declare function eventTimestamp(event: SessionStreamEvent | undefined): n
 export declare function stableUserMessageId(sourceId: string, _turnId: string, _stableRoot: string): string;
 export declare function activeTurnIdAfterPendingSubmission(events: readonly SessionStreamEvent[], pending: Pick<AgentPendingTurn, "eventCountAtSubmission" | "submittedAt">): string | undefined;
 export declare const INTERRUPTED_TOOL_ERROR = "Open Agent: tool call cancelled before completion.";
-export declare const CANCELLING_TOOL_ERROR = "Open Agent: tool call cancellation is pending.";
 export declare const INCOMPLETE_TOOL_ERROR = "Open Agent: tool call did not complete.";
 export declare function isInterruptedToolPart(part: EveToolPart): boolean;
-export declare function isCancellationPendingToolPart(part: EveToolPart): boolean;
 export type DisplayEveMessage = EveMessage & {
     readonly metadata?: EveMessage["metadata"] & {
         readonly localStatus?: "cancelled";
@@ -77,6 +76,10 @@ export declare function eventsForMessagePresentation(message: EveMessage, events
 export declare function projectInterruptedMessages(messages: readonly EveMessage[], events: readonly SessionStreamEvent[], interruptions: readonly AgentInterruptedTurn[]): readonly DisplayEveMessage[];
 export declare function presentAgentStep(events: readonly SessionStreamEvent[], turnId: string | undefined, stepIndex: number): AgentStepPresentation;
 export declare function reasoningContentForStep(events: readonly SessionStreamEvent[], turnId: string | undefined, stepIndex: number | undefined): string;
+export declare function reasoningTiming(events: readonly SessionStreamEvent[], turnId: string | undefined, stepIndex: number | undefined): {
+    readonly endedAt?: number;
+    readonly startedAt?: number;
+};
 export declare function presentAgentTurn(message: EveMessage, events: readonly SessionStreamEvent[], closedIds?: ReadonlySet<string>): AgentTurnPresentation | undefined;
 export declare function syntheticMessageReceiptClientMessageId(event: Extract<SessionStreamEvent, {
     type: "delivery.consumed";
@@ -87,11 +90,12 @@ export declare function hasSettledLatestTurn(events: readonly SessionStreamEvent
 export declare function hasTerminalSessionBoundary(events: readonly SessionStreamEvent[]): boolean;
 export declare function failureForTurn(events: readonly SessionStreamEvent[], turnId: string | undefined): AgentTurnFailure | undefined;
 export declare function eventsBeforeLastUserTurn(events: readonly SessionStreamEvent[]): readonly SessionStreamEvent[];
-export declare function presentSubagentCall(events: readonly SessionStreamEvent[], callId: string): SubagentCallPresentation;
+export declare function presentSubagentCall(events: readonly SessionStreamEvent[], callId: string, durable?: readonly AgentSubagentSummary[]): SubagentCallPresentation;
 export declare function presentSubagentSessions(events: readonly SessionStreamEvent[]): readonly SubagentSessionPresentation[];
 export declare function eventsForAssistantSegment(message: EveMessage, events: readonly SessionStreamEvent[]): {
     readonly events: readonly SessionStreamEvent[];
     readonly settledAt?: number;
 };
+export declare function hasModelStepOutput(events: readonly SessionStreamEvent[], turnId: string | undefined, stepIndex: number): boolean;
 export declare function withThinkingPlaceholder(message: EveMessage, events: readonly SessionStreamEvent[]): readonly EveMessagePart[];
 //# sourceMappingURL=turn-presentation.d.ts.map

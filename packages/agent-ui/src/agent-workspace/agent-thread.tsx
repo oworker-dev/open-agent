@@ -3,7 +3,7 @@
 import type { UserContent } from "ai";
 import { parseAssetPrompt, serializeAssetPrompt } from "@oworker/open-agent-contracts/asset";
 import { receivedClientMessageId, textFromDelivery } from "./thread-storage.js";
-import { ClientError, conversationOf, type ClientSession, type SessionStreamEvent } from "eve/client";
+import { ClientError, type ClientSession, type SessionStreamEvent } from "eve/client";
 import { activeTurn as eveActiveTurn, failure as eveFailure, idle as eveIdle, session as eveSession, turn as eveTurn, turns as eveTurns, waiting as eveWaiting } from "eve/events";
 import { useEveAgent, type EveMessage } from "eve/react";
 import { AssistantRuntimeProvider, unstable_defaultDirectiveFormatter, useExternalStoreRuntime, type AppendMessage, type ExternalStoreAdapter, type ExternalThreadQueueAdapter, type RespondToToolApprovalOptions } from "@assistant-ui/react";
@@ -43,7 +43,6 @@ type Cancellation = {
   localTurnId?: string;
   pendingClientMessageId?: string;
   requested: boolean;
-  sentSessionId?: string;
   sentTurnId?: string;
   turnId?: string;
 };
@@ -55,9 +54,7 @@ type LocalInterruption = {
 
 const CANCELLATION_STREAM_REATTACH_AFTER_MS = 5_000;
 const MAX_PROVIDER_SUBMISSION_RETRIES = 3;
-// Thread state is a persistence/cache boundary, not the render clock. Eve
-// already publishes the live reducer at frame cadence; checkpoint less often
-// so the parent workspace is not rebuilt for every provider fragment.
+// Thread state is a persistence/cache boundary, not the render clock.
 const LIVE_CHECKPOINT_INTERVAL_MS = 250;
 // A thread can briefly have two React owners during a recovery/navigation
 // handoff. Keep mailbox admission single-flight across those owners; the
@@ -111,6 +108,7 @@ export function AgentThreadView({
   onRetryRecovery,
   onRecoveryNeeded,
   providerReady,
+  readOnly = false,
   recoveryError,
   reasoningLevels,
   thread,
@@ -135,10 +133,12 @@ export function AgentThreadView({
   readonly onRetryRecovery?: () => void;
   readonly onRecoveryNeeded: () => void;
   readonly providerReady: boolean;
+  readonly readOnly?: boolean;
   readonly recoveryError?: string;
   readonly reasoningLevels: readonly string[];
   readonly thread: AgentThread;
 }) {
+  const canSubmit = providerReady && !readOnly;
   const preferencesRef = useRef(thread.preferences);
   const latestEventsRef = useRef<readonly SessionStreamEvent[]>(thread.events);
   const persistedInterruption = thread.status === "cancelling"
@@ -323,21 +323,15 @@ export function AgentThreadView({
     attachAgentSession(connection, connection.initialSession),
   );
 
-  const requestDurableCancellation = useCallback((durableSession: ClientSession, turnId?: string) => {
+  const requestDurableCancellation = useCallback((durableSession: ClientSession, turnId: string) => {
     const requestState = cancellationRef.current;
-    if (!requestState.requested) return;
-    if (turnId) {
-      if (requestState.sentTurnId === turnId) return;
-      requestState.sentTurnId = turnId;
-    } else {
-      if (requestState.sentSessionId === durableSession.state.sessionId) return;
-      requestState.sentSessionId = durableSession.state.sessionId;
-    }
+    if (!requestState.requested || requestState.turnId !== turnId || requestState.sentTurnId === turnId) return;
+    requestState.sentTurnId = turnId;
 
     const cancelRequest = mailbox?.cancelSession
-      ? mailbox.cancelSession({ sessionId: durableSession.state.sessionId, ...(turnId ? { turnId } : {}) })
+      ? mailbox.cancelSession({ sessionId: durableSession.state.sessionId, turnId })
           .then((status) => ({ status }))
-      : durableSession.cancel(turnId ? { turnId } : undefined);
+      : durableSession.cancel({ turnId });
     void cancelRequest
       .then((result) => {
         // A late response from an older cancel request must not resurrect the
@@ -363,7 +357,6 @@ export function AgentThreadView({
         // target without cancelling a newer turn. The next durable
         // stream event (or a recovery attach) will settle it authoritatively.
         requestState.sentTurnId = undefined;
-        requestState.sentSessionId = undefined;
         setCancellationError(error instanceof Error ? error.message : "Unable to stop this turn.");
         setCancellationState("cancelling");
       });
@@ -394,29 +387,6 @@ export function AgentThreadView({
           checkpointTimerRef.current = undefined;
           flushCheckpointRef.current();
         }, LIVE_CHECKPOINT_INTERVAL_MS);
-      }
-      if (event.type === "turn.started") {
-        const cancellation = cancellationRef.current;
-        const bindsCancellation = cancellation.requested && !cancellation.pendingClientMessageId &&
-          cancellation.turnId === undefined;
-        if (bindsCancellation) cancellation.turnId = event.data.turnId;
-        if (bindsCancellation && cancellation.localTurnId) {
-          const interruptedTurns = retargetInterruptedTurn(
-            interruptedTurnsRef.current,
-            cancellation.localTurnId,
-            event.data.turnId,
-          );
-          interruptedTurnsRef.current = interruptedTurns;
-          cancellation.localTurnId = event.data.turnId;
-          setLocalInterruption((current) => current
-            ? { ...current, turnId: event.data.turnId }
-            : current);
-          onChange({ interruptedTurns, updatedAt: Date.now() });
-        }
-        const durableSession = sessionRef.current;
-        if (durableSession && bindsCancellation) {
-          requestDurableCancellation(durableSession, event.data.turnId);
-        }
       }
       // A message receipt is the durable acknowledgement for the optimistic
       // submission. Clear only the pre-session retry banner here; stream
@@ -497,7 +467,10 @@ export function AgentThreadView({
       if (event.type === "turn.settled" && event.data.outcome !== "failed") {
         setTurnError(undefined);
       }
-      const committedView = eventCursor === undefined ? undefined : presentationSnapshot(compactedEventsRef.current).view;
+      // Progress cannot settle an admission or interaction. Replaying the whole
+      // transcript for every input fragment makes large edits quadratic.
+      const progress = event.type === "content.delta" || event.type === "call.input" || event.type === "call.progress";
+      const committedView = eventCursor === undefined || progress ? undefined : presentationSnapshot(compactedEventsRef.current).view;
       if (committedView && eveIdle(committedView)) {
         // Release the admission gate at the durable boundary. A stale `true` here
         // would queue every later user message forever.
@@ -594,7 +567,7 @@ export function AgentThreadView({
       if (
         sessionRef.current &&
         cancellationRef.current.requested &&
-        !cancellationRef.current.pendingClientMessageId
+        cancellationRef.current.turnId
       ) {
         requestDurableCancellation(sessionRef.current, cancellationRef.current.turnId);
       }
@@ -625,7 +598,8 @@ export function AgentThreadView({
       thread.status !== "cancelling" ||
       !attachedSession?.state.sessionId
     ) return;
-    requestDurableCancellation(attachedSession, persistedCancellationTurnId);
+    const targetTurnId = cancellationRef.current.turnId;
+    if (targetTurnId) requestDurableCancellation(attachedSession, targetTurnId);
   }, [agent.session?.sessionId, persistedCancellationTurnId, requestDurableCancellation, thread.status]);
 
   const flushLiveCheckpoint = useCallback(() => {
@@ -656,29 +630,14 @@ export function AgentThreadView({
   }, [agent.session, onChange]);
   flushCheckpointRef.current = flushLiveCheckpoint;
 
-  // File edits can emit hundreds of action.input.appended deltas (or their
-  // compacted cumulative projection). Keep Eve's authoritative state and
-  // cursor live on every event, while
-  // coalescing the expensive message/diff projection to a bounded cadence.
-  // Unlike useDeferredValue, this cannot be starved by a continuous stream of
-  // external-store updates: the latest snapshot is always published after the
-  // same short interval.
-  const liveRenderSource = useMemo(() => {
-    // Eve publishes its reducer and onEvent callback independently. Reading
-    // `agent.data.messages` beside the mutable checkpoint can therefore mix a
-    // new assistant snapshot with the previous event order during steering.
-    // Derive both values from one immutable event snapshot so every render
-    // observes one coherent transcript. The compacted projection already
-    // removes superseded cumulative deltas before this bounded reduction.
-    const events = compactedEventsRef.current.length === 0 && agent.status === "resuming"
-      ? [...thread.events]
-      : [...compactedEventsRef.current];
-    return { events, messages: messagesFromEvents(events) };
+  // Fold the immutable published event log at Eve's coalesced notification
+  // cadence. Its local message projection also contains submission receipts;
+  // durable events keep user identities stable through steering and replay.
+  const liveRenderSnapshot = useMemo(() => {
+    return agent.events.length === 0 && agent.status === "resuming"
+      ? { events: thread.events, messages: messagesFromEvents(thread.events) }
+      : { events: agent.events, messages: messagesFromEvents(agent.events) };
   }, [agent.events, agent.status, thread.events]);
-  // Eve itself publishes at frame cadence (~16ms). Keep a single short
-  // coalescing window for expensive projections without adding a visible
-  // half-frame of latency to first-token/tool updates.
-  const liveRenderSnapshot = useThrottledSnapshot(liveRenderSource, 32);
   const renderEvents = liveRenderSnapshot.events;
   const renderMessages = liveRenderSnapshot.messages;
   const historyWasPrepended = initialHistoryStartIndexRef.current !== undefined &&
@@ -975,7 +934,7 @@ export function AgentThreadView({
   // Questions are non-blocking from the composer: a new message is a normal
   // follow-up and Eve clears the pending question. Approvals remain locked so
   // unrelated text cannot accidentally be interpreted as a permission choice.
-  const inputLocked = pendingInputRequests.some((request) => request.request.kind !== "question");
+  const inputLocked = readOnly || agent.status === "resuming" || pendingInputRequests.some((request) => request.request.kind !== "question");
 
   const closeInputRequests = useCallback((requestIds: readonly string[]) => {
     if (requestIds.length === 0) return;
@@ -1264,7 +1223,7 @@ export function AgentThreadView({
       !error ||
       !pending ||
       pending.state !== "submitting" ||
-      !providerReady ||
+      !canSubmit ||
       agent.session?.sessionId ||
       !isRetryableSubmissionError(error) ||
       providerRetry?.exhausted
@@ -1318,7 +1277,7 @@ export function AgentThreadView({
         setTurnError(retryError instanceof Error ? retryError.message : "Agent request failed.");
       });
     }, providerRetryDelay(nextAttempt));
-  }, [agent.error, agent.send, agent.session?.sessionId, onChange, providerReady, providerRetry?.exhausted, thread.pendingTurn, thread.retainedContext]);
+  }, [agent.error, agent.send, agent.session?.sessionId, canSubmit, onChange, providerRetry?.exhausted, thread.pendingTurn, thread.retainedContext]);
 
   useEffect(() => {
     if (
@@ -1484,14 +1443,25 @@ export function AgentThreadView({
     const acceptedPendingReceipt = pendingAtInterruption
       ? acceptedMessageReceivedEvent(pendingAtInterruption, authoritativeEvents)
       : undefined;
-    const pendingClientMessageId = pendingAtInterruption?.operation === "send" &&
-      pendingAtInterruption.state === "submitting" && !acceptedPendingReceipt
+    const pendingClientMessageId = pendingAtInterruption?.state === "submitting" && !acceptedPendingReceipt
       ? pendingAtInterruption.id
       : undefined;
-    // Until the receipt identifies this send, an older turn (including its
-    // settlement) cannot be the cancellation target.
+    // Until the receipt identifies this submission (including an edit), an
+    // older turn and its settlement cannot be the cancellation target.
     const turnId = pendingClientMessageId ? undefined : acceptedPendingReceipt?.data.turnId ??
       latestActiveTurnId(authoritativeEvents);
+    if (!turnId && !pendingClientMessageId) {
+      // A queue can keep the composer busy after the turn has already ended.
+      // With no active/admitting target, Stop only withdraws the queued item;
+      // a session-wide cancel could otherwise kill the user's next message.
+      turnAdmissionBusyRef.current = false;
+      settleCancellationUi();
+      onChange({ status: "ready", updatedAt: Date.now() });
+      void withdrawLatestQueuedFollowUp().then((draft) => {
+        if (draft !== undefined) onChange({ draftRestore: { id: createPendingTurnId(), text: draft }, updatedAt: Date.now() });
+      });
+      return;
+    }
     const visibleTurnId = turnId ?? pendingAtInterruption?.id ?? createPendingTurnId();
     const interruptedPendingTurn = pendingAtInterruption
       ? { ...pendingAtInterruption, state: "interrupted" as const }
@@ -1581,7 +1551,7 @@ export function AgentThreadView({
       });
     }
     const queuedFollowUpWithdrawal = withdrawLatestQueuedFollowUp();
-    if (durableSession && !pendingClientMessageId) {
+    if (durableSession && turnId) {
       requestDurableCancellation(durableSession, turnId);
     }
     void queuedFollowUpWithdrawal.then((draft) => {
@@ -1595,11 +1565,11 @@ export function AgentThreadView({
 
   const submit = async (message: PromptInputMessage) => {
     const text = expandPromptDirectives(message.text, commands, mentions).trim();
-    if (!providerReady) return;
+    if (!canSubmit) return;
     if ((text.length === 0 && message.files.length === 0) || inputLocked) return;
-    closeInputRequests(pendingInputRequests
+    const questionIds = pendingInputRequests
       .filter((request) => request.request.kind === "question")
-      .map((request) => request.interactionId));
+      .map((request) => request.interactionId);
     // The event handler clears the imperative gate as soon as Eve emits its
     // durable boundary. A render can still carry the previous `admissionBusy`
     // value for one frame; trust the current Eve transcript in that window so
@@ -1607,7 +1577,8 @@ export function AgentThreadView({
     const liveSessionSettled = hasSettledLatestTurn(authoritativeEvents) &&
       hasSettledSessionBoundary(authoritativeEvents);
     if (liveSessionSettled) turnAdmissionBusyRef.current = false;
-    if (!cancellationSettling && (admissionBusy || turnAdmissionBusyRef.current) && !liveSessionSettled) {
+    if (!cancellationSettling && (admissionBusy || turnAdmissionBusyRef.current) && !liveSessionSettled &&
+        (mailbox || questionIds.length === 0)) {
       if (message.files.length > 0) {
         setQueueError(messages.queueAttachmentsUnsupported);
         return;
@@ -1618,6 +1589,7 @@ export function AgentThreadView({
       }
       if (text.length > 0) {
         const expectedTurnId = latestActiveTurnId(authoritativeEvents);
+        closeInputRequests(questionIds);
         setQueueError(undefined);
         updateQueuedTurns([
           ...queuedTurnsRef.current,
@@ -1634,6 +1606,9 @@ export function AgentThreadView({
       }
       return;
     }
+    // Without a server mailbox, a question's free-text continuation must reach
+    // Eve now; a local queue waiting for that question's turn to end deadlocks.
+    closeInputRequests(questionIds);
     turnAdmissionBusyRef.current = true;
     // Preserve the old turn's cancellation target and output fence while Eve
     // accepts the next delivery. Native queue policy prevents steering it.
@@ -1969,6 +1944,7 @@ export function AgentThreadView({
     },
     newMessage: (message) => submit(promptFromAssistantMessage(getEveMessageContent(message))),
     respondToToolApproval: async (response) => {
+      if (!canSubmit) return;
       prepareTurn();
       await agent.respond(
         [{ optionId: response.optionId, interactionId: response.approvalId, text: response.reason }],
@@ -1984,7 +1960,7 @@ export function AgentThreadView({
       // Lock regular sends while an approval is pending, but keep the runtime
       // available to the edit composer. assistant-ui intentionally allows edits
       // while `isSendDisabled` is true; `isDisabled` would disable both paths.
-      isDisabled: !providerReady,
+      isDisabled: !canSubmit,
       isSendDisabled: inputLocked,
       // The workspace projects its own deterministic assistant placeholder
       // while a turn is being admitted. Passing `isRunning` before that
@@ -2004,7 +1980,7 @@ export function AgentThreadView({
       onNew: (message) => runtimeCallbacksRef.current.newMessage(message),
       onRespondToToolApproval: (response) => runtimeCallbacksRef.current.respondToToolApproval(response),
     }),
-    [assistantMessages, attachmentAdapter, inputLocked, isBusy, providerReady, queueAdapter],
+    [assistantMessages, attachmentAdapter, canSubmit, inputLocked, isBusy, queueAdapter],
   );
   const assistantRuntime = useExternalStoreRuntime(assistantRuntimeAdapter);
 
@@ -2024,7 +2000,7 @@ export function AgentThreadView({
       pendingTurn.mailboxItemId ||
       !pendingTurn.beforeTurnId ||
       !mailbox ||
-      !providerReady ||
+      !canSubmit ||
       mailboxEnqueueIdsRef.current.has(pendingTurn.id)
     ) return;
     const sessionId = sessionRef.current?.state.sessionId ?? agent.session?.sessionId;
@@ -2089,7 +2065,7 @@ export function AgentThreadView({
     mailbox,
     messages.queueDeliveryFailed,
     onChange,
-    providerReady,
+    canSubmit,
     requestRecovery,
     thread.pendingTurn,
     thread.retainedContext,
@@ -2139,7 +2115,7 @@ export function AgentThreadView({
   }, [mailbox, messages.queueDeliveryFailed, onChange, requestRecovery, thread.pendingTurn]);
 
   useEffect(() => {
-    if (!mailbox || !agent.session?.sessionId) return;
+    if (!canSubmit || !mailbox || !agent.session?.sessionId) return;
     // Keep the operation idempotent until the mailbox receipt is reflected in
     // the durable queue row. React may run this effect once more between the
     // enqueue response and the `onChange` snapshot; clearing the guard in a
@@ -2243,7 +2219,7 @@ export function AgentThreadView({
         turn.id === next.id ? { ...turn, state: "delivery-failed" } : turn,
       ));
     });
-  }, [authoritativeEvents, agent.session?.sessionId, cancellationSettling, durableTurnOpen, isRecovering, liveTurnOpen, mailbox, messages.queueDeliveryFailed, pendingTurnInFlight, runtimeIsBusy, thread.queuedTurns]);
+  }, [authoritativeEvents, agent.session?.sessionId, cancellationSettling, canSubmit, durableTurnOpen, isRecovering, liveTurnOpen, mailbox, messages.queueDeliveryFailed, pendingTurnInFlight, runtimeIsBusy, thread.queuedTurns]);
 
   useEffect(() => {
     if (!mailbox || isRecovering) return;
@@ -2317,7 +2293,7 @@ export function AgentThreadView({
 
   useEffect(() => {
     if (
-      admissionBusy || runtimeIsBusy || inputLocked || !providerReady ||
+      admissionBusy || runtimeIsBusy || inputLocked || !canSubmit ||
       dispatchingQueuedTurnIdRef.current ||
       !agent.session?.sessionId
     ) return;
@@ -2368,11 +2344,11 @@ export function AgentThreadView({
       onChange({ pendingTurn: undefined, queuedTurns });
       setTurnError(error instanceof Error ? error.message : messages.queueDeliveryFailed);
     });
-  }, [admissionBusy, agent, agent.session?.sessionId, inputLocked, messages.queueDeliveryFailed, onChange, providerReady, runtimeIsBusy, thread.queuedTurns]);
+  }, [admissionBusy, agent, agent.session?.sessionId, canSubmit, inputLocked, messages.queueDeliveryFailed, onChange, runtimeIsBusy, thread.queuedTurns]);
 
   const inputResponseEnqueueIdsRef = useRef(new Set<string>());
   useEffect(() => {
-    if (!mailbox || !providerReady) return;
+    if (!mailbox || !canSubmit) return;
     const sessionId = sessionRef.current?.state.sessionId ?? agent.session?.sessionId;
     const next = inputResponseSubmissionsRef.current.find((submission) =>
       submission.state === "submitting" && !submission.mailboxItemId &&
@@ -2405,7 +2381,7 @@ export function AgentThreadView({
     }).finally(() => {
       inputResponseEnqueueIdsRef.current.delete(next.id);
     });
-  }, [agent.session?.sessionId, mailbox, messages.queueDeliveryFailed, providerReady, requestRecovery, thread.inputResponseSubmissions, thread.retainedContext, updateInputResponseSubmissions]);
+  }, [agent.session?.sessionId, canSubmit, mailbox, messages.queueDeliveryFailed, requestRecovery, thread.inputResponseSubmissions, thread.retainedContext, updateInputResponseSubmissions]);
 
   useEffect(() => {
     if (!mailbox) return;
@@ -2444,6 +2420,7 @@ export function AgentThreadView({
   }, [mailbox, requestRecovery, thread.inputResponseSubmissions, updateInputResponseSubmissions]);
 
   const respond = (inputResponses: readonly AgentInputResponse[]) => {
+    if (!canSubmit) return Promise.resolve();
     prepareTurn();
     if (!mailbox) {
       return agent.respond(inputResponses, retainedContextOptions(thread.retainedContext)).then(() => undefined);
@@ -2479,9 +2456,10 @@ export function AgentThreadView({
       <main className="flex min-h-0 flex-1 flex-col overflow-hidden">
       <AssistantThreadSurface
         assetUrl={client?.assetUrl}
-          approvalTakeover={approvalTakeover}
+          approvalTakeover={canSubmit ? approvalTakeover : undefined}
           cancellationState={cancellationState}
           commands={commands}
+          composerHidden={readOnly}
           composerTop={inputResponseError || showRecoveryStatus || visibleQueuedTurns.length > 0 || queueError ? (
             <>
               {inputResponseError ? (
@@ -2515,7 +2493,8 @@ export function AgentThreadView({
           fallbackStartedAt={displayPendingTurn?.submittedAt}
           inputDisabled={inputLocked}
           isBusy={isBusy}
-          messageEditingAllowed={latestEditableTurnId(projectionEvents) !== undefined}
+          isRestoring={agent.status === "resuming"}
+          messageEditingAllowed={!readOnly && latestEditableTurnId(projectionEvents) !== undefined}
           sessionTerminal={sessionTerminal}
           sessionSettled={editBoundarySettled}
           onCancel={requestCancellation}
@@ -3082,19 +3061,8 @@ function isAgentTurnBusyError(error: unknown): boolean {
   return error instanceof Error && /already processing a turn/i.test(error.message);
 }
 
-// Rebuilding Eve's reducer is linear in the event count. A single render can
-// ask for the same immutable snapshot more than once (recovery projection,
-// edit projection, and interruption normalization). Cache by snapshot
-// identity so those consumers share one reduction pass; WeakMap keeps old
-// long-session snapshots collectible.
-const messagesByEventSnapshot = new WeakMap<object, readonly EveMessage[]>();
-
 function messagesFromEvents(events: readonly SessionStreamEvent[]): readonly EveMessage[] {
-  const cached = messagesByEventSnapshot.get(events as object);
-  if (cached) return cached;
-  const messages = conversationOf(events).messages;
-  messagesByEventSnapshot.set(events as object, messages);
-  return messages;
+  return presentationSnapshot(events).messages;
 }
 
 function hasCompleteEveEventPrefix(thread: AgentThread): boolean {
@@ -3103,12 +3071,22 @@ function hasCompleteEveEventPrefix(thread: AgentThread): boolean {
   if (thread.transcriptWindow && thread.transcriptWindow.startIndex > 0) return false;
 
   const coverage = thread.transcriptCoverage;
-  if (coverage) {
-    return coverage.complete && coverage.startIndex === 0 && coverage.projection === undefined;
-  }
-
+  if (coverage && (!coverage.complete || coverage.startIndex !== 0)) return false;
   const first = thread.events[0];
-  return first?.type === "session.started" && first.meta.position.line === 0;
+  if (first?.type !== "session.started") return false;
+  // Prove coverage before hydrating a persisted v27 source log. A projection
+  // label alone need not force replay, but a missing line/fact still does.
+  let nextLine = 0;
+  let nextFact = 0;
+  for (const event of thread.events) {
+    if (event.meta.position.line !== nextLine || event.meta.position.index !== nextFact) return false;
+    if (event.meta.endOfLine === false) nextFact += 1;
+    else {
+      nextLine = event.meta.next ?? nextLine + 1;
+      nextFact = 0;
+    }
+  }
+  return nextFact === 0 && nextLine === thread.session.streamIndex;
 }
 
 /**
@@ -3454,21 +3432,21 @@ function EmptyThread({ disabled, messages, onPrompt }: { readonly disabled: bool
 }
 
 function latestTurnOutcome(events: readonly SessionStreamEvent[]): "cancelled" | "completed" | "failed" | undefined {
-  const view = conversationOf(events).view;
+  const view = presentationSnapshot(events).view;
   return eveSession(view).outcome === "failed" ? "failed" : eveTurns(view).at(-1)?.outcome;
 }
 function hasSettledSessionBoundary(events: readonly SessionStreamEvent[]): boolean {
-  const view = conversationOf(events).view;
+  const view = presentationSnapshot(events).view;
   return eveIdle(view) && eveActiveTurn(view) === undefined;
 }
-function hasOpenLatestTurn(events: readonly SessionStreamEvent[]): boolean { return eveActiveTurn(conversationOf(events).view) !== undefined; }
+function hasOpenLatestTurn(events: readonly SessionStreamEvent[]): boolean { return eveActiveTurn(presentationSnapshot(events).view) !== undefined; }
 function latestTurnFailure(events: readonly SessionStreamEvent[]): string | undefined {
-  const view = conversationOf(events).view;
+  const view = presentationSnapshot(events).view;
   const latest = eveTurns(view).at(-1);
   return latest ? eveFailure(view, latest.turnId)?.message : eveFailure(view)?.message;
 }
 function latestTurnHasStepFailure(events: readonly SessionStreamEvent[]): boolean {
-  const view = conversationOf(events).view;
+  const view = presentationSnapshot(events).view;
   const latest = eveTurns(view).at(-1);
   return Boolean(latest && events.some((event) => event.type === "model.settled" && event.data.outcome === "failed" && event.scope?.turnId === latest.turnId));
 }

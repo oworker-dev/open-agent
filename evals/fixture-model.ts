@@ -115,11 +115,12 @@ function compactionPrompt(request: MockModelRequest): string {
 }
 
 function askQuestion(request: MockModelRequest, task: string) {
+  const multiple = task.includes("EVAL_ASK_MULTI");
   const result = resultById(request, "eval-question");
   if (result) {
     return result.isError
       ? "ASK_DENIED_WITHOUT_INTERACTION"
-      : `ASK_COMPLETED ${JSON.stringify(result.output)}`;
+      : `${multiple ? "ASK_MULTI_COMPLETED" : "ASK_COMPLETED"} ${JSON.stringify(result.output)}`;
   }
   const offered = request.tools.some((tool) => tool.name === "ask_question");
   if (task.includes("EVAL_ASK_DISABLED") && offered) return "ASK_UNEXPECTEDLY_ADVERTISED";
@@ -128,6 +129,7 @@ function askQuestion(request: MockModelRequest, task: string) {
   // reject it before the workflow opens an interaction.
   return tool("ask_question", {
     question: "Which output format should I use?",
+    ...(multiple ? { multiple: true } : {}),
     options: [
       { label: "Markdown", description: "Readable plain text." },
       { label: "JSON", description: "Structured data." },

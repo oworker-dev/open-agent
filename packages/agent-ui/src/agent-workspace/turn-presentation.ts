@@ -1,5 +1,5 @@
 import { conversationOf, type SessionStreamEvent } from "eve/client";
-import { activeTurn, call, calls, children, contentPreviews, failure, openInteractions, parts, runs, session, turn, turns, waiting, type Interaction, type SessionView } from "eve/events";
+import { activeTurn, call, calls, children, contentPreviews, failure, openInteractions, parts, runs, session, task, turn, turns, waiting, type Interaction, type SessionView } from "eve/events";
 import type { EveMessage, EveMessagePart, EveToolPart } from "eve/react";
 import type { AgentInterruptedTurn, AgentPendingTurn, AgentSubagentSummary } from "./contracts.js";
 
@@ -9,6 +9,7 @@ export type SubagentCallPresentation = {
   readonly childSessionId?: string;
   readonly endedAt?: number;
   readonly name?: string;
+  readonly nickname?: string;
   readonly startedAt?: number;
   readonly status: "cancelled" | "completed" | "failed" | "running" | "starting" | "waiting";
 };
@@ -31,7 +32,8 @@ export function mergeSubagentSessions(
     return {
       ...session,
       ...(durableSession.callId ? { callId: durableSession.callId } : {}),
-      ...(durableSession.name || durableSession.nickname ? { name: durableSession.nickname ?? durableSession.name } : {}),
+      ...(durableSession.name ? { name: durableSession.name } : {}),
+      ...(durableSession.nickname ? { nickname: durableSession.nickname } : {}),
       ...(durableSession.task ? { task: durableSession.task } : {}),
       status: durableStatus(durableSession.status),
     };
@@ -42,7 +44,8 @@ export function mergeSubagentSessions(
     merged.push({
       callId: child.callId ?? child.childSessionId,
       childSessionId: child.childSessionId,
-      ...(child.name || child.nickname ? { name: child.nickname ?? child.name } : {}),
+      ...(child.name ? { name: child.name } : {}),
+      ...(child.nickname ? { nickname: child.nickname } : {}),
       ...(child.task ? { task: child.task } : {}),
       status: durableStatus(child.status),
     });
@@ -166,10 +169,8 @@ export function activeTurnIdAfterPendingSubmission(events: readonly SessionStrea
 }
 
 export const INTERRUPTED_TOOL_ERROR = "Open Agent: tool call cancelled before completion.";
-export const CANCELLING_TOOL_ERROR = "Open Agent: tool call cancellation is pending.";
 export const INCOMPLETE_TOOL_ERROR = "Open Agent: tool call did not complete.";
 export function isInterruptedToolPart(part: EveToolPart): boolean { return part.state === "cancelled"; }
-export function isCancellationPendingToolPart(part: EveToolPart): boolean { return part.error?.code === "LOCAL_CANCELLATION_PENDING"; }
 
 /** App-owned presentation state, never a fabricated Eve lifecycle fact. */
 export type DisplayEveMessage = EveMessage & {
@@ -224,7 +225,7 @@ export function projectInterruptedMessages(
         if (part.type === "tool" && !["completed", "failed", "rejected", "cancelled"].includes(part.state)) {
           return { ...part, inputText: undefined, state: "cancelled",
             ...(part.interaction ? { interaction: { ...part.interaction, status: "settled", outcome: "interrupted" } } : {}),
-            error: { code: "LOCAL_CANCELLATION_PENDING", message: CANCELLING_TOOL_ERROR } };
+            error: { code: "LOCAL_CANCELLED", message: INTERRUPTED_TOOL_ERROR } };
         }
         return part;
       }),
@@ -258,7 +259,33 @@ export function reasoningContentForStep(events: readonly SessionStreamEvent[], t
   const selected = runs(view, { turnId }).filter((_run, index) => stepIndex === undefined || index === stepIndex);
   const ids = new Set(selected.map((run) => run.runId));
   return [...parts(view, { turnId, kind: "reasoning" }).flatMap((part) => ids.has(part.runId) && typeof part.value === "string" ? [part.value] : []),
-    ...contentPreviews(view).flatMap((part) => part.kind === "reasoning" && part.runId && ids.has(part.runId) ? [part.text] : [])].join("\n").trim();
+    ...contentPreviews(view).flatMap((part) => part.kind === "reasoning" && part.runId && ids.has(part.runId) ? [part.text] : [])].join("\n\n").trim();
+}
+
+/** Reasoning ends at its content boundary, independently of reply/tool execution. */
+export function reasoningTiming(events: readonly SessionStreamEvent[], turnId: string | undefined, stepIndex: number | undefined): { readonly endedAt?: number; readonly startedAt?: number } {
+  if (!turnId) return {};
+  const view = presentationSnapshot(events).view;
+  const run = runs(view, { turnId })[stepIndex ?? 0];
+  const step = presentAgentStep(events, turnId, stepIndex ?? 0);
+  const retryIndex = events.findLastIndex((event) => event.type === "model.retried" && event.data.runId === run?.runId);
+  const completed = events.findLast((event, index) => index > retryIndex && event.type === "content.completed" && event.data.kind === "reasoning" && event.data.runId === run?.runId);
+  const streaming = contentPreviews(view).some((part) => part.runId === run?.runId && part.kind === "reasoning");
+  return { startedAt: step.startedAt, endedAt: streaming ? step.endedAt : eventTimestamp(completed) ?? step.endedAt };
+}
+
+/** Completion can be committed after a call; keep its thought above that step's tools. */
+function orderReasoningBeforeTools(parts: readonly EveMessagePart[]): readonly EveMessagePart[] {
+  const ordered = [...parts];
+  for (const part of parts) {
+    if (part.type !== "reasoning" || part.stepIndex === undefined) continue;
+    const index = ordered.indexOf(part);
+    const toolIndex = ordered.findIndex((candidate) => candidate.type === "tool" && candidate.stepIndex === part.stepIndex);
+    if (toolIndex < 0 || index < toolIndex) continue;
+    ordered.splice(index, 1);
+    ordered.splice(toolIndex, 0, part);
+  }
+  return ordered;
 }
 
 export function presentAgentTurn(message: EveMessage, events: readonly SessionStreamEvent[], closedIds: ReadonlySet<string> = new Set()): AgentTurnPresentation | undefined {
@@ -295,7 +322,7 @@ export function presentAgentTurn(message: EveMessage, events: readonly SessionSt
   return {
     endedAt: ended,
     finalPart,
-    processParts: message.parts.filter((part) => part !== finalPart),
+    processParts: orderReasoningBeforeTools(message.parts.filter((part) => part !== finalPart)),
     proxiedInputParts: [],
     showExecutionGroup,
     startedAt: eventTimestamp(segment.events.find((event) => event.type === "model.started" || event.type === "call.requested")) ?? timestamp(owner?.startedAt),
@@ -323,21 +350,33 @@ export function eventsBeforeLastUserTurn(events: readonly SessionStreamEvent[]):
   const index = events.findIndex((event) => event.type === "turn.started" && event.data.turnId === receipt.data.turnId);
   return events.slice(0, index < 0 ? events.indexOf(receipt) : index);
 }
-export function presentSubagentCall(events: readonly SessionStreamEvent[], callId: string): SubagentCallPresentation {
+export function presentSubagentCall(events: readonly SessionStreamEvent[], callId: string, durable: readonly AgentSubagentSummary[] = []): SubagentCallPresentation {
   const view = presentationSnapshot(events).view;
-  const child = children(view).find((entry) => entry.callId === callId);
   const entry = call(view, callId);
+  const input = entry?.input && typeof entry.input === "object" && !Array.isArray(entry.input) ? entry.input : undefined;
+  const taskId = entry?.taskId ?? (input && "taskId" in input && typeof input.taskId === "string" ? input.taskId : undefined);
+  const originalCallId = taskId ? task(view, taskId)?.callId ?? callId : callId;
+  const child = children(view).find((candidate) => candidate.callId === originalCallId);
+  const originalInput = call(view, originalCallId)?.input;
+  const nickname = originalInput && typeof originalInput === "object" && "nickname" in originalInput
+    && typeof originalInput.nickname === "string" ? originalInput.nickname.trim() : undefined;
   const state = entry?.state;
+  const record = durable.find((candidate) => candidate.childSessionId === child?.sessionId || candidate.callId === callId);
   return {
     ...(child ? { childSessionId: child.sessionId, name: child.name } : {}),
+    ...(record?.nickname || nickname ? { nickname: record?.nickname || nickname } : {}),
     startedAt: timestamp(entry?.startedAt), endedAt: timestamp(entry?.endedAt),
     status: !entry ? "starting" : state === "completed" ? "completed" : state === "failed" || state === "rejected" ? "failed" : state === "cancelled" ? "cancelled" : state === "approval" || state === "blocked" ? "waiting" : "running",
   };
 }
 export function presentSubagentSessions(events: readonly SessionStreamEvent[]): readonly SubagentSessionPresentation[] {
-  return events.flatMap((event) => event.type === "call.requested" && event.data.capability.kind === "agent"
-    ? [{ ...presentSubagentCall(events, event.data.callId), callId: event.data.callId, task: subagentTask(event.data.input) }]
-    : []);
+  const sessions = new Map<string, SubagentSessionPresentation>();
+  for (const event of events) {
+    if (event.type !== "call.requested" || event.data.capability.kind !== "agent") continue;
+    const child = { ...presentSubagentCall(events, event.data.callId), callId: event.data.callId, task: subagentTask(event.data.input) };
+    sessions.set(child.childSessionId ?? child.callId, child);
+  }
+  return [...sessions.values()];
 }
 export function eventsForAssistantSegment(message: EveMessage, events: readonly SessionStreamEvent[]): { readonly events: readonly SessionStreamEvent[]; readonly settledAt?: number } {
   const turnId = message.metadata?.turnId;
@@ -360,6 +399,16 @@ export function eventsForAssistantSegment(message: EveMessage, events: readonly 
   return { events: events.slice(Math.max(0, start), next < 0 ? undefined : next).filter((event) => eventTurnId(event) === turnId), ...(next >= 0 ? { settledAt: eventTimestamp(events[next]) } : {}) };
 }
 
+/** Visible output includes tool input previews before a call is committed. */
+export function hasModelStepOutput(events: readonly SessionStreamEvent[], turnId: string | undefined, stepIndex: number): boolean {
+  if (!turnId) return false;
+  return presentationSnapshot(events).messages.some((message) => message.role === "assistant" && message.metadata?.turnId === turnId &&
+    message.parts.some((part) => part.stepIndex === stepIndex && (
+      part.type === "tool" && part.kind !== "control" || part.type === "text" && part.text.trim().length > 0
+    )),
+  );
+}
+
 /** Add only the current empty model step; Eve already owns real reasoning parts. */
 export function withThinkingPlaceholder(message: EveMessage, events: readonly SessionStreamEvent[]): readonly EveMessagePart[] {
   const turnId = message.metadata?.turnId;
@@ -369,10 +418,8 @@ export function withThinkingPlaceholder(message: EveMessage, events: readonly Se
   const stepIndex = steps.length - 1;
   const run = steps[stepIndex];
   if (!run || run.status === "settled" || message.parts.some((part) => part.type === "reasoning" && part.stepIndex === stepIndex)) return message.parts;
-  if (calls(view, { turnId }).some((item) => item.runId === run.runId && item.kind !== "control") ||
-      parts(view, { turnId, kind: "text" }).some((part) => part.runId === run.runId && typeof part.value === "string" && part.value.trim()) ||
-      contentPreviews(view).some((part) => part.runId === run.runId && part.kind === "text" && part.text.trim())) return message.parts;
-  return [...message.parts, { type: "reasoning", state: "streaming", stepIndex, text: "" }];
+  if (hasModelStepOutput(events, turnId, stepIndex)) return message.parts;
+  return orderReasoningBeforeTools([...message.parts, { type: "reasoning", state: "streaming", stepIndex, text: "" }]);
 }
 function subagentTask(input: unknown): string | undefined {
   if (!input || typeof input !== "object") return undefined;

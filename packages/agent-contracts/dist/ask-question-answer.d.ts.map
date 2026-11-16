@@ -1,0 +1,1 @@
+{"version":3,"file":"ask-question-answer.d.ts","sourceRoot":"","sources":["../src/ask-question-answer.ts"],"names":[],"mappings":"AAEA,MAAM,MAAM,iBAAiB,GAAG;IAC9B,QAAQ,CAAC,SAAS,EAAE,SAAS,MAAM,EAAE,CAAC;IACtC,QAAQ,CAAC,cAAc,EAAE,MAAM,CAAC;CACjC,CAAC;AAEF,wBAAgB,uBAAuB,CAAC,MAAM,EAAE,iBAAiB,GAAG,MAAM,CAKzE;AAED,wBAAgB,sBAAsB,CAAC,KAAK,EAAE,MAAM,GAAG,iBAAiB,GAAG,SAAS,CAanF"}

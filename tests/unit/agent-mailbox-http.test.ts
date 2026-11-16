@@ -183,6 +183,7 @@ function enqueueOnlyStore(results: EnqueueAgentMailboxResult[]): AgentMailboxSto
     },
     fail: unsupported,
     findOwned: unsupported,
+    findByClientMessageId: unsupported,
     markSubmissionAmbiguous: unsupported,
     retryOwned: unsupported,
   };

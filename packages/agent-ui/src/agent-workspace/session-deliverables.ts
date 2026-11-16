@@ -1,4 +1,42 @@
 import type { AgentDeliverableEndpoint, AgentSessionDeliverable, AgentWorkspaceClientConfig } from "./contracts.js";
+import type { SessionStreamEvent } from "eve/client";
+
+export function publicationVersionLabel(version: string | undefined): string | undefined {
+  const label = version?.trim();
+  if (!label) return undefined;
+  return /^\d/u.test(label) ? `v${label}` : label;
+}
+
+export function deliverableExpired(deliverable: AgentSessionDeliverable): boolean {
+  return Boolean(deliverable.expiresAt && Date.parse(deliverable.expiresAt) <= Date.now());
+}
+
+/** Keep published history visible after its temporary files have expired. */
+export function sessionPublicationsFromEvents(events: readonly SessionStreamEvent[]): readonly AgentSessionDeliverable[] {
+  const kinds = new Map<string, "artifact" | "website-preview">();
+  const publications = new Map<string, AgentSessionDeliverable>();
+  for (const event of events) {
+    if (event.type === "call.requested") {
+      const name = event.data.capability.name.toLowerCase().replaceAll("-", "_");
+      if (["publish_artifact", "artifact_publish"].includes(name)) kinds.set(event.data.callId, "artifact");
+      if (["publish_preview", "website_preview"].includes(name)) kinds.set(event.data.callId, "website-preview");
+    }
+    if (event.type !== "call.settled" || event.data.outcome !== "completed" || !isRecord(event.data.output)) continue;
+    const output = event.data.output;
+    const kind = kinds.get(event.data.callId) ?? (output.kind === "artifact" || output.kind === "website-preview" ? output.kind : undefined);
+    if (!kind) continue;
+    const parsed = parseSessionDeliverables([{
+      ...output,
+      createdAt: output.createdAt ?? event.meta.at,
+      id: kind === "artifact" ? output.artifactId : output.previewId,
+      kind,
+      sizeBytes: output.bytes ?? output.sizeBytes,
+      title: kind === "artifact" ? output.filename : output.title ?? output.entrypoint ?? "Website preview",
+    }])[0];
+    if (parsed) publications.set(`${parsed.kind}:${parsed.id}`, parsed);
+  }
+  return [...publications.values()];
+}
 
 export async function loadSessionDeliverables({
   client,

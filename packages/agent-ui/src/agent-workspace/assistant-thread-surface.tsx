@@ -24,9 +24,7 @@ import {
   CopyIcon,
   ChevronDownIcon,
   DownloadIcon,
-  EyeIcon,
   FileIcon,
-  ImageIcon,
   LockKeyholeIcon,
   LoaderCircleIcon,
   PlusIcon,
@@ -50,7 +48,7 @@ import { ToolFallback } from "../assistant-ui/tool-fallback.js";
 import { TooltipIconButton } from "../assistant-ui/tooltip-icon-button.js";
 import { Button } from "../ui/button.js";
 import { Alert, AlertDescription, AlertTitle } from "../ui/alert.js";
-import { Attachment, AttachmentAction, AttachmentContent, AttachmentDescription, AttachmentGroup, AttachmentMedia, AttachmentTitle, AttachmentTrigger } from "../ui/attachment.js";
+import { Attachment, AttachmentGroup } from "../ui/attachment.js";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "../ui/dialog.js";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "../ui/collapsible.js";
 import { cn } from "../utils.js";
@@ -67,7 +65,11 @@ import { classifyAgentFailure, presentAgentTurn, type AgentTurnFailure } from ".
 import type { AgentComposerDraftRestore, AgentExecutionMode, AgentModelOption, AgentPromptMenuItem, AgentSessionDeliverable, AgentThreadPreferences } from "./contracts.js";
 import type { AgentLocale, AgentMessages } from "./i18n.js";
 import type { AgentUsageSummary } from "./usage.js";
-import { useAssetDownload, useAssetPreview, useAssetText } from "./asset-preview.js";
+import { useAssetDownload, useAssetText } from "./asset-preview.js";
+import { useTaskScrollAnchor } from "./use-task-scroll-anchor.js";
+import { receivedClientMessageId } from "./thread-storage.js";
+import { AgentHistoryLoading } from "./history-loading.js";
+import { AttachmentFileIcon, AttachmentImagePreview } from "./attachment-preview.js";
 
 export type AgentCancellationState = "idle" | "requested" | "cancelling";
 
@@ -85,6 +87,7 @@ export function AssistantThreadSurface({
   closedInputRequestIds,
   commands,
   composerTop,
+  composerHidden = false,
   draftStorageKey,
   draftRestore,
   events,
@@ -95,6 +98,7 @@ export function AssistantThreadSurface({
   historyStartIndex,
   inputDisabled,
   isBusy,
+  isRestoring = false,
   scrollToBottomOnInitialize = true,
   scrollToBottomOnThreadSwitch = true,
   sessionTerminal,
@@ -126,6 +130,7 @@ export function AssistantThreadSurface({
   readonly closedInputRequestIds: ReadonlySet<string>;
   readonly commands: readonly AgentPromptMenuItem[];
   readonly composerTop?: ReactNode;
+  readonly composerHidden?: boolean;
   readonly draftStorageKey: string;
   readonly draftRestore?: AgentComposerDraftRestore;
   readonly events: readonly SessionStreamEvent[];
@@ -137,6 +142,7 @@ export function AssistantThreadSurface({
   /** Locks the main composer without disabling assistant-ui's edit composer. */
   readonly inputDisabled?: boolean;
   readonly isBusy: boolean;
+  readonly isRestoring?: boolean;
   /** Avoid assistant-ui's mount-time bottom scroll during an edit remount. */
   readonly scrollToBottomOnInitialize?: boolean;
   /** Avoid thread-switch scroll during an edit remount. */
@@ -174,7 +180,9 @@ export function AssistantThreadSurface({
   // Entering assistant-ui's edit composer changes the external message store
   // before our edit callback runs. Suppress mount/switch scrolling for that
   // handoff so the user's current viewport is not pulled to the bottom.
-  const composerIsEditing = useAuiState((state) => state.composer.isEditing);
+  const composerIsEditing = useAuiState((state) => state.thread.messages.some((message) => message.composer.isEditing));
+  const runtimeDisabled = useAuiState((state) => state.thread.isDisabled);
+  const renderedUserId = useAuiState((state) => state.thread.messages.findLast((message) => message.role === "user")?.id);
   const viewportRef = useRef<HTMLDivElement>(null);
   const historyRequestInFlightRef = useRef(false);
   const pendingHistoryAnchorRef = useRef<{
@@ -191,6 +199,28 @@ export function AssistantThreadSurface({
     [eveMessages],
   );
   const lastAssistantMessageId = [...eveMessages].reverse().find((message) => message.role === "assistant")?.id;
+  const latestMessage = eveMessages.at(-1);
+  const latestUserId = eveMessages.findLast((message) => message.role === "user")?.id;
+  const latestUserReceipt = events.findLast((event) => event.type === "delivery.consumed"
+    && latestUserId === `${event.data.deliveryId}:user`);
+  // Eve replaces an optimistic user ID with its delivery ID. Keep scroll
+  // intent attached to the submission across that receipt handoff.
+  const userKey = latestUserReceipt?.type === "delivery.consumed"
+    ? `${receivedClientMessageId(latestUserReceipt) ?? latestUserReceipt.data.deliveryId}:user`
+    : latestUserId;
+  const { contentRef, reserveRef, resumeBottomFollow } = useTaskScrollAnchor({
+    hasExecutionGroup: latestMessage?.role === "assistant"
+      && Boolean(presentAgentTurn(latestMessage, events, closedInputRequestIds)?.showExecutionGroup),
+    isBusy,
+    isEditing: composerIsEditing,
+    isRestoring,
+    renderedUserId,
+    scrollOnInitialize: viewportScrollOnInitialize,
+    scrollOnThreadSwitch: viewportScrollOnThreadSwitch,
+    userId: latestUserId,
+    userKey,
+    viewportRef,
+  });
   const canRespondToInputRequest = eveMessages.some((message) =>
     message.parts.some((part) =>
       (part.type === "tool" && part.interaction?.status === "open") || (part.type === "interaction" && part.status === "open"),
@@ -280,15 +310,13 @@ export function AssistantThreadSurface({
     >
       <ThreadPrimitive.Viewport
         aria-live="polite"
-        // The native top anchor owns placement for the whole response. A
-        // second bottom-follow policy races its placeholder/receipt handoff.
         autoScroll={false}
         scrollToBottomOnRunStart={false}
         onScroll={handleViewportScroll}
         ref={viewportRef}
-        scrollToBottomOnInitialize={viewportScrollOnInitialize}
-        scrollToBottomOnThreadSwitch={viewportScrollOnThreadSwitch}
-        turnAnchor="top"
+        scrollToBottomOnInitialize={false}
+        scrollToBottomOnThreadSwitch={false}
+        turnAnchor="bottom"
         className="relative flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-auto px-3 pt-3 sm:px-4 sm:pt-4"
         data-slot="thread-viewport"
         role="log"
@@ -299,7 +327,7 @@ export function AssistantThreadSurface({
             <span className="sr-only">{locale === "zh-CN" ? "正在加载更早消息" : "Loading earlier messages"}</span>
           </div>
         ) : null}
-        <div className="mx-auto mb-14 flex w-full max-w-(--thread-max-width) flex-col gap-y-6 empty:hidden">
+        <div ref={contentRef} className="mx-auto mb-14 flex w-full shrink-0 max-w-(--thread-max-width) flex-col gap-y-6 empty:hidden">
           <ThreadPrimitive.Messages>
             {({ message }) => message.composer.isEditing ? (
               <EditMessage messages={messages} />
@@ -308,7 +336,7 @@ export function AssistantThreadSurface({
           ) : (
             <AssistantMessage
               assetUrl={assetUrl}
-              canRespond={!isBusy || canRespondToInputRequest}
+              canRespond={!runtimeDisabled && (!isBusy || canRespondToInputRequest)}
               events={events}
               fallbackStartedAt={fallbackStartedAt}
               // A terminal/retry error replaces the live thinking placeholder;
@@ -340,22 +368,24 @@ export function AssistantThreadSurface({
             />
           ) : null}
         </div>
+        <div aria-hidden="true" className="shrink-0" data-slot="task-scroll-reserve" ref={reserveRef} />
 
         <ThreadPrimitive.Empty>
-          {!isBusy ? <AssistantEmptyState messages={messages} /> : null}
+          {isRestoring ? <AgentHistoryLoading locale={locale} /> : !isBusy && !runtimeError ? <AssistantEmptyState messages={messages} /> : null}
         </ThreadPrimitive.Empty>
 
-        <ThreadPrimitive.ViewportFooter className="sticky bottom-0 z-20 mx-auto mt-auto flex w-full max-w-(--thread-max-width) flex-col bg-background pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-0 sm:pb-4 md:pb-5">
+        <ThreadPrimitive.ViewportFooter data-slot="thread-viewport-footer" className="sticky bottom-0 z-20 mx-auto mt-auto flex w-full shrink-0 max-w-(--thread-max-width) flex-col bg-background pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-0 sm:pb-4 md:pb-5">
           <ThreadPrimitive.ScrollToBottom asChild>
             <TooltipIconButton
               tooltip={locale === "zh-CN" ? "滚动到底部" : "Scroll to bottom"}
+              onClick={resumeBottomFollow}
               className="absolute -top-9 left-1/2 z-10 size-8 -translate-x-1/2 rounded-full disabled:invisible"
               variant="outline"
             >
               <ArrowDownIcon className="size-4" />
             </TooltipIconButton>
           </ThreadPrimitive.ScrollToBottom>
-          <AssistantComposer
+          {composerHidden ? null : <AssistantComposer
             approvalTakeover={approvalTakeover}
             cancellationState={cancellationState}
             commands={commands}
@@ -376,7 +406,7 @@ export function AssistantThreadSurface({
             preferences={preferences}
             reasoningLevels={reasoningLevels}
             usage={usage}
-          />
+          />}
         </ThreadPrimitive.ViewportFooter>
       </ThreadPrimitive.Viewport>
     </ThreadPrimitive.Root>
@@ -485,11 +515,18 @@ function UserMessage({ isBusy, messages, messageEditingAllowed, sessionTerminal 
     <MessagePrimitive.Root
       className="group fade-in slide-in-from-bottom-1 animate-in mx-auto grid w-full max-w-(--thread-max-width) auto-rows-auto grid-cols-[minmax(72px,1fr)_auto] content-start gap-y-2 px-2 duration-150 [&:where(>*)]:col-start-2"
     >
-      <AttachmentGroup className="col-start-2 mb-0 ml-auto max-w-[88%] justify-start py-0">
-        <MessagePrimitive.Attachments>
-          {({ attachment }) => <UserAttachment attachment={attachment} messages={messages} />}
-        </MessagePrimitive.Attachments>
-      </AttachmentGroup>
+      <div className="col-start-2 ml-auto flex max-w-full flex-col items-end gap-3 empty:hidden" data-user-attachments>
+        <div className="flex max-w-full flex-wrap justify-end gap-3 empty:hidden" data-user-image-attachments>
+          <MessagePrimitive.Attachments>
+            {({ attachment }) => isImageAttachment(attachment) ? <UserAttachment attachment={attachment} messages={messages} /> : null}
+          </MessagePrimitive.Attachments>
+        </div>
+        <div className="flex max-w-full flex-wrap justify-end gap-2 empty:hidden" data-user-file-attachments>
+          <MessagePrimitive.Attachments>
+            {({ attachment }) => !isImageAttachment(attachment) ? <UserAttachment attachment={attachment} messages={messages} /> : null}
+          </MessagePrimitive.Attachments>
+        </div>
+      </div>
       <div className="relative col-start-2 min-w-0">
         <div
           className="peer rounded-xl bg-muted px-4 py-2 text-foreground wrap-break-word empty:hidden"
@@ -516,45 +553,30 @@ function UserMessage({ isBusy, messages, messageEditingAllowed, sessionTerminal 
   );
 }
 
+function isImageAttachment(attachment: AssistantAttachment): boolean {
+  return attachment.contentType?.startsWith("image/") ?? attachment.type === "image";
+}
+
 function UserAttachment({ attachment, messages }: { readonly attachment: CompleteAttachment; readonly messages: AgentMessages }) {
-  const isImage = attachment.contentType?.startsWith("image/") ?? attachment.type === "image";
+  const isImage = isImageAttachment(attachment);
   const isTextPreviewable = isTextAssetPreviewable(attachment.contentType);
   const contentUrl = attachmentContentUrl(attachment);
-  const { url: previewUrl, error: previewError, retry: retryPreview } = useAssetPreview(isImage ? attachmentContentUrl(attachment) : undefined);
-  const [imagePreviewOpen, setImagePreviewOpen] = useState(false);
   const [textPreviewOpen, setTextPreviewOpen] = useState(false);
   const textPreview = useAssetText(textPreviewOpen && isTextPreviewable ? contentUrl : undefined);
   const download = useAssetDownload(contentUrl, attachment.name);
   return (
     <>
       {isImage ? (
-        <Attachment className="size-24 min-w-0 overflow-hidden p-0 sm:size-28" orientation="vertical" size="sm" state={previewError ? "error" : previewUrl ? "done" : "processing"}>
-          <AttachmentMedia className="size-full rounded-xl" variant={previewUrl ? "image" : "icon"}>
-            {previewUrl ? <img alt={attachment.name} src={previewUrl} /> : <ImageIcon className="size-5" />}
-          </AttachmentMedia>
-          {previewUrl ? (
-            <AttachmentTrigger aria-label={`${messages.attachment}: ${attachment.name}`} onClick={() => setImagePreviewOpen(true)} />
-          ) : previewError ? (
-            <AttachmentTrigger aria-label={messages.retry} onClick={retryPreview} title={previewError}><RotateCcwIcon className="m-auto size-4" /></AttachmentTrigger>
-          ) : null}
-        </Attachment>
+        <AttachmentImagePreview dismissLabel={messages.dismiss} label={`${messages.attachment}: ${attachment.name}`} name={attachment.name} retryLabel={messages.retry} source={contentUrl} />
       ) : (
-        <Attachment className="w-[min(18rem,100%)] flex-nowrap" size="sm" state="done">
-          <AttachmentMedia variant="icon"><FileIcon className="size-4" /></AttachmentMedia>
-          <AttachmentContent>
-            <AttachmentTitle>{attachment.name}</AttachmentTitle>
-            <AttachmentDescription>{attachment.contentType ?? messages.attachment}</AttachmentDescription>
-          </AttachmentContent>
-          {isTextPreviewable ? <AttachmentAction aria-label={`${messages.previewFile}: ${attachment.name}`} disabled={textPreviewOpen} onClick={() => setTextPreviewOpen(true)} title={messages.previewFile}><EyeIcon className="size-3.5" /></AttachmentAction> : null}
-          <AttachmentAction aria-label={`${messages.attachment}: ${attachment.name}`} disabled={download.loading} onClick={() => void download.download()} title={attachment.name}><DownloadIcon className="size-3.5" /></AttachmentAction>
+        <Attachment className="h-10 min-w-0 max-w-full flex-nowrap rounded-full" data-attachment-kind="file" state="done">
+          <button aria-label={`${messages.attachment}: ${attachment.name}`} className="flex h-full min-w-0 items-center gap-2 rounded-full px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring" disabled={download.loading || !contentUrl} onClick={() => isTextPreviewable ? setTextPreviewOpen(true) : void download.download()} title={attachment.name} type="button">
+            <AttachmentFileIcon filename={attachment.name} mediaType={attachment.contentType} />
+            <span className="truncate font-medium">{attachment.name}</span>
+          </button>
         </Attachment>
       )}
       {download.error ? <p className="text-xs text-destructive" role="alert">{download.error}</p> : null}
-      {imagePreviewOpen && previewUrl ? (
-        <button aria-label={messages.dismiss} className="fixed inset-0 z-50 flex cursor-zoom-out items-center justify-center bg-black/70 p-4" onClick={() => setImagePreviewOpen(false)} type="button">
-          <img alt={attachment.name} className="max-h-[90vh] max-w-[90vw] rounded-xl object-contain" src={previewUrl} />
-        </button>
-      ) : null}
       {isTextPreviewable ? <Dialog open={textPreviewOpen} onOpenChange={setTextPreviewOpen}>
         <DialogContent className="grid max-h-[min(80vh,48rem)] max-w-3xl grid-rows-[auto_minmax(0,1fr)_auto]">
           <DialogHeader>
@@ -582,7 +604,7 @@ function UserAttachment({ attachment, messages }: { readonly attachment: Complet
 function isTextAssetPreviewable(mediaType: string | undefined): boolean {
   const normalized = mediaType?.split(";", 1)[0]?.trim().toLowerCase();
   return Boolean(normalized && (
-    ["text/plain", "text/markdown", "text/csv", "text/tab-separated-values", "application/json", "application/x-ndjson", "application/yaml", "application/x-yaml"].includes(normalized)
+    ["text/plain", "text/html", "text/markdown", "text/csv", "text/tab-separated-values", "application/json", "application/x-ndjson", "application/yaml", "application/x-yaml"].includes(normalized)
   ));
 }
 
@@ -806,6 +828,9 @@ export function AssistantComposer({
   const isRunning = useAuiState((state) => state.thread.isRunning);
   const composerIsEmpty = useAuiState((state) => state.composer.isEmpty);
   const composerText = useAuiState((state) => state.composer.text);
+  const hasSendableContent = useAuiState((state) => state.composer.text.trim().length > 0
+    || state.composer.attachments.some((attachment) => attachment.status.type === "complete" || attachment.status.type === "requires-action"));
+  const hasPendingAttachment = useAuiState((state) => state.composer.attachments.some((attachment) => attachment.status.type === "running" || attachment.status.type === "incomplete"));
   const runtimeInputDisabled = useAuiState((state) => state.thread.isDisabled);
   const stopping = cancellationState !== "idle";
   const runtimeBusy = isBusy || (isRunning && !sessionSettled);
@@ -927,7 +952,7 @@ export function AssistantComposer({
             <ApprovalComposerTakeover cancellationState={cancellationState} locale={locale} onCancel={onCancel} onRespond={onInputResponses} request={approvalTakeover} />
           ) : (
             <>
-              <AttachmentGroup className="px-1 py-0.5 empty:hidden">
+              <AttachmentGroup className="gap-2.5 px-1 py-1 empty:hidden" data-composer-attachments>
                 <ComposerPrimitive.Attachments>
                   {({ attachment }) => (
                     <ComposerAttachment attachment={attachment} messages={messages} />
@@ -1024,7 +1049,7 @@ export function AssistantComposer({
                 aria-hidden={(stopping || runtimeBusy) && composerIsEmpty}
                 aria-label={runtimeBusy && !stopping ? messages.queueFollowUp : messages.send}
                 className={cn("size-9 shrink-0 rounded-full sm:size-8", ((stopping || runtimeBusy) && composerIsEmpty) && "hidden")}
-                disabled={composerDisabled || ((stopping || runtimeBusy) && composerIsEmpty)}
+                disabled={composerDisabled || !hasSendableContent || hasPendingAttachment || ((stopping || runtimeBusy) && composerIsEmpty)}
                 onClick={() => {
                   aui.composer.send();
                   blurComposerOnTouch(composerInputRef);
@@ -1057,7 +1082,6 @@ function blurComposerOnTouch(inputRef: React.RefObject<HTMLDivElement | null>) {
 
 function ComposerAttachment({ attachment, messages }: { readonly attachment: AssistantAttachment; readonly messages: AgentMessages }) {
   const [previewUrl, setPreviewUrl] = useState<string>();
-  const [previewOpen, setPreviewOpen] = useState(false);
   useEffect(() => {
     if (!attachment.file || !attachment.contentType?.startsWith("image/")) {
       setPreviewUrl(undefined);
@@ -1067,49 +1091,39 @@ function ComposerAttachment({ attachment, messages }: { readonly attachment: Ass
     setPreviewUrl(url);
     return () => URL.revokeObjectURL(url);
   }, [attachment.contentType, attachment.file]);
-  const isImage = attachment.contentType?.startsWith("image/") ?? attachment.type === "image";
+  const isImage = isImageAttachment(attachment);
   const state = attachment.status.type === "incomplete" ? "error" : attachment.status.type === "running" ? "uploading" : "done";
-  if (isImage) {
-    return (
-      <>
-        <Attachment className="size-20 min-w-0 overflow-hidden p-0" orientation="vertical" size="sm" state={state}>
-          <AttachmentMedia className="size-full rounded-xl" variant={previewUrl ? "image" : "icon"}>
-            {previewUrl ? <img alt={attachment.name} src={previewUrl} /> : <ImageIcon className="size-5" />}
-          </AttachmentMedia>
-          {previewUrl ? <AttachmentTrigger aria-label={`${messages.attachment}: ${attachment.name}`} onClick={() => setPreviewOpen(true)} /> : null}
-          {attachment.status.type === "running" ? (
-            <span className="pointer-events-none absolute inset-x-1 bottom-1 z-20 rounded-full bg-background/90 px-1 py-0.5 text-center text-[10px] tabular-nums text-foreground">
-              {Math.round(attachment.status.progress)}%
-            </span>
-          ) : null}
-          <AttachmentPrimitive.Remove aria-label={messages.removeAttachment} className="absolute right-1 top-1 z-20 flex size-5 items-center justify-center rounded-full bg-background/90 text-muted-foreground hover:text-foreground">
-            <XIcon className="size-3" />
-          </AttachmentPrimitive.Remove>
-        </Attachment>
-        {previewOpen && previewUrl ? (
-          <button aria-label={messages.dismiss} className="fixed inset-0 z-50 flex cursor-zoom-out items-center justify-center bg-black/70 p-4" onClick={() => setPreviewOpen(false)} type="button">
-            <img alt={attachment.name} className="max-h-[90vh] max-w-[90vw] rounded-xl object-contain" src={previewUrl} />
-          </button>
-        ) : null}
-      </>
-    );
-  }
-  return (
-    <Attachment className="max-w-[min(18rem,calc(100vw-2rem))]" size="sm" state={state}>
-      <AttachmentMedia variant="icon"><FileIcon className="size-4" /></AttachmentMedia>
-      <AttachmentContent>
-        <AttachmentTitle>{attachment.name}</AttachmentTitle>
-        <AttachmentDescription>
-          {attachment.status.type === "running"
-            ? `${Math.round(attachment.status.progress)}%`
-            : attachment.status.type === "incomplete"
-              ? attachment.status.message ?? messages.attachment
-              : messages.attachment}
-        </AttachmentDescription>
-      </AttachmentContent>
-      <AttachmentPrimitive.Remove aria-label={messages.removeAttachment} className="relative z-20 rounded-sm text-muted-foreground hover:text-foreground">
-        <XIcon className="size-3" />
-      </AttachmentPrimitive.Remove>
+  const progress = attachment.status.type === "running" ? Math.max(0, Math.min(100, Math.round(attachment.status.progress))) : 0;
+  const controls = <>
+    {attachment.status.type === "running" ? (
+      <span aria-label={`${messages.attachment}: ${attachment.name}`} aria-valuemax={100} aria-valuemin={0} aria-valuenow={progress} aria-valuetext={`${progress}%`} className="pointer-events-none absolute left-1.5 top-1.5 z-20 flex size-6 items-center justify-center rounded-full bg-background/95 text-foreground shadow-sm" role="progressbar" title={`${progress}%`}>
+        <svg aria-hidden className="absolute inset-0 size-full -rotate-90" fill="none" viewBox="0 0 24 24">
+          <circle className="text-border" cx="12" cy="12" r="9.5" stroke="currentColor" strokeWidth="2" />
+          <circle cx="12" cy="12" pathLength="100" r="9.5" stroke="currentColor" strokeDasharray="100" strokeDashoffset={100 - progress} strokeLinecap="round" strokeWidth="2" />
+        </svg>
+        <span aria-hidden className="text-[8px] font-medium tabular-nums">{progress}</span>
+      </span>
+    ) : attachment.status.type === "incomplete" ? (
+      <span className={cn("pointer-events-none absolute inset-x-1.5 bottom-9 z-20 line-clamp-2 rounded bg-background/95 px-1.5 py-1 text-[10px] leading-3 text-destructive shadow-sm", isImage && "bottom-1.5")} role="alert" title={attachment.status.message}>
+        {attachment.status.message ?? messages.attachment}
+      </span>
+    ) : null}
+    <AttachmentPrimitive.Remove aria-label={`${messages.removeAttachment}: ${attachment.name}`} className="absolute right-1.5 top-1.5 z-20 flex size-6 items-center justify-center rounded-full border border-border/60 bg-background/95 text-muted-foreground opacity-0 shadow-sm transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover/attachment:opacity-100 group-focus-within/attachment:opacity-100 [@media(hover:none)]:opacity-100">
+      <XIcon className="size-3.5" />
+    </AttachmentPrimitive.Remove>
+  </>;
+  return isImage ? (
+    <AttachmentImagePreview className="size-24" dismissLabel={messages.dismiss} label={`${messages.attachment}: ${attachment.name}`} name={attachment.name} retryLabel={messages.retry} source={previewUrl} state={state}>
+      {controls}
+    </AttachmentImagePreview>
+  ) : (
+    <Attachment className="h-24 w-36 min-w-0 max-w-[calc(100vw-4rem)] flex-col flex-nowrap gap-0 overflow-hidden rounded-lg" data-attachment-kind="file" state={state}>
+      <div className="flex w-full flex-1 items-center justify-center bg-muted/50 text-muted-foreground"><FileIcon className="size-5" strokeWidth={1.5} /></div>
+      <div className="flex h-8 w-full shrink-0 items-center gap-1.5 px-2" title={attachment.name}>
+        <AttachmentFileIcon className="size-3.5" filename={attachment.name} mediaType={attachment.contentType} preview />
+        <span className="min-w-0 truncate text-xs">{attachment.name}</span>
+      </div>
+      {controls}
     </Attachment>
   );
 }

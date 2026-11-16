@@ -1,3 +1,42 @@
+export function publicationVersionLabel(version) {
+    const label = version?.trim();
+    if (!label)
+        return undefined;
+    return /^\d/u.test(label) ? `v${label}` : label;
+}
+export function deliverableExpired(deliverable) {
+    return Boolean(deliverable.expiresAt && Date.parse(deliverable.expiresAt) <= Date.now());
+}
+export function sessionPublicationsFromEvents(events) {
+    const kinds = new Map();
+    const publications = new Map();
+    for (const event of events) {
+        if (event.type === "call.requested") {
+            const name = event.data.capability.name.toLowerCase().replaceAll("-", "_");
+            if (["publish_artifact", "artifact_publish"].includes(name))
+                kinds.set(event.data.callId, "artifact");
+            if (["publish_preview", "website_preview"].includes(name))
+                kinds.set(event.data.callId, "website-preview");
+        }
+        if (event.type !== "call.settled" || event.data.outcome !== "completed" || !isRecord(event.data.output))
+            continue;
+        const output = event.data.output;
+        const kind = kinds.get(event.data.callId) ?? (output.kind === "artifact" || output.kind === "website-preview" ? output.kind : undefined);
+        if (!kind)
+            continue;
+        const parsed = parseSessionDeliverables([{
+                ...output,
+                createdAt: output.createdAt ?? event.meta.at,
+                id: kind === "artifact" ? output.artifactId : output.previewId,
+                kind,
+                sizeBytes: output.bytes ?? output.sizeBytes,
+                title: kind === "artifact" ? output.filename : output.title ?? output.entrypoint ?? "Website preview",
+            }])[0];
+        if (parsed)
+            publications.set(`${parsed.kind}:${parsed.id}`, parsed);
+    }
+    return [...publications.values()];
+}
 export async function loadSessionDeliverables({ client, endpoint = "/api/deliverables", fetcher = fetch, sessionId, signal, }) {
     const configuredHeaders = typeof client?.headers === "function" ? await client.headers() : client?.headers;
     const headers = new Headers(configuredHeaders);

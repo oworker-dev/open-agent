@@ -17,6 +17,7 @@ import {
   ExternalLinkIcon,
   FileIcon,
   ImageIcon,
+  ImagesIcon,
   KeyRoundIcon,
   LoaderCircleIcon,
   NetworkIcon,
@@ -31,7 +32,8 @@ import {
 } from "lucide-react";
 import { createContext, useContext, useEffect, useRef, useState } from "react";
 import type { SessionStreamEvent } from "eve/client";
-import { calls, contentPreviews, runs, signInEnding, type Answer } from "eve/events";
+import { calls, runs, signInEnding, type Answer } from "eve/events";
+import { encodeMultiSelectAnswer, parseMultiSelectAnswer } from "@oworker/open-agent-contracts";
 import { useScrollLock } from "@assistant-ui/react";
 import { useAssetDownload, useAssetPreview } from "./asset-preview.js";
 import { parsePartialJsonObject } from "assistant-stream/utils";
@@ -72,21 +74,24 @@ import { cn } from "../utils.js";
 import type { AgentLocale } from "./i18n.js";
 import type { AgentSessionDeliverable } from "./contracts.js";
 import { AgentToolRenderersContext, type AgentToolRenderers } from "./tool-renderers.js";
+import { AgentSubagentsContext } from "./subagent-context.js";
+import { deliverableExpired, publicationVersionLabel } from "./session-deliverables.js";
+import { AttachmentImagePreview } from "./attachment-preview.js";
 import {
   eventsForMessagePresentation,
   isLocallyInterruptedMessage,
   eventTurnId,
-  eventStepIndex,
   presentationSnapshot,
   failureForTurn,
   classifyAgentFailure,
   isRetryableAgentFailure,
-  isCancellationPendingToolPart,
+  hasModelStepOutput,
   isInterruptedToolPart,
   presentAgentTurn,
   presentAgentStep,
   presentSubagentCall,
   reasoningContentForStep,
+  reasoningTiming,
   withThinkingPlaceholder,
   type AgentStepPresentation,
   type AgentTurnPresentation,
@@ -404,6 +409,10 @@ function ProcessParts({
   readonly parts: readonly EveMessagePart[];
   readonly turnId?: string;
 }) {
+  const renderers = useContext(AgentToolRenderersContext);
+  const usesImageGallery = (part: EveToolPart) => isViewImageTool(normalizeToolName(part.name))
+    && !part.interaction && !renderers?.[part.name]
+    && !["cancelled", "failed", "rejected", "approval"].includes(part.state);
   const rendered: React.ReactNode[] = [];
   const toolGroupOrdinalByStep = new Map<number, number>();
   const lastReasoningPartByStep = new Map<number, number>();
@@ -448,11 +457,17 @@ function ProcessParts({
       continue;
     }
 
+    const imageGallery = usesImageGallery(part);
     const toolParts: EveToolPart[] = [];
     let cursor = index;
-    while (cursor < parts.length && parts[cursor]?.type === "tool") {
+    while (cursor < parts.length && parts[cursor]?.type === "tool" && usesImageGallery(parts[cursor] as EveToolPart) === imageGallery) {
       toolParts.push(parts[cursor] as EveToolPart);
       cursor += 1;
+    }
+    if (imageGallery) {
+      rendered.push(<ViewedImages assetUrl={assetUrl} key={`images:${toolParts[0]!.callId}`} locale={locale} parts={toolParts} />);
+      index = cursor;
+      continue;
     }
     if (toolParts.every((toolPart) => Boolean(toolPart.interaction))) {
       rendered.push(
@@ -645,6 +660,7 @@ function DefaultToolPart({
   readonly onOpenSubagent?: (sessionId: string) => void;
   readonly part: EveToolPart;
 }) {
+  const subagents = useContext(AgentSubagentsContext);
   const inputRequest = part.interaction;
   if (inputRequest) {
     return <InputRequestCard canRespond={canRespond} closed={closedInputRequestIds.has(inputRequest.interactionId)} events={events} locale={locale} onClose={onCloseInputRequest} onInputResponses={onInputResponses} part={part} />;
@@ -653,7 +669,6 @@ function DefaultToolPart({
   const defaultOpen = part.state === "approval";
   const Icon = toolIcon(part);
   const interrupted = isInterruptedToolPart(part);
-  const cancellationPending = isCancellationPendingToolPart(part);
   const statusLabel = isFileMutationTool(part) ? undefined : toolStatusLabel(locale, part);
 
   return (
@@ -665,8 +680,6 @@ function DefaultToolPart({
           <LoaderCircleIcon className="size-4 shrink-0 animate-spin [animation-duration:0.65s]" />
         ) : interrupted ? (
           <CircleStopIcon className="size-4 shrink-0 text-muted-foreground" />
-        ) : cancellationPending ? (
-          <LoaderCircleIcon className="size-4 shrink-0 animate-spin text-muted-foreground [animation-duration:0.9s]" />
         ) : part.state === "failed" || part.state === "rejected" ? (
           <XCircleIcon className="size-4 shrink-0 text-destructive" />
         ) : (
@@ -675,7 +688,7 @@ function DefaultToolPart({
         {isFileMutationTool(part) ? (
           <FileMutationToolTitle events={events} locale={locale} part={part} />
         ) : (
-          <span className="truncate">{toolTitle(locale, part, events)}</span>
+          <span className="truncate">{toolTitle(locale, part, events, subagents)}</span>
         )}
         {statusLabel ? (
           <span className={cn("shrink-0 text-xs", part.state === "failed" && "text-destructive")}>
@@ -690,9 +703,7 @@ function DefaultToolPart({
           <p className={cn("whitespace-pre-wrap text-xs", interrupted ? "text-muted-foreground" : "text-destructive")}>
             {interrupted
               ? localize(locale, "Tool call stopped before completion.", "工具调用在完成前已中断。")
-              : cancellationPending
-                ? localize(locale, "Stopping tool call…", "正在停止工具调用…")
-                : part.error?.message}
+              : part.error?.message}
           </p>
         ) : null}
       </ToolFallbackContent>
@@ -937,6 +948,30 @@ const VIEW_IMAGE_MEDIA_TYPES = new Set([
   "image/svg+xml",
   "image/webp",
 ]);
+
+function ViewedImages({ assetUrl, locale, parts }: {
+  readonly assetUrl?: (assetId: string) => string;
+  readonly locale: AgentLocale;
+  readonly parts: readonly EveToolPart[];
+}) {
+  const running = parts.some(part => !isToolTerminal(part));
+  const label = running
+    ? localize(locale, `Viewing ${parts.length} ${parts.length === 1 ? "image" : "images"}`, `正在查看 ${parts.length} 张图像`)
+    : localize(locale, `Viewed ${parts.length} ${parts.length === 1 ? "image" : "images"}`, `已查看 ${parts.length} 张图像`);
+  return <ToolFallbackRoot className="my-0" data-tool-view="view-images" defaultOpen>
+    <CollapsibleTrigger className="group/trigger flex max-w-full items-center gap-2 py-1.5 text-sm text-muted-foreground hover:text-foreground">
+      {running ? <LoaderCircleIcon className="size-4 shrink-0 animate-spin" /> : <ImagesIcon className="size-4 shrink-0" />}
+      <span>{label}</span>
+      <ChevronDownIcon className="size-3.5 shrink-0 -rotate-90 transition-transform group-data-[state=open]/trigger:rotate-0" />
+    </CollapsibleTrigger>
+    <CollapsibleContent>
+      <div className="flex flex-wrap gap-3 py-1" data-viewed-image-thumbnails>
+        {parts.map(part => <ViewImageToolContent assetUrl={assetUrl} input={toolInput(part)} key={part.callId} locale={locale} output={part.output} running={!isToolTerminal(part)} />)}
+      </div>
+    </CollapsibleContent>
+  </ToolFallbackRoot>;
+}
+
 function ViewImageToolContent({
   assetUrl,
   input,
@@ -962,7 +997,6 @@ function ViewImageToolContent({
   const sourceUrl = assetId
     ? assetUrl?.(assetId) ?? `/api/assets/${encodeURIComponent(assetId)}`
     : undefined;
-  const { url: previewUrl } = useAssetPreview(sourceUrl);
   const details = [
     mediaType && VIEW_IMAGE_MEDIA_TYPES.has(mediaType) ? mediaType : undefined,
     dimensions ? `${dimensions.width}\u00d7${dimensions.height}` : undefined,
@@ -973,44 +1007,7 @@ function ViewImageToolContent({
         : localize(locale, "resized preview", "已缩放预览图")
       : undefined,
   ].filter((value): value is string => Boolean(value));
-  const [previewOpen, setPreviewOpen] = useState(false);
-
-  return (
-    <div data-tool-view="view-image">
-      <Attachment className="max-w-[min(100%,28rem)]" size="default" state={running ? "processing" : "done"}>
-        <AttachmentMedia className="size-12" variant={previewUrl ? "image" : "icon"}>
-          {previewUrl ? <img alt={path} src={previewUrl} /> : <ImageIcon className="size-5" />}
-        </AttachmentMedia>
-        <AttachmentContent>
-          <AttachmentTitle title={path}>{path}</AttachmentTitle>
-          <AttachmentDescription>
-            {details.length > 0
-              ? details.join(" \u00b7 ")
-              : running
-                ? localize(locale, "Preparing image preview...", "正在准备图片预览…")
-                : localize(locale, "Image metadata unavailable", "图片元数据不可用")}
-          </AttachmentDescription>
-        </AttachmentContent>
-        {previewUrl ? (
-          <AttachmentTrigger
-            aria-label={localize(locale, `Preview ${path}`, `预览 ${path}`)}
-            onClick={() => setPreviewOpen(true)}
-            title={localize(locale, "Preview image", "预览图片")}
-          />
-        ) : null}
-      </Attachment>
-      {previewOpen && previewUrl ? (
-        <button
-          aria-label={localize(locale, "Close image preview", "关闭图片预览")}
-          className="fixed inset-0 z-50 flex cursor-zoom-out items-center justify-center bg-black/70 p-6"
-          onClick={() => setPreviewOpen(false)}
-          type="button"
-        >
-          <img alt={path} className="max-h-[90vh] max-w-[90vw] rounded-xl object-contain shadow-2xl" src={previewUrl} />
-        </button>
-      ) : null}
-    </div>
-  );
+  return <AttachmentImagePreview dismissLabel={localize(locale, "Close image preview", "关闭图片预览")} label={localize(locale, `Preview ${path}`, `预览 ${path}`)} name={path} retryLabel={localize(locale, "Retry preview", "重试预览")} source={sourceUrl} state={running ? "processing" : "done"} title={[path, ...details].join(" · ")} />;
 }
 
 function imageDimensions(value: unknown): { readonly height: number; readonly width: number } | undefined {
@@ -1042,7 +1039,7 @@ function toolIcon(part: EveToolPart): React.ComponentType<{ className?: string }
 
 function isToolTerminal(part: EveToolPart): boolean {
   return part.state === "rejected" || part.state === "failed" ||
-    (part.state === "completed");
+    part.state === "completed" || part.state === "cancelled";
 }
 
 function normalizeToolName(toolName: string): string {
@@ -1092,14 +1089,6 @@ function fileMutationTitle(
   part: EveToolPart,
   events: readonly SessionStreamEvent[] = [],
 ): string {
-  if (isCancellationPendingToolPart(part)) {
-    const summary = fileMutationSummary(part, events);
-    const stats = [
-      summary.additions > 0 ? `+${summary.additions}` : undefined,
-      summary.deletions > 0 ? `-${summary.deletions}` : undefined,
-    ].filter(Boolean).join(" ");
-    return [localize(locale, "Stopping", "正在停止"), summary.path, stats].filter(Boolean).join(" ");
-  }
   if (isInterruptedToolPart(part)) {
     const summary = fileMutationSummary(part, events);
     const stats = [
@@ -1123,7 +1112,6 @@ function fileMutationActionLabel(
   part: EveToolPart,
   summary: FileMutationSummary,
 ): string {
-  if (isCancellationPendingToolPart(part)) return localize(locale, "Stopping", "正在停止");
   if (isInterruptedToolPart(part)) return localize(locale, "Stopped", "已中断");
   if (part.state === "failed") return localize(locale, "Failed", "失败");
   if (part.state === "rejected") return localize(locale, "Not approved", "未批准");
@@ -1268,46 +1256,20 @@ function ReasoningPart({
     : { status: "running" as const };
   const retryItems = step.retries ?? (step.retry ? [step.retry] : []);
   const stepIndex = part.stepIndex ?? 0;
-  const durationSeconds = useElapsedSeconds(timing.startedAt, timing.endedAt);
   const retryInFlight = hasTurnId && isReasoningRetryInFlight(events, turnId, part.stepIndex);
   const eventText = hasTurnId ? reasoningContentForStep(events, turnId, part.stepIndex) : "";
-  const run = hasTurnId ? runs(presentationSnapshot(events).view, { turnId })[stepIndex] : undefined;
-  const hasTextOutput = Boolean(run && contentPreviews(presentationSnapshot(events).view).some((preview) =>
-    preview.runId === run.runId && preview.kind === "text" && preview.text.trim(),
-  ));
-  // A browser-only assistant placeholder has no durable turn id yet. Do not
-  // let a historical step with the same numeric index hide that placeholder
-  // before Eve emits the current turn's first event.
-  const responseStarted = Boolean(turnId) && !eventText && (hasTextOutput || events.some((event) =>
-    event.type === "content.completed" && event.data.kind === "text" &&
-    eventTurnMatches(event, turnId, stepIndex, events) && typeof event.data.value === "string" && event.data.value.trim().length > 0,
-  ));
-  const streaming = !interrupted && (part.state === "streaming" || retryInFlight) && !responseStarted;
   // When Eve retries a step it reuses the same step/turn coordinates. The
   // reducer snapshot can still contain the previous attempt's completed text
   // while the new attempt has not emitted its first delta; never display that
   // stale text during the hand-off. For compact historical checkpoints with
   // no retry boundary, the reducer text remains the useful fallback.
   const text = hasTurnId ? (retryInFlight ? eventText : eventText || part.text.trim()) : "";
-  // Empty reasoning boundaries are protocol bookkeeping, not user-visible
-  // reasoning. Keep a live placeholder while the step is running, but remove
-  // it after completion instead of rendering an empty "Reasoning complete".
-  if (!text && !streaming) {
-    return (
-      <ReasoningBlock
-        durationSeconds={durationSeconds}
-        events={events}
-        failure={step.failure}
-        locale={locale}
-        retryItems={retryItems}
-        stepIndex={stepIndex}
-        streaming={false}
-        text=""
-        timing={timing}
-        turnId={turnId}
-      />
-    );
-  }
+  // An empty placeholder ends as soon as this step displays text or a tool,
+  // including streamed arguments. Real reasoning and retry diagnostics stay.
+  // Without a durable turn id, output from earlier turns cannot hide it.
+  const streaming = !interrupted && (part.state === "streaming" || retryInFlight) &&
+    (Boolean(text) || !hasModelStepOutput(events, turnId, stepIndex));
+  const durationSeconds = useElapsedSeconds(text || streaming ? timing.startedAt : undefined, timing.endedAt);
   return (
     <ReasoningBlock
       durationSeconds={durationSeconds}
@@ -1380,10 +1342,6 @@ function ReasoningBlock({
   );
 }
 
-function eventTurnMatches(event: SessionStreamEvent, turnId: string | undefined, stepIndex: number, events: readonly SessionStreamEvent[]): boolean {
-  return turnId !== undefined && eventTurnId(event) === turnId && eventStepIndex(event, events) === stepIndex;
-}
-
 function isReasoningRetryInFlight(events: readonly SessionStreamEvent[], turnId: string | undefined, stepIndex: number | undefined): boolean {
   if (!turnId || stepIndex === undefined) return false;
   const run = runs(presentationSnapshot(events).view, { turnId })[stepIndex];
@@ -1402,6 +1360,8 @@ function reasoningTriggerLabel(
 function reasoningSummary(text: string): string | undefined {
   const firstLine = text
     .replaceAll(/^[#>*\-\s]+/gm, "")
+    .replaceAll(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replaceAll(/[*_`~]/g, "")
     .split(/\n|(?<=[.!?。！？])\s+/u)
     .map((line) => line.trim())
     .find(Boolean);
@@ -1411,12 +1371,6 @@ function reasoningSummary(text: string): string | undefined {
 
 function activeReasoningStep(events: readonly SessionStreamEvent[], turnId: string | undefined): number {
   return turnId ? Math.max(0, runs(presentationSnapshot(events).view, { turnId }).length - 1) : 0;
-}
-
-function reasoningTiming(events: readonly SessionStreamEvent[], turnId: string | undefined, stepIndex: number | undefined): { readonly endedAt?: number; readonly startedAt?: number } {
-  if (!turnId) return {};
-  const step = presentAgentStep(events, turnId, stepIndex ?? 0);
-  return { startedAt: step.startedAt, endedAt: step.endedAt };
 }
 
 function eventTime(event: SessionStreamEvent | undefined): number | undefined {
@@ -1679,6 +1633,7 @@ function PublishedDeliverableCard({ deliverable, locale }: { readonly deliverabl
   const openDeliverable = useContext(DeliverableOpenContext);
   return <ArtifactCard
     aria-label={`${locale === "zh-CN" ? "打开" : "Open"} ${deliverable.title}`}
+    disabled={deliverableExpired(deliverable)}
     icon={deliverable.kind === "website-preview" ? <MonitorIcon className="size-4" /> : undefined}
     meta={publishedDeliverableMeta(deliverable, locale)}
     onClick={() => openDeliverable ? openDeliverable(deliverable) : window.open(deliverable.url, "_blank", "noopener,noreferrer")}
@@ -1688,12 +1643,12 @@ function PublishedDeliverableCard({ deliverable, locale }: { readonly deliverabl
 
 function publishedDeliverableMeta(deliverable: AgentSessionDeliverable, locale: AgentLocale): string {
   const title = deliverable.alias && deliverable.title !== deliverable.alias ? deliverable.title : undefined;
-  const version = deliverable.version ? `v${deliverable.version}` : undefined;
+  const version = publicationVersionLabel(deliverable.version);
   const kind = deliverable.kind === "website-preview"
     ? localize(locale, "Website preview", "网站预览")
     : localize(locale, "Published artifact", "发布资产");
   const fileCount = deliverable.fileCount ? `${deliverable.fileCount} ${localize(locale, "files", "个文件")}` : undefined;
-  return [kind, version, title, fileCount, deliverable.mediaType, formatBytes(deliverable.sizeBytes)].filter(Boolean).join(" · ");
+  return [kind, deliverableExpired(deliverable) ? localize(locale, "Expired", "已过期") : undefined, version, title, fileCount, deliverable.mediaType, formatBytes(deliverable.sizeBytes)].filter(Boolean).join(" · ");
 }
 
 function toolPatch(part: EveToolPart, _events: readonly SessionStreamEvent[] = []): string | undefined {
@@ -1851,7 +1806,8 @@ function SubagentProgress({
   readonly onOpenSubagent?: (sessionId: string) => void;
   readonly part: EveToolPart;
 }) {
-  const presentation = presentSubagentCall(events, part.callId);
+  const subagents = useContext(AgentSubagentsContext);
+  const presentation = presentSubagentCall(events, part.callId, subagents);
   const elapsedSeconds = useElapsedSeconds(presentation.startedAt, presentation.endedAt);
   const isActive = presentation.status === "running" || presentation.status === "starting";
   const title = presentation.status === "completed"
@@ -2155,6 +2111,7 @@ function InputRequestCard({
       : localize(locale, "Session limit reached", "已达到会话限制");
 
   const choices = inputRequest.options ?? [];
+  const multipleSelection = isQuestion && part.type === "tool" && asRecord(part.input)?.multiple === true;
 
   const settled = interaction.status === "settled" || Boolean(inputResponse) || closed;
   const [open, setOpen] = useState(!settled);
@@ -2194,6 +2151,7 @@ function InputRequestCard({
                   closed={closed}
                   inputResponse={inputResponse}
                   locale={locale}
+                  multipleSelection={multipleSelection}
                   options={choices}
                   selectedOptionId={selectedOption?.id}
                 />
@@ -2206,6 +2164,7 @@ function InputRequestCard({
                   acceptsFreeform={acceptsFreeform}
                   canRespond={canRespond}
                   locale={locale}
+                  multipleSelection={multipleSelection}
                   onInputResponses={onInputResponses}
                   options={choices}
                   prompt={inputRequest.prompt}
@@ -2283,15 +2242,22 @@ function InputRequestReview({
   closed,
   inputResponse,
   locale,
+  multipleSelection,
   options,
   selectedOptionId,
 }: {
   readonly closed: boolean;
   readonly inputResponse?: Answer;
   readonly locale: AgentLocale;
+  readonly multipleSelection: boolean;
   readonly options: readonly { readonly description?: string; readonly id: string; readonly label: string }[];
   readonly selectedOptionId?: string;
 }) {
+  const decodedAnswer = multipleSelection && inputResponse?.text
+    ? parseMultiSelectAnswer(inputResponse.text)
+    : undefined;
+  const selectedOptionIds = new Set(decodedAnswer?.optionIds ?? (selectedOptionId ? [selectedOptionId] : []));
+  const additionalText = decodedAnswer?.additionalText ?? inputResponse?.text?.trim();
   return (
     <div className="mt-3 space-y-2 text-sm" data-tool-view="input-review">
       <p className="text-xs text-muted-foreground">
@@ -2305,11 +2271,16 @@ function InputRequestReview({
             <li
               className={cn(
                 "flex items-start gap-2 rounded-md bg-muted/40 px-2.5 py-2",
-                selectedOptionId === option.id && "bg-accent/80 text-foreground",
+                selectedOptionIds.has(option.id) && "bg-accent/80 text-foreground",
               )}
+              data-option-selected={selectedOptionIds.has(option.id) ? "true" : undefined}
               key={option.id}
             >
-              <span className={cn("mt-1 size-2 shrink-0 rounded-full border border-muted-foreground/40", selectedOptionId === option.id && "border-primary bg-primary")} />
+              <span className={cn(
+                "mt-1 size-2 shrink-0 border border-muted-foreground/40",
+                multipleSelection ? "rounded-[2px]" : "rounded-full",
+                selectedOptionIds.has(option.id) && "border-primary bg-primary",
+              )} />
               <span className="min-w-0">
                 <span className="block font-medium">{option.label}</span>
                 {option.description ? <span className="block text-xs leading-5 text-muted-foreground">{option.description}</span> : null}
@@ -2321,7 +2292,7 @@ function InputRequestReview({
       <div className="rounded-md bg-muted/40 px-2.5 py-2">
         <p className="text-xs text-muted-foreground">{localize(locale, "Additional information", "补充信息")}</p>
         <p className="mt-1 whitespace-pre-wrap break-words text-foreground">
-          {inputResponse?.text?.trim() || localize(locale, "No additional information provided.", "未提供补充信息。")}
+          {additionalText || localize(locale, "No additional information provided.", "未提供补充信息。")}
         </p>
       </div>
     </div>
@@ -2334,6 +2305,7 @@ function QuestionnaireResponseForm({
   acceptsFreeform,
   canRespond,
   locale,
+  multipleSelection,
   onInputResponses,
   options,
   prompt,
@@ -2342,13 +2314,14 @@ function QuestionnaireResponseForm({
   readonly acceptsFreeform: boolean;
   readonly canRespond: boolean;
   readonly locale: AgentLocale;
+  readonly multipleSelection: boolean;
   readonly onInputResponses: (responses: readonly AgentInputResponse[]) => void | Promise<void>;
   readonly options: readonly { readonly description?: string; readonly id: string; readonly label: string; readonly style?: "danger" | "default" | "primary" }[];
   readonly prompt: string;
   readonly requestId: string;
 }) {
   const [freeformText, setFreeformText] = useState("");
-  const [selectedOptionId, setSelectedOptionId] = useState("");
+  const [selectedOptionIds, setSelectedOptionIds] = useState<readonly string[]>([]);
   const hasFreeformAnswer = acceptsFreeform && freeformText.trim().length > 0;
   const questionnaireItems = [{
     choices: [
@@ -2368,6 +2341,15 @@ function QuestionnaireResponseForm({
         event.preventDefault();
         if (!canRespond) return;
         const text = freeformText.trim();
+        if (multipleSelection) {
+          if (selectedOptionIds.length === 0 && !text) return;
+          void onInputResponses([{
+            interactionId: requestId,
+            text: encodeMultiSelectAnswer({ additionalText: text, optionIds: selectedOptionIds }),
+          }]);
+          return;
+        }
+        const selectedOptionId = selectedOptionIds[0];
         if (!selectedOptionId && !text) return;
         void onInputResponses([{
           ...(selectedOptionId ? { optionId: selectedOptionId } : {}),
@@ -2376,16 +2358,27 @@ function QuestionnaireResponseForm({
         }]);
       }}
     >
-      <QuestionnaireItem name="response" required>
+      <QuestionnaireItem multiple={multipleSelection} name="response" required>
         <QuestionnaireTitle className="sr-only">{prompt}</QuestionnaireTitle>
         <QuestionnaireChoices>
+          {multipleSelection && options.length > 0 ? (
+            <p className="text-xs text-muted-foreground">{localize(locale, "Choose all that apply.", "可多选。")}</p>
+          ) : null}
           {options.map((option) => (
             <QuestionnaireChoice
-              checked={selectedOptionId === option.id}
+              checked={selectedOptionIds.includes(option.id)}
               className={option.style === "danger" ? "border-destructive/40 data-checked:bg-destructive/10" : option.style === "primary" ? "data-checked:border-primary/50" : undefined}
               disabled={!canRespond}
               key={option.id}
-              onChange={(event) => setSelectedOptionId(event.currentTarget.checked ? option.id : "")}
+              multipleSelection={multipleSelection}
+              onChange={(event) => {
+                const checked = event.currentTarget.checked;
+                setSelectedOptionIds((current) => {
+                  if (!multipleSelection) return checked ? [option.id] : [];
+                  if (checked) return current.includes(option.id) ? current : [...current, option.id];
+                  return current.filter((id) => id !== option.id);
+                });
+              }}
               value={option.id}
             >
               <span className={cn("min-w-0 break-words font-medium", option.style === "danger" && "text-destructive")}>{option.label}</span>
@@ -2394,7 +2387,7 @@ function QuestionnaireResponseForm({
           ))}
           {acceptsFreeform ? (
             <>
-              <QuestionnaireChoice checked={!selectedOptionId && hasFreeformAnswer} className="hidden" value={FREEFORM_OPTION_ID}>
+              <QuestionnaireChoice checked={(multipleSelection || selectedOptionIds.length === 0) && hasFreeformAnswer} className="hidden" multipleSelection={multipleSelection} value={FREEFORM_OPTION_ID}>
                 {localize(locale, "Freeform answer", "补充回答")}
               </QuestionnaireChoice>
               <textarea
@@ -2483,7 +2476,6 @@ function localize(locale: AgentLocale, english: string, chinese: string): string
 }
 
 function toolStatusLabel(locale: AgentLocale, part: EveToolPart): string {
-  if (isCancellationPendingToolPart(part)) return localize(locale, "Stopping", "正在停止");
   if (isInterruptedToolPart(part)) return localize(locale, "Stopped", "已中断");
   if (part.state === "running" || part.state === "blocked") {
     return localize(locale, "Running", "运行中");
@@ -2510,10 +2502,15 @@ function toolTitle(
   locale: AgentLocale,
   part: EveToolPart,
   events: readonly SessionStreamEvent[] = [],
+  subagents: React.ContextType<typeof AgentSubagentsContext> = [],
 ): string {
   const kind = part.kind;
   if (kind === "skill") return localize(locale, "Loaded skill", "加载技能");
-  if (kind === "agent") return localize(locale, "Sub-agent", "子代理");
+  if (kind === "agent") {
+    const child = presentSubagentCall(events, part.callId, subagents);
+    const label = child.nickname ?? (child.name !== "agent" ? child.name : undefined);
+    return [localize(locale, "Sub-agent", "子代理"), label].filter(Boolean).join(" · ");
+  }
 
   const normalized = part.name.toLocaleLowerCase().replaceAll("-", "_");
   if (normalized === "ask_question") return localize(locale, "Question", "确认问题");

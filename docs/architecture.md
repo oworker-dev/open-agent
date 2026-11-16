@@ -53,18 +53,19 @@ Do not use user-wide or canvas-wide state as the implicit Agent history.
 Eve exposes one stable `sessionId` handle for messages, controls, and the durable
 event stream. No operation follows or replaces that identity implicitly.
 
-`turn.completed` is not a safe boundary for an ordinary next turn. A normal
-follow-up starts only after `session.waiting`; terminal alternatives are
-`session.completed` and `session.failed`. Active-turn steering is a separate
+The v27 `turn.settled` and session projection describe durable readiness;
+model or reasoning completion alone does not settle a turn. Active-turn steering is a separate
 operation: it targets an already durable `turnId` and becomes user input inside
 that same turn at a model-step boundary rather than opening a second turn.
 
-The authoritative browser cursor is `session.streamIndex`, the absolute number
-of consumed server events. It is deliberately independent from the UI event
-snapshot: cumulative `message.appended` and `reasoning.appended` deltas are
-compacted to their latest projection so long conversations do not grow
-quadratically in browser storage. During an active request, the workspace
-advances the absolute cursor for every consumed event and promptly persists an
+The authoritative browser cursor is `session.streamIndex`, the next complete
+source line in Eve's v27 stream. Several facts may share one atomic line, so
+the cursor advances only when that line is complete. The UI preserves the raw
+ordered events and deduplicates by source position; progress records contain
+new deltas, not cumulative snapshots that can replace earlier records.
+Progress notifications are coalesced before message projection, and immutable
+snapshots share one cached fold. See [UI streaming fixes](./ui-runtime-streaming-2026-11-13.md).
+During an active request, the workspace promptly persists an
 accepted `sessionId`. Normal turns use one Eve-managed live stream; Eve owns its
 transport backoff. Recovery first performs one bounded ordered catch-up from the
 persisted cursor so it cannot skip durable model or tool events. Only when that
@@ -75,12 +76,13 @@ cursor. Browser supervision measures the last event React actually observed;
 a half-open transport is replaced from that cursor, not from a reader-local
 index that the UI may never have rendered.
 
-Stopping is two-phase. The browser immediately detaches its local stream and
-keeps an unadmitted optimistic user message as an editable `interrupted` row.
-It also posts Eve's cooperative session cancellation and consumes the durable
-`turn.cancelled` then `session.waiting` boundary. Recovery streams are aborted
-before the cancellation consumer attaches, so one session never accumulates
-competing stream readers.
+Stopping immediately freezes the target turn's displayed output and marks its
+unfinished tools stopped. The browser keeps consuming durable events while
+requesting cancellation for that exact turn and observes `turn.settled` before
+clearing its cancellation marker. The composer remains available; a message
+sent during settlement uses queue policy. An unadmitted optimistic user message
+remains editable as an `interrupted` row. Display overlays never rewrite the
+authoritative event log or cancel a newer turn implicitly.
 
 Eve remains the source of truth for normal conversation history and automatic
 compaction. The browser adds a recovery checkpoint only because Eve excludes an
@@ -538,10 +540,10 @@ The Muses Studio reference integration currently has two separate surfaces:
   API (`/api/agent/runs`). The Agent-to-host canvas bridge uses the signed
   `host_capabilities`/`host_invoke` protocol.
 
-The repository now builds `@oworker/open-agent-contracts@0.1.0-alpha.11`,
-`@oworker/open-agent-client@0.1.0-alpha.11`, `@oworker/open-agent-host@0.1.0-alpha.11`,
-`@oworker/open-agent-ui@0.1.0-alpha.11`, and
-`@oworker/open-agent-mcp-adapter@0.1.0-alpha.11` as real ESM/declaration packages
+The repository now builds `@oworker/open-agent-contracts@0.1.0-alpha.13`,
+`@oworker/open-agent-client@0.1.0-alpha.13`, `@oworker/open-agent-host@0.1.0-alpha.13`,
+`@oworker/open-agent-ui@0.1.0-alpha.13`, and
+`@oworker/open-agent-mcp-adapter@0.1.0-alpha.13` as real ESM/declaration packages
 with stable exports. A conformance command packs all five tarballs, installs them
 in an empty consumer, and imports their public entrypoints, an assistant-ui
 surface, and the stylesheet export. The compiled ESM, declarations, source
@@ -663,17 +665,33 @@ keeps the root task in `waiting` until a later root `turn.started` event. This
 preserves Eve's native pause/resume behavior while preventing a completed parent
 boundary from hiding a blocked child.
 
-Delegated work is projected from Eve's native `subagent.called`,
-`subagent.completed`, and correlated `action.result` events. The parent task
+Delegated work is projected from Eve's native `call.requested`, `child.opened`,
+`task.started`, and correlated `call.settled` / `task.ended` events. The parent task
 shows starting, running, stopped, failed, and returned-result states with
 elapsed time. Parent cancellation and terminal sessions explicitly close an
 otherwise orphaned child timer. Eve's built-in `agent` copy shares the root
 sandbox; declared specialists have their own sandbox boundary. The UI does not
 invent child reasoning or tool progress: those details belong to the child
-session stream identified by `childSessionId`. Active/Done navigation opens that
-independent durable stream, reconnects by cursor, and exposes guarded child
-cancellation. This makes a quiet parent stream understandable without
-pretending that unavailable child events were observed.
+session stream identified by `childSessionId`. Tool cards show the durable
+nickname and open that independent stream in the right-side workspace, keeping
+the parent conversation mounted. The side-view list owns child-session closure;
+closing a content tab only hides the view. A confirmed `closed` record is terminal
+even if an earlier inspection or historical event replay arrives later. Closed
+children remain readable with their composer hidden. This makes a quiet parent
+stream understandable without pretending that unavailable child events were observed.
+
+The `child.opened` hook registers the parent/child association and stable nickname
+under the authenticated owner, independently of browser checkpointing. The UI
+fetches durable children on session entry and polls while any child is active.
+The authored `agent` tool extends the official input with an optional `nickname`
+for a new child's role. It preserves Eve's dispatch metadata and executor, so
+root-only availability, parallel tasks, continuation and cancellation remain
+framework-owned. Continuing an existing `taskId` preserves its registered name.
+
+The side-view publication list merges successful publish results from loaded
+history with the live registry; current registry URLs take priority. Expired
+publications remain visible but cannot be opened. Their history does not restore
+files already removed by retention cleanup.
 
 ### Supervisor boundary
 
@@ -691,6 +709,13 @@ bounded ordered catch-up from the observed cursor, and resumes live following.
 It never skips directly to the tail when the ordered range contains events.
 Provider retry remains owned by Eve; UI elapsed-time messages describe waiting
 and durability without claiming an unobserved retry attempt.
+
+History restoration shows a loading skeleton instead of the new-conversation
+prompt. An intact source log can seed Eve directly only after verifying every
+line and fact through the saved cursor; partial windows still replay. Initial
+bottom scrolling waits until assistant-ui has committed the restored user row,
+and follows subsequent history growth unless the reader scrolls away. Restoring
+an existing task does not activate the send-time task anchor.
 
 At the model-provider boundary, HTTP 403 and 404 use the existing bounded
 three-attempt policy. Exhaustion fails the current turn and parks an interactive

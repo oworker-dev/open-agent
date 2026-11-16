@@ -43,6 +43,21 @@ test("a stopped turn cannot freeze later receipts or the next turn", () => {
   assert.equal(projected.at(-1)?.metadata?.localStatus, undefined);
 });
 
+test("stopped tools are terminal immediately and do not retain cancellation-pending labels", () => {
+  const before = [...runningEvents(), ...line(5,
+    { type: "call.requested", scope: { turnId: "first" }, data: { callId: "edit", owner: { runId: "first:run" }, capability: { kind: "tool", name: "edit_file" }, input: { path: "example.txt" } } },
+    { type: "call.started", scope: { turnId: "first" }, data: { callId: "edit" } })];
+  for (const events of [before, [...before, ...line(6,
+    { type: "call.settled", scope: { turnId: "first" }, data: { callId: "edit", outcome: "interrupted" } },
+    { type: "turn.settled", data: { turnId: "first", outcome: "cancelled" } })]]) {
+    const messages = projectInterruptedMessages(conversationOf(events).messages, events, [{ turnId: "first", streamIndex: 6, eventCount: before.length }]);
+    const tool = messages.flatMap((message) => message.parts).find((part) => part.type === "tool");
+    assert.equal(tool?.state, "cancelled");
+    assert.equal(tool?.error?.code, "LOCAL_CANCELLED");
+    assert.deepEqual(convertEveMessages(messages).at(-1)?.content.find((part) => part.type === "tool-call")?.result, { error: tool?.error?.message });
+  }
+});
+
 test("a stop before the durable receipt retains one user row and an empty stopped assistant", () => {
   const events = [...line(0, { type: "session.started", data: {} }), ...startTurn(1, "first", "d1", "Edited prompt"), ...reply(4, "first", "d1", "Should never flash")];
   const stopped = projectInterruptedMessages(conversationOf(events).messages, events, [{ turnId: "first", streamIndex: 1, eventCount: 1 }]);

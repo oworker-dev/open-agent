@@ -2,7 +2,7 @@ import { readDeploymentAgentRuntimeConfig } from "@/lib/agent-runtime-config";
 import { enqueueAgentMailboxHttpRequest } from "@/server/agent-mailbox/http";
 import { createPostgresAgentMailboxStoreFromEnvironment } from "@/server/data/agent-mailbox-store";
 import { createPostgresSessionOwnershipStoreFromEnvironment } from "@/server/data/session-ownership-store";
-import { authenticateStandaloneRequest } from "@/server/http/standalone-request-auth";
+import { authenticateStandaloneRequest, standaloneSessionAuth } from "@/server/http/standalone-request-auth";
 
 export const runtime = "nodejs";
 
@@ -24,6 +24,7 @@ export async function POST(request: Request): Promise<Response> {
     );
   }
   return await enqueueAgentMailboxHttpRequest({
+    callerAuth: standaloneSessionAuth(authenticated.identity),
     owner: authenticated.identity,
     ...(ownershipStore ? { ownershipStore } : {}),
     request,

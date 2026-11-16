@@ -39,6 +39,29 @@ test("Eve persists provider tool input deltas before the complete tool call", as
   assert.equal(inputEvents[0]?.data.name, "apply_patch");
 });
 
+test("reasoning summary boundaries remain separate and finish before tool input", async () => {
+  const events: SessionEvent[] = [];
+  await emitStreamContent(async (event) => { events.push(...(Array.isArray(event) ? event : [event]) as SessionEvent[]); },
+    { sequence: 0, sessionStarted: true, stepIndex: 0, turnId: "turn", runId: "run" },
+    stream([
+      { type: "reasoning-start", id: "first" },
+      { type: "reasoning-delta", id: "first", text: "**First summary**" },
+      { type: "reasoning-end", id: "first" },
+      { type: "reasoning-start", id: "second" },
+      { type: "reasoning-delta", id: "second", text: "**Second summary**" },
+      // Providers may delay reasoning-end until the whole response ends.
+      { type: "tool-input-start", id: "call", toolName: "edit_file" },
+      { type: "tool-input-delta", id: "call", delta: '{"path":"example.txt"}' },
+      { type: "tool-call", toolCallId: "call", toolName: "edit_file", input: { path: "example.txt" } },
+      { type: "reasoning-end", id: "second" },
+    ] as TextStreamPart<ToolSet>[]),
+    { excludedActionToolNames: new Set(), tools: new Map([["edit_file", { name: "edit_file", description: "Edit a file", inputSchema: jsonSchema({ type: "object" }) }]]) });
+  const summaries = events.filter((event): event is Extract<SessionEvent, { type: "content.completed" }> => event.type === "content.completed" && event.data.kind === "reasoning");
+  assert.deepEqual(summaries.map((event) => event.data.value), ["**First summary**", "**Second summary**"]);
+  assert.ok(events.indexOf(summaries[1]!) < events.findIndex((event) => event.type === "call.input"));
+  assert.equal(events.filter((event) => event.type === "call.requested").length, 1);
+});
+
 test("adjacent provider input snapshots coalesce behind a slow durable writer", async () => {
   let releaseFirst!: () => void;
   const firstBlocked = new Promise<void>((resolve) => {

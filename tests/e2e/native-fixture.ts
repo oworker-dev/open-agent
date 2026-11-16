@@ -21,14 +21,16 @@ export class NativeFixture {
   onSend?: (body: Record<string, unknown>) => Promise<void>;
   onEdit?: (body: Record<string, unknown>) => Promise<void>;
   onCancel?: (turnId?: string) => Promise<void>;
+  onRead?: (start: number) => Promise<void>;
   page: Page;
   constructor(page: Page, readonly namespace: "standalone" | "agent" = "standalone") { this.page = page; }
   get cursor() { return eveEventsCursor(this.events); }
   async install() {
     const { page } = this;
-    await page.exposeBinding("__readNativeEve", (_source, start: number) => ({
-      body: wireLines(this.events.filter((event) => event.meta.position.line >= start)), tail: this.cursor - 1,
-    }));
+    await page.exposeBinding("__readNativeEve", async (_source, start: number) => {
+      await this.onRead?.(start);
+      return { body: wireLines(this.events.filter((event) => event.meta.position.line >= start)), tail: this.cursor - 1 };
+    });
     await page.addInitScript(({ sessionId }) => {
       type Connection = { cursor: number; controller: ReadableStreamDefaultController<Uint8Array> };
       const streams = new Set<Connection>();

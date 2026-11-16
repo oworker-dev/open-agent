@@ -1,5 +1,5 @@
 import type { AuthFn } from "eve/channels/auth";
-import { resolveStandaloneRequestIdentity } from "../../server/http/standalone-request-auth.ts";
+import { resolveStandaloneRequestIdentity, standaloneSessionAuth } from "../../server/http/standalone-request-auth.ts";
 
 /**
  * Authenticates the standalone Web app's opaque browser credential. Host
@@ -9,11 +9,6 @@ export function standaloneCookieAuth(): AuthFn<Request> {
   return (request) => {
     const identity = resolveStandaloneRequestIdentity(request);
     if (!identity) return null;
-    return {
-      attributes: { tenantId: identity.tenantId },
-      authenticator: "standalone-cookie",
-      principalId: identity.principalId,
-      principalType: identity.principalType,
-    };
+    return standaloneSessionAuth(identity);
   };
 }

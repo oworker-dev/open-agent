@@ -50,6 +50,12 @@ explicitly means “new task”; the standalone `/` route uses this behavior.
 Keep client and storage adapters stable within the same service/account scope,
 and read rotating credentials from their request callbacks.
 
+New messages use normal bottom-follow scrolling. The first execution group in
+a newly submitted response smoothly moves its user message to the top once;
+reasoning alone does not trigger this. Scrolling to read history opts out of
+that movement. Streaming, group collapse and replay do not repeat it, and each
+same-turn follow-up has its own scroll boundary.
+
 `deliverableEndpoint` may be a URL template or `(sessionId) => url` resolver
 returning `{ deliverables: [...] }`. `onOpenDeliverable` can hand a published
 file or website to a host-owned workbench. Without an override, the default UI
@@ -104,6 +110,12 @@ Custom interaction UIs receive `canRespond`, `inputRequestClosed`,
 callbacks, `assetUrl`, locale, and the current message's events are also passed
 through. These callbacks use the workspace's existing submission and persistence
 path. Returning `defaultContent` retains the supplied ask/approval behavior.
+
+The built-in `ask_question` UI supports `multiple: true` for non-exclusive
+choices. Custom renderers can read that flag from `part.input`; the shared
+`encodeMultiSelectAnswer` and `parseMultiSelectAnswer` helpers are exported by
+`@oworker/open-agent-contracts` for storing and restoring the selected option IDs
+through Eve's standard text answer field.
 
 Renderers are React components supplied locally by the host. They do not belong
 in serialized Runtime Config or cross-origin iframe messages. Tool authorization

@@ -4,9 +4,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { conversationOf } from "eve/client";
 import { activeTurn, session as sessionState, waiting } from "eve/events";
 import { AgentThreadView } from "./agent-thread.js";
+import { AgentHistoryLoading } from "./history-loading.js";
 import { attachAgentSession, createAgentSession } from "./agent-client.js";
 import { AGENT_THREAD_STORAGE_VERSION, appendThreadEventIndexed, eventIdentity, threadEventCursor, compactThreadEvents } from "./thread-storage.js";
-export function AgentChildSessionView({ client, commands, locale, mailbox, mentions, models, onEvent, onOpenDeliverable, onOpenSubagent, onStorageError, preferences, providerReady = true, reasoningLevels, sessionId, storageKey, threadStorage, }) {
+export function AgentChildSessionView({ client, commands, locale, mailbox, mentions, models, onEvent, onOpenDeliverable, onOpenSubagent, onStorageError, preferences, providerReady = true, readOnly = false, reasoningLevels, sessionId, storageKey, threadStorage, }) {
     const [thread, setThread] = useState();
     const [loadError, setLoadError] = useState();
     const [historyLoading, setHistoryLoading] = useState(false);
@@ -267,9 +268,9 @@ export function AgentChildSessionView({ client, commands, locale, mailbox, menti
         return _jsx("div", { className: "flex min-h-0 flex-1 items-center justify-center px-6 text-sm text-destructive", role: "alert", children: loadError });
     }
     if (!thread) {
-        return _jsx("div", { className: "flex min-h-0 flex-1 items-center justify-center px-6 text-sm text-muted-foreground", role: "status", children: "Loading sub-agent history\u2026" });
+        return _jsx(AgentHistoryLoading, { locale: locale });
     }
-    return (_jsx(AgentThreadView, { client: client, commands: commands, draftStorageKey: `open-agent:child-draft:${sessionId}`, locale: locale, mailbox: mailbox, mentions: mentions, models: models, onChange: handleThreadChange, onEvent: onEvent, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, onRecoveryNeeded: recoverChild, onRetryRecovery: recoverChild, isRecovering: following, recoveryError: followError, providerReady: providerReady, reasoningLevels: reasoningLevels, thread: thread, historyHasMore: thread.transcriptWindow?.hasMoreBefore === true, historyLoading: historyLoading, onLoadEarlier: loadEarlier }, `${thread.id}:${thread.revision ?? 0}`));
+    return (_jsx(AgentThreadView, { client: client, commands: commands, draftStorageKey: `open-agent:child-draft:${sessionId}`, locale: locale, mailbox: mailbox, mentions: mentions, models: models, onChange: handleThreadChange, onEvent: onEvent, onOpenDeliverable: onOpenDeliverable, onOpenSubagent: onOpenSubagent, onRecoveryNeeded: recoverChild, onRetryRecovery: recoverChild, isRecovering: following, recoveryError: followError, providerReady: providerReady, readOnly: readOnly, reasoningLevels: reasoningLevels, thread: thread, historyHasMore: thread.transcriptWindow?.hasMoreBefore === true, historyLoading: historyLoading, onLoadEarlier: loadEarlier }, `${thread.id}:${thread.revision ?? 0}`));
 }
 function persistedChildControls(thread) {
     return {

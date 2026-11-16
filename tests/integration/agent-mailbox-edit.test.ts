@@ -5,6 +5,8 @@ import test from "node:test";
 import { closeAgentDatabasePools, getAgentDatabasePool, quoteIdentifier } from "../../server/data/agent-database.ts";
 import { createPostgresAgentMailboxStore, type AgentMailboxPayload } from "../../server/data/agent-mailbox-store.ts";
 import { createPostgresSessionOwnershipStore } from "../../server/data/session-ownership-store.ts";
+import { commitConsumedMailboxMessage } from "../../agent/lib/mailbox-consumption.ts";
+import { serializeAssetPrompt } from "@oworker/open-agent-contracts/asset";
 
 // Each run owns a separate schema. Production mailbox workers cannot dispatch
 // these fixtures, even when the test database shares a PostgreSQL instance.
@@ -96,6 +98,31 @@ test("PostgreSQL rejects unsafe steer edits before enqueue", {
     })).status, "forbidden");
     await owners.claim("session-no-steer", owner);
     assert.equal((await enqueue("session-no-steer", "edit")).status, "created");
+  });
+
+  await t.test("consumed same-turn question input releases the next FIFO message", async () => {
+    const sessionId = "session-question-followups";
+    await owners.claim(sessionId, owner);
+    await pool.query(`update ${schema}.agent_mailbox_items set available_at = now() + interval '1 day'`);
+    const first = await enqueue(sessionId, "steer");
+    const second = await enqueue(sessionId, "steer");
+    if (!("item" in first) || !("item" in second)) throw new Error("Missing follow-up fixtures");
+    const claimed = await store.claimNext();
+    assert.equal(claimed?.itemId, first.item.itemId);
+    await store.beginAdmission(claimed!.itemId, claimed!.claimToken!);
+    await store.accept(claimed!.itemId, claimed!.claimToken!, sessionId);
+    assert.equal(await store.claimNext(), undefined);
+    assert.equal(await store.findByClientMessageId("other-session", first.item.clientMessageId), undefined);
+    const consumed = { deliveryId: "ask-answer", turnId: "turn_0", parts: [
+      { kind: "text" as const, text: serializeAssetPrompt(first.item.payload.message!, [], first.item.clientMessageId) },
+    ] };
+    for (let replay = 0; replay < 2; replay++) {
+      const committed = await commitConsumedMailboxMessage({
+        consumed, principal: { id: owner.principalId, type: owner.principalType }, sessionId, store,
+      });
+      assert.equal(committed?.status, "committed");
+    }
+    assert.equal((await store.claimNext())?.itemId, second.item.itemId);
   });
 
   const admittedEdit = async () => {

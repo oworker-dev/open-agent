@@ -13,13 +13,14 @@ export type AgentApprovalTakeover = {
     readonly prompt: string;
     readonly toolName: string;
 };
-export declare function AssistantThreadSurface({ assetUrl, approvalTakeover, cancellationState, closedInputRequestIds, commands, composerTop, draftStorageKey, draftRestore, events, eveMessages, fallbackStartedAt, historyHasMore, historyLoading, historyStartIndex, inputDisabled, isBusy, scrollToBottomOnInitialize, scrollToBottomOnThreadSwitch, sessionTerminal, sessionSettled, messageEditingAllowed, onCancel, locale, mentions, messages, models, onInputResponses, onCloseInputRequest, onDraftRestoreConsumed, onOpenDeliverable, onOpenSubagent, onLoadEarlier, onPreferencesChange, onRetryRuntimeError, preferences, reasoningLevels, runtimeError, runtimeFailure, runtimeRetry, usage, }: {
+export declare function AssistantThreadSurface({ assetUrl, approvalTakeover, cancellationState, closedInputRequestIds, commands, composerTop, composerHidden, draftStorageKey, draftRestore, events, eveMessages, fallbackStartedAt, historyHasMore, historyLoading, historyStartIndex, inputDisabled, isBusy, isRestoring, scrollToBottomOnInitialize, scrollToBottomOnThreadSwitch, sessionTerminal, sessionSettled, messageEditingAllowed, onCancel, locale, mentions, messages, models, onInputResponses, onCloseInputRequest, onDraftRestoreConsumed, onOpenDeliverable, onOpenSubagent, onLoadEarlier, onPreferencesChange, onRetryRuntimeError, preferences, reasoningLevels, runtimeError, runtimeFailure, runtimeRetry, usage, }: {
     readonly assetUrl?: (assetId: string) => string;
     readonly approvalTakeover?: AgentApprovalTakeover;
     readonly cancellationState: AgentCancellationState;
     readonly closedInputRequestIds: ReadonlySet<string>;
     readonly commands: readonly AgentPromptMenuItem[];
     readonly composerTop?: ReactNode;
+    readonly composerHidden?: boolean;
     readonly draftStorageKey: string;
     readonly draftRestore?: AgentComposerDraftRestore;
     readonly events: readonly SessionStreamEvent[];
@@ -30,6 +31,7 @@ export declare function AssistantThreadSurface({ assetUrl, approvalTakeover, can
     readonly historyStartIndex?: number;
     readonly inputDisabled?: boolean;
     readonly isBusy: boolean;
+    readonly isRestoring?: boolean;
     readonly scrollToBottomOnInitialize?: boolean;
     readonly scrollToBottomOnThreadSwitch?: boolean;
     readonly sessionTerminal?: boolean;

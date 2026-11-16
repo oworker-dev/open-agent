@@ -2,7 +2,7 @@
 
 import { activeTurn, failure, idle, session as eveSession, turns } from "eve/events";
 import { ClientError, type Client, type ClientSession, type SessionStreamEvent } from "eve/client";
-import { AlertCircleIcon, ArrowLeftIcon, MenuIcon, PanelLeftCloseIcon, PanelLeftIcon, PanelRightIcon, ServerOffIcon } from "lucide-react";
+import { AlertCircleIcon, MenuIcon, PanelLeftCloseIcon, PanelLeftIcon, PanelRightIcon, ServerOffIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { Button } from "../ui/button.js";
@@ -17,7 +17,8 @@ import { attachAgentSession, createAgentSession } from "./agent-client.js";
 import { AgentChildSessionView } from "./agent-child-session.js";
 import { AgentSettingsDialog } from "./agent-settings-dialog.js";
 import { AgentSidebar } from "./agent-sidebar.js";
-import { AgentSubagentMenu } from "./agent-subagent-menu.js";
+import { AgentHistoryLoading } from "./history-loading.js";
+import { AgentSubagentsContext } from "./subagent-context.js";
 import { AgentSecondaryView, type AgentSecondaryChild, type AgentSecondaryTab } from "./agent-secondary-view.js";
 import { AgentThreadView } from "./agent-thread.js";
 import { cn } from "../utils.js";
@@ -49,7 +50,7 @@ import {
   presentationSnapshot,
   mergeSubagentSessions,
 } from "./turn-presentation.js";
-import { loadSessionDeliverables } from "./session-deliverables.js";
+import { loadSessionDeliverables, sessionPublicationsFromEvents } from "./session-deliverables.js";
 import { readCommittedRange } from "./stream-range.js";
 import { AssetPreviewProvider } from "./asset-preview.js";
 import { AgentToolRenderersContext, type AgentToolRenderers } from "./tool-renderers.js";
@@ -63,6 +64,7 @@ const SIDEBAR_MAX_WIDTH = 420;
 const SIDEBAR_DEFAULT_WIDTH = 252;
 const SIDEBAR_COLLAPSED_THRESHOLD = 1;
 const FLOATING_SIDEBAR_DEFAULT_WIDTH = 288;
+const EMPTY_SUBAGENTS: readonly AgentSubagentSummary[] = [];
 
 type WorkbenchLayoutMode = "split" | "collapsing" | "fullscreen" | "expanding";
 
@@ -141,7 +143,6 @@ export function AgentWorkspace({
   const threadsRef = useRef<readonly AgentThread[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<string>();
   const activeThreadIdRef = useRef<string | undefined>(undefined);
-  const [activeSubagentSessionId, setActiveSubagentSessionId] = useState<string>();
   const [isHydrated, setIsHydrated] = useState(false);
   const [recoveringIds, setRecoveringIds] = useState<Set<string>>(new Set());
   const [reconnectingIds, setReconnectingIds] = useState<Set<string>>(new Set());
@@ -160,12 +161,17 @@ export function AgentWorkspace({
   const [secondaryOpen, setSecondaryOpen] = useState(false);
   const [secondaryTab, setSecondaryTab] = useState<AgentSecondaryTab>("home");
   const [secondaryChildSessionId, setSecondaryChildSessionId] = useState<string>();
+  const [requestedChild, setRequestedChild] = useState<{ readonly sessionId: string; readonly requestId: number }>();
+  const [closingSubagents, setClosingSubagents] = useState<Set<string>>(new Set());
+  const [subagentControlError, setSubagentControlError] = useState<string>();
   const [sessionAssets, setSessionAssets] = useState<readonly AgentSessionAsset[]>([]);
   const [sessionDeliverables, setSessionDeliverables] = useState<readonly AgentSessionDeliverable[]>([]);
   const [deliverablesLoading, setDeliverablesLoading] = useState(false);
   const [deliverablesError, setDeliverablesError] = useState<string>();
   const [requestedDeliverable, setRequestedDeliverable] = useState<{ readonly deliverable: AgentSessionDeliverable; readonly requestId: number }>();
-  const [durableSubagents, setDurableSubagents] = useState<readonly AgentSubagentSummary[]>([]);
+  const [subagentSnapshot, setSubagentSnapshot] = useState<{ readonly sessionId?: string; readonly children: readonly AgentSubagentSummary[] }>({ children: EMPTY_SUBAGENTS });
+  const selectedSessionId = threads.find((thread) => thread.id === activeThreadId)?.session.sessionId;
+  const durableSubagents = subagentSnapshot.sessionId === selectedSessionId ? subagentSnapshot.children : EMPTY_SUBAGENTS;
   const [assetsLoading, setAssetsLoading] = useState(false);
   const [assetsError, setAssetsError] = useState<string>();
   const [ephemeralThreadIds, setEphemeralThreadIds] = useState<Set<string>>(new Set());
@@ -253,7 +259,10 @@ export function AgentWorkspace({
         setThreads(restoredThreads);
         setActiveThreadId(restoredActive);
         setEphemeralThreadIds(rootThread ? new Set([rootThread.id]) : new Set());
-        setActiveSubagentSessionId(requestedActive ? initialSubagentSessionId : undefined);
+        if (requestedActive && initialSubagentSessionId) {
+          setRequestedChild({ sessionId: initialSubagentSessionId, requestId: ++deliverableRequestSequence.current });
+          setSecondaryOpen(true);
+        }
         setLocale(restoredLocale);
         setSidebarOpen(window.matchMedia("(min-width: 1024px)").matches);
         setIsHydrated(true);
@@ -276,7 +285,6 @@ export function AgentWorkspace({
         setThreads([fallback]);
         setActiveThreadId(fallback.id);
         setEphemeralThreadIds(new Set([fallback.id]));
-        setActiveSubagentSessionId(undefined);
         setLocale(restoredLocale);
         setSidebarOpen(window.matchMedia("(min-width: 1024px)").matches);
         setIsHydrated(true);
@@ -292,12 +300,12 @@ export function AgentWorkspace({
       onActiveThreadChange?.(undefined);
       return;
     }
-    if (activeSubagentSessionId) {
-      onActiveSubagentChange?.(activeThreadId, activeSubagentSessionId);
+    if (secondaryOpen && secondaryChildSessionId) {
+      onActiveSubagentChange?.(activeThreadId, secondaryChildSessionId);
       return;
     }
     onActiveThreadChange?.(activeThreadId);
-  }, [activeSubagentSessionId, activeThreadId, ephemeralThreadIds, isHydrated, onActiveSubagentChange, onActiveThreadChange]);
+  }, [secondaryOpen, secondaryChildSessionId, activeThreadId, ephemeralThreadIds, isHydrated, onActiveSubagentChange, onActiveThreadChange]);
 
   useEffect(() => {
     if (!isHydrated) return;
@@ -684,7 +692,7 @@ export function AgentWorkspace({
     // on an untouched session should focus that same draft instead of filling
     // the recent-session list with unusable empty rows.
     if (active && ephemeralThreadIds.has(active.id) && isEmptyDraftThread(active)) {
-      setActiveSubagentSessionId(undefined);
+      setSecondaryChildSessionId(undefined);
       if (!window.matchMedia("(min-width: 1024px)").matches) setSidebarOpen(false);
       return;
     }
@@ -692,7 +700,8 @@ export function AgentWorkspace({
     setThreads((current) => [thread, ...current]);
     setActiveThreadId(thread.id);
     setEphemeralThreadIds((current) => new Set(current).add(thread.id));
-    setActiveSubagentSessionId(undefined);
+    setSecondaryChildSessionId(undefined);
+    setRequestedChild(undefined);
     if (!window.matchMedia("(min-width: 1024px)").matches) setSidebarOpen(false);
   }, [activeThreadId, ephemeralThreadIds, messages.newTask, stableDefaults]);
 
@@ -724,12 +733,12 @@ export function AgentWorkspace({
         const replacement = createAgentThread(Date.now(), messages.newTask, stableDefaults);
         setActiveThreadId(replacement.id);
         setEphemeralThreadIds((current) => new Set(current).add(replacement.id));
-        setActiveSubagentSessionId(undefined);
+        setSecondaryChildSessionId(undefined);
         return [replacement];
       }
       if (threadId === activeThreadId) {
         setActiveThreadId(next[0]?.id);
-        setActiveSubagentSessionId(undefined);
+        setSecondaryChildSessionId(undefined);
       }
       return next;
     });
@@ -838,7 +847,7 @@ export function AgentWorkspace({
     }
     activeThreadIdRef.current = threadId;
     setActiveThreadId(threadId);
-    setActiveSubagentSessionId(undefined);
+    setSecondaryChildSessionId(undefined);
     if (!window.matchMedia("(min-width: 1024px)").matches) setSidebarOpen(false);
   }, [suspendThreadRecovery]);
 
@@ -864,6 +873,16 @@ export function AgentWorkspace({
   activeSessionScopeRef.current = activeThread?.session.sessionId;
   const visibleThreads = threads.filter((thread) => !ephemeralThreadIds.has(thread.id));
   const publicationRefreshKey = activeThread ? latestPublicationResultKey(activeThread.events) : undefined;
+  const historicalPublications = useMemo(() => sessionPublicationsFromEvents(activeThread?.events ?? []),
+    // Tool deltas do not change publication records. Rebuild only at a publication
+    // boundary or when an earlier history window has been loaded.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [activeThread?.id, publicationRefreshKey]);
+  const displayedDeliverables = useMemo(() => {
+    const items = new Map(historicalPublications.map((item) => [`${item.kind}:${item.id}`, item]));
+    for (const item of sessionDeliverables) items.set(`${item.kind}:${item.id}`, item);
+    return [...items.values()];
+  }, [historicalPublications, sessionDeliverables]);
   const projectedSubagentActivityKey = activeThread
     ? mergeSubagentSessions(activeThread.events, [])
         .map((child) => `${child.childSessionId ?? ""}:${child.status}`)
@@ -884,8 +903,8 @@ export function AgentWorkspace({
     const hasActiveProjectedSubagent = projectedSubagents.some((child) =>
       child.status === "starting" || child.status === "running" || child.status === "waiting",
     );
-    if (!loadSubagents || !sessionId || !hasActiveProjectedSubagent) {
-      setDurableSubagents([]);
+    if (!loadSubagents || !sessionId) {
+      setSubagentSnapshot({ children: EMPTY_SUBAGENTS });
       return;
     }
     let inFlight = false;
@@ -894,7 +913,13 @@ export function AgentWorkspace({
       inFlight = true;
       try {
         const next = await loadSubagents(sessionId);
-        if (!cancelled) setDurableSubagents(next);
+        if (!cancelled) setSubagentSnapshot((current) => ({ sessionId, children: next.map((child) => {
+          // A response captured before close may arrive after its result.
+          const closed = current.sessionId === sessionId
+            ? current.children.find((prior) => prior.childSessionId === child.childSessionId && prior.status === "closed")
+            : undefined;
+          return closed ?? child;
+        }) }));
       } catch {
         // Parent events remain useful while the control-plane endpoint is
         // unavailable; the next interval or navigation retries the read.
@@ -903,10 +928,10 @@ export function AgentWorkspace({
       }
     };
     void refresh();
-    const timer = window.setInterval(() => void refresh(), 5_000);
+    const timer = hasActiveProjectedSubagent ? window.setInterval(() => void refresh(), 5_000) : undefined;
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
+      if (timer !== undefined) window.clearInterval(timer);
     };
   }, [activeThread?.session.sessionId, durableSubagentActivityKey, loadSubagents, projectedSubagentActivityKey]);
 
@@ -973,16 +998,18 @@ export function AgentWorkspace({
     return () => controller.abort();
   }, [activeThread?.session.sessionId, client, deliverableEndpoint]);
 
-  const previousAssetThreadId = useRef<string | undefined>(undefined);
+  const previousAssetScope = useRef<string | undefined>(undefined);
   useEffect(() => {
-    // Hydration already selected the child from the URL. Only an actual
-    // switch between parent threads should clear that selection.
-    if (previousAssetThreadId.current && previousAssetThreadId.current !== activeThread?.id) {
-      setActiveSubagentSessionId(undefined);
+    // A child can consume the URL request before this parent effect runs.
+    // Preserve that first selection; clear it only when leaving its scope.
+    const scope = activeThread ? `${activeThread.id}:${activeThread.session.sessionId ?? "draft"}` : undefined;
+    if (previousAssetScope.current && previousAssetScope.current !== scope) {
+      setRequestedChild(undefined);
+      setSecondaryChildSessionId(undefined);
     }
-    previousAssetThreadId.current = activeThread?.id;
+    previousAssetScope.current = scope;
     setSecondaryTab("home");
-    setSecondaryChildSessionId(undefined);
+    setSubagentControlError(undefined);
     setRequestedDeliverable(undefined);
     setSessionAssets([]);
     setSessionDeliverables([]);
@@ -991,12 +1018,12 @@ export function AgentWorkspace({
   }, [activeThread?.id, activeThread?.session.sessionId]);
 
   useEffect(() => {
-    if (!secondaryOpen || activeSubagentSessionId) return;
+    if (!secondaryOpen) return;
     const cleanups = [refreshAssets(), refreshDeliverables()];
     return () => {
       for (const cleanup of cleanups) if (typeof cleanup === "function") cleanup();
     };
-  }, [activeSubagentSessionId, publicationRefreshKey, refreshAssets, refreshDeliverables, secondaryOpen]);
+  }, [publicationRefreshKey, refreshAssets, refreshDeliverables, secondaryOpen]);
 
   useEffect(() => {
     if (!activeThread?.session.sessionId) setSecondaryOpen(false);
@@ -1188,14 +1215,29 @@ export function AgentWorkspace({
     isHydrated,
   ]);
 
-  const activeSubagent = activeThread && activeSubagentSessionId
-    ? findSubagentSession(activeThread.events, activeSubagentSessionId, locale, durableSubagents)
-    : undefined;
   const openSubagent = useCallback((sessionId: string) => {
-    if (!activeThread || !findSubagentSession(activeThread.events, sessionId, locale, durableSubagents)) return;
-    setActiveSubagentSessionId(sessionId);
-  }, [activeThread, locale]);
-  const closeSubagent = useCallback(() => setActiveSubagentSessionId(undefined), []);
+    setRequestedChild({ sessionId, requestId: ++deliverableRequestSequence.current });
+    setSecondaryOpen(true);
+  }, []);
+  const closeSubagent = useCallback(async (sessionId: string) => {
+    if (!controlSubagent || closingSubagents.has(sessionId)) return;
+    const parentSessionId = activeThread?.session.sessionId;
+    setClosingSubagents((current) => new Set(current).add(sessionId));
+    setSubagentControlError(undefined);
+    try {
+      const result = await controlSubagent({ action: "close", sessionId });
+      if (!result) throw new Error(locale === "zh-CN" ? "子代理关闭失败，请重试。" : "The sub-agent could not be closed. Please retry.");
+      if (activeSessionScopeRef.current === parentSessionId) {
+        setSubagentSnapshot((current) => ({ sessionId: parentSessionId, children: [
+          ...(current.sessionId === parentSessionId ? current.children : []).filter((child) => child.childSessionId !== sessionId), result,
+        ] }));
+      }
+    } catch (error) {
+      if (activeSessionScopeRef.current === parentSessionId) setSubagentControlError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setClosingSubagents((current) => withoutSetValue(current, sessionId));
+    }
+  }, [activeThread?.session.sessionId, closingSubagents, controlSubagent, locale]);
   const changeActiveThread = useCallback(
     (patch: AgentThreadPatch) => {
       if (!activeThreadId) return;
@@ -1928,13 +1970,14 @@ export function AgentWorkspace({
     ? `${activeThread.id}:${threadRuntimeSeeds.get(activeThread.id) ?? "initial"}`
     : "none";
   const activeIsHydrating = activeThread?.hydration === "summary";
-  if (!isHydrated || !activeThread) return <div className="flex h-dvh items-center justify-center bg-background text-muted-foreground">{messages.loading}</div>;
+  if (!isHydrated || !activeThread) return <div className="flex h-dvh items-center bg-background"><AgentHistoryLoading locale={locale} /></div>;
 
   const workbenchFullscreen = desktopLayout && workbenchMode === "fullscreen";
   const workbenchTransitioning = workbenchMode === "collapsing" || workbenchMode === "expanding";
 
   return (
     <AgentToolRenderersContext.Provider value={toolRenderers}>
+    <AgentSubagentsContext.Provider value={durableSubagents}>
     <AssetPreviewProvider client={client}>
     <div
       className="open-agent-ui relative h-dvh overflow-hidden bg-sidebar text-foreground"
@@ -1964,27 +2007,14 @@ export function AgentWorkspace({
           <div className="flex min-w-0 items-center gap-2">
             <Button aria-label={messages.openNavigation} className="lg:hidden" onClick={() => setSidebarOpen(true)} size="icon-sm" variant="ghost"><MenuIcon className="size-4" /></Button>
             <Button aria-label={messages.toggleNavigation} className="hidden lg:inline-flex" disabled={workbenchTransitioning} onClick={toggleDesktopSidebar} size="icon-sm" variant="ghost">{workbenchMode === "split" ? <PanelLeftCloseIcon className="size-4" /> : <PanelLeftIcon className="size-4" />}</Button>
-            {activeSubagentSessionId ? (
-              <Button aria-label={messages.backToTask} onClick={closeSubagent} size="icon-sm" variant="ghost">
-                <ArrowLeftIcon className="size-4" />
-              </Button>
-            ) : null}
             <h2 className="truncate font-medium text-[15px]">
-              {activeSubagentSessionId ? activeSubagent?.label ?? messages.subagentSession : activeThread.title}
+              {activeThread.title}
             </h2>
           </div>
           <div className="flex items-center gap-1">
             <Button aria-label={secondaryOpen ? messages.closeSecondaryView : messages.openSecondaryView} onClick={() => setSecondaryOpen((open) => !open)} size="icon-sm" variant="ghost">
               <PanelRightIcon className="size-4" />
             </Button>
-            <AgentSubagentMenu
-              activeSessionId={activeSubagentSessionId}
-            durableSessions={durableSubagents}
-            events={activeThread.events}
-            locale={locale}
-            onControl={controlSubagent}
-            onOpen={openSubagent}
-            />
             {hostSlots?.threadHeaderEnd}
           </div>
         </header>
@@ -2014,32 +2044,9 @@ export function AgentWorkspace({
                 </Button>
               </div>
             ) : (
-              <p className="text-sm text-muted-foreground" role="status">{messages.loading}</p>
+              <AgentHistoryLoading locale={locale} />
             )}
           </main>
-        ) : activeSubagentSessionId ? (
-          activeSubagent ? (
-            <AgentChildSessionView
-              client={client}
-              commands={commands}
-              locale={locale}
-              mailbox={mailbox}
-              mentions={mentions}
-              models={models}
-              onEvent={onEvent}
-              onOpenDeliverable={openDeliverable}
-              onOpenSubagent={openSubagent}
-              onStorageError={onStorageError}
-              preferences={activeThread.preferences}
-              providerReady={runtimeStatus.provider !== "unconfigured"}
-              reasoningLevels={reasoningLevels}
-              sessionId={activeSubagentSessionId}
-              storageKey={storageKey}
-              threadStorage={threadStorage}
-            />
-          ) : (
-            <UnavailableSubagentView locale={locale} onBack={closeSubagent} />
-          )
         ) : (
           <div className="flex min-h-0 flex-1 flex-col">
             <AgentThreadView
@@ -2090,12 +2097,17 @@ export function AgentWorkspace({
                     assets={sessionAssets}
                     assetsError={assetsError}
                     assetsLoading={assetsLoading}
-                    deliverables={deliverablesError ? undefined : sessionDeliverables}
+                    deliverables={displayedDeliverables}
                     deliverablesError={deliverablesError}
                     deliverablesLoading={deliverablesLoading}
                     children={activeThread ? subagentsForThread(activeThread.events, durableSubagents) : []}
+                    closingChildren={closingSubagents}
+                    childControlError={subagentControlError}
+                    onCloseChild={controlSubagent ? closeSubagent : undefined}
+                    requestedChild={requestedChild}
                     childContent={secondaryChildSessionId && activeThread ? (
                       <AgentChildSessionView
+                        key={secondaryChildSessionId}
                         client={client}
                         commands={commands}
                         locale={locale}
@@ -2108,6 +2120,8 @@ export function AgentWorkspace({
                         onStorageError={onStorageError}
                         preferences={activeThread.preferences}
                         providerReady={runtimeStatus.provider !== "unconfigured"}
+                        readOnly={Boolean(loadSubagents && subagentSnapshot.sessionId !== selectedSessionId)
+                          || durableSubagents.some((child) => child.childSessionId === secondaryChildSessionId && child.status === "closed")}
                         reasoningLevels={reasoningLevels}
                         sessionId={secondaryChildSessionId}
                         storageKey={storageKey}
@@ -2121,6 +2135,7 @@ export function AgentWorkspace({
                     onOpenChild={(sessionId) => {
                       setSecondaryChildSessionId(sessionId);
                     }}
+                    onHideChild={() => setSecondaryChildSessionId(undefined)}
                     onRefreshAssets={refreshAssets}
                     onRefreshDeliverables={refreshDeliverables}
                     onSelectTab={setSecondaryTab}
@@ -2153,6 +2168,7 @@ export function AgentWorkspace({
       <AgentSettingsDialog extensions={extensions} locale={locale} messages={messages} onLocaleChange={setLocale} onOpenChange={setSettingsOpen} open={settingsOpen} />
     </div>
     </AssetPreviewProvider>
+    </AgentSubagentsContext.Provider>
     </AgentToolRenderersContext.Provider>
   );
 }
@@ -2285,55 +2301,15 @@ function FloatingAgentSidebar({
   );
 }
 
-function findSubagentSession(
-  events: readonly SessionStreamEvent[],
-  sessionId: string,
-  locale: AgentLocale,
-  durable: readonly AgentSubagentSummary[] = [],
-): { readonly label: string; readonly task?: string } | undefined {
-  const sessions = mergeSubagentSessions(events, durable);
-  const index = sessions.findIndex((candidate) => candidate.childSessionId === sessionId);
-  const session = sessions[index];
-  if (!session) return undefined;
-  return {
-    label: session.name && session.name !== "agent"
-      ? session.name
-      : locale === "zh-CN" ? `子代理 ${index + 1}` : `Sub-agent ${index + 1}`,
-    ...(session.task ? { task: session.task } : {}),
-  };
-}
-
 function subagentsForThread(events: readonly SessionStreamEvent[], durable: readonly AgentSubagentSummary[] = []): readonly AgentSecondaryChild[] {
   return mergeSubagentSessions(events, durable)
     .filter((session): session is typeof session & { readonly childSessionId: string } => Boolean(session.childSessionId))
     .map((session, index) => ({
       childSessionId: session.childSessionId,
-      nickname: session.name && session.name !== "agent" ? session.name : `Sub-agent ${index + 1}`,
-      status: session.status,
+      nickname: session.nickname ?? (session.name && session.name !== "agent" ? session.name : `Sub-agent ${index + 1}`),
+      status: durable.find((child) => child.childSessionId === session.childSessionId)?.status ?? session.status,
       ...(session.task ? { task: session.task } : {}),
     }));
-}
-
-function UnavailableSubagentView({
-  locale,
-  onBack,
-}: {
-  readonly locale: AgentLocale;
-  readonly onBack: () => void;
-}) {
-  const messages = messagesFor(locale);
-  return (
-    <main className="flex min-h-0 flex-1 items-center justify-center bg-background px-6">
-      <div className="max-w-md text-center">
-        <AlertCircleIcon className="mx-auto size-5 text-muted-foreground" />
-        <p className="mt-3 text-sm text-muted-foreground">{messages.subagentUnavailable}</p>
-        <Button className="mt-4" onClick={onBack} size="sm" variant="outline">
-          <ArrowLeftIcon className="size-4" />
-          {messages.backToTask}
-        </Button>
-      </div>
-    </main>
-  );
 }
 
 const RECOVERY_TAIL_LOOKUP_TIMEOUT_MS = 1_500;
@@ -2991,8 +2967,9 @@ function resolveSessionAssetEndpoint(endpoint: AgentAssetEndpoint, sessionId: st
 
 function latestPublicationResultKey(events: readonly SessionStreamEvent[]): string | undefined {
   const publications = new Set(events.flatMap((event) => event.type === "call.requested" && ["publish_artifact", "artifact_publish", "publish_preview", "website_preview"].includes(event.data.capability.name.toLowerCase().replaceAll("-", "_")) ? [event.data.callId] : []));
-  const latest = events.findLast((event) => event.type === "call.settled" && event.data.outcome === "completed" && publications.has(event.data.callId));
-  return latest ? eventIdentity(latest) : undefined;
+  const results = events.filter((event) => event.type === "call.settled" && event.data.outcome === "completed"
+    && (publications.has(event.data.callId) || isRecord(event.data.output) && ["artifact", "website-preview"].includes(String(event.data.output.kind))));
+  return results.length ? results.map(eventIdentity).join(";") : undefined;
 }
 
 function parseSessionAssets(payload: unknown): readonly AgentSessionAsset[] {

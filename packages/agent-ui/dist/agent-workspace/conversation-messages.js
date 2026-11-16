@@ -1,11 +1,11 @@
 import { receivedClientMessageId } from "./thread-storage.js";
-import { conversationOf } from "eve/client";
 import { conversation } from "eve/events";
+import { presentationSnapshot } from "./turn-presentation.js";
 export function projectConversationMessages(messages, events, pendingEdit) {
     const accepted = pendingEdit && events.some((event) => event.type === "delivery.consumed" && receivedClientMessageId(event) === pendingEdit.clientMessageId);
     const target = pendingEdit && !accepted ? events.find((event) => event.type === "turn.started" && event.data.turnId === pendingEdit.beforeTurnId) : undefined;
     const selectedEvents = target ? events.filter((event) => event.meta.position.line < target.meta.position.line) : events;
-    const view = conversationOf(selectedEvents).view;
+    const view = presentationSnapshot(selectedEvents).view;
     const selected = new Set(conversation(view).map((turn) => turn.turnId));
     const importedIds = new Set(selectedEvents.flatMap((event) => event.type === "delivery.consumed" && selected.has(event.data.turnId)
         ? (event.data.history ?? []).map((_item, index) => `${event.data.deliveryId}:imported:${index}`)

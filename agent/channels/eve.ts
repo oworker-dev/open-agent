@@ -33,6 +33,7 @@ import { mailboxSessionAuth, parseMailboxSessionAuth } from "../lib/mailbox-sess
 import {
   inspectMailboxBoundary,
   MailboxBoundaryInspectionTimeoutError,
+  resetMailboxSession,
   type MailboxBoundary,
 } from "../lib/mailbox-boundary.ts";
 import { parseAnswers, type SessionStreamEvent } from "eve/client";
@@ -234,10 +235,9 @@ const mailboxRoute = POST(MAILBOX_ROUTE, async (request, args) => {
     });
   }
   if (input.action === "reset") {
-    const receipt = await session.reset(input.reason ? { reason: input.reason } : undefined);
-    const result = await receipt.result({ signal: AbortSignal.timeout(15_000) });
+    const result = await resetMailboxSession(session, input.reason);
     if (result.status === "failed") return mailboxProblem(502, result.error.code, result.error.message);
-    return Response.json({ ok: true, status: "reset", sessionId: receipt.sessionId }, { headers: { "cache-control": "no-store" } });
+    return Response.json({ ok: true, status: result.status, sessionId: session.id }, { headers: { "cache-control": "no-store" } });
   }
   let boundary: MailboxBoundary;
   try {

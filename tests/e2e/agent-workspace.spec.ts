@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { conversationOf } from "eve/client";
 import { conversation } from "eve/events";
+import { encodeMultiSelectAnswer } from "@oworker/open-agent-contracts";
 import { parseAssetPrompt, serializeAssetPrompt } from "@oworker/open-agent-contracts/asset";
 import { NativeFixture, line, reply, startTurn } from "./native-fixture.ts";
 
@@ -335,6 +336,131 @@ test("native tool calls retain the execution group", async ({ page }) => {
   await expect(page.getByRole("button", { name: /^Worked for/ })).toBeVisible();
 });
 
+for (const blank of ["absent", "preview", "completed"] as const) test(`empty thinking exits when tool input appears and stays absent during execution (${blank})`, async ({ page }) => {
+  const f = fixtures.get(page)!;
+  const turnId = "empty-thought";
+  f.onSend = async (body) => f.publish(startTurn(f.cursor, turnId, "empty-delivery", String(body.message)));
+  await page.goto("/");
+  await f.send("Edit without a reasoning summary");
+  const thought = page.locator('[data-slot="reasoning-trigger"]');
+  await expect(thought).toHaveCount(1);
+  if (blank === "preview") await f.publish(line(f.cursor, { type: "content.delta", scope: { turnId, runId: `${turnId}:run` }, data: {
+    partId: "blank", kind: "reasoning", delta: "\n ",
+  } }));
+  if (blank === "completed") await f.publish(line(f.cursor, { type: "content.completed", scope: { turnId }, data: {
+    partId: "blank", runId: `${turnId}:run`, kind: "reasoning", phase: "narration", value: "",
+  } }));
+  await f.publish(line(f.cursor, { type: "call.input", scope: { turnId, runId: `${turnId}:run` }, data: {
+    callId: "empty-file", kind: "tool", name: "edit_file", delta: '{"path":"empty.txt","old_string":"","new_string":"',
+  } }));
+  await expect(page.getByRole("button", { name: /^Editing/ })).toBeVisible();
+  await expect(thought).toHaveCount(0);
+  await page.waitForTimeout(1100);
+  await expect(thought).toHaveCount(0);
+  await f.publish(line(f.cursor,
+    { type: "call.requested", scope: { turnId }, data: { callId: "empty-file", owner: { runId: `${turnId}:run` }, capability: { kind: "tool", name: "edit_file" }, input: { path: "empty.txt", old_string: "", new_string: "content" } } },
+    { type: "call.started", scope: { turnId }, data: { callId: "empty-file" } }));
+  await expect(page.getByRole("button", { name: /Creating empty.txt/ })).toBeVisible();
+  await expect(thought).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /^Working/ })).toBeVisible();
+  // A newer model step must retain its own placeholder even if an old tool runs.
+  await f.publish(line(f.cursor,
+    { type: "model.settled", scope: { turnId }, data: { runId: `${turnId}:run`, outcome: "completed", finishReason: "tool-calls" } },
+    { type: "model.requested", scope: { turnId }, data: { runId: "after-tool", owner: { turnId } } },
+    { type: "model.started", scope: { turnId }, data: { runId: "after-tool", modelId: "test", attempt: 0 } }));
+  await expect(thought).toHaveCount(1);
+  await expect(thought).toContainText("Thinking");
+  await f.publish(line(f.cursor,
+    { type: "model.retried", scope: { turnId }, data: { runId: "after-tool", attempt: 0, error: { code: "TRANSIENT", message: "Try again" } } },
+    { type: "model.started", scope: { turnId }, data: { runId: "after-tool", modelId: "test", attempt: 1 } }));
+  await expect(thought).toHaveCount(1);
+  await expect(page.locator("[data-agent-retry]")).toHaveCount(1);
+  await f.publish(line(f.cursor, { type: "content.delta", scope: { turnId, runId: "after-tool" }, data: { partId: "reply", kind: "text", delta: "Reply after tool" } }));
+  await expect(page.getByRole("log")).toContainText("Reply after tool");
+  await expect(thought).toHaveCount(0);
+});
+
+test("reasoning completes its own timer and stays above tools through the next step", async ({ page }) => {
+  const f = fixtures.get(page)!;
+  f.onSend = async (body) => f.publish(startTurn(f.cursor, "thought-order", "thought-delivery", String(body.message))
+    .map((event) => ({ ...event, meta: { ...event.meta, at: new Date(Date.now() - 5000).toISOString() } })));
+  await page.goto("/");
+  await f.send("Inspect the code");
+  await f.publish(line(f.cursor, { type: "content.delta", scope: { turnId: "thought-order", runId: "thought-order:run" }, data: { partId: "thought", kind: "reasoning", delta: "**Inspecting files**\n\nFirst paragraph." } }));
+  const thought = page.locator('[data-slot="reasoning-trigger"]');
+  await expect(thought).toContainText("Inspecting files");
+  await expect(thought).not.toContainText("*");
+  await f.publish(line(f.cursor,
+    { type: "call.requested", scope: { turnId: "thought-order" }, data: { callId: "inspect-tool", owner: { runId: "thought-order:run" }, capability: { kind: "tool", name: "bash" }, input: { command: "printf inspect" } } },
+    { type: "call.started", scope: { turnId: "thought-order" }, data: { callId: "inspect-tool" } }));
+  const tool = page.getByRole("button", { name: /printf inspect/ });
+  await expect(tool).toBeVisible();
+  const expectBefore = async () => expect((await thought.first().boundingBox())!.y).toBeLessThan((await tool.boundingBox())!.y);
+  await expectBefore();
+  await f.publish(line(f.cursor, { type: "content.completed", scope: { turnId: "thought-order" }, data: { partId: "thought", runId: "thought-order:run", kind: "reasoning", phase: "narration", value: "**Inspecting files**\n\nFirst paragraph." } })
+    .map((event) => ({ ...event, meta: { ...event.meta, at: new Date(Date.now() - 2500).toISOString() } })));
+  await expect(thought).toContainText("Reasoning complete");
+  const label = await thought.textContent();
+  await page.waitForTimeout(1200);
+  await expect(thought).toHaveText(label!);
+  await expectBefore();
+  await f.publish(line(f.cursor,
+    { type: "call.settled", scope: { turnId: "thought-order" }, data: { callId: "inspect-tool", outcome: "completed", output: "ok" } },
+    { type: "model.settled", scope: { turnId: "thought-order" }, data: { runId: "thought-order:run", outcome: "completed", finishReason: "tool-calls" } },
+    { type: "model.requested", scope: { turnId: "thought-order" }, data: { runId: "next-thought", owner: { turnId: "thought-order" } } },
+    { type: "model.started", scope: { turnId: "thought-order" }, data: { runId: "next-thought", modelId: "test", attempt: 0 } }));
+  await expect(thought).toHaveCount(2);
+  await expectBefore();
+  expect((await thought.last().boundingBox())!.y).toBeGreaterThan((await tool.boundingBox())!.y);
+});
+
+test("stopped file tools immediately stop animating and stay stopped after settlement", async ({ page }) => {
+  const f = fixtures.get(page)!;
+  f.onSend = async (body) => f.publish([...startTurn(f.cursor, "stop-file", "stop-file-delivery", String(body.message)),
+    ...line(f.cursor + 3,
+      { type: "call.requested", scope: { turnId: "stop-file" }, data: { callId: "file", owner: { runId: "stop-file:run" }, capability: { kind: "tool", name: "edit_file" }, input: { path: "example.txt", old_string: "before", new_string: "after" } } },
+      { type: "call.started", scope: { turnId: "stop-file" }, data: { callId: "file" } })]);
+  await page.goto("/");
+  await f.send("Edit a file");
+  const tool = page.getByRole("button", { name: /example.txt/ });
+  await expect(tool.locator(".animate-spin")).toHaveCount(1);
+  await page.getByRole("button", { name: "Stop", exact: true }).click();
+  await expect(tool).toContainText("Stopped");
+  await expect(tool.locator(".animate-spin")).toHaveCount(0);
+  await f.publish(line(f.cursor,
+    { type: "call.settled", scope: { turnId: "stop-file" }, data: { callId: "file", outcome: "interrupted" } },
+    { type: "turn.settled", data: { turnId: "stop-file", outcome: "cancelled" } },
+    { type: "delivery.settled", data: { deliveryId: "stop-file-delivery", turnId: "stop-file", outcome: "handled" } }));
+  await expect(page.getByRole("button", { name: "Send", exact: true })).toBeVisible();
+  await expect(tool).toContainText("Stopped");
+  await expect(tool.locator(".animate-spin")).toHaveCount(0);
+});
+
+test("a burst of file input remains incremental without blocking the composer", async ({ page }) => {
+  const f = fixtures.get(page)!;
+  f.onSend = async (body) => f.publish(startTurn(f.cursor, "file-burst", "burst-delivery", String(body.message)));
+  await page.goto("/");
+  await f.send("Receive a large file edit");
+  await page.evaluate(() => {
+    const browser = window as typeof window & { auditTasks: number[] };
+    browser.auditTasks = [];
+    new PerformanceObserver((list) => browser.auditTasks.push(...list.getEntries().map((entry) => entry.duration))).observe({ type: "longtask" });
+  });
+  const input = JSON.stringify({ path: "burst.txt", old_string: "", new_string: "x".repeat(60_000) + "BURST_END" });
+  const events = [];
+  for (let offset = 0; offset < input.length; offset += 120) events.push(...line(f.cursor + events.length, { type: "call.input", scope: { turnId: "file-burst", runId: "file-burst:run" }, data: {
+    callId: "burst-file", ...(offset === 0 ? { kind: "tool" as const, name: "edit_file" } : {}), delta: input.slice(offset, offset + 120),
+  } }));
+  await f.publish(events);
+  const tool = page.getByRole("button", { name: /burst.txt/ });
+  await expect(tool).toBeVisible();
+  await tool.click();
+  await expect(page.getByRole("log")).toContainText("BURST_END");
+  await page.getByRole("textbox", { name: "Do anything" }).fill("Composer remains responsive");
+  const longest = await page.evaluate(() => Math.max(0, ...(window as typeof window & { auditTasks: number[] }).auditTasks));
+  expect(longest).toBeLessThan(1000);
+});
+
 test("rapid steering keeps each user, thought, and execution group in its own segment through replay", async ({ page }) => {
   const f = fixtures.get(page)!;
   const turnId = "steering";
@@ -448,7 +574,8 @@ test("batched steering keeps both user boundaries and streams tool input and out
   await expect(rows.nth(4).getByText("Final output", { exact: true })).toBeVisible();
   await expect(rows.nth(4)).not.toContainText("Partial output");
   await expect(rows.nth(1)).not.toContainText("printf streamed");
-  await expect.poll(() => f.collection.threads[0]?.events.length).toBe(f.events.length);
+  // The active stream's checkpoint debounce is 15s; include its save cadence.
+  await expect.poll(() => f.collection.threads[0]?.events.length, { timeout: 20_000 }).toBe(f.events.length);
   await page.reload();
   await expect(rows).toHaveCount(5);
   await expect(rows.nth(2)).toContainText("First queued correction");
@@ -523,6 +650,61 @@ for (const freeform of [false, true]) test(`question cards submit ${freeform ? "
   await page.reload({ waitUntil: "domcontentloaded" });
   await expect(page.getByText("Format confirmed", { exact: true })).toHaveCount(1);
   await expect(page.getByRole("log").getByText("Help me choose an output format", { exact: true })).toHaveCount(1);
+});
+
+test("multi-select question submits and restores selected options and additional text", async ({ page }) => {
+  const f = fixtures.get(page)!;
+  const turnId = "question-multi";
+  const responseText = encodeMultiSelectAnswer({
+    additionalText: "Keep it concise.",
+    optionIds: ["Markdown", "JSON"],
+  });
+  f.onSend = async (body) => {
+    await f.publish(startTurn(f.cursor, turnId, "question-multi-delivery", String(body.message)));
+    await f.publish(line(f.cursor,
+      { type: "call.requested", scope: { turnId }, data: { callId: "ask-format-multi", owner: { runId: `${turnId}:run` }, capability: { kind: "tool", name: "ask_question" }, input: { question: "Which formats should I prepare?", multiple: true } } },
+      { type: "call.started", scope: { turnId }, data: { callId: "ask-format-multi" } },
+      { type: "model.settled", scope: { turnId }, data: { runId: `${turnId}:run`, outcome: "completed", finishReason: "tool-calls" } },
+      { type: "interaction.opened", scope: { turnId }, data: { interactionId: "format-multi", subject: { callId: "ask-format-multi" }, request: { kind: "question", prompt: "Which formats should I prepare?", display: "select", allowFreeform: true, options: [{ id: "Markdown", label: "Markdown" }, { id: "JSON", label: "JSON" }, { id: "CSV", label: "CSV" }] } } },
+      { type: "turn.paused", data: { turnId, awaiting: [{ interactionId: "format-multi" }] } },
+    ));
+  };
+  f.onEdit = async (body) => {
+    expect(body.operationKind).toBe("respond");
+    expect(body.inputResponses).toEqual([{ interactionId: "format-multi", text: responseText }]);
+    f.mailboxStatus = "committed";
+    await f.publish(line(f.cursor,
+      { type: "interaction.settled", scope: { turnId }, data: { interactionId: "format-multi", outcome: "accepted", response: { text: responseText } } },
+      { type: "call.settled", scope: { turnId }, data: { callId: "ask-format-multi", outcome: "completed", output: { status: "answered", answer: "Selected options:\n- Markdown\n- JSON\n\nAdditional information:\nKeep it concise." } } },
+      { type: "model.requested", scope: { turnId }, data: { runId: "after-multi-question", owner: { turnId } } },
+      { type: "model.started", scope: { turnId }, data: { runId: "after-multi-question", modelId: "test", attempt: 0 } },
+      { type: "content.completed", scope: { turnId }, data: { partId: "multi-format-reply", runId: "after-multi-question", kind: "text", phase: "reply", value: "Formats confirmed" } },
+      { type: "model.settled", scope: { turnId }, data: { runId: "after-multi-question", outcome: "completed", finishReason: "stop" } },
+      { type: "turn.settled", data: { turnId, outcome: "completed", reply: ["multi-format-reply"] } },
+      { type: "delivery.settled", data: { deliveryId: "question-multi-delivery", turnId, outcome: "handled" } },
+    ));
+  };
+
+  await page.goto("/");
+  await f.send("Prepare the formats");
+  const card = page.locator('[data-input-request-kind="question"]');
+  await expect(card.getByRole("checkbox", { name: "Markdown", exact: true })).toBeVisible();
+  await card.getByRole("checkbox", { name: "Markdown", exact: true }).check();
+  await card.getByRole("checkbox", { name: "JSON", exact: true }).check();
+  await card.getByRole("textbox", { name: "Additional information" }).fill("Keep it concise.");
+  await card.getByRole("button", { name: "Confirm", exact: true }).click();
+  await expect(page.getByText("Formats confirmed", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: /^Worked for/ }).click();
+  await card.getByRole("button").first().click();
+  await expect(card.locator('[data-option-selected="true"]')).toHaveCount(2);
+  await expect(card.getByText("Keep it concise.", { exact: true })).toBeVisible();
+  expect(f.edits).toHaveLength(1);
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.getByRole("button", { name: /^Worked for/ }).click();
+  const restoredCard = page.locator('[data-input-request-kind="question"]');
+  await restoredCard.getByRole("button").first().click();
+  await expect(restoredCard.locator('[data-option-selected="true"]')).toHaveCount(2);
+  await expect(restoredCard.getByText("Keep it concise.", { exact: true })).toBeVisible();
 });
 
 test("a paused approval can stop its exact turn without sending an approval decision", async ({ page }) => {
@@ -632,7 +814,7 @@ test("stop during an ambiguous first admission keeps the composer locked without
   expect(submissions).toBe(1);
 });
 
-for (const scrolled of [false, true]) test(`new turn anchors its user and adjacent placeholder through response (history scrolled=${scrolled})`, async ({ page }) => {
+for (const scrolled of [false, true]) test(`plain chat follows the bottom without pushing the user to the top (history scrolled=${scrolled})`, async ({ page }) => {
   const f = fixtures.get(page)!; f.seed(22);
   let submittedMessage = "";
   f.onSend = async (body) => { submittedMessage = String(body.message); };
@@ -640,12 +822,12 @@ for (const scrolled of [false, true]) test(`new turn anchors its user and adjace
   await expect(page.getByRole("log").getByText("History request 21", { exact: true })).toBeVisible();
   const viewport = page.locator('[data-slot="thread-viewport"]');
   if (scrolled) await viewport.evaluate((element) => { element.scrollTop = 0; });
-  await f.send("Anchor this new turn");
-  const user = page.getByRole("log").getByText("Anchor this new turn", { exact: true });
+  await f.send("A new chat message");
+  const user = page.getByRole("log").getByText("A new chat message", { exact: true });
   await expect(user).toBeVisible();
   const thinking = page.getByRole("log").getByText("Thinking", { exact: true }).last();
   await expect(thinking).toBeVisible();
-  await expect.poll(async () => (await user.boundingBox())!.y - (await viewport.boundingBox())!.y).toBeLessThan(100);
+  await expect.poll(async () => (await user.boundingBox())!.y - (await viewport.boundingBox())!.y).toBeGreaterThan(150);
   await expect.poll(async () => {
     const before = (await user.boundingBox())!.y;
     await page.waitForTimeout(100);
@@ -654,7 +836,7 @@ for (const scrolled of [false, true]) test(`new turn anchors its user and adjace
   const initial = await user.boundingBox();
   const placeholder = await thinking.boundingBox();
   const viewportBox = await viewport.boundingBox();
-  expect(initial!.y - viewportBox!.y).toBeLessThan(100);
+  expect(initial!.y - viewportBox!.y).toBeGreaterThan(150);
   expect(placeholder!.y - (initial!.y + initial!.height)).toBeLessThan(110);
   await expect.poll(() => submittedMessage).not.toBe("");
   await f.publish(startTurn(f.cursor, "anchored", "delivery-1", submittedMessage, "history-21"));
@@ -662,10 +844,136 @@ for (const scrolled of [false, true]) test(`new turn anchors its user and adjace
     partId: "anchored:reply", kind: "text", delta: "Response begins here.",
   } }));
   await expect(page.getByText("Response begins here.", { exact: true })).toBeVisible();
-  expect(Math.abs((await user.boundingBox())!.y - initial!.y)).toBeLessThan(8);
+  expect((await user.boundingBox())!.y - viewportBox!.y).toBeGreaterThan(150);
   await f.publish(reply(f.cursor, "anchored", "delivery-1", "Response begins here."));
   await expect(page.getByRole("button", { name: "Send", exact: true })).toBeVisible();
-  expect(Math.abs((await user.boundingBox())!.y - initial!.y)).toBeLessThan(8);
+  expect((await user.boundingBox())!.y - viewportBox!.y).toBeGreaterThan(150);
+  await expect(page.locator('[data-slot="task-scroll-reserve"]')).toHaveCSS("height", "0px");
+  const longReply = Array.from({ length: 65 }, (_, index) => `Chat paragraph ${index}.`).join("\n\n");
+  // A second chat can grow beyond the viewport and still follow its output.
+  f.onSend = async body => { await f.publish(startTurn(f.cursor, "long-chat", "delivery-2", String(body.message), "anchored")); };
+  await f.send("Continue chatting");
+  await f.publish(line(f.cursor, { type: "content.delta", scope: { turnId: "long-chat", runId: "long-chat:run" }, data: {
+    partId: "long-chat:reply", kind: "text", delta: longReply,
+  } }));
+  await expect(page.getByText("Chat paragraph 64.", { exact: true })).toBeInViewport();
+  await expect.poll(() => viewport.evaluate(element => element.scrollHeight - element.scrollTop - element.clientHeight)).toBeLessThan(2);
+});
+
+for (const mobile of [false, true]) test(`only the first execution group pushes up; streaming, collapse and the next chat keep their scroll policy (mobile=${mobile})`, async ({ page }) => {
+  if (mobile) await page.setViewportSize({ width: 390, height: 844 });
+  const f = fixtures.get(page)!; f.seed(22);
+  f.onSend = async body => { await f.publish(startTurn(f.cursor, "task-anchor", "delivery-1", String(body.message), "history-21")); };
+  await page.goto("/threads/native-thread");
+  await f.send("Work on this task");
+  const viewport = page.locator('[data-slot="thread-viewport"]');
+  const user = page.getByRole("log").getByText("Work on this task", { exact: true });
+  const offset = async () => (await user.boundingBox())!.y - (await viewport.boundingBox())!.y;
+  await expect.poll(offset).toBeGreaterThan(150);
+  await f.publish(line(f.cursor, { type: "content.completed", scope: { turnId: "task-anchor" }, data: {
+    partId: "task-thought", runId: "task-anchor:run", kind: "reasoning", phase: "narration", value: "Consider the task first.",
+  } }));
+  await expect(page.getByRole("button", { name: /^Reasoning complete/ })).toBeVisible();
+  await expect.poll(offset).toBeGreaterThan(150);
+  await f.publish(line(f.cursor,
+    { type: "call.requested", scope: { turnId: "task-anchor" }, data: { callId: "anchor-tool", owner: { runId: "task-anchor:run" }, capability: { kind: "tool", name: "bash" }, input: { command: "printf ok" } } },
+    { type: "call.started", scope: { turnId: "task-anchor" }, data: { callId: "anchor-tool" } }));
+  await expect(page.getByRole("button", { name: /^Working/ })).toBeVisible();
+  await expect.poll(offset).toBeLessThan(25);
+  await page.waitForTimeout(250); // allow the single smooth scroll to finish
+  const anchoredOffset = await offset();
+  await f.publish(line(f.cursor, { type: "call.settled", scope: { turnId: "task-anchor" }, data: { callId: "anchor-tool", outcome: "completed", output: "ok" } }));
+  await f.publish(line(f.cursor, { type: "content.delta", scope: { turnId: "task-anchor", runId: "task-anchor:run" }, data: {
+    partId: "task-anchor:reply", kind: "text", delta: "Task complete.",
+  } }));
+  await expect(page.getByText("Task complete.", { exact: true })).toBeVisible();
+  expect(Math.abs(await offset() - anchoredOffset)).toBeLessThan(8);
+  const furtherOutput = Array.from({ length: 40 }, (_, index) => `Task result paragraph ${index}.`).join("\n\n");
+  await f.publish(line(f.cursor, { type: "content.delta", scope: { turnId: "task-anchor", runId: "task-anchor:run" }, data: {
+    partId: "task-anchor:reply", kind: "text", delta: `\n\n${furtherOutput}`,
+  } }));
+  await expect(page.getByText("Task result paragraph 39.", { exact: true })).toHaveCount(1);
+  await page.waitForTimeout(150);
+  expect(Math.abs(await offset() - anchoredOffset)).toBeLessThan(8);
+  await f.publish(reply(f.cursor, "task-anchor", "delivery-1", `Task complete.\n\n${furtherOutput}`));
+  await expect(page.getByRole("button", { name: /^Worked for/ })).toBeVisible();
+  await page.waitForTimeout(350); // group collapse must preserve the anchor too
+  expect(Math.abs(await offset() - anchoredOffset)).toBeLessThan(8);
+  await page.getByRole("button", { name: "Scroll to bottom", exact: true }).click();
+  await expect.poll(() => viewport.evaluate(element => element.scrollHeight - element.scrollTop - element.clientHeight)).toBeLessThan(2);
+
+  f.onSend = async body => { await f.publish(startTurn(f.cursor, "next-chat", "delivery-2", String(body.message), "task-anchor")); };
+  await f.send("Thanks, just chatting now");
+  const nextUser = page.getByRole("log").getByText("Thanks, just chatting now", { exact: true });
+  await expect.poll(async () => (await nextUser.boundingBox())!.y - (await viewport.boundingBox())!.y).toBeGreaterThan(150);
+  await expect(page.locator('[data-slot="task-scroll-reserve"]')).toHaveCSS("height", "0px");
+});
+
+for (const beforeReceipt of [false, true]) test(`reading history before a tool appears prevents task anchoring and later output from stealing the viewport (before receipt=${beforeReceipt})`, async ({ page }) => {
+  const f = fixtures.get(page)!; f.seed(22);
+  f.onSend = async body => {
+    if (!beforeReceipt) await f.publish(startTurn(f.cursor, "reading", "delivery-1", String(body.message), "history-21"));
+  };
+  await page.goto("/threads/native-thread");
+  await f.send("Start while I read history");
+  const viewport = page.locator('[data-slot="thread-viewport"]');
+  await expect(page.getByRole("log").getByText("Start while I read history", { exact: true })).toBeVisible();
+  await viewport.hover({ position: { x: 20, y: 100 } });
+  await page.mouse.wheel(0, -550);
+  await page.waitForTimeout(300);
+  const readingTop = await viewport.evaluate(element => element.scrollTop);
+  if (beforeReceipt) await f.publish(startTurn(f.cursor, "reading", "delivery-1", String(f.sends[0]!.message), "history-21"));
+  await f.publish(line(f.cursor,
+    { type: "call.requested", scope: { turnId: "reading" }, data: { callId: "reading-tool", owner: { runId: "reading:run" }, capability: { kind: "tool", name: "bash" }, input: { command: "printf ok" } } },
+    { type: "call.started", scope: { turnId: "reading" }, data: { callId: "reading-tool" } }));
+  await expect(page.getByRole("button", { name: /^Working/ })).toHaveCount(1);
+  await f.publish(reply(f.cursor, "reading", "delivery-1", "Reading stays where you left it."));
+  await page.waitForTimeout(350);
+  expect(Math.abs(await viewport.evaluate(element => element.scrollTop) - readingTop)).toBeLessThan(8);
+  await expect(page.locator('[data-slot="task-scroll-reserve"]')).toHaveCSS("height", "0px");
+});
+
+test("same-turn follow-ups receive their own task anchor and replay does not reactivate it", async ({ page }) => {
+  const f = fixtures.get(page)!; f.seed(22);
+  const turnId = "follow-anchor";
+  const tool = (index: number) => line(f.cursor,
+    { type: "call.requested", scope: { turnId }, data: { callId: `follow-tool-${index}`, owner: { runId: index ? "follow-run" : `${turnId}:run` }, capability: { kind: "tool", name: "bash" }, input: { command: "printf ok" } } },
+    { type: "call.started", scope: { turnId }, data: { callId: `follow-tool-${index}` } });
+  f.onSend = async body => { await f.publish(startTurn(f.cursor, turnId, "delivery-1", String(body.message), "history-21")); await f.publish(tool(0)); };
+  f.onEdit = async body => {
+    await f.publish(line(f.cursor,
+      { type: "delivery.admitted", data: { deliveryId: "follow-delivery", source: { channel: "eve" } } },
+      { type: "delivery.consumed", scope: { turnId }, data: { deliveryId: "follow-delivery", turnId, parts: [{ kind: "text", text: serializeAssetPrompt(String(body.message), [], String(body.clientMessageId)) }] } },
+      { type: "model.requested", scope: { turnId }, data: { runId: "follow-run", owner: { turnId } } },
+      { type: "model.started", scope: { turnId }, data: { runId: "follow-run", modelId: "test", attempt: 0 } }));
+    await f.publish(tool(1));
+  };
+  await page.goto("/threads/native-thread"); await f.send("First task segment");
+  const viewport = page.locator('[data-slot="thread-viewport"]');
+  const offset = async (text: string) => (await page.getByRole("log").getByText(text, { exact: true }).boundingBox())!.y - (await viewport.boundingBox())!.y;
+  await expect.poll(() => offset("First task segment")).toBeLessThan(25);
+  await f.send("Follow-up task segment");
+  await expect.poll(() => offset("Follow-up task segment")).toBeLessThan(25);
+  await f.publish(reply(f.cursor, turnId, "delivery-1", "Both segments done."));
+  await expect(page.getByRole("button", { name: "Send", exact: true })).toBeVisible();
+  await expect.poll(() => f.collection.threads[0]?.events.length).toBe(f.events.length);
+  await page.reload();
+  await expect(page.getByText("Both segments done.", { exact: true })).toBeVisible();
+  await expect(page.locator('[data-slot="task-scroll-reserve"]')).toHaveCSS("height", "0px");
+});
+
+test("opening or refreshing an already running task does not activate a new task anchor", async ({ page }) => {
+  const f = fixtures.get(page)!; f.seed(22);
+  f.events.push(...startTurn(f.cursor, "resumed-task", "resumed-delivery", "An existing running task", "history-21"));
+  f.events.push(...line(f.cursor,
+    { type: "call.requested", scope: { turnId: "resumed-task" }, data: { callId: "resumed-tool", owner: { runId: "resumed-task:run" }, capability: { kind: "tool", name: "bash" }, input: { command: "printf ok" } } },
+    { type: "call.started", scope: { turnId: "resumed-task" }, data: { callId: "resumed-tool" } }));
+  await page.goto("/threads/native-thread");
+  await expect(page.getByRole("button", { name: /^Working/ })).toBeVisible();
+  await expect(page.locator('[data-slot="task-scroll-reserve"]')).toHaveCSS("height", "0px");
+  await page.reload();
+  await expect(page.getByRole("button", { name: /^Working/ })).toBeVisible();
+  await expect(page.locator('[data-slot="task-scroll-reserve"]')).toHaveCSS("height", "0px");
 });
 
 test("stop freezes visible output immediately while durable cancellation is still pending", async ({ page }) => {
@@ -727,6 +1035,40 @@ test("send during cancellation reaches Eve immediately and a late cancel receipt
   await page.reload();
   await expect(page.getByRole("log").getByText("First stopped request", { exact: true })).toHaveCount(1);
   await expect(page.getByRole("log").getByText("Send before cancellation returns", { exact: true })).toHaveCount(1);
+});
+
+test("stopping only a queued follow-up never cancels the next turn", async ({ page }) => {
+  const f = fixtures.get(page)!;
+  f.seed(1);
+  f.collection = { ...f.collection, threads: f.collection.threads.map((thread) => ({
+    ...thread,
+    queuedTurns: [{
+      id: "queued-followup", mailboxItemId: "queued-item", delivery: "server" as const,
+      state: "queued" as const, submittedAt: Date.now(), text: "Withdraw this queued message",
+    }],
+  })) };
+  let withdrawn = false;
+  await page.route("**/api/standalone/mailbox/queued-item", (route) => {
+    if (route.request().method() === "DELETE") withdrawn = true;
+    return route.fulfill({ json: { ok: true, item: {
+      itemId: "queued-item", clientMessageId: "queued-followup", status: withdrawn ? "cancelled" : "queued",
+    } } });
+  });
+  f.onSend = async (body) => {
+    await f.publish(startTurn(f.cursor, "next-turn", "next-delivery", String(body.message), "history-0"));
+  };
+  await page.goto("/threads/native-thread");
+  await expect(page.getByText("Withdraw this queued message", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Stop", exact: true }).click();
+  await f.send("New message immediately after stop");
+  await expect.poll(() => f.sendCount).toBe(1);
+  await expect(page.getByRole("button", { name: "Stop", exact: true })).toBeVisible();
+  expect(withdrawn).toBe(true);
+  expect(f.cancellations).toEqual([]);
+  await f.publish(reply(f.cursor, "next-turn", "next-delivery", "The new turn survived"));
+  await expect(page.getByText("The new turn survived", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Send", exact: true })).toBeVisible();
+  expect(f.cancellations).toEqual([]);
 });
 
 test("stop before the first receipt then send keeps one session and cancels only the original delivery", async ({ page }) => {

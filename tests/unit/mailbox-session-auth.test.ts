@@ -17,6 +17,10 @@ import { createEveAgentMailboxRuntime } from "../../server/agent-mailbox/eve-run
 import { enqueueAgentMailboxHttpRequest } from "../../server/agent-mailbox/http.ts";
 import type { AgentMailboxPayload, AgentMailboxStore } from "../../server/data/agent-mailbox-store.ts";
 import { sameResponder } from "../../node_modules/eve/dist/src/harness/hitl/responders.js";
+import { SessionInputQueue } from "../../node_modules/eve/dist/src/execution/session/input-queue.js";
+import { principalOf } from "../../node_modules/eve/dist/src/execution/session/principal.js";
+import { standaloneCookieAuth } from "../../agent/lib/standalone-auth.ts";
+import { authenticateStandaloneRequest, standaloneSessionAuth } from "../../server/http/standalone-request-auth.ts";
 
 const secret = "mailbox-identity-test-secret-at-least-32-bytes";
 const issuer = "https://host.example.test";
@@ -143,6 +147,68 @@ test("mailbox caller metadata cannot cross principal, tenant, type or issuer own
   assert.equal(parseMailboxSessionAuth({ ...caller, subject: [] }, owner), undefined);
   assert.equal(parseMailboxSessionAuth({ ...caller, authenticator: "" }, owner), undefined);
   assert.equal(parseMailboxSessionAuth({ ...caller, attributes: null }, owner), undefined);
+});
+
+test("standalone mailbox steering retains the direct caller through persistence and signed dispatch", async () => {
+  const request = new Request("https://agent.test/api/standalone/mailbox", {
+    method: "POST",
+    headers: { "content-type": "application/json", cookie: `open_agent_anonymous=${"a".repeat(43)}` },
+    body: JSON.stringify({
+      clientMessageId: "standalone-steer", sessionId: "session-1",
+      operationId: "standalone-steer", operationKind: "steer", expectedTurnId: "turn-1", message: "Change the current task.",
+      preferences: { modelId: DEFAULT_AGENT_RUNTIME_CONFIG.defaultModelId, reasoning: "low", executionMode: "standard" },
+      callerAuth: caller,
+    }),
+  });
+  const initial = await standaloneCookieAuth()(request);
+  assert.ok(initial);
+  const authenticated = authenticateStandaloneRequest(request);
+  const standaloneOwner = authenticated.identity;
+  let stored: AgentMailboxPayload | undefined;
+  const enqueueStore: Pick<AgentMailboxStore, "enqueue"> = {
+    async enqueue(input) {
+      stored = JSON.parse(JSON.stringify(input.payload));
+      return { status: "created", item: { ...input, ...input.owner, itemId: "mail-1", payload: input.payload,
+        status: "queued", attemptCount: 0, availableAt: "2026-11-14T00:00:00Z",
+        createdAt: "2026-11-14T00:00:00Z", updatedAt: "2026-11-14T00:00:00Z" } };
+    },
+  };
+  const response = await enqueueAgentMailboxHttpRequest({
+    callerAuth: standaloneSessionAuth(standaloneOwner),
+    owner: standaloneOwner, request, runtimeConfig: DEFAULT_AGENT_RUNTIME_CONFIG, store: enqueueStore as AgentMailboxStore,
+  });
+  assert.equal(response.status, 202, await response.text());
+  assert.ok(stored?.callerAuth);
+  assert.equal(stored.callerAuth.authenticator, "standalone-cookie");
+  assert.equal(stored.callerAuth.subject, undefined, "client-supplied callerAuth must be ignored");
+  assert.equal(stored.callerAuth.attributes.agentHostScope, undefined);
+
+  const runtime = createEveAgentMailboxRuntime({
+    AGENT_MAILBOX_DISPATCH_SECRET: secret, AGENT_RUNTIME_URL: "https://runtime.test",
+  }, async (url, init) => {
+    const dispatched = new Request(url, init);
+    const body = await dispatched.text();
+    assert.equal(verifyMailboxDispatchRequest(dispatched, body, { secret }), true);
+    const delivered = JSON.parse(body);
+    const callerAuth = parseMailboxSessionAuth(delivered.callerAuth, delivered);
+    assert.ok(callerAuth);
+    const resumed = mailboxSessionAuth({ ...delivered, callerAuth });
+    const identity = { callerCallId: undefined, principal: principalOf(initial) };
+    const consume = (auth: typeof resumed) => {
+      const queue = new SessionInputQueue([]);
+      const admission = queue.enqueueDelivery({ kind: "deliver", auth, turnPolicy: "steer", payloads: [{ message: delivered.message }] });
+      assert.ok(admission);
+      return queue.takeSteering(new Set([admission.sequence]), identity);
+    };
+    assert.ok(consume(resumed), "the real Eve queue must consume this input within the active turn");
+    assert.equal(sameResponder(initial, resumed), true, "ask and approval answers must retain their responder");
+    assert.equal(consume({ ...resumed, authenticator: "agent-mailbox-dispatch" }), undefined,
+      "the previous fallback identity reproduces waiting until the next turn");
+    assert.equal(consume({ ...resumed, principalId: "another-browser" }), undefined,
+      "a different browser must still be unable to steer the turn");
+    return Response.json({ sessionId: delivered.sessionId }, { status: 202 });
+  });
+  await runtime.deliver({ clientMessageId: "standalone-steer", itemId: "mail-1", owner: standaloneOwner, payload: stored, sessionId: "session-1" });
 });
 
 test("legacy standalone mailbox messages retain their owner without inheriting Host grants", () => {

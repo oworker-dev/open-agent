@@ -49,6 +49,19 @@ test("sync derives idempotent child metadata and stable nickname from Eve events
   assert.equal(snapshot?.activeCount, 0);
 });
 
+test("model-assigned role names persist across parent event replay", async () => {
+  const store = createMemoryAgentSubagentStore();
+  const options = { accessToken: "token", identity: owner, ownershipStore, parentSessionId: "parent", store };
+  const events = [
+    { type: "call.requested", data: { callId: "call", capability: { kind: "agent", name: "agent" }, input: { message: "Review", nickname: "代码审查" } } },
+    { type: "task.started", data: { taskId: "task", startedBy: { callId: "call" } } },
+    { type: "child.opened", data: { sessionId: "child", owner: { taskId: "task" }, name: "agent" } },
+  ];
+  assert.equal((await syncAgentSubagentsFromEvents({ ...options, events }))[0]?.nickname, "代码审查");
+  const replay = events.map(event => event.type === "call.requested" ? { ...event, data: { ...event.data, input: { nickname: "Changed" } } } : event);
+  assert.equal((await syncAgentSubagentsFromEvents({ ...options, events: replay }))[0]?.nickname, "代码审查");
+});
+
 test("background admission is not mistaken for a child completion", async () => {
   const store = createMemoryAgentSubagentStore();
   const children = await syncAgentSubagentsFromEvents({
@@ -166,6 +179,45 @@ test("closing a child retires its exact Eve session before closing the durable p
   });
   assert.deepEqual(retired, ["child"]);
   assert.equal(result?.status, "closed");
+});
+
+test("closed children survive stale inspection and historical event replay with their nickname", async () => {
+  const store = createMemoryAgentSubagentStore();
+  await store.create({ owner, parentSessionId: "parent", childSessionId: "child", callId: "call", nickname: "Atlas", status: "waiting" });
+  let inspections = 0;
+  const options = { accessToken: "token", identity: owner, ownershipStore, store, runtime: {
+    async inspect() { inspections++; return { status: "waiting" as const }; },
+    async cancel() { return "no_active_turn" as const; },
+    async reset() { return "reset" as const; },
+  } };
+  await closeAgentSubagent({ ...options, childSessionId: "child" });
+  assert.equal((await inspectAgentSubagent({ ...options, childSessionId: "child" }))?.status, "closed");
+  const replayed = await syncAgentSubagentsFromEvents({ ...options, parentSessionId: "parent", events: [
+    { type: "child.opened", data: { sessionId: "child", owner: { callId: "call" }, name: "agent" } },
+    { type: "call.settled", data: { callId: "call", outcome: "completed" } },
+  ] });
+  assert.equal(replayed[0]?.status, "closed");
+  assert.equal(replayed[0]?.nickname, "Atlas");
+  assert.equal(inspections, 0);
+  assert.equal((await listAgentSubagents({ ...options, parentSessionId: "parent" }))?.activeCount, 0);
+});
+
+test("an inspection already in flight cannot reopen a concurrently closed child", async () => {
+  const store = createMemoryAgentSubagentStore();
+  await store.create({ owner, parentSessionId: "parent", childSessionId: "child", status: "running" });
+  const started = Promise.withResolvers<void>();
+  const boundary = Promise.withResolvers<{ status: "waiting" }>();
+  const options = { accessToken: "token", identity: owner, ownershipStore, store, runtime: {
+    inspect() { started.resolve(); return boundary.promise; },
+    async cancel() { return "no_active_turn" as const; },
+    async reset() { return "reset" as const; },
+  } };
+  const inspecting = inspectAgentSubagent({ ...options, childSessionId: "child" });
+  await started.promise;
+  await closeAgentSubagent({ ...options, childSessionId: "child" });
+  boundary.resolve({ status: "waiting" });
+  assert.equal((await inspecting)?.status, "closed");
+  assert.equal((await store.findOwned(owner, "child"))?.status, "closed");
 });
 
 test("spawn persistence failure terminally retires the unowned child", async () => {

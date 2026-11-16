@@ -1,28 +1,21 @@
 import { defineHook } from "eve/hooks";
+import { delivery } from "eve/events";
 import { createPostgresAgentMailboxStoreFromEnvironment } from "../../server/data/agent-mailbox-store";
-import { commitMailboxReceiptWithRetry } from "../lib/mailbox-commit-retry";
+import { commitConsumedMailboxMessage } from "../lib/mailbox-consumption.ts";
 
 const mailboxStore = createPostgresAgentMailboxStoreFromEnvironment();
 
 export default defineHook({
   events: {
-    async "delivery.consumed"(_event, ctx) {
-      const auth = ctx.session.auth.current;
-      const itemId = auth?.attributes.agentMailboxDispatch === "1" || auth?.authenticator === "agent-mailbox-dispatch"
-        ? auth.attributes.agentMailboxItemId
-        : undefined;
-      if (!mailboxStore || typeof itemId !== "string" || !itemId.trim()) return;
-      const item = await commitMailboxReceiptWithRetry({
-        itemId,
-        onRetry: ({ attempt, delayMs }) => console.warn("Mailbox commit confirmation unavailable; retrying.", {
-          attempt,
-          delayMs,
-          sessionId: ctx.session.id,
-        }),
+    async "delivery.consumed"(event, ctx) {
+      if (!mailboxStore) return;
+      const item = await commitConsumedMailboxMessage({
+        consumed: event.data,
+        principal: delivery(ctx.view, event.data.deliveryId)?.principal,
         sessionId: ctx.session.id,
         store: mailboxStore,
       });
-      if (item.cancellationRequestedAt) ctx.cancel("The user stopped this mailbox delivery before it began responding.");
+      if (item?.cancellationRequestedAt) ctx.cancel("The user stopped this mailbox delivery before it began responding.");
     },
   },
 });
